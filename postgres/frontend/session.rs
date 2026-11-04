@@ -27,7 +27,7 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_truncate, is_tx_exit_stmt,
+    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
     PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
@@ -423,19 +423,8 @@ fn prepare_statement_inner(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     reject_catalog_dml(translated.cmd.stmt())?;
-    match translated.cmd.stmt() {
-        ast::Stmt::DropView { view_name, .. } => reject_drop_of_other_view_kind(
-            &pg_conn.conn,
-            view_name,
-            is_drop_matview(&parse_result),
-        )?,
-        ast::Stmt::DropTable { tbl_name, .. } => {
-            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, TableRemoval::Drop)?
-        }
-        ast::Stmt::Delete { tbl_name, .. } if is_truncate(&parse_result) => {
-            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, TableRemoval::Truncate)?
-        }
-        _ => {}
+    if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
+        reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
 
     let conn = Arc::clone(&pg_conn.conn);
@@ -1505,54 +1494,6 @@ fn reject_drop_of_other_view_kind(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum TableRemoval {
-    Drop,
-    Truncate,
-}
-
-/// Rejects DROP TABLE and TRUNCATE of a table that another table references
-/// with a foreign key, as PostgreSQL does. Core would instead delete the rows
-/// and run the ON DELETE actions of the referencing tables, or leave their
-/// foreign keys pointing at a table that no longer exists.
-fn reject_removal_of_referenced_table(
-    conn: &Arc<Connection>,
-    tbl_name: &ast::QualifiedName,
-    removal: TableRemoval,
-) -> Result<()> {
-    let schema = tbl_name.namespace.as_ref().map(|name| name.as_str());
-    let name = tbl_name.name.as_str();
-    for namespace in relation_lookup_namespaces(conn, schema) {
-        let referencing = conn.with_schema(namespace.database_id(), |schema| {
-            let ns = namespace.target.id;
-            schema
-                .get_btree_table(ns, name)
-                .map(|_| schema.tables_referencing(ns, name))
-        });
-        let Some(referencing) = referencing.transpose()? else {
-            continue;
-        };
-        let Some((_, child)) = referencing.first() else {
-            return Ok(());
-        };
-        return Err(match removal {
-            TableRemoval::Drop => sqlstate_error(
-                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
-                format!(
-                    "cannot drop table {name} because other objects depend on it: table {child} references it"
-                ),
-            ),
-            TableRemoval::Truncate => sqlstate_error(
-                SQLSTATE_FEATURE_NOT_SUPPORTED,
-                format!(
-                    "cannot truncate a table referenced in a foreign key constraint: table {child} references {name}"
-                ),
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// The namespaces that a relation is looked up in, in order. A relation
 /// named with a schema is in that schema. Otherwise it is looked up in the
 /// same order as core does: temp first, then the namespaces of the search
@@ -1614,7 +1555,9 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     let table_name = match stmt {
         ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name.name.as_str()),
+        ast::Stmt::Delete { tbl_name, .. } | ast::Stmt::Truncate { tbl_name } => {
+            Some(tbl_name.name.as_str())
+        }
         ast::Stmt::Update(update) => Some(update.tbl_name.name.as_str()),
         _ => None,
     };
@@ -1630,6 +1573,7 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     let verb = match stmt {
         ast::Stmt::Insert { .. } => "insert into",
         ast::Stmt::Delete { .. } => "delete from",
+        ast::Stmt::Truncate { .. } => "truncate",
         ast::Stmt::Update { .. } => "update",
         _ => unreachable!(),
     };
@@ -2139,11 +2083,18 @@ fn reject_drop_of_schema_referenced_from_outside(
         let SchemaObject::Table(table) = object else {
             continue;
         };
-        let outside = conn
-            .with_schema(namespace.database_id(), |s| s.tables_referencing(ns, table))?
-            .into_iter()
-            .find(|(child_ns, _)| *child_ns != ns);
-        if let Some((_, child)) = outside {
+        let outside = conn.with_schema(namespace.database_id(), |s| {
+            if !s.any_resolved_fks_referencing(ns, table) {
+                return Ok(None);
+            }
+            Ok::<_, LimboError>(
+                s.resolved_fks_referencing(ns, table)?
+                    .into_iter()
+                    .find(|fk_ref| fk_ref.child_namespace != ns)
+                    .map(|fk_ref| fk_ref.child_table.name.clone()),
+            )
+        })?;
+        if let Some(child) = outside {
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!(

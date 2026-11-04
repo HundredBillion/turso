@@ -1298,13 +1298,7 @@ impl PostgreSQLTranslator {
             })
             .ok_or_else(|| ParseError::ParseError("TRUNCATE: missing table name".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation)?;
-        Ok(ast::Stmt::Delete {
-            with: None,
-            tbl_name,
-            indexed: None,
-            where_clause: None,
-            returning: vec![],
-        })
+        Ok(ast::Stmt::Truncate { tbl_name })
     }
 
     fn translate_create_view(
@@ -6915,17 +6909,6 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// A TRUNCATE statement, which translates to a DELETE without WHERE.
-pub fn is_truncate(parse_result: &ParseResult) -> bool {
-    use pg_query::NodeRef;
-
-    parse_result
-        .protobuf
-        .nodes()
-        .first()
-        .is_some_and(|(node, ..)| matches!(node, NodeRef::TruncateStmt(_)))
-}
-
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
 /// compatibility but are not stored.
 #[derive(Debug, Clone)]
@@ -9646,16 +9629,10 @@ mod tests {
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
 
-        if let ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            ..
-        } = translated
-        {
+        if let ast::Stmt::Truncate { tbl_name } = translated {
             assert_eq!(tbl_name.name.as_str(), "users");
-            assert!(where_clause.is_none(), "TRUNCATE should have no WHERE");
         } else {
-            panic!("Expected Delete for TRUNCATE, got: {translated:?}");
+            panic!("Expected Truncate, got: {translated:?}");
         }
     }
 

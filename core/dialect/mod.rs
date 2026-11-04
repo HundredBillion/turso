@@ -297,6 +297,29 @@ pub trait Dialect: Send + Sync + 'static {
     fn enforces_foreign_keys_by_default(&self) -> bool {
         false
     }
+
+    /// The error for removing table `table` with `removal` while another
+    /// table, `referencing_table`, has a foreign key to it. Asked only while
+    /// foreign keys are enforced.
+    ///
+    /// PostgreSQL refuses both DROP TABLE and TRUNCATE. SQLite drops the
+    /// table after deleting its rows, which runs the ON DELETE actions of
+    /// the referencing table, so the default is `None`.
+    fn referenced_table_removal_error(
+        &self,
+        _removal: TableRemoval,
+        _table: &str,
+        _referencing_table: &str,
+    ) -> Option<crate::LimboError> {
+        None
+    }
+}
+
+/// A statement that removes all rows of a table at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRemoval {
+    DropTable,
+    Truncate,
 }
 
 #[cfg(test)]
