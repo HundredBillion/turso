@@ -6915,6 +6915,17 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// A TRUNCATE statement, which translates to a DELETE without WHERE.
+pub fn is_truncate(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    parse_result
+        .protobuf
+        .nodes()
+        .first()
+        .is_some_and(|(node, ..)| matches!(node, NodeRef::TruncateStmt(_)))
+}
+
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
 /// compatibility but are not stored.
 #[derive(Debug, Clone)]

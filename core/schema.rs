@@ -4395,6 +4395,34 @@ impl Schema {
         })
     }
 
+    /// The tables, other than `table_name` itself, that have a foreign key to
+    /// `table_name` in `namespace`.
+    pub fn tables_referencing(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Vec<(NamespaceId, String)> {
+        let mut out = Vec::new();
+        for (child_namespace, objects) in &self.namespaces {
+            for t in objects.tables.values() {
+                let Some(child) = t.btree() else {
+                    continue;
+                };
+                let is_self =
+                    *child_namespace == namespace && child.name.eq_ignore_ascii_case(table_name);
+                if !is_self
+                    && child.foreign_keys.iter().any(|fk| {
+                        fk.parent_namespace == namespace
+                            && fk.parent_table.eq_ignore_ascii_case(table_name)
+                    })
+                {
+                    out.push((*child_namespace, child.name.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Returns true if `table_name` declares any FOREIGN KEYs
     pub fn has_child_fks(&self, namespace: NamespaceId, table_name: &str) -> bool {
         self.get_table(namespace, table_name)
