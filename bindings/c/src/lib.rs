@@ -3,7 +3,7 @@
 
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
@@ -20,7 +20,7 @@ static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 /// `sqlite_search_count`.
 #[no_mangle]
 #[allow(non_upper_case_globals)]
-pub static mut sqlite3_search_count: ffi::c_int = 0;
+pub static sqlite3_search_count: AtomicI32 = AtomicI32::new(0);
 
 /// Test-only export of core's SQLite varint encoder for the TCL harness's
 /// btree_varint_test command (upstream test3.c). `buf` must have room for
@@ -1213,7 +1213,9 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let current = stmt.stmt.metrics().search_count;
     let delta = current - stmt.prev_search_count;
     stmt.prev_search_count = current;
-    sqlite3_search_count = sqlite3_search_count.saturating_add(delta as ffi::c_int);
+    let _ = sqlite3_search_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_add(delta as ffi::c_int))
+    });
     rc
 }
 
