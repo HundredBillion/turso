@@ -33,6 +33,8 @@ struct sqlite3_stmt {
     link(name = "turso_sqlite3", kind = "raw-dylib")
 )]
 extern "C" {
+    fn sqlite3_errcode(db: *mut sqlite3) -> i32;
+    fn sqlite3_errmsg(db: *mut sqlite3) -> *const libc::c_char;
     fn sqlite3_libversion() -> *const libc::c_char;
     fn sqlite3_libversion_number() -> i32;
     fn sqlite3_close(db: *mut sqlite3) -> i32;
@@ -232,6 +234,8 @@ const SQLITE_CHECKPOINT_PASSIVE: i32 = 0;
 const SQLITE_CHECKPOINT_FULL: i32 = 1;
 const SQLITE_CHECKPOINT_RESTART: i32 = 2;
 const SQLITE_CHECKPOINT_TRUNCATE: i32 = 3;
+const SQLITE_BUSY: i32 = 5;
+const SQLITE_CONSTRAINT: i32 = 19;
 const SQLITE_INTEGER: i32 = 1;
 const SQLITE_FLOAT: i32 = 2;
 const SQLITE_ABORT: i32 = 4;
@@ -397,6 +401,100 @@ mod tests {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    #[test]
+    fn exec_failure_updates_connection_error_state() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE example(id INTEGER PRIMARY KEY); INSERT INTO example VALUES(1)"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO example VALUES(1)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_CONSTRAINT
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT);
+            let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                .to_str()
+                .unwrap();
+            assert!(message.contains("UNIQUE"), "{message}");
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT 1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn mvcc_exec_conflict_sets_busy_error_on_connection() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path =
+                std::ffi::CString::new(dir.path().join("conflict.db").to_str().unwrap()).unwrap();
+            let mut first = ptr::null_mut();
+            let mut second = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut first), SQLITE_OK);
+            assert_eq!(sqlite3_exec(first, c"PRAGMA journal_mode=mvcc; CREATE TABLE example(id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO example VALUES(1,0)".as_ptr(), None, ptr::null_mut(), ptr::null_mut()), SQLITE_OK);
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut second), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    first,
+                    c"BEGIN CONCURRENT; UPDATE example SET value=1 WHERE id=1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    second,
+                    c"BEGIN CONCURRENT; UPDATE example SET value=2 WHERE id=1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_BUSY
+            );
+            assert_eq!(sqlite3_errcode(second), SQLITE_BUSY);
+            assert_eq!(
+                sqlite3_exec(
+                    first,
+                    c"COMMIT".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(second), SQLITE_OK);
+            assert_eq!(sqlite3_close(first), SQLITE_OK);
         }
     }
 

@@ -1205,8 +1205,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
             stmt.clear_text_cache();
             SQLITE_DONE
         }
-        Err(LimboError::Busy) => SQLITE_BUSY,
-        Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
         Err(err) => {
             let mut db_inner = db.inner.lock().unwrap();
             set_db_err(&mut db_inner, err)
@@ -1241,6 +1239,10 @@ pub unsafe extern "C" fn sqlite3_exec(
     }
 
     let db_ref: &sqlite3 = &*db;
+    {
+        let mut inner = db_ref.inner.lock().unwrap();
+        set_db_err_msg(&mut inner, SQLITE_OK, "not an error");
+    }
     let sql_cstr = CStr::from_ptr(sql);
     let sql_str = match sql_cstr.to_str() {
         Ok(s) => s,
@@ -1260,11 +1262,11 @@ pub unsafe extern "C" fn sqlite3_exec(
         let is_dql = is_query_statement(trimmed);
         if !is_dql {
             // For DML/DDL, use normal execute path
-            let db_inner = db_ref.inner.lock().unwrap();
+            let mut db_inner = db_ref.inner.lock().unwrap();
             match db_inner.conn.execute(trimmed) {
                 Ok(_) => continue,
                 Err(e) => {
-                    return handle_limbo_err(e, err);
+                    return handle_limbo_err(&mut db_inner, e, err);
                 }
             }
         } else if callback.is_none() {
@@ -1519,7 +1521,8 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let result = stmt_run_to_completion(stmt);
     if let Err(err) = stmt.stmt.reset() {
         if result == SQLITE_OK {
-            return handle_limbo_err(err, std::ptr::null_mut());
+            let mut inner = stmt.db.inner.lock().unwrap();
+            return handle_limbo_err(&mut inner, err, std::ptr::null_mut());
         }
     }
     stmt.prev_search_count = 0;
@@ -3859,7 +3862,8 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
-        LimboError::Busy => SQLITE_BUSY,
+        LimboError::Busy | LimboError::WriteWriteConflict => SQLITE_BUSY,
+        LimboError::Interrupt => SQLITE_INTERRUPT,
         // SQLite reports operations on an expired blob handle (its row's table was
         // written after sqlite3_blob_open) as SQLITE_ABORT.
         LimboError::BlobHandleExpired => SQLITE_ABORT,
@@ -3871,8 +3875,13 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     }
 }
 
-fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
+unsafe fn handle_limbo_err(
+    db: &mut sqlite3Inner,
+    err: LimboError,
+    container: *mut *mut ffi::c_char,
+) -> i32 {
     let code = limbo_err_code(&err);
+    set_db_err_msg(db, code, &format!("{err}"));
     if !container.is_null() {
         let err_msg = format!("{err}");
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
