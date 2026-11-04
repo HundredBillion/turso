@@ -4401,8 +4401,8 @@ impl Schema {
         &self,
         namespace: NamespaceId,
         table_name: &str,
-    ) -> Vec<(NamespaceId, String)> {
-        let mut out = Vec::new();
+    ) -> Result<Vec<(NamespaceId, String)>> {
+        let mut out = Vec::try_with_capacity_ext(0)?;
         for (child_namespace, objects) in &self.namespaces {
             for t in objects.tables.values() {
                 let Some(child) = t.btree() else {
@@ -4416,11 +4416,11 @@ impl Schema {
                             && fk.parent_table.eq_ignore_ascii_case(table_name)
                     })
                 {
-                    out.push((*child_namespace, child.name.clone()));
+                    out.try_push((*child_namespace, child.name.clone()))?;
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Returns true if `table_name` declares any FOREIGN KEYs

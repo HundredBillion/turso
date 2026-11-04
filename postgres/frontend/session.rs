@@ -1525,10 +1525,11 @@ fn reject_removal_of_referenced_table(
     for namespace in relation_lookup_namespaces(conn, schema) {
         let referencing = conn.with_schema(namespace.database_id(), |schema| {
             let ns = namespace.target.id;
-            schema.get_btree_table(ns, name)?;
-            Some(schema.tables_referencing(ns, name))
+            schema
+                .get_btree_table(ns, name)
+                .map(|_| schema.tables_referencing(ns, name))
         });
-        let Some(referencing) = referencing else {
+        let Some(referencing) = referencing.transpose()? else {
             continue;
         };
         let Some((_, child)) = referencing.first() else {
@@ -2138,11 +2139,10 @@ fn reject_drop_of_schema_referenced_from_outside(
         let SchemaObject::Table(table) = object else {
             continue;
         };
-        let outside = conn.with_schema(namespace.database_id(), |s| {
-            s.tables_referencing(ns, table)
-                .into_iter()
-                .find(|(child_ns, _)| *child_ns != ns)
-        });
+        let outside = conn
+            .with_schema(namespace.database_id(), |s| s.tables_referencing(ns, table))?
+            .into_iter()
+            .find(|(child_ns, _)| *child_ns != ns);
         if let Some((_, child)) = outside {
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
