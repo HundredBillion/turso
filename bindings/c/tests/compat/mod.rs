@@ -153,6 +153,31 @@ extern "C" {
     fn sqlite3_value_blob(value: *mut libc::c_void) -> *const libc::c_void;
     fn sqlite3_value_bytes(value: *mut libc::c_void) -> i32;
     fn sqlite3_result_int64(context: *mut libc::c_void, val: i64);
+    fn sqlite3_create_function(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        n_args: i32,
+        enc: i32,
+        context: *mut libc::c_void,
+        func: Option<unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void)>,
+        step: Option<unsafe extern "C" fn()>,
+        final_: Option<unsafe extern "C" fn()>,
+    ) -> i32;
+    fn sqlite3_create_collation(
+        db: *mut sqlite3,
+        name: *const libc::c_char,
+        enc: i32,
+        context: *mut libc::c_void,
+        compare: Option<
+            unsafe extern "C" fn(
+                *mut libc::c_void,
+                i32,
+                *const libc::c_void,
+                i32,
+                *const libc::c_void,
+            ) -> i32,
+        >,
+    ) -> i32;
     fn sqlite3_create_function_v2(
         db: *mut sqlite3,
         name: *const libc::c_char,
@@ -276,6 +301,102 @@ mod tests {
                 }
                 assert_eq!(sqlite3_close(db), SQLITE_OK);
             }
+        }
+    }
+
+    #[test]
+    fn legacy_scalar_function_registration_executes_callback() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function(
+                    db,
+                    c"legacy_answer".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(legacy_answer),
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT legacy_answer()".as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(statement, 0), 42);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn legacy_answer(
+        context: *mut libc::c_void,
+        _argc: i32,
+        _argv: *mut *mut libc::c_void,
+    ) {
+        sqlite3_result_int(context, 42);
+    }
+
+    #[test]
+    fn legacy_collation_registration_passes_context_to_callback() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            let mut calls = 0_i32;
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_collation(
+                    db,
+                    c"legacy_reverse".as_ptr(),
+                    SQLITE_UTF8,
+                    &mut calls as *mut i32 as *mut libc::c_void,
+                    Some(legacy_reverse)
+                ),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT 'a' COLLATE legacy_reverse < 'b'".as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(statement, 0), 0);
+            assert!(calls > 0);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn legacy_reverse(
+        context: *mut libc::c_void,
+        left_len: i32,
+        left: *const libc::c_void,
+        right_len: i32,
+        right: *const libc::c_void,
+    ) -> i32 {
+        *(context as *mut i32) += 1;
+        let left = std::slice::from_raw_parts(left as *const u8, left_len as usize);
+        let right = std::slice::from_raw_parts(right as *const u8, right_len as usize);
+        match right.cmp(left) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
         }
     }
 

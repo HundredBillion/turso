@@ -3160,6 +3160,17 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_collation(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    enc: ffi::c_int,
+    context: *mut ffi::c_void,
+    cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
+) -> ffi::c_int {
+    sqlite3_create_collation_v2(db, name, enc, context, cmp, None)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
     db: *mut sqlite3,
     name: *const ffi::c_char,
@@ -3232,6 +3243,20 @@ unsafe extern "C" fn collation_bridge_destroy(context: usize) {
     if let Some(destroy) = bridge.destroy {
         destroy(bridge.context);
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_function(
+    db: *mut sqlite3,
+    name: *const ffi::c_char,
+    n_args: ffi::c_int,
+    enc: ffi::c_int,
+    context: *mut ffi::c_void,
+    func: Option<unsafe extern "C" fn()>,
+    step: Option<unsafe extern "C" fn()>,
+    final_: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    sqlite3_create_function_v2(db, name, n_args, enc, context, func, step, final_, None)
 }
 
 #[no_mangle]

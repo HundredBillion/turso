@@ -355,6 +355,21 @@ int sqlite3_stricmp(const char *_a, const char *_b);
 
 int sqlite3_strnicmp(const char *_a, const char *_b, int _n);
 
+int sqlite3_create_collation(sqlite3 *db,
+                            const char *name,
+                            int enc,
+                            void *context,
+                            int (*compare)(void *, int, const void *, int, const void *));
+
+int sqlite3_create_function(sqlite3 *db,
+                           const char *name,
+                           int n_args,
+                           int enc,
+                           void *context,
+                           void (*func)(void *, int, void **),
+                           void (*step)(void *, int, void **),
+                           void (*final_)(void *));
+
 int sqlite3_create_collation_v2(sqlite3 *_db,
                                 const char *_name,
                                 int _enc,

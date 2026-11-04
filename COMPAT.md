@@ -712,7 +712,7 @@ Modifiers:
 
 | Interface                    | Status  | Comment |
 |------------------------------|---------|---------|
-| sqlite3_create_function      | ❌ No      |         |
+| sqlite3_create_function      | 🚧 Partial | Scalar callbacks; delegates to sqlite3_create_function_v2 |
 | sqlite3_create_function_v2   | ❌ No      | Stub    |
 | sqlite3_create_function16    | ❌ No      |         |
 | sqlite3_create_window_function | ❌ No    | Stub    |
@@ -745,7 +745,7 @@ Modifiers:
 
 | Interface                   | Status  | Comment |
 |-----------------------------|---------|---------|
-| sqlite3_create_collation    | ❌ No      |         |
+| sqlite3_create_collation    | 🚧 Partial | UTF-8 callbacks; delegates to sqlite3_create_collation_v2 |
 | sqlite3_create_collation_v2 | ❌ No      | Stub    |
 | sqlite3_create_collation16  | ❌ No      |         |
 | sqlite3_collation_needed    | ❌ No      |         |
