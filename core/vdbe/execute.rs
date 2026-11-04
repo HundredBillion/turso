@@ -10571,15 +10571,7 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
-                if !program.connection.is_db_initialized() {
-                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
-                } else {
-                    let version_integer =
-                        return_if_io!(state, pager.with_header(|header| header.version_number))
-                            .get() as i64;
-                    let version = execute_turso_version(version_integer);
-                    state.registers[*dest].set_text(Text::new(version))?;
-                }
+                state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
             }
             ScalarFunc::SqliteVersion => {
                 let version = execute_sqlite_version();
@@ -18788,14 +18780,6 @@ fn execute_sqlite_version() -> String {
     crate::dialect::sqlite::SQLITE_VERSION.to_string()
 }
 
-fn execute_turso_version(version_integer: i64) -> String {
-    let major = version_integer / 1_000_000;
-    let minor = (version_integer % 1_000_000) / 1_000;
-    let release = version_integer % 1_000;
-
-    format!("{major}.{minor}.{release}")
-}
-
 /// Coerce a value to i64 using the same non-NULL conversion rules as
 /// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
@@ -20308,13 +20292,6 @@ mod tests {
             execute_sqlite_version(),
             crate::dialect::sqlite::SQLITE_VERSION
         );
-    }
-
-    #[test]
-    fn test_execute_turso_version() {
-        let version_integer = 3046001;
-        let expected = "3.46.1";
-        assert_eq!(execute_turso_version(version_integer), expected);
     }
 
     #[test]

@@ -223,6 +223,63 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn turso_version_stays_the_engine_version_after_schema_creation() {
+        unsafe {
+            for filename in [c":memory:", c"turso-version-test.db"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = if filename == c":memory:" {
+                    std::ffi::CString::new(":memory:").unwrap()
+                } else {
+                    std::ffi::CString::new(temp.path().join("version.db").to_str().unwrap())
+                        .unwrap()
+                };
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+                for phase in 0..3 {
+                    if phase == 1 {
+                        assert_eq!(
+                            sqlite3_exec(
+                                db,
+                                c"CREATE TABLE example(id INTEGER)".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut()
+                            ),
+                            SQLITE_OK
+                        );
+                    } else if phase == 2 {
+                        assert_eq!(sqlite3_close(db), SQLITE_OK);
+                        assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+                    }
+                    let mut statement = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT turso_version()".as_ptr(),
+                            -1,
+                            &mut statement,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+                    let version = std::ffi::CStr::from_ptr(
+                        sqlite3_column_text(statement, 0) as *const libc::c_char
+                    );
+                    assert_eq!(
+                        version.to_str().unwrap(),
+                        env!("CARGO_PKG_VERSION"),
+                        "phase {phase}"
+                    );
+                    assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+                }
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
     fn test_libversion() {
         unsafe {
             let version = sqlite3_libversion();
