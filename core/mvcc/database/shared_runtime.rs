@@ -38,6 +38,7 @@ pub(crate) struct SharedOpenState {
     loaded: Option<LoadedManifest>,
     refresh: Option<SharedRefresh>,
     failed: bool,
+    manifest_ready: bool,
     bindings: Vec<FileBinding>,
 }
 
@@ -148,6 +149,7 @@ impl SharedMvccRuntime {
             loaded: None,
             refresh: None,
             failed: false,
+            manifest_ready: false,
             bindings: Vec::new(),
         })
     }
@@ -158,7 +160,7 @@ impl SharedOpenState {
         if self.failed {
             return Err(LimboError::InvalidArgument("shared open already failed".into()).into());
         }
-        if self.loaded.is_some() || self.refresh.is_some() {
+        if self.manifest_ready {
             return Ok(IOResult::Done(()));
         }
         let result = self.load.as_mut().unwrap().poll();
@@ -181,6 +183,7 @@ impl SharedOpenState {
                     }
                 }
                 self.loaded = Some(loaded);
+                self.manifest_ready = true;
                 Ok(IOResult::Done(()))
             }
             Err(error) => {
@@ -287,6 +290,144 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
         })();
         if !matches!(&result, Ok(IOResult::IO(_))) {
             state.reset();
+        }
+        result
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SharedBootstrapState {
+    stage: SharedBootstrapStage,
+    connection: Option<Weak<Connection>>,
+    reparse: crate::connection::ReparseSchemaState,
+    base: super::shared_bootstrap::SharedBaseContextState,
+    post: Option<BootstrapState>,
+    tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+}
+
+#[derive(Default)]
+enum SharedBootstrapStage {
+    #[default]
+    Start,
+    Reparse,
+    Base,
+    Replay,
+    Post,
+    Done,
+    Failed,
+}
+
+impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
+    pub(crate) fn bootstrap_shared_nonblock(
+        &self,
+        connection: &Arc<Connection>,
+        open: &mut SharedOpenState,
+        state: &mut SharedBootstrapState,
+    ) -> IOResultOr<()> {
+        let result = (|| {
+            let runtime = self.shared_runtime.get().ok_or_else(|| {
+                LimboError::InvalidArgument("shared bootstrap requires attached runtime".into())
+            })?;
+            if !Arc::ptr_eq(runtime, &open.runtime)
+                || state.connection.as_ref().is_some_and(|saved| {
+                    !saved
+                        .upgrade()
+                        .is_some_and(|saved| Arc::ptr_eq(&saved, connection))
+                })
+            {
+                return Err(
+                    LimboError::InvalidArgument("shared bootstrap owner changed".into()).into(),
+                );
+            }
+            loop {
+                match state.stage {
+                    SharedBootstrapStage::Start => {
+                        if !connection.is_mvcc_bootstrap_connection()
+                            || !self.txs.is_empty()
+                            || runtime.replay.lock().is_some()
+                        {
+                            return Err(LimboError::InvalidArgument(
+                                "shared base requires a fresh bootstrap store".into(),
+                            )
+                            .into());
+                        }
+                        return_if_io!(open.poll_manifest());
+                        state.connection = Some(Arc::downgrade(connection));
+                        state.tvfs =
+                            Self::capture_table_valued_functions(&connection.schema.read());
+                        state.stage = SharedBootstrapStage::Reparse;
+                    }
+                    SharedBootstrapStage::Reparse => {
+                        return_if_io!(connection.reparse_schema_nonblock(&mut state.reparse));
+                        self.rehydrate_connection_table_valued_functions(connection, &state.tvfs)?;
+                        *connection.db.schema.lock() = connection.schema.read().clone();
+                        let header =
+                            return_if_io!(connection.pager.load().with_header(|header| *header));
+                        self.global_header.write().replace(header);
+                        self.bootstrap_map_root_pages(connection)?;
+                        state.stage = SharedBootstrapStage::Base;
+                    }
+                    SharedBootstrapStage::Base => {
+                        let context =
+                            return_if_io!(self
+                                .prepare_shared_base_context_nonblock(connection, &mut state.base));
+                        let persistent = context.persistent_tx_ts_max;
+                        let observed = open.loaded.as_ref().unwrap().record();
+                        if persistent > observed.prefix().committed_timestamp {
+                            return Err(LimboError::Corrupt(
+                                "checkpoint is newer than shared manifest".into(),
+                            )
+                            .into());
+                        }
+                        self.clock.publish_observed(persistent, || -> Result<()> {
+                            self.durable_txid_max.store(persistent, Ordering::Release);
+                            self.last_committed_tx_ts
+                                .store(persistent, Ordering::Release);
+                            self.last_global_header_ts
+                                .store(persistent, Ordering::Release);
+                            Ok(())
+                        })?;
+                        let replay = SharedReplayContext::new(context, observed, runtime.storage());
+                        *runtime.replay.lock() = Some(replay.clone());
+                        open.refresh = Some(
+                            replay.refresh(open.loaded.take().unwrap(), runtime.logical.clone())?,
+                        );
+                        state.stage = SharedBootstrapStage::Replay;
+                    }
+                    SharedBootstrapStage::Replay => {
+                        let loaded =
+                            return_if_io!(open.refresh.as_mut().unwrap().poll(self, connection));
+                        loaded.into_guard()?.finish()?;
+                        open.refresh = None;
+                        open.bindings.clear();
+                        open.admission = None;
+                        connection.promote_to_regular_connection();
+                        state.post = Some(BootstrapState::LoadSequences {
+                            load_st: crate::connection::LoadSequenceDescriptorsState::default(),
+                        });
+                        state.stage = SharedBootstrapStage::Post;
+                    }
+                    SharedBootstrapStage::Post => {
+                        return_if_io!(
+                            self.bootstrap_nonblock(connection, state.post.as_mut().unwrap())
+                        );
+                        state.post = None;
+                        state.stage = SharedBootstrapStage::Done;
+                    }
+                    SharedBootstrapStage::Done => return Ok(IOResult::Done(())),
+                    SharedBootstrapStage::Failed => {
+                        return Err(LimboError::InvalidArgument(
+                            "shared bootstrap already failed".into(),
+                        )
+                        .into())
+                    }
+                }
+            }
+        })();
+        if result.is_err() {
+            open.abort();
+            state.stage = SharedBootstrapStage::Failed;
+            state.post = None;
         }
         result
     }
