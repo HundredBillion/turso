@@ -121,7 +121,7 @@ fn shared_id_opcode_native_sequence_preserves_saved_outer_owner() {
         .execute("INSERT INTO preserved(id,value) VALUES(100,'outer')")
         .unwrap();
     let outer = first.get_mv_tx_id_for_db(0).unwrap();
-    let store = first.mv_store().unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
     let snapshot = store.read_snapshot_ts(outer);
     let allocated = integers(&first, "SELECT nextval('owner_sequence')")[0];
     assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
