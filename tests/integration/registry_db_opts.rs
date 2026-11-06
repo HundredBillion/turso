@@ -7,8 +7,9 @@ use std::sync::Arc;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::{
     ConnectOpts, Database, DatabaseOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
-    OpenOptions, PlatformIO, SqliteDialect, IO,
+    OpenOptions, PlatformIO, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 fn platform_io() -> Arc<dyn IO> {
     Arc::new(PlatformIO::new().unwrap())

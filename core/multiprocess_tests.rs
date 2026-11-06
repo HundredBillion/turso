@@ -1119,7 +1119,6 @@ fn multiprocess_shm_schema_child_process() {
 fn attached_memory_targets_stay_private_with_multiprocess_wal() {
     let dir = tempfile::tempdir().unwrap();
     let main_path = dir.path().join("main.db");
-    let memory_vfs_path = dir.path().join("memory-vfs.db");
     let db = Database::open_file_with_flags(
         multiprocess_test_io(),
         main_path.to_str().unwrap(),
@@ -1135,26 +1134,60 @@ fn attached_memory_targets_stay_private_with_multiprocess_wal() {
         ":memory:".to_string(),
         String::new(),
         "file::memory:?cache=private".to_string(),
-        format!("file:{}?vfs=memory", memory_vfs_path.display()),
     ] {
         for connection in [&conn, &other] {
             connection
                 .execute(format!("ATTACH '{target}' AS aux"))
-                .unwrap();
+                .unwrap_or_else(|err| panic!("ATTACH {target:?} failed: {err}"));
             let id = connection.get_database_id_by_name("aux").unwrap();
             assert!(!connection
                 .get_source_database(id)
                 .experimental_multiprocess_wal_enabled());
-            connection.execute("CREATE TABLE aux.test(x)").unwrap();
+            connection
+                .execute("CREATE TABLE aux.test(x)")
+                .unwrap_or_else(|err| {
+                    panic!("private target {target:?} reused another schema: {err}")
+                });
         }
         conn.execute("INSERT INTO aux.test VALUES (1)").unwrap();
-        assert_eq!(attached_count(&conn), "1");
-        assert_eq!(attached_count(&other), "0");
+        assert_eq!(attached_count(&conn), "1", "target: {target:?}");
+        assert_eq!(attached_count(&other), "0", "target: {target:?}");
         for connection in [&conn, &other] {
             connection.execute("DETACH aux").unwrap();
         }
     }
-    assert!(!memory_vfs_path.exists());
+}
+
+#[test]
+fn attached_memory_vfs_supports_local_wal_with_multiprocess_main() {
+    for multiprocess in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let memory_vfs_path = dir.path().join("memory-vfs.db");
+        let db = Database::open_file_with_flags(
+            multiprocess_test_io(),
+            main_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new()
+                .with_multiprocess_wal(multiprocess)
+                .with_attach(true),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let target = format!("file:{}?vfs=memory", memory_vfs_path.display());
+        conn.execute(format!("ATTACH '{target}' AS aux"))
+            .unwrap_or_else(|err| panic!("ATTACH {target:?}, multiprocess={multiprocess}: {err}"));
+        let id = conn.get_database_id_by_name("aux").unwrap();
+        assert!(!conn
+            .get_source_database(id)
+            .experimental_multiprocess_wal_enabled());
+        conn.execute("CREATE TABLE aux.test(x); INSERT INTO aux.test VALUES (1)")
+            .unwrap();
+        assert_eq!(attached_count(&conn), "1");
+        assert!(!memory_vfs_path.exists());
+    }
 }
 
 #[test]
@@ -1192,7 +1225,7 @@ fn attached_memory_permissions_with_readonly_multiprocess_main() {
         .unwrap();
     assert_eq!(
         get_rows(&conn, "SELECT x FROM local_t"),
-        vec![vec![Value::Integer(7)]]
+        vec![vec![Value::from_i64(7)]]
     );
     assert!(matches!(
         conn.execute("INSERT INTO main_t VALUES (8)"),
