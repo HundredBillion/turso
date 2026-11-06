@@ -114,15 +114,67 @@ pub(super) fn resume_prepared_marker(
 }
 
 impl OrdinaryOfflineBackend {
-    pub(super) fn create_staged(_path: &Path) -> Result<Self> {
-        Err(LimboError::InvalidArgument(
-            "fresh offline initialization is not implemented".into(),
-        ))
+    pub(super) fn create_staged(path: &Path) -> Result<Self> {
+        super::require_linux_platform()?;
+        let parent = super::canonical_parent(path)?;
+        let directory = std::fs::File::open(&parent).map_err(fs_error)?;
+        if !crate::mvcc::shared_files::filesystem_supported(
+            crate::mvcc::shared_files::filesystem_magic(&directory)?,
+        ) {
+            return Err(LimboError::InvalidArgument(
+                "fresh shared databases require native ext-family storage".into(),
+            ));
+        }
+        let path =
+            parent.join(path.file_name().ok_or_else(|| {
+                LimboError::InvalidArgument("staging path needs a filename".into())
+            })?);
+        for sidecar in [
+            PathBuf::from(format!("{}-wal", path_string(&path)?)),
+            path.with_extension("db-log"),
+            PathBuf::from(format!("{}-tshm", path_string(&path)?)),
+        ] {
+            match std::fs::symlink_metadata(sidecar) {
+                Ok(_) => {
+                    return Err(LimboError::InvalidArgument(
+                        "fresh staging sidecar already exists".into(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(fs_error(error)),
+            }
+        }
+        let native = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(fs_error)?;
+        lock_exclusive(&native)?;
+        let id = identity(&native)?;
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new()?);
+        let main = io.open_file(path_string(&path)?, OpenFlags::NoLock, false)?;
+        if main.file_id()? != Some(id) {
+            return Err(LimboError::InvalidArgument(
+                "staging identity changed".into(),
+            ));
+        }
+        let connection = open_connection(&path, io, main)?;
+        connection.execute("PRAGMA journal_mode=mvcc")?;
+        connection.close()?;
+        drop(connection);
+        Self::open_retained(&path, native)
     }
 
     pub(super) fn open(path: &Path, _: OfflinePrerequisite) -> Result<Self> {
         super::require_linux_platform()?;
         let native = open_native(path)?;
+        Self::open_retained(path, native)
+    }
+
+    fn open_retained(path: &Path, native: std::fs::File) -> Result<Self> {
         lock_exclusive(&native)?;
         let database_id = identity(&native)?;
         let path = path.canonicalize().map_err(fs_error)?;
@@ -166,15 +218,7 @@ impl OrdinaryOfflineBackend {
                 "offline database identity changed".into(),
             ));
         }
-        let options = crate::OpenOptions::new(Arc::new(crate::dialect::EngineDialect))
-            .flags(OpenFlags::NoLock)
-            .storage(Arc::new(DatabaseFile::new(main.clone())));
-        let mut state = crate::database::OpenDbAsyncState::new();
-        let db = io.block(|| {
-            crate::Database::do_open_async(&mut state, io.clone(), path_string(&path)?, &options)
-        })?;
-        let connection = db.connect(crate::ConnectOpts::new())?;
-        connection.execute("PRAGMA synchronous=FULL")?;
+        let connection = open_connection(&path, io, main.clone())?;
         Ok(Self {
             path,
             connection,
@@ -288,6 +332,23 @@ impl OfflineBackend for OrdinaryOfflineBackend {
         }
         result
     }
+}
+
+fn open_connection(
+    path: &Path,
+    io: Arc<dyn IO>,
+    main: Arc<dyn crate::io::File>,
+) -> Result<Arc<Connection>> {
+    let options = crate::OpenOptions::new(Arc::new(crate::dialect::EngineDialect))
+        .flags(OpenFlags::NoLock)
+        .storage(Arc::new(DatabaseFile::new(main)));
+    let mut state = crate::database::OpenDbAsyncState::new();
+    let db = io.block(|| {
+        crate::Database::do_open_async(&mut state, io.clone(), path_string(path)?, &options)
+    })?;
+    let connection = db.connect(crate::ConnectOpts::new())?;
+    connection.execute("PRAGMA synchronous=FULL")?;
+    Ok(connection)
 }
 
 fn path_string(path: &Path) -> Result<&str> {
