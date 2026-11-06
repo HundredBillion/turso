@@ -1,5 +1,6 @@
 use super::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
 use super::shared_authority::PublishedPrefix;
+use super::shared_ids::{DatabaseGeneration, InitialIds, INITIAL_RETAINED_BYTES};
 use crate::io::FileId;
 use crate::{LimboError, Result};
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +15,8 @@ pub(super) const SHARED_MVCC_VERSION: u8 = 254;
 pub(super) trait OfflineBackend {
     fn path(&self) -> &Path;
     fn recover_materialize_sync(&mut self) -> Result<u64>;
+    /// Lowest consumed logical ID, including retired IDs, after materialization.
+    fn materialized_logical_floor(&mut self) -> Result<i64>;
     fn commit_marker_checkpoint_sync(&mut self, marker: u8) -> Result<()>;
 }
 
@@ -55,9 +58,9 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
     }
 
     pub(super) fn upgrade(&mut self) -> Result<()> {
-        if self.history_limit == 0 {
+        if self.history_limit < INITIAL_RETAINED_BYTES {
             return Err(LimboError::InvalidArgument(
-                "shared MVCC history limit must be positive".into(),
+                "shared MVCC history limit must fit the initial ID journal".into(),
             ));
         }
         require_linux_platform()?;
@@ -73,7 +76,8 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
         let id = identity(&file)?;
         require_path_identity(self.backend.path(), id)?;
         let namespace = namespace_for(self.backend.path(), id)?;
-        prepare_namespace(&namespace, id, timestamp, self.history_limit)?;
+        let logical_floor = self.backend.materialized_logical_floor()?;
+        prepare_namespace(&namespace, id, timestamp, logical_floor, self.history_limit)?;
         self.backend
             .commit_marker_checkpoint_sync(SHARED_MVCC_VERSION)?;
         require_marker(&file, SHARED_MVCC_VERSION)?;
@@ -105,7 +109,15 @@ pub(super) fn validate_shared_open(path: &Path) -> Result<PublishedPrefix> {
     let file = File::open(path).map_err(fs_error)?;
     require_marker(&file, SHARED_MVCC_VERSION)?;
     let namespace = namespace_for(path, identity(&file)?)?;
-    for name in ["authority", "logical", "physical-wal", "physical-tshm"] {
+    for name in [
+        "authority",
+        "logical",
+        "physical-wal",
+        "physical-tshm",
+        "ids-a",
+        "ids-b",
+        "ids-selector",
+    ] {
         if !File::open(namespace.join(name))
             .map_err(fs_error)?
             .metadata()
@@ -168,6 +180,9 @@ impl StagedDatabase {
             "authority",
             "physical-wal",
             "physical-tshm",
+            "ids-a",
+            "ids-b",
+            "ids-selector",
         ] {
             File::open(self.namespace.join(name))
                 .map_err(fs_error)?
@@ -248,8 +263,22 @@ fn prepare_namespace(
     namespace: &Path,
     id: FileId,
     timestamp: u64,
+    logical_floor: i64,
     history_limit: u64,
 ) -> Result<()> {
+    if history_limit < INITIAL_RETAINED_BYTES {
+        return Err(LimboError::InvalidArgument(
+            "shared MVCC history limit must fit the initial ID journal".into(),
+        ));
+    }
+    let ids = InitialIds::new(
+        id,
+        DatabaseGeneration {
+            generation: 1,
+            checkpoint_timestamp: timestamp,
+        },
+        logical_floor,
+    )?;
     let record = ManifestRecord::new(
         1,
         id,
@@ -272,6 +301,9 @@ fn prepare_namespace(
         ("manifest", bytes.as_slice()),
         ("logical", &[]),
         ("physical-wal", &[]),
+        ("ids-a", ids.bank_a.as_slice()),
+        ("ids-b", &[]),
+        ("ids-selector", ids.selector.as_slice()),
     ] {
         let mut file = OpenOptions::new()
             .write(true)
@@ -332,6 +364,9 @@ fn remove_namespace(namespace: &Path) -> Result<()> {
         "authority",
         "physical-wal",
         "physical-tshm",
+        "ids-a",
+        "ids-b",
+        "ids-selector",
     ];
     for entry in fs::read_dir(namespace).map_err(fs_error)? {
         let entry = entry.map_err(fs_error)?;
@@ -526,6 +561,12 @@ pub(super) mod tests {
             })?;
             Ok(0)
         }
+        fn materialized_logical_floor(&mut self) -> Result<i64> {
+            let pager = self.conn.pager.load().clone();
+            pager
+                .io
+                .block(|| pager.with_header(|header| -i64::from(header.database_size.get().max(1))))
+        }
         fn commit_marker_checkpoint_sync(&mut self, marker: u8) -> Result<()> {
             self.calls.push("marker");
             if self.fail_marker {
@@ -576,7 +617,7 @@ pub(super) mod tests {
         let path = dir.path().join("existing.db");
         let backend = PagerBackend::create(&path);
         let mut transition =
-            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192);
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 65536);
         transition.upgrade().unwrap();
         validate_shared_open(&path).unwrap();
         assert_eq!(transition.backend.calls, ["materialize", "marker"]);
@@ -620,7 +661,7 @@ pub(super) mod tests {
         let mut backend = PagerBackend::create(&path);
         backend.fail_marker = true;
         let mut transition =
-            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192);
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 65536);
         assert!(transition.upgrade().is_err());
         require_marker(&File::open(&path).unwrap(), 2).unwrap();
         assert!(validate_shared_open(&path).is_err());
@@ -641,7 +682,7 @@ pub(super) mod tests {
         let destination = dir.path().join("published.db");
         let backend = PagerBackend::create(&staged);
         assert!(!destination.exists());
-        OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192)
+        OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 65536)
             .publish_new(&destination)
             .unwrap();
         validate_shared_open(&destination).unwrap();
@@ -669,7 +710,7 @@ pub(super) mod tests {
         let backend = PagerBackend::create(&path);
         let touched = backend.materialized.clone();
         let mut transition =
-            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192);
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 65536);
         assert!(transition.upgrade().is_err());
         assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -683,11 +724,13 @@ pub(super) mod tests {
         let touched = backend.materialized.clone();
         touched.store(false, std::sync::atomic::Ordering::SeqCst);
         let before = fs::read(&path).unwrap();
-        assert!(
-            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192)
-                .publish_new(&path)
-                .is_err()
-        );
+        assert!(OfflineModeChange::new(
+            backend,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+            65536
+        )
+        .publish_new(&path)
+        .is_err());
         assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
         require_marker(&File::open(&path).unwrap(), 2).unwrap();
         assert_eq!(fs::read(&path).unwrap(), before);
@@ -750,11 +793,26 @@ pub(super) mod tests {
         fs::write(namespace.join("manifest"), manifest).unwrap();
         fs::write(namespace.join("logical"), []).unwrap();
         #[cfg(target_os = "linux")]
-        initialize_authority(&namespace, id, 8192).unwrap();
+        initialize_authority(&namespace, id, 65536).unwrap();
         #[cfg(not(target_os = "linux"))]
         fs::write(namespace.join("authority"), [0; 4096]).unwrap();
         fs::write(namespace.join("physical-wal"), []).unwrap();
         initialize_physical_coordination(&namespace).unwrap();
+        let floor = -i64::try_from(file.metadata().unwrap().len() / 512)
+            .unwrap()
+            .max(1);
+        let ids = InitialIds::new(
+            id,
+            DatabaseGeneration {
+                generation: 1,
+                checkpoint_timestamp: 0,
+            },
+            floor,
+        )
+        .unwrap();
+        fs::write(namespace.join("ids-a"), ids.bank_a).unwrap();
+        fs::write(namespace.join("ids-b"), []).unwrap();
+        fs::write(namespace.join("ids-selector"), ids.selector).unwrap();
         (path, destination)
     }
 
@@ -767,6 +825,9 @@ pub(super) mod tests {
             "manifest",
             "physical-wal",
             "physical-tshm",
+            "ids-a",
+            "ids-b",
+            "ids-selector",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (staged, destination) = fixture(dir.path());
@@ -994,7 +1055,7 @@ pub(super) mod tests {
         let destination = dir.path().join("published.db");
         let backend = PagerBackend::create(&staged);
         let mut transition =
-            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192);
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 65536);
         transition.upgrade().unwrap();
         transition
             .backend
@@ -1065,5 +1126,8 @@ pub(crate) fn prepare_test_namespace(
     require_marker(&file, SHARED_MVCC_VERSION)?;
     let id = identity(&file)?;
     let namespace = namespace_for(path, id)?;
-    prepare_namespace(&namespace, id, timestamp, history_limit)
+    let floor = -i64::try_from(file.metadata().map_err(fs_error)?.len() / 512)
+        .map_err(|_| LimboError::DatabaseFull)?
+        .max(1);
+    prepare_namespace(&namespace, id, timestamp, floor, history_limit)
 }
