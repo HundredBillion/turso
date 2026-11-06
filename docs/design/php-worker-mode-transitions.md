@@ -97,3 +97,40 @@ The two ignored old-executable tests additionally require `TURSO_OLD_CLI` pointi
 to an independently built, provenance-recorded older Linux CLI; run the same
 filter with `-- --ignored --nocapture`. Keep the older executable outside the
 candidate build target so a rebuild cannot silently replace the control.
+
+## Existing authority files
+
+`SharedMvccAuthority::open_existing` opens atomically without `Create`. It rejects
+missing files, every length other than 4096 bytes, uninitialized headers and
+incompatible database identities/versions/configurations. It never repairs or
+recreates their format. A live mapping whose pathname was unlinked cannot cause
+a second authority inode to be initialized by this entry point.
+
+A valid authority still uses its lifetime locks: if no participants survive,
+reopening advances the epoch, clears abandoned registrations and requires recovery.
+That valid-state bookkeeping is distinct from resetting an invalid file. Runtime
+callers must retain the returned authority through their use; a path-existence
+precheck followed by the creating constructor is not equivalent.
+
+The Linux unlink regression has a test-only negative control. Set
+`TURSO_AUTHORITY_LEGACY_CREATE_CONTROL=1` and run the exact filter
+`authority_existing_only_does_not_recreate_unlinked_live_mapping`: the unchanged
+creating opener must make the assertion fail. Run again without that environment
+variable to test the existing-only constructor. The remaining authority tests
+cover missing/short/uninitialized/incompatible state, unchanged bytes/inode,
+live contention and required recovery after participant close or process death.
+Native Linux execution of this followup is pending at commit time.
+
+### Hosted component validation
+
+[Linux run 42258321658](https://github.com/HundredBillion/turso/actions/runs/42258321658)
+validated mode source `eb235884d` plus `89ab458f7` in union revision `cd05dd0ad`.
+All 14 selected mode checks passed (including the subprocess entry point), with
+two older-executable checks explicitly ignored pending a separately built Linux
+control. This includes the descriptor/path-replacement regression, four SIGKILL
+publication boundaries, real authority/physical coordination initialization,
+offline pager transition/retry, and committed WAL-only row rejection before
+checkpoint. The same run passed 7 authority, 8 committed-prefix and 15 manifest
+checks. These are component results; the public shared transaction protocol is
+still disabled, and real MvStore offline materialization is not supplied by the
+test backend.
