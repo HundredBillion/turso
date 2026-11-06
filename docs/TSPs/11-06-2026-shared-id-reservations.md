@@ -280,3 +280,21 @@ Read-only participants can inspect reservation watermarks and liveness under aut
 - [ ] Wire real imported committed oracle, transaction registration ownership, savepoints, commit/rollback retirement and bounded checkpoint requests.
 - [ ] Verify with simultaneous independent PHP writers before either commit, explicit IDs, rollback, process death, restart, DDL/checkpoint remapping and a delayed lower sequence commit.
 - [ ] Record exact source/runtime identities and native evidence. Private component tests alone cannot close the global-ID or full shared-mode acceptance requirement.
+
+## Selector codec milestone evidence
+
+The first implementation slice contains the full-page selector codec, immutable
+bank-header validation and witness-first selection. Eight focused local tests pass,
+including every truncated selector-slot length and 4096 generated roundtrip/bit
+corruption cases. Selection refuses corrupt referenced data even when an older
+complete bank exists; prepared successor selection requires an exact recovered
+database generation and checkpoint timestamp. Both-invalid selector copies and
+equal-sequence conflicts fail closed. The initial mirrored-selection test failed
+against the loading stub before implementation. Focused clippy and formatting pass
+with the existing baseline lint allowances. Root independently reviewed the
+selection/data-validation ordering.
+
+This slice performs no runtime I/O and does not prove selector synchronization,
+reservation acknowledgement, record replay, compaction or global-ID integration.
+`slots_agree` reports matching read bytes only; it is not a durable bank-reuse proof.
+The remaining Task 1 record/replay checks and Tasks 2–4 remain open.
