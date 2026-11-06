@@ -1,0 +1,53 @@
+
+running 1 test
+test index_method::dense_ivf::dense_ivf_recall_probe ... DENSE_SETUP rows=100000 dimensions=32 clusters=32 queries=100 seed=19937 train_ms=9.397 insert_ms=401.525 base_bytes=15204352 corpus=synthetic_boundary_mixture
+DENSE_EXACT tenant=0 p50_ms=33.522 p95_ms=36.169 p99_ms=46.731
+DENSE_EXACT_TENANT_INDEX tenant=0 p50_ms=45.915 p95_ms=47.616 p99_ms=48.691
+DENSE_EXACT tenant=1 p50_ms=10.787 p95_ms=11.140 p99_ms=11.250
+DENSE_EXACT_TENANT_INDEX tenant=1 p50_ms=5.303 p95_ms=5.560 p99_ms=5.679
+DENSE_EXACT tenant=2 p50_ms=9.836 p95_ms=10.682 p99_ms=16.359
+DENSE_EXACT_TENANT_INDEX tenant=2 p50_ms=5.129 p95_ms=5.282 p99_ms=8.201
+DENSE_EXACT tenant=3 p50_ms=6.718 p95_ms=7.114 p99_ms=9.562
+DENSE_EXACT_TENANT_INDEX tenant=3 p50_ms=0.239 p95_ms=0.258 p99_ms=0.355
+DENSE_EXACT tenant=4 p50_ms=6.321 p95_ms=6.556 p99_ms=7.512
+DENSE_EXACT_TENANT_INDEX tenant=4 p50_ms=0.075 p95_ms=0.087 p99_ms=0.089
+DENSE_STORAGE nprobe=1 build_ms=1190.935 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=16.026 update_wal_bytes=733392 reopen_first_query_ms=1.495
+DENSE_RECALL nprobe=1 tenant=0 recall_at_10=0.725000 candidate_visits_mean=2513.0 p50_ms=0.764 p95_ms=0.926 p99_ms=1.076
+DENSE_RECALL nprobe=1 tenant=1 recall_at_10=0.695000 candidate_visits_mean=317.9 p50_ms=0.149 p95_ms=0.168 p99_ms=0.169
+DENSE_RECALL nprobe=1 tenant=2 recall_at_10=0.680000 candidate_visits_mean=311.6 p50_ms=0.138 p95_ms=0.164 p99_ms=0.195
+DENSE_RECALL nprobe=1 tenant=3 recall_at_10=0.100000 candidate_visits_mean=2.5 p50_ms=0.042 p95_ms=0.052 p99_ms=0.055
+DENSE_RECALL nprobe=1 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.035 p95_ms=0.039 p99_ms=0.044
+DENSE_STORAGE nprobe=2 build_ms=1102.279 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=9.363 update_wal_bytes=733392 reopen_first_query_ms=2.326
+DENSE_RECALL nprobe=2 tenant=0 recall_at_10=0.955000 candidate_visits_mean=5008.6 p50_ms=1.385 p95_ms=1.529 p99_ms=1.558
+DENSE_RECALL nprobe=2 tenant=1 recall_at_10=0.900000 candidate_visits_mean=631.6 p50_ms=0.238 p95_ms=0.267 p99_ms=0.289
+DENSE_RECALL nprobe=2 tenant=2 recall_at_10=0.920000 candidate_visits_mean=625.0 p50_ms=0.227 p95_ms=0.250 p99_ms=0.253
+DENSE_RECALL nprobe=2 tenant=3 recall_at_10=0.200000 candidate_visits_mean=5.0 p50_ms=0.047 p95_ms=0.065 p99_ms=0.070
+DENSE_RECALL nprobe=2 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.038 p95_ms=0.047 p99_ms=0.048
+DENSE_STORAGE nprobe=4 build_ms=1071.671 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=9.017 update_wal_bytes=733392 reopen_first_query_ms=3.906
+DENSE_RECALL nprobe=4 tenant=0 recall_at_10=0.995000 candidate_visits_mean=10003.5 p50_ms=2.568 p95_ms=2.981 p99_ms=2.988
+DENSE_RECALL nprobe=4 tenant=1 recall_at_10=0.980000 candidate_visits_mean=1250.0 p50_ms=0.399 p95_ms=0.473 p99_ms=0.535
+DENSE_RECALL nprobe=4 tenant=2 recall_at_10=0.955000 candidate_visits_mean=1234.7 p50_ms=0.385 p95_ms=0.445 p99_ms=0.446
+DENSE_RECALL nprobe=4 tenant=3 recall_at_10=0.295000 candidate_visits_mean=8.8 p50_ms=0.054 p95_ms=0.074 p99_ms=0.083
+DENSE_RECALL nprobe=4 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.040 p95_ms=0.049 p99_ms=0.060
+DENSE_STORAGE nprobe=8 build_ms=1070.417 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=9.224 update_wal_bytes=733392 reopen_first_query_ms=7.532
+DENSE_RECALL nprobe=8 tenant=0 recall_at_10=1.000000 candidate_visits_mean=20078.5 p50_ms=5.003 p95_ms=5.466 p99_ms=5.869
+DENSE_RECALL nprobe=8 tenant=1 recall_at_10=0.990000 candidate_visits_mean=2526.6 p50_ms=0.738 p95_ms=0.817 p99_ms=0.897
+DENSE_RECALL nprobe=8 tenant=2 recall_at_10=0.985000 candidate_visits_mean=2483.3 p50_ms=0.734 p95_ms=0.761 p99_ms=0.812
+DENSE_RECALL nprobe=8 tenant=3 recall_at_10=0.535000 candidate_visits_mean=22.5 p50_ms=0.067 p95_ms=0.078 p99_ms=0.080
+DENSE_RECALL nprobe=8 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.044 p95_ms=0.053 p99_ms=0.054
+DENSE_STORAGE nprobe=16 build_ms=1075.382 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=9.538 update_wal_bytes=733392 reopen_first_query_ms=12.881
+DENSE_RECALL nprobe=16 tenant=0 recall_at_10=1.000000 candidate_visits_mean=40068.8 p50_ms=9.934 p95_ms=10.364 p99_ms=12.001
+DENSE_RECALL nprobe=16 tenant=1 recall_at_10=1.000000 candidate_visits_mean=5035.1 p50_ms=1.379 p95_ms=1.495 p99_ms=1.650
+DENSE_RECALL nprobe=16 tenant=2 recall_at_10=0.995000 candidate_visits_mean=4953.9 p50_ms=1.412 p95_ms=1.560 p99_ms=1.562
+DENSE_RECALL nprobe=16 tenant=3 recall_at_10=0.840000 candidate_visits_mean=45.0 p50_ms=0.087 p95_ms=0.105 p99_ms=0.109
+DENSE_RECALL nprobe=16 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.052 p95_ms=0.060 p99_ms=0.060
+DENSE_STORAGE nprobe=32 build_ms=1174.510 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=33.569 update_wal_bytes=733392 reopen_first_query_ms=25.974
+DENSE_RECALL nprobe=32 tenant=0 recall_at_10=1.000000 candidate_visits_mean=80000.0 p50_ms=20.010 p95_ms=21.302 p99_ms=23.161
+DENSE_RECALL nprobe=32 tenant=1 recall_at_10=1.000000 candidate_visits_mean=10000.0 p50_ms=2.995 p95_ms=3.417 p99_ms=3.661
+DENSE_RECALL nprobe=32 tenant=2 recall_at_10=1.000000 candidate_visits_mean=9900.0 p50_ms=2.912 p95_ms=3.044 p99_ms=3.104
+DENSE_RECALL nprobe=32 tenant=3 recall_at_10=1.000000 candidate_visits_mean=100.0 p50_ms=0.126 p95_ms=0.139 p99_ms=0.145
+DENSE_RECALL nprobe=32 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.065 p95_ms=0.084 p99_ms=0.086
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1330 filtered out; finished in 11.86s
+
