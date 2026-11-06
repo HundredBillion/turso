@@ -1191,6 +1191,209 @@ fn multiprocess_shm_schema_child_process() {
 }
 
 #[test]
+fn attached_memory_targets_stay_private_with_multiprocess_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.db");
+    let db = Database::open_file_with_flags(
+        multiprocess_test_io(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    for target in [
+        ":memory:".to_string(),
+        String::new(),
+        "file::memory:?cache=private".to_string(),
+    ] {
+        for connection in [&conn, &other] {
+            connection
+                .execute(format!("ATTACH '{target}' AS aux"))
+                .unwrap_or_else(|err| panic!("ATTACH {target:?} failed: {err}"));
+            let id = connection.get_database_id_by_name("aux").unwrap();
+            assert!(!connection
+                .get_source_database(id)
+                .experimental_multiprocess_wal_enabled());
+            connection
+                .execute("CREATE TABLE aux.test(x)")
+                .unwrap_or_else(|err| {
+                    panic!("private target {target:?} reused another schema: {err}")
+                });
+        }
+        conn.execute("INSERT INTO aux.test VALUES (1)").unwrap();
+        assert_eq!(attached_count(&conn), "1", "target: {target:?}");
+        assert_eq!(attached_count(&other), "0", "target: {target:?}");
+        for connection in [&conn, &other] {
+            connection.execute("DETACH aux").unwrap();
+        }
+    }
+}
+
+#[test]
+fn attached_memory_vfs_supports_local_wal_with_multiprocess_main() {
+    for multiprocess in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let memory_vfs_path = dir.path().join("memory-vfs.db");
+        let db = Database::open_file_with_flags(
+            multiprocess_test_io(),
+            main_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new()
+                .with_multiprocess_wal(multiprocess)
+                .with_attach(true),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let target = format!("file:{}?vfs=memory", memory_vfs_path.display());
+        conn.execute(format!("ATTACH '{target}' AS aux"))
+            .unwrap_or_else(|err| panic!("ATTACH {target:?}, multiprocess={multiprocess}: {err}"));
+        let id = conn.get_database_id_by_name("aux").unwrap();
+        assert!(!conn
+            .get_source_database(id)
+            .experimental_multiprocess_wal_enabled());
+        conn.execute("CREATE TABLE aux.test(x); INSERT INTO aux.test VALUES (1)")
+            .unwrap();
+        assert_eq!(attached_count(&conn), "1");
+        assert!(!memory_vfs_path.exists());
+    }
+}
+
+#[test]
+fn attached_memory_permissions_with_readonly_multiprocess_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.db");
+    let db = Database::open_file_with_flags(
+        multiprocess_test_io(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    db.connect(ConnectOpts::new())
+        .unwrap()
+        .execute("CREATE TABLE main_t(x); INSERT INTO main_t VALUES (7)")
+        .unwrap();
+    let conn = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+    for target in [":memory:", ""] {
+        conn.execute(format!("ATTACH '{target}' AS aux")).unwrap();
+        let id = conn.get_database_id_by_name("aux").unwrap();
+        assert!(!conn
+            .get_source_database(id)
+            .experimental_multiprocess_wal_enabled());
+        assert!(get_rows(&conn, "SELECT name FROM aux.sqlite_schema").is_empty());
+        assert!(matches!(
+            conn.execute("CREATE TABLE aux.test(x)"),
+            Err(LimboError::ReadOnly)
+        ));
+        conn.execute("DETACH aux").unwrap();
+    }
+    conn.execute("CREATE TEMP TABLE local_t(x); INSERT INTO local_t SELECT x FROM main_t")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT x FROM local_t"),
+        vec![vec![Value::from_i64(7)]]
+    );
+    assert!(matches!(
+        conn.execute("INSERT INTO main_t VALUES (8)"),
+        Err(LimboError::ReadOnly)
+    ));
+    let missing = dir.path().join("missing.db");
+    assert!(conn
+        .execute(format!("ATTACH '{}' AS disk", missing.display()))
+        .is_err());
+    assert!(!missing.exists());
+}
+
+fn attached_count(conn: &Arc<Connection>) -> String {
+    get_rows(conn, "select count(*) from aux.test")[0][0].to_string()
+}
+
+fn attached_multiprocess_reader_sees_other_process_commits(main_read_only: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("attach-main.db");
+    let aux_path = dir.path().join("attach-aux.db");
+    let main_path_str = main_path.to_str().unwrap();
+    let aux_path_str = aux_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let aux_db = open_multiprocess_db(io.clone(), aux_path_str).unwrap();
+    let aux_conn = aux_db.connect(ConnectOpts::new()).unwrap();
+    aux_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    aux_conn
+        .execute("insert into test(value) values ('parent')")
+        .unwrap();
+    let main_db = open_multiprocess_db(io.clone(), main_path_str).unwrap();
+    main_db
+        .connect(ConnectOpts::new())
+        .unwrap()
+        .execute("create table main_t(id integer primary key)")
+        .unwrap();
+    drop(main_db);
+    drop(aux_conn);
+    drop(aux_db);
+
+    let flags = if main_read_only {
+        OpenFlags::ReadOnly
+    } else {
+        OpenFlags::default()
+    };
+    let main_db = Database::open_file_with_flags(
+        io,
+        main_path_str,
+        flags,
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    let conn = main_db.connect(ConnectOpts::new()).unwrap();
+    conn.execute(format!("attach '{aux_path_str}' as aux"))
+        .unwrap();
+    assert_eq!(attached_count(&conn), "1");
+
+    let child_output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", aux_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child writer to attached db failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    assert_eq!(
+        attached_count(&conn),
+        "2",
+        "long-lived connection must observe another process's commit to the attached db"
+    );
+}
+
+#[test]
+fn attached_db_observes_other_process_commits_with_multiprocess_wal() {
+    attached_multiprocess_reader_sees_other_process_commits(false);
+}
+
+#[test]
+fn attached_db_observes_other_process_commits_with_read_only_multiprocess_wal() {
+    attached_multiprocess_reader_sees_other_process_commits(true);
+}
+
+#[test]
 fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-subprocess.db");

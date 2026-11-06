@@ -2004,13 +2004,20 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        // Private memory targets and VFS backends without shared WAL keep their local WAL.
+        db_opts = db_opts.with_multiprocess_wal(
+            db_opts.enable_multiprocess_wal
+                && !is_memory_like(&opts.path)
+                && io.supports_shared_wal_coordination(),
+        );
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts.clone())
+                .skip_db_opts_check_on_registry_hit(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
