@@ -947,10 +947,69 @@ fn bench_json_patch(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_json_extract(criterion: &mut Criterion) {
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))
+        .expect("open extraction benchmark database");
+    let conn = db.connect(ConnectOpts::new()).expect("connect benchmark");
+    conn.execute("CREATE TABLE documents(payload)")
+        .expect("create benchmark table");
+    for size in [1024, 10240, 102400] {
+        let prefix = r#"{"first":42,"nested":{"items":[1,2,3]},"padding":""#;
+        let suffix = r#"","last":43}"#;
+        let document = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(size - prefix.len() - suffix.len())
+        );
+        conn.execute("DELETE FROM documents")
+            .expect("clear benchmark table");
+        conn.execute(format!("INSERT INTO documents VALUES(jsonb('{document}'))"))
+            .expect("insert benchmark document");
+        let mut group = criterion.benchmark_group(format!("JSON Extract/{size}"));
+        for (name, expression) in [
+            ("first", "json_extract(payload,'$.first')"),
+            ("last", "json_extract(payload,'$.last')"),
+            ("nested", "json_extract(payload,'$.nested.items[#-1]')"),
+            ("missing", "json_extract(payload,'$.missing.child')"),
+            (
+                "multiple",
+                "json_extract(payload,'$.first','$.last','$.nested.items[1]')",
+            ),
+            ("subdocument", "jsonb_extract(payload,'$.nested')"),
+        ] {
+            group.bench_function(name, |b| {
+                let mut statement = conn
+                    .prepare(format!("SELECT {expression} FROM documents"))
+                    .expect("prepare benchmark extraction");
+                b.iter(|| {
+                    loop {
+                        match statement.step().expect("step benchmark extraction") {
+                            turso_core::StepResult::Row => {
+                                black_box(statement.row());
+                            }
+                            turso_core::StepResult::Done => break,
+                            turso_core::StepResult::IO
+                            | turso_core::StepResult::Yield
+                            | turso_core::StepResult::Sleep { .. } => {
+                                db.io.step().expect("complete benchmark I/O")
+                            }
+                            other => panic!("unexpected extraction step: {other:?}"),
+                        }
+                    }
+                    statement.reset().expect("reset benchmark extraction");
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench, bench_sequential_jsonb, bench_json_patch
+    targets = bench, bench_sequential_jsonb, bench_json_patch, bench_json_extract
 }
 
 criterion_main!(benches);

@@ -339,8 +339,8 @@ pub fn json_array_length(
     let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
-        let mut op = SearchOperation::new(json.len() / 2)?;
-        let _ = json.operate_on_path(&path, &mut op);
+        let mut op = SearchOperation::new(0)?;
+        let _ = json.search_path(&path, &mut op)?;
         if let Ok(len) = op.result().array_len() {
             return Ok(Value::from_i64(len as i64));
         }
@@ -448,10 +448,10 @@ pub fn json_arrow_extract(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let mut op = SearchOperation::new(json.len())?;
-        let res = json.operate_on_path(&path, &mut op);
+        let mut op = SearchOperation::new(0)?;
+        let found = json.search_path(&path, &mut op)?;
         let extracted = op.result();
-        if res.is_ok() {
+        if found {
             Ok(Value::Text(Text::json(extracted.to_string()?)))
         } else {
             Ok(Value::Null)
@@ -475,15 +475,15 @@ pub fn json_arrow_shift_extract(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let mut op = SearchOperation::new(json.len())?;
-        let res = json.operate_on_path(&path, &mut op);
+        let mut op = SearchOperation::new(0)?;
+        let found = json.search_path(&path, &mut op)?;
         let extracted = op.result();
         let element_type = match extracted.element_type() {
             Err(_) => return Ok(Value::Null),
             Ok(el) => el,
         };
 
-        if res.is_ok() {
+        if found {
             Ok(json_string_to_db_type(
                 extracted,
                 element_type,
@@ -572,14 +572,14 @@ where
         if let Some(path) = json_path_from_db_value(&first_path, true)? {
             let mut json = value;
 
-            let mut op = SearchOperation::new(json.len())?;
-            let res = json.operate_on_path(&path, &mut op);
+            let mut op = SearchOperation::new(0)?;
+            let found = json.search_path(&path, &mut op)?;
             let extracted = op.result();
             let element_type = match extracted.element_type() {
                 Err(_) => return Ok((null, ElementType::NULL)),
                 Ok(el) => el,
             };
-            if res.is_ok() {
+            if found {
                 return Ok((extracted, element_type));
             } else {
                 return Ok((null, ElementType::NULL));
@@ -596,10 +596,10 @@ where
     for path in paths {
         let path = json_path_from_db_value(&path, true);
         if let Some(path) = path? {
-            let mut op = SearchOperation::new(json.len())?;
-            let res = json.operate_on_path(&path, &mut op);
+            let mut op = SearchOperation::new(0)?;
+            let found = json.search_path(&path, &mut op)?;
             let extracted = op.result();
-            if res.is_ok() {
+            if found {
                 result.append_to_array_unsafe(&extracted.data());
             } else {
                 result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());

@@ -700,6 +700,7 @@ impl PathOperation for SearchOperation {
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         let end = json.element_end(idx, &[header_size, size])?;
+        self.value.data.try_reserve(end - idx)?;
         self.value.data.extend_from_slice(&json.data[idx..end]);
         self.value_offset = idx;
         self.label_offset = label_idx;
@@ -2594,6 +2595,33 @@ impl Jsonb {
         path: &JsonPath,
         mode: PathOperationMode,
     ) -> Result<Vec<JsonTraversalResult>> {
+        self.navigate_path_internal(path, mode, true)
+    }
+
+    pub(crate) fn search_path(
+        &mut self,
+        path: &JsonPath,
+        operation: &mut SearchOperation,
+    ) -> Result<bool> {
+        let stack =
+            match self.navigate_path_internal(path, PathOperationMode::ReplaceExisting, false) {
+                Ok(stack) => stack,
+                Err(LimboError::OutOfMemory) => return Err(LimboError::OutOfMemory),
+                Err(_) => return Ok(false),
+            };
+        match operation.execute(self, stack) {
+            Ok(()) => Ok(true),
+            Err(LimboError::OutOfMemory) => Err(LimboError::OutOfMemory),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn navigate_path_internal(
+        &mut self,
+        path: &JsonPath,
+        mode: PathOperationMode,
+        create_intermediates: bool,
+    ) -> Result<Vec<JsonTraversalResult>> {
         let mut path_iter = path.elements.iter().peekable();
         let mut pos = 0;
         let mut stack: Vec<JsonTraversalResult> = Vec::with_capacity(path.elements.len());
@@ -2610,7 +2638,7 @@ impl Jsonb {
                 path_iter.peek().is_some()
             };
 
-            let segment_mode = if is_intermediate_segment {
+            let segment_mode = if is_intermediate_segment && create_intermediates {
                 PathOperationMode::Upsert
             } else {
                 mode
@@ -5508,6 +5536,77 @@ mod path_operations_tests {
     }
 
     #[test]
+    fn search_path_preserves_document_on_success_and_failure() {
+        let original = Jsonb::from_str(r#"{"items":[1,null,{"a.b":"v"}],"kept":42}"#)
+            .expect("valid test document");
+        let mut document = original.clone();
+        for _ in 0..2 {
+            for (path, expected) in [
+                ("$", Some(r#"{"items":[1,null,{"a.b":"v"}],"kept":42}"#)),
+                ("$.kept", Some("42")),
+                ("$.items", Some(r#"[1,null,{"a.b":"v"}]"#)),
+                ("$.items[#-1].\"a.b\"", Some("\"v\"")),
+                ("$.items[1]", Some("null")),
+                ("$.kept.child", None),
+                ("$.missing.child", None),
+                ("$.missing[0].child", None),
+                ("$.items[3].child", None),
+                ("$.items[#].child", None),
+            ] {
+                let path = crate::json::path::json_path(path).expect("valid test path");
+                let mut operation = SearchOperation::new(0).expect("allocate search result");
+                let found = document
+                    .search_path(&path, &mut operation)
+                    .expect("allocate result");
+                if let Some(expected) = expected {
+                    assert!(found, "existing path");
+                    assert_eq!(
+                        operation.result().to_string().expect("serialize result"),
+                        expected
+                    );
+                } else {
+                    assert!(!found, "missing path must not create a container");
+                }
+                assert_eq!(document, original);
+            }
+        }
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn search_path_matches_snapshot_search(values: Vec<i32>, depth: u8, index: i16) -> bool {
+        let values = values
+            .into_iter()
+            .take(64)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        let mut text = format!("[{}]", values.join(","));
+        let depth = depth % 16;
+        for _ in 0..depth {
+            text = format!("{{\"child\":{text}}}");
+        }
+        let index = index % 128;
+        let locator = if index < 0 {
+            format!("[#{}]", index)
+        } else {
+            format!("[{index}]")
+        };
+        let path_text = format!("${}{locator}", ".child".repeat(depth as usize));
+        let path = crate::json::path::json_path(&path_text).expect("valid generated path");
+        let original = Jsonb::from_str(&text).expect("valid generated JSON");
+        let mut snapshot_document = original.clone();
+        let mut search_document = original.clone();
+        let mut snapshot = SearchOperation::new(0).expect("allocate snapshot result");
+        let mut search = SearchOperation::new(0).expect("allocate search result");
+        let snapshot_result = snapshot_document.operate_on_path(&path, &mut snapshot);
+        let search_result = search_document
+            .search_path(&path, &mut search)
+            .expect("allocate result");
+        snapshot_result.is_ok() == search_result
+            && snapshot.result() == search.result()
+            && search_document == original
+    }
+
+    #[test]
     fn test_search_operation() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -5704,6 +5803,12 @@ mod path_operations_tests {
             jsonb.operate_on_path(&path, &mut search).is_err(),
             "oversized child size must not be sliced out of bounds"
         );
+        let original = jsonb.clone();
+        let mut search = SearchOperation::new(0).expect("allocate search result");
+        assert!(!jsonb
+            .search_path(&path, &mut search)
+            .expect("malformed document"));
+        assert_eq!(jsonb, original);
 
         let mut jsonb = Jsonb {
             data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],

@@ -490,11 +490,8 @@ fn navigate_to_path(
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
-    if jsonb
-        .operate_on_path(&json_path, &mut search_operation)
-        .is_err()
-    {
+    let mut search_operation = SearchOperation::new(0)?;
+    if !jsonb.search_path(&json_path, &mut search_operation)? {
         return Ok(None);
     }
     let value_offset = search_operation.value_offset() as i64;

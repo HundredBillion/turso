@@ -80,6 +80,11 @@ path = "json_benchmark.rs"
 harness = false
 
 [[bench]]
+name = "json_extract_allocations"
+path = "json_extract_allocations.rs"
+harness = false
+
+[[bench]]
 name = "tpc_h_benchmark"
 path = "tpc_h_benchmark.rs"
 harness = false
