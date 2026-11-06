@@ -1,0 +1,42 @@
+[
+  {
+    "phase": "before_commit",
+    "expected_generation": 1,
+    "acknowledged": false,
+    "recovery": {
+      "ok": true,
+      "generation": 1
+    },
+    "outcome": "absent"
+  },
+  {
+    "phase": "committed",
+    "expected_generation": 2,
+    "acknowledged": false,
+    "recovery": {
+      "ok": true,
+      "generation": 2
+    },
+    "outcome": "completed-commit-without-ack"
+  },
+  {
+    "phase": "published",
+    "expected_generation": 2,
+    "acknowledged": false,
+    "recovery": {
+      "ok": true,
+      "generation": 2
+    },
+    "outcome": "completed-commit-without-ack"
+  },
+  {
+    "phase": "ack",
+    "expected_generation": 2,
+    "acknowledged": true,
+    "recovery": {
+      "ok": true,
+      "generation": 2
+    },
+    "outcome": "acknowledged-commit"
+  }
+]

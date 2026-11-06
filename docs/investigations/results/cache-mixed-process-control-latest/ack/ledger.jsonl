@@ -1,0 +1,2 @@
+{"document_id": 3, "kind": "intent", "phase": "ack", "quantity": 1, "transaction": 2, "version": 2}
+{"document_id": 3, "kind": "ack", "quantity": 1, "transaction": 2, "version": 2}

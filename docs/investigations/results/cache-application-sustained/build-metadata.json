@@ -1,0 +1,15 @@
+{
+  "revisions": {
+    "upstream": "2709799dad2ebb0f1749cfa62fa28514f568da28",
+    "fork": "4ccf547a400777307a834b554f467c8868830f5c",
+    "candidate": "c4808695adcbe8fbd6f240d34910f7fd3a3febb6"
+  },
+  "fixture_sha256": "8169e3eccc7fb0dec2b7ca4646decc49496dfcffd6bf365330871d4c4f4d090f",
+  "toolchain": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: x86_64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "profile": "lib-release,opt3,debug0,codegen16,lto=false,panic=unwind",
+  "binaries": {
+    "upstream": "e87db0ce6dec88c8ebb97d18b296feb34ee0e66591447455f22dc1699814c655",
+    "fork": "925691ef2c80d9dfadabca95bdb1983dc97c8ccdfd68819d49ae0eabec7194dd",
+    "candidate": "0cb0eeaf6b49d9d2e296999f882b222e313a4d7a9d71f059f9cd37ab2c770ba3"
+  }
+}

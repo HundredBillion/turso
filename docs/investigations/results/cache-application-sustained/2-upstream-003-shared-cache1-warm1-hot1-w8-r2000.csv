@@ -1,0 +1,2 @@
+path,cache,warm,hot,workers,rate,requests,elapsed_s,throughput,p50_us,p95_us,p99_us,late_p99_us,hits,misses
+127.0.0.1:36107,true,true,true,8,2000,60000,30.000085,1999.994,133.961,142.415,153.420,63.837,60000,0

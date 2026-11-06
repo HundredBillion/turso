@@ -1,0 +1,18 @@
+[
+  {
+    "event": "ready"
+  },
+  {
+    "event": "before_commit"
+  },
+  {
+    "event": "committed"
+  },
+  {
+    "event": "published"
+  },
+  {
+    "event": "ack",
+    "generation": 2
+  }
+]

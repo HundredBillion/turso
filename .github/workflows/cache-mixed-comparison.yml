@@ -1,0 +1,36 @@
+name: Bounded mixed-write cache comparison
+on:
+  workflow_dispatch:
+    inputs:
+      fixture_ref:
+        description: Probe source revision
+        required: false
+      candidate_ref:
+        description: Experimental runtime revision
+        default: ad54b7aaa6bf7b3933d4971ba039f14bab21e3d6
+        required: true
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.fixture_ref || github.sha }}
+      - uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: "1.88.0"
+      - name: Build matched controls, verify recovery, then screen mixed traffic
+        env:
+          MIXED_CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        run: python3 scripts/compare_cache_mixed.py --output mixed-comparison --candidate "$MIXED_CANDIDATE_REF"
+      - name: Preserve executables, hashes, traces, ledgers and resource reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixed-cache-comparison
+          path: mixed-comparison/
+          retention-days: 14

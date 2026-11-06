@@ -1,8 +1,6 @@
 # JSON extraction: correctness, allocations and timing controls
 
-Correctness and allocation checks pass. **Latency acceptance remains pending the
-isolated Linux comparison.** The local host had substantial unrelated CPU work;
-its timing results must not be presented as a demonstrated speed improvement.
+Correctness and allocation checks pass. **Latency acceptance remains unresolved after multiple hosted comparisons.** Favorable large-extraction medians coexist with repeat variation and smaller regressions. This experimental production diff remains on its review branch; no unconditional speedup or main-branch acceptance is claimed. Local shared-host timings are not acceptance evidence.
 
 ## Change
 
@@ -134,3 +132,11 @@ hypothesis, not a finding. A diagnostic rebuild using one canonical source path,
 including an identical-source rebuild control, is the next way to distinguish
 build-layout effects from an attributable execution regression. Preserve the
 current favorable and unfavorable evidence while that investigation remains open.
+
+## Canonical rebuild and same-host counter-evidence
+
+The [canonical-path hosted control](https://github.com/HundredBillion/turso/actions/runs/42250171490) rebuilt all variants from the same path and included an identical-source fork rebuild. The two fork binaries had identical hashes. Earlier small-size/patch regressions shrank or reversed, but 100 KiB first extraction was 23.657 microseconds for the candidate versus 21.335 for fork and 21.108 for upstream (about 11–12% slower). Multiple extraction remained faster: 24.474 versus fork 27.970 microseconds. [Metadata and complete summaries](results/json-canonical) preserve this unfavorable observation.
+
+A subsequent [same-host preserved-binary comparison](json-matched-artifacts-results.md) ran both original and canonical executable pairs without rebuilding. Four rotated repeats found median first-extraction improvements around 21–22% and multiple-extraction improvements around 35–42% for both pairs. However, individual candidate first-extraction repeats ranged roughly 18–62 microseconds. Original small-size and simple-patch regressions persisted at +5% and +4.08%; canonical simple patch was +2.35%. [Hashes and summaries](results/json-matched-artifacts) retain all observations.
+
+The canonical reversal therefore is not a stable property of that executable alone. Its cause remains unproven. The later favorable medians do not erase the regression evidence, and allocation savings alone do not satisfy the requested main-branch performance criterion. Source-based diagnostics and any later candidate must preserve these controls rather than selecting only favorable runs.
