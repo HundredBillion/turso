@@ -136,6 +136,156 @@ pub(super) struct LoadedIds {
     banks: [Vec<u8>; 2],
 }
 
+impl LoadedIds {
+    /// Persists a change already checked against live registrations and the committed oracle.
+    /// This layer validates replay and durability; it does not choose or authorize an ID.
+    pub(super) fn append(mut self, change: journal::Change) -> Result<IdAppend> {
+        use crate::io::File;
+        if self.guard.published()? != self.identity.prefix
+            || self.selection.selector.prepared.is_some()
+            || self.selection.selected != self.selection.selector.active
+        {
+            return Err(invalid(
+                "ID append requires the current finalized generation",
+            ));
+        }
+        let record = journal::Record {
+            sequence: self
+                .state
+                .last_record
+                .checked_add(1)
+                .ok_or(LimboError::DatabaseFull)?,
+            change,
+        }
+        .encode()?;
+        let mut selector = self.selection.selector;
+        selector.sequence = selector
+            .sequence
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        let old_end = selector.active.end;
+        selector.active.end = old_end
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or(LimboError::TooBig)?;
+        let bank = usize::from(selector.active.bank);
+        let mut required = self
+            .identity
+            .prefix
+            .end_offset
+            .checked_add(self.files.selector.size()?)
+            .ok_or(LimboError::TooBig)?;
+        for index in 0..2 {
+            let physical = self.files.banks[index].size()?;
+            let size = if index == bank {
+                physical.max(selector.active.end)
+            } else {
+                physical
+            };
+            required = required.checked_add(size).ok_or(LimboError::TooBig)?;
+        }
+        if required > self.files.history_budget {
+            return Err(LimboError::Busy);
+        }
+        let bytes = &mut self.banks[bank];
+        bytes.try_reserve_exact(PAGE_SIZE)?;
+        bytes.extend_from_slice(&record);
+        selector.active.running_crc = crc32c::crc32c(bytes);
+        // Validate a private replay before any I/O; failed mutations never escape as live state.
+        self.state = journal::State::replay_snapshot(
+            &bytes[PAGE_SIZE..],
+            self.identity.database.generation,
+            (selector.active.snapshot_end as usize) - PAGE_SIZE,
+        )?;
+        let selector_bytes = selector.encode()?;
+        let record_buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+        record_buffer.as_mut_slice().copy_from_slice(&record);
+        let selector_buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+        selector_buffer
+            .as_mut_slice()
+            .copy_from_slice(&selector_bytes);
+        self.selection = SelectedIds {
+            selector,
+            selected: selector.active,
+            slots_agree: true,
+        };
+        Ok(IdAppend {
+            loaded: Some(self),
+            record_buffer,
+            selector_buffer,
+            old_end,
+            step: 0,
+            pending: None,
+            finished: false,
+        })
+    }
+}
+
+pub(super) struct IdAppend {
+    loaded: Option<LoadedIds>,
+    record_buffer: Arc<Buffer>,
+    selector_buffer: Arc<Buffer>,
+    old_end: u64,
+    step: u8,
+    pending: Option<Completion>,
+    finished: bool,
+}
+impl IdAppend {
+    pub(super) fn poll(&mut self) -> Result<IOResult<LoadedIds>> {
+        use crate::io::{File, FileSyncType};
+        if self.finished {
+            return Err(invalid("ID append already terminated"));
+        }
+        self.finished = true;
+        loop {
+            if let Some(completion) = self.pending.take() {
+                if !completion.finished() {
+                    self.pending = Some(completion.clone());
+                    self.finished = false;
+                    return Ok(IOResult::IO(IOCompletions(completion)));
+                }
+                if let Some(error) = completion.get_error() {
+                    return Err(error.into());
+                }
+            }
+            let loaded = self.loaded.as_ref().unwrap();
+            let bank = &loaded.files.banks[usize::from(loaded.selection.selected.bank)];
+            let selector = &loaded.files.selector;
+            let completion = match self.step {
+                0 => bank.truncate(self.old_end, Completion::new_trunc(|_| {}))?,
+                1 => bank.pwrite(
+                    self.old_end,
+                    self.record_buffer.clone(),
+                    Completion::new_write(|_| {}),
+                )?,
+                2 => bank.sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)?,
+                3 => selector.pwrite(
+                    0,
+                    self.selector_buffer.clone(),
+                    Completion::new_write(|_| {}),
+                )?,
+                4 => selector.sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)?,
+                5 => selector.pwrite(
+                    PAGE_SIZE as u64,
+                    self.selector_buffer.clone(),
+                    Completion::new_write(|_| {}),
+                )?,
+                6 => selector.sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)?,
+                7 => {
+                    if !loaded.guard.io_retired() {
+                        let completion = loaded.guard.retirement_completion();
+                        self.finished = false;
+                        return Ok(IOResult::IO(IOCompletions(completion)));
+                    }
+                    return Ok(IOResult::Done(self.loaded.take().unwrap()));
+                }
+                _ => unreachable!(),
+            };
+            self.step += 1;
+            self.pending = Some(completion);
+        }
+    }
+}
+
 impl IdLoad {
     pub(super) fn poll(&mut self) -> Result<IOResult<LoadedIds>> {
         use crate::io::File;
@@ -275,6 +425,12 @@ mod tests {
     use crate::mvcc::shared_authority::{authority_for_test, SharedMvccAuthority};
     use crate::sync::atomic::{AtomicBool, AtomicUsize};
 
+    enum Mutation {
+        Write(u64, Arc<Buffer>),
+        Truncate(u64),
+        Sync,
+    }
+
     struct TestFile {
         id: FileId,
         bytes: Mutex<Vec<u8>>,
@@ -284,11 +440,20 @@ mod tests {
         pending: Mutex<Option<(u64, Completion)>>,
         retained: Mutex<Vec<Completion>>,
         mutations: AtomicUsize,
+        writable: AtomicBool,
+        durable: Mutex<Vec<u8>>,
+        fault: Mutex<Option<(Arc<AtomicUsize>, usize)>>,
+        delay_mutations: AtomicBool,
+        pending_mutation: Mutex<Option<(Mutation, Completion)>>,
     }
     impl TestFile {
         fn new(ino: u64, bytes: Vec<u8>) -> Arc<Self> {
             Arc::new(Self {
                 id: FileId { dev: 1, ino },
+                fault: Mutex::new(None),
+                delay_mutations: AtomicBool::new(false),
+                pending_mutation: Mutex::new(None),
+                durable: Mutex::new(bytes.clone()),
                 bytes: Mutex::new(bytes),
                 publication: AtomicBool::new(false),
                 delayed: AtomicBool::new(false),
@@ -296,7 +461,57 @@ mod tests {
                 pending: Mutex::new(None),
                 retained: Mutex::new(Vec::new()),
                 mutations: AtomicUsize::new(0),
+                writable: AtomicBool::new(false),
             })
+        }
+        fn mutate(&self, action: Mutation, completion: Completion) -> Result<Completion> {
+            self.mutations.fetch_add(1, Ordering::AcqRel);
+            if !self.writable.load(Ordering::Acquire) {
+                return Err(invalid("unexpected loader mutation"));
+            }
+            if let Some((step, fail_at)) = &*self.fault.lock() {
+                if step.fetch_add(1, Ordering::AcqRel) == *fail_at {
+                    return Err(invalid("injected ID journal mutation failure"));
+                }
+            }
+            if self.delay_mutations.load(Ordering::Acquire) {
+                assert!(self
+                    .pending_mutation
+                    .lock()
+                    .replace((action, completion.clone()))
+                    .is_none());
+            } else {
+                self.perform_mutation(action, &completion);
+            }
+            Ok(completion)
+        }
+        fn perform_mutation(&self, action: Mutation, completion: &Completion) {
+            let count = match action {
+                Mutation::Write(pos, buffer) => {
+                    let mut bytes = self.bytes.lock();
+                    let start = pos as usize;
+                    let len = bytes.len().max(start + buffer.len());
+                    bytes.resize(len, 0);
+                    bytes[start..start + buffer.len()].copy_from_slice(buffer.as_slice());
+                    buffer.len() as i32
+                }
+                Mutation::Truncate(size) => {
+                    self.bytes.lock().resize(size as usize, 0);
+                    0
+                }
+                Mutation::Sync => {
+                    *self.durable.lock() = self.bytes.lock().clone();
+                    0
+                }
+            };
+            completion.complete(count);
+        }
+        fn complete_mutation(&self, retain: bool) {
+            let (action, completion) = self.pending_mutation.lock().take().unwrap();
+            self.perform_mutation(action, &completion);
+            if retain {
+                self.retained.lock().push(completion);
+            }
         }
         fn complete_read(&self, pos: u64, completion: &Completion) {
             let bytes = self.bytes.lock();
@@ -347,17 +562,15 @@ mod tests {
             }
             Ok(completion)
         }
-        fn pwrite(&self, _: u64, _: Arc<Buffer>, _: Completion) -> Result<Completion> {
-            self.mutations.fetch_add(1, Ordering::AcqRel);
-            Err(invalid("unexpected loader write"))
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.mutate(Mutation::Write(pos, buffer), c)
         }
-        fn truncate(&self, _: u64, _: Completion) -> Result<Completion> {
-            self.mutations.fetch_add(1, Ordering::AcqRel);
-            Err(invalid("unexpected loader truncate"))
+        fn truncate(&self, size: u64, c: Completion) -> Result<Completion> {
+            self.mutate(Mutation::Truncate(size), c)
         }
-        fn sync(&self, _: Completion, _: FileSyncType) -> Result<Completion> {
-            self.mutations.fetch_add(1, Ordering::AcqRel);
-            Err(invalid("unexpected loader sync"))
+        fn sync(&self, c: Completion, kind: FileSyncType) -> Result<Completion> {
+            assert!(matches!(kind, FileSyncType::FullFsync));
+            self.mutate(Mutation::Sync, c)
         }
         fn shared_wal_try_lock_byte(
             &self,
@@ -386,6 +599,7 @@ mod tests {
         files: Arc<SharedIds>,
         selector: Arc<TestFile>,
         bank: Arc<TestFile>,
+        unused: Arc<TestFile>,
         identity: RecoveryIdentity,
     }
     fn fixture() -> Fixture {
@@ -435,7 +649,7 @@ mod tests {
         let files = SharedIds::open_existing(
             [
                 GuardedFile::new(bank.clone(), &authority),
-                GuardedFile::new(unused, &authority),
+                GuardedFile::new(unused.clone(), &authority),
             ],
             GuardedFile::new(selector.clone(), &authority),
             id,
@@ -450,6 +664,7 @@ mod tests {
             files,
             selector,
             bank,
+            unused,
             identity: RecoveryIdentity {
                 database,
                 prefix: PublishedPrefix::default(),
@@ -599,6 +814,206 @@ mod tests {
             assert!(load.poll().is_err());
             assert_eq!(f.selector.mutations.load(Ordering::Acquire), 0);
         }
+    }
+
+    fn loaded(f: &Fixture) -> LoadedIds {
+        let mut load = f
+            .files
+            .load(f.authority.try_acquire().unwrap(), f.identity)
+            .unwrap();
+        let IOResult::Done(loaded) = load.poll().unwrap() else {
+            panic!("synchronous fixture");
+        };
+        loaded
+    }
+
+    #[test]
+    fn id_append_acknowledges_only_durable_mirrored_floor() {
+        let f = fixture();
+        f.bank.writable.store(true, Ordering::Release);
+        f.selector.writable.store(true, Ordering::Release);
+        let mut append = loaded(&f)
+            .append(journal::Change::LogicalFloor(-200))
+            .unwrap();
+        let IOResult::Done(result) = append.poll().unwrap() else {
+            panic!("synchronous mutation fixture");
+        };
+        assert_eq!(result.state.logical_floor, -200);
+        let slots = f.selector.durable.lock();
+        let bank = f.bank.durable.lock();
+        let selected = select(
+            [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+            [&bank, &[]],
+            f.files.database_id,
+            f.identity.database,
+        )
+        .unwrap();
+        assert!(selected.slots_agree);
+        assert_eq!(
+            replay_selected(selected, [&bank, &[]])
+                .unwrap()
+                .logical_floor,
+            -200
+        );
+        assert_eq!(f.bank.mutations.load(Ordering::Acquire), 3);
+        assert_eq!(f.selector.mutations.load(Ordering::Acquire), 4);
+        result.guard.finish().unwrap();
+    }
+
+    #[test]
+    fn id_append_failure_boundaries_recover_a_complete_selected_floor() {
+        for fail_at in 0..7 {
+            let f = fixture();
+            let step = Arc::new(AtomicUsize::new(0));
+            for file in [&f.bank, &f.selector] {
+                file.writable.store(true, Ordering::Release);
+                *file.fault.lock() = Some((step.clone(), fail_at));
+            }
+            let mut append = loaded(&f)
+                .append(journal::Change::LogicalFloor(-200))
+                .unwrap();
+            assert!(append.poll().is_err(), "failure boundary {fail_at}");
+            assert!(append.poll().is_err(), "error must be terminal");
+            drop(append);
+            let slots = f.selector.durable.lock();
+            let bank = f.bank.durable.lock();
+            let selected = select(
+                [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+                [&bank, &[]],
+                f.files.database_id,
+                f.identity.database,
+            )
+            .unwrap();
+            let floor = replay_selected(selected, [&bank, &[]])
+                .unwrap()
+                .logical_floor;
+            assert_eq!(
+                floor,
+                if fail_at >= 5 { -200 } else { -100 },
+                "failure boundary {fail_at}"
+            );
+            let mut guard = f.authority.try_acquire().unwrap();
+            assert!(guard.requires_recovery());
+            guard.recover(PublishedPrefix::default()).unwrap();
+            guard.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn id_append_preflight_failure_does_not_mutate_files() {
+        for case in 0..3 {
+            let mut f = fixture();
+            let pressure = case != 0;
+            if case == 1 {
+                Arc::get_mut(&mut f.files).unwrap().history_budget = (4 * PAGE_SIZE) as u64;
+            } else if case == 2 {
+                f.unused.bytes.lock().resize(2 * PAGE_SIZE, 0);
+                Arc::get_mut(&mut f.files).unwrap().history_budget = (6 * PAGE_SIZE) as u64;
+            }
+            let change = journal::Change::LogicalFloor(if pressure { -200 } else { -1 });
+            let result = loaded(&f).append(change);
+            if pressure {
+                assert!(matches!(result, Err(LimboError::Busy)));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(f.bank.mutations.load(Ordering::Acquire), 0);
+            assert_eq!(f.selector.mutations.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn id_append_waits_for_each_mutation_and_final_backend_retirement() {
+        let f = fixture();
+        for file in [&f.bank, &f.selector] {
+            file.writable.store(true, Ordering::Release);
+            file.delay_mutations.store(true, Ordering::Release);
+        }
+        let mut append = loaded(&f)
+            .append(journal::Change::LogicalFloor(-200))
+            .unwrap();
+        for step in 0..7 {
+            let IOResult::IO(waiter) = append.poll().unwrap() else {
+                panic!("mutation {step} must wait");
+            };
+            assert!(!waiter.0.finished());
+            assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+            let file = if step < 3 { &f.bank } else { &f.selector };
+            file.complete_mutation(true);
+        }
+        let IOResult::IO(waiter) = append.poll().unwrap() else {
+            panic!("retirement must wait");
+        };
+        assert!(!waiter.0.finished());
+        f.bank.retire();
+        assert!(!waiter.0.finished());
+        f.selector.retire();
+        assert!(waiter.0.finished());
+        let IOResult::Done(result) = append.poll().unwrap() else {
+            panic!("all writes retired");
+        };
+        assert_eq!(result.state.logical_floor, -200);
+        result.guard.finish().unwrap();
+    }
+
+    #[test]
+    fn id_append_abort_at_every_mutation_keeps_authority_until_retirement() {
+        for cancel_at in 0..7 {
+            let f = fixture();
+            for file in [&f.bank, &f.selector] {
+                file.writable.store(true, Ordering::Release);
+                file.delay_mutations.store(true, Ordering::Release);
+            }
+            let mut append = loaded(&f)
+                .append(journal::Change::LogicalFloor(-200))
+                .unwrap();
+            for step in 0..=cancel_at {
+                let IOResult::IO(waiter) = append.poll().unwrap() else {
+                    panic!("mutation {step} must wait");
+                };
+                let file = if step < 3 { &f.bank } else { &f.selector };
+                if step == cancel_at {
+                    waiter.0.abort();
+                    assert!(append.poll().is_err());
+                    drop(append);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    file.complete_mutation(true);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    file.retire();
+                    let mut guard = f.authority.try_acquire().unwrap();
+                    assert!(guard.requires_recovery());
+                    guard.recover(PublishedPrefix::default()).unwrap();
+                    guard.finish().unwrap();
+                    break;
+                }
+                file.complete_mutation(false);
+            }
+        }
+    }
+
+    #[test]
+    fn id_append_discards_only_unacknowledged_tail_and_reuses_held_bindings() {
+        let f = fixture();
+        f.bank.bytes.lock().extend_from_slice(&[0x55; PAGE_SIZE]);
+        f.bank.writable.store(true, Ordering::Release);
+        f.selector.writable.store(true, Ordering::Release);
+        let mut current = loaded(&f);
+        for floor in [-200, -300] {
+            let mut append = current
+                .append(journal::Change::LogicalFloor(floor))
+                .unwrap();
+            let IOResult::Done(result) = append.poll().unwrap() else {
+                panic!("synchronous fixture");
+            };
+            assert_eq!(result.state.logical_floor, floor);
+            assert_eq!(
+                result.selection.selected.end,
+                f.bank.bytes.lock().len() as u64
+            );
+            current = result;
+        }
+        assert_eq!(current.state.last_record, 3);
+        current.guard.finish().unwrap();
     }
 
     struct RetirementIo {
