@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f2f7cfc754acdefac4db2b86a12ad133f47e1afb
+          ref: 5cadd17f48f949a99f654ac86ee492eb87208f7b
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f2f7cfc754acdefac4db2b86a12ad133f47e1afb
+          test "$(git rev-parse HEAD)" = 5cadd17f48f949a99f654ac86ee492eb87208f7b
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
