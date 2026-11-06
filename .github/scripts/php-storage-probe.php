@@ -60,12 +60,15 @@ foreach (['legacy', 'wal', 'mvcc'] as $mode) {
     if ($mode === 'mvcc' && $engine !== 'turso') { continue; }
     foreach (['reader-first', 'writer-first'] as $closeOrder) {
         $file = $path.'.'.$mode.'.'.$closeOrder.'.db';
-        $setup = openDb($file);
+        if ($mode === 'legacy') { copy($argv[3], $file); }
+        $setup = $mode === 'legacy' ? null : openDb($file);
         if ($mode !== 'legacy') {
             check(strtolower((string)$setup->query('PRAGMA journal_mode='.$mode)->fetchColumn()) === $mode, 'fixture journal mode');
         }
-        $setup->exec('CREATE TABLE sample(x)');
-        $setup->exec('INSERT INTO sample VALUES(1)');
+        if ($setup !== null) {
+            $setup->exec('CREATE TABLE sample(x)');
+            $setup->exec('INSERT INTO sample VALUES(1)');
+        }
         $setup = null;
         $bytes = storageBytes($file);
         $reader = openDb('file:'.$file.'?mode=ro');
@@ -73,7 +76,7 @@ foreach (['legacy', 'wal', 'mvcc'] as $mode) {
         $pending->exec('CREATE TEMP TABLE private_temp(x)');
         $pending->exec('INSERT INTO private_temp VALUES(1)');
         $pending = null;
-        check(storageBytes($file) === $bytes, 'unused writer and TEMP changed persistent bytes');
+        check($engine === 'turso' ? storageBytes($file) === $bytes : hash_file('sha256', $file) === $bytes[basename($file)], 'unused writer and TEMP changed persistent bytes');
         $reader->exec('BEGIN');
         check((int)$reader->query('SELECT count(*) FROM sample')->fetchColumn() === 1, 'initial snapshot');
         $writer = openDb($file);
