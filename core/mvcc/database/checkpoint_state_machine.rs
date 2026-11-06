@@ -1292,6 +1292,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         self.mvstore
             .table_id_to_rootpage
+            .load()
             .iter()
             .find(|entry| {
                 let e = entry.value();
@@ -1314,6 +1315,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
         self.mvstore
             .table_id_to_rootpage
+            .load()
             .get(&table_id)
             .is_some_and(|entry| {
                 let e = entry.value();
@@ -2086,6 +2088,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 && self
                     .mvstore
                     .table_id_to_rootpage
+                    .load()
                     .get(&MVTableId::from(root_page))
                     .and_then(|entry| entry.value().root_page)
                     .is_some()
@@ -2178,6 +2181,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(root_page) = self
                     .mvstore
                     .table_id_to_rootpage
+                    .load()
                     .get(&table_id)
                     .and_then(|entry| entry.value().root_page)
                 {
@@ -2199,6 +2203,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(root_page) = self
                     .mvstore
                     .table_id_to_rootpage
+                    .load()
                     .get(&table_id)
                     .and_then(|entry| entry.value().root_page)
                 {

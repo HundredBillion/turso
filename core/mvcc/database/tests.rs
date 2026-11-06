@@ -715,6 +715,7 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     assert!(
         db.mvcc_store
             .table_id_to_rootpage
+            .load()
             .get(&MVTableId::from(-999_i64))
             .is_none(),
         "stale root-page entries must be cleared"
@@ -15361,13 +15362,22 @@ fn test_checkpoint_drop_table_removes_stale_rootpage_mapping() {
     );
     let rootpage = rows[0][0].as_int().unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
-    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+    assert!(db
+        .mvcc_store
+        .table_id_to_rootpage
+        .load()
+        .get(&table_id)
+        .is_some());
 
     db.conn.execute("DROP TABLE stale_root").unwrap();
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     assert!(
-        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        db.mvcc_store
+            .table_id_to_rootpage
+            .load()
+            .get(&table_id)
+            .is_none(),
         "dropped checkpointed table mapping must not survive rootpage reuse"
     );
 }
@@ -15393,7 +15403,12 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
     );
     let rootpage = rows[0][0].as_int().unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
-    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+    assert!(db
+        .mvcc_store
+        .table_id_to_rootpage
+        .load()
+        .get(&table_id)
+        .is_some());
 
     db.conn.execute("DROP TABLE stale_root").unwrap();
     db.conn
@@ -15409,7 +15424,11 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     assert!(
-        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        db.mvcc_store
+            .table_id_to_rootpage
+            .load()
+            .get(&table_id)
+            .is_none(),
         "dropped checkpointed table mapping must be removed after retry"
     );
 }
@@ -25466,6 +25485,7 @@ fn recovery_decodes_entire_frame_before_mutating_store_or_context() {
     assert!(db
         .mvcc_store
         .table_id_to_rootpage
+        .load()
         .get(&rowid.table_id)
         .is_none());
     assert_eq!(ctx.max_commit_ts_seen, 17);
@@ -26466,5 +26486,41 @@ fn peer_import_publishes_dropped_physical_roots_for_checkpoint() {
     assert_eq!(
         versions[0].data.as_deref().unwrap(),
         record.as_blob().as_slice()
+    );
+}
+
+#[cfg(all(host_shared_wal, unix))]
+#[test]
+fn shared_generation_reload_allocation_failure_keeps_existing_map_and_clock() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("generation-reload.db-log"),
+        alloc.clone(),
+        false,
+    )
+    .unwrap();
+    store.insert_table_id_to_rootpage(MVTableId::from(-90), Some(42));
+    let previous = store.table_id_to_rootpage.load_full();
+    let before_txid = store.tx_ids.load(Ordering::SeqCst);
+    let before_floor = store.next_table_id.load(Ordering::SeqCst);
+    let before_clock = store.clock.get_timestamp(crate::mvcc::clock::no_op);
+    let mut header = DatabaseHeader::default();
+    header.database_size = 42.into();
+    header.read_version = crate::storage::sqlite3_ondisk::RawVersion(SHARED_MVCC_VERSION);
+    header.write_version = header.read_version;
+    alloc.fail_allocations(true);
+    let result = store.prepare_generation_reload(header, &Schema::new(), 100);
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
+    assert!(Arc::ptr_eq(
+        &previous,
+        &store.table_id_to_rootpage.load_full()
+    ));
+    assert_eq!(store.current_root_page(&MVTableId::from(-90)), Some(42));
+    assert_eq!(store.tx_ids.load(Ordering::SeqCst), before_txid);
+    assert_eq!(store.next_table_id.load(Ordering::SeqCst), before_floor);
+    assert_eq!(
+        store.clock.get_timestamp(crate::mvcc::clock::no_op),
+        before_clock + 1
     );
 }
