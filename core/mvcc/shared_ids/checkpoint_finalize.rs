@@ -22,8 +22,8 @@ impl SuspendedPreparedIds {
         };
         if !crate::sync::Weak::ptr_eq(&suspended.lease, &guard.io_lease())
             || !proof.matches_lease(&guard)
-            || proof.source_database() != suspended.identity.database
-            || proof.source_database() != old.database
+            || proof.source_database() != Some(suspended.identity.database)
+            || proof.source_database() != Some(old.database)
             || proof
                 .source_identity()
                 .is_some_and(|source| source != suspended.identity)
