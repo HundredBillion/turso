@@ -1077,6 +1077,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if !matches!(self.state, CheckpointState::PrepareCheckpoint)
             || self.shared_materialization.is_some()
             || self.mvstore.uses_passive_checkpoint()
+            || !self.durable_mvcc_metadata
+            || self.mvcc_meta_table.is_none()
             || self.sync_mode != SyncMode::Full
             || !matches!(
                 self.mode,
