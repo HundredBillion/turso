@@ -22,6 +22,7 @@ pub(super) struct SharedRefresh {
     last_frame_timestamp: u64,
     pending: Option<PreparedRecoveryFrame>,
     finished: bool,
+    locally_committed: Option<u64>,
 }
 
 impl SharedReplayContext {
@@ -51,6 +52,7 @@ impl SharedReplayContext {
             header_read: false,
             pending: None,
             finished: false,
+            locally_committed: None,
         };
         refresh.reset_reader()?;
         Ok(refresh)
@@ -164,6 +166,24 @@ impl SharedRefresh {
         Ok(())
     }
 
+    pub(super) fn observe_local_commit(mut self, timestamp: u64) -> Result<Self> {
+        if self
+            .loaded
+            .as_ref()
+            .unwrap()
+            .record()
+            .prefix()
+            .committed_timestamp
+            != timestamp
+        {
+            return Err(LimboError::Corrupt(
+                "local commit differs from selected manifest".into(),
+            ));
+        }
+        self.locally_committed = Some(timestamp);
+        Ok(self)
+    }
+
     pub(super) fn poll<C: LogicalClock, A: ConcurrentAllocator>(
         &mut self,
         store: &MvStore<C, A>,
@@ -211,7 +231,16 @@ impl SharedRefresh {
             loop {
                 let context = &mut self.state.as_mut().unwrap().context;
                 if self.pending.is_some() {
-                    store.install_peer_frame(connection, context, &mut self.pending)?;
+                    if let Some(timestamp) = self.locally_committed {
+                        store.observe_local_replay_frame(
+                            connection,
+                            context,
+                            &mut self.pending,
+                            timestamp,
+                        )?;
+                    } else {
+                        store.install_peer_frame(connection, context, &mut self.pending)?;
+                    }
                 }
                 let Some(frame) = return_if_io!(context.reader.next_transaction_frame()) else {
                     break;
@@ -300,6 +329,80 @@ impl SharedRefresh {
             let previous = self.owner.state.lock().replace(state);
             assert!(previous.is_none(), "shared replay context has two owners");
         }
+    }
+}
+
+impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
+    fn observe_local_replay_frame(
+        &self,
+        connection: &Arc<Connection>,
+        context: &mut RecoverCtx,
+        pending: &mut Option<PreparedRecoveryFrame>,
+        expected_timestamp: u64,
+    ) -> Result<()> {
+        let frame = pending.as_ref().unwrap();
+        if frame.commit_timestamp != expected_timestamp
+            || self.last_committed_tx_ts.load(Ordering::Acquire) != expected_timestamp
+        {
+            return Err(LimboError::Corrupt(
+                "local replay context is not a finalized commit".into(),
+            ));
+        }
+        let mut dropped = context.dropped_root_pages.clone();
+        let mut touched = HashMap::default();
+        touched.try_reserve(frame.decoded_frame.len())?;
+        for op in &frame.decoded_frame {
+            match op {
+                StreamingResult::UpsertTableRow { row, .. }
+                    if row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
+                {
+                    let root = self.validate_recovery_schema_root(row.payload())?;
+                    if root.1 && root.0 > 0 {
+                        dropped.remove(&root.0);
+                    }
+                    touched.insert(row.id.row_id.to_int_or_panic(), Some(root));
+                }
+                StreamingResult::DeleteTableRow { rowid, .. }
+                    if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
+                {
+                    let id = rowid.row_id.to_int_or_panic();
+                    let root = match touched.get(&id) {
+                        Some(root) => *root,
+                        None => context
+                            .schema_rows
+                            .get(&id)
+                            .map(|record| self.validate_recovery_schema_root(record.as_blob()))
+                            .transpose()?,
+                    };
+                    if let Some((root, true)) = root {
+                        if root > 0 {
+                            dropped.insert(root);
+                        }
+                    }
+                    touched.insert(id, None);
+                }
+                _ => {}
+            }
+        }
+        let frame = pending.take().unwrap();
+        let schema_changed = frame.schema_after.is_some();
+        if let Some(rows) = frame.schema_rows_after {
+            context.schema_rows = rows;
+        }
+        if let Some(types) = frame.type_sqls_after {
+            context.type_sqls = types;
+        }
+        if schema_changed {
+            context.current_schema = connection.schema.read().clone();
+        }
+        context.index_infos = if schema_changed {
+            HashMap::default()
+        } else {
+            frame.index_infos
+        };
+        context.dropped_root_pages = dropped;
+        context.max_commit_ts_seen = expected_timestamp;
+        Ok(())
     }
 }
 
@@ -572,6 +675,94 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn shared_refresh_local_commit_updates_context_without_rewriting_live_chains() {
+        use super::super::tests::{generate_simple_string_row, MvccTestDb};
+        use crate::mvcc::persistent_storage::logical_log::LogicalLog;
+        let db = MvccTestDb::new();
+        let store = &db.mvcc_store;
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io.open_file("local-log", OpenFlags::Create, false).unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let row = generate_simple_string_row((-22).into(), 1, "local");
+        store.insert_table_id_to_rootpage(row.id.table_id, None);
+        let tx = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+        store.insert(tx, row.clone()).unwrap();
+        let version = RowVersion::new(
+            123,
+            Some(TxTimestampOrID::Timestamp(10)),
+            None,
+            row.data.clone(),
+            false,
+        );
+        io.wait_for_completion(
+            log.log_tx(LogRecord::for_test(10, &[(row.id.clone(), version)], None))
+                .unwrap(),
+        )
+        .unwrap();
+        let initial = ManifestRecord::new(
+            1,
+            FileId { dev: 1, ino: 2 },
+            1,
+            0,
+            PublishedPrefix::default(),
+        )
+        .unwrap();
+        let selected = ManifestRecord::new(
+            2,
+            initial.database_id(),
+            1,
+            log.header().unwrap().salt,
+            PublishedPrefix {
+                committed_timestamp: 10,
+                end_offset: log.offset,
+                running_crc: log.running_crc,
+            },
+        )
+        .unwrap();
+        let authority = authority_for_test(Arc::new(AuthorityFile));
+        let replay = SharedReplayContext::new(
+            context(&db),
+            initial,
+            Arc::new(Storage::new(file.clone(), io.clone(), None)),
+        );
+        let chain = store.rows.get(&row.id).unwrap();
+        let original_id = chain.value().read()[0].id;
+        store.last_committed_tx_ts.store(10, Ordering::Release);
+        let mut refresh = replay
+            .refresh(loaded(&io, selected, &authority), file)
+            .unwrap()
+            .observe_local_commit(10)
+            .unwrap();
+        let selected = io.block(|| refresh.poll(store.as_ref(), &db.conn)).unwrap();
+        assert!(store
+            .txs
+            .get(&tx)
+            .unwrap()
+            .value()
+            .ensure_peer_unconflicted()
+            .is_ok());
+        assert_eq!(chain.value().read().len(), 1);
+        assert_eq!(chain.value().read()[0].id, original_id);
+        assert_eq!(
+            replay
+                .state
+                .lock()
+                .as_ref()
+                .unwrap()
+                .context
+                .max_commit_ts_seen,
+            10
+        );
+        selected.into_guard().unwrap().finish().unwrap();
+        store.rollback_tx(
+            tx,
+            db.conn.pager.load().clone(),
+            &db.conn,
+            crate::MAIN_DB_ID,
+        );
+    }
+
     struct DelayedLogFile {
         inner: Arc<dyn File>,
         pending: Mutex<Option<(u64, Completion)>>,
