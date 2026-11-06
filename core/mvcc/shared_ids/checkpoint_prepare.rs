@@ -218,4 +218,102 @@ impl PreparedIds {
     pub(in crate::mvcc) fn target(&self) -> DatabaseGeneration {
         self.loaded.selection.selector.prepared.unwrap().database
     }
+
+    pub(in crate::mvcc) fn prepared_floor(&self) -> Result<i64> {
+        prepared_floor(self.loaded.selection, &self.loaded.banks)
+    }
+}
+
+/// Retains the prepared image while the coordinator temporarily owns its exact guard.
+pub(in crate::mvcc) struct SuspendedPreparedIds {
+    files: Arc<SharedIds>,
+    bindings: [FileBinding; 3],
+    identity: RecoveryIdentity,
+    selection: SelectedIds,
+    state: journal::State,
+    banks: [Vec<u8>; 2],
+    lease: crate::sync::Weak<PublicationLease>,
+}
+
+impl PreparedIds {
+    pub(in crate::mvcc) fn suspend(self) -> (SuspendedPreparedIds, AuthorityGuard) {
+        let LoadedIds {
+            files,
+            guard,
+            bindings,
+            identity,
+            selection,
+            state,
+            banks,
+        } = self.loaded;
+        let lease = guard.io_lease();
+        (
+            SuspendedPreparedIds {
+                files,
+                bindings,
+                identity,
+                selection,
+                state,
+                banks,
+                lease,
+            },
+            guard,
+        )
+    }
+}
+
+impl SuspendedPreparedIds {
+    pub(in crate::mvcc) fn source_identity(&self) -> RecoveryIdentity {
+        self.identity
+    }
+
+    pub(in crate::mvcc) fn target(&self) -> Result<DatabaseGeneration> {
+        self.selection
+            .selector
+            .prepared
+            .map(|reference| reference.database)
+            .ok_or_else(|| invalid("prepared ID witness is absent"))
+    }
+
+    pub(in crate::mvcc) fn prepared_floor(&self) -> Result<i64> {
+        prepared_floor(self.selection, &self.banks)
+    }
+
+    pub(in crate::mvcc) fn rejoin_source(self, guard: AuthorityGuard) -> Result<PreparedIds> {
+        let lease = guard.io_lease();
+        if !crate::sync::Weak::ptr_eq(&self.lease, &lease)
+            || guard.published()? != self.identity.prefix
+        {
+            return Err(invalid(
+                "prepared IDs require the original source authority lease",
+            ));
+        }
+        PublicationLease::pin(&lease)?;
+        Ok(PreparedIds {
+            loaded: LoadedIds {
+                files: self.files,
+                guard,
+                bindings: self.bindings,
+                identity: self.identity,
+                selection: self.selection,
+                state: self.state,
+                banks: self.banks,
+            },
+        })
+    }
+}
+
+fn prepared_floor(selection: SelectedIds, banks: &[Vec<u8>; 2]) -> Result<i64> {
+    let selected = selection
+        .selector
+        .prepared
+        .ok_or_else(|| invalid("prepared ID witness is absent"))?;
+    let state = replay_selected(
+        SelectedIds {
+            selected,
+            ..selection
+        },
+        [&banks[0], &banks[1]],
+    )?;
+    Ok(state.logical_floor)
 }
