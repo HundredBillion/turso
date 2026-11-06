@@ -13,6 +13,25 @@ pub(super) struct OrdinaryOfflineBackend {
     main: Arc<dyn crate::io::File>,
     retained: Vec<std::fs::File>,
     materialized: Option<(u64, i64)>,
+    #[cfg(test)]
+    marker_hook: Option<Box<dyn FnMut(MarkerPoint)>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkerPoint {
+    Committed,
+    Checkpointed,
+}
+
+pub(super) fn resume_prepared_marker(
+    _path: &Path,
+    _history_limit: u64,
+    _: OfflinePrerequisite,
+) -> Result<()> {
+    Err(LimboError::InvalidArgument(
+        "prepared marker recovery is not wired".into(),
+    ))
 }
 
 impl OrdinaryOfflineBackend {
@@ -77,6 +96,8 @@ impl OrdinaryOfflineBackend {
             main,
             retained,
             materialized: None,
+            #[cfg(test)]
+            marker_hook: None,
         })
     }
 }
@@ -160,10 +181,18 @@ impl OfflineBackend for OrdinaryOfflineBackend {
                 })
             })?;
             self.connection.execute("COMMIT")?;
+            #[cfg(test)]
+            if let Some(hook) = self.marker_hook.as_mut() {
+                hook(MarkerPoint::Committed);
+            }
             self.connection
                 .checkpoint(crate::CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 })?;
+            #[cfg(test)]
+            if let Some(hook) = self.marker_hook.as_mut() {
+                hook(MarkerPoint::Checkpointed);
+            }
             let completion = self
                 .main
                 .sync(crate::Completion::new_sync(|_| {}), FileSyncType::Fsync)?;
@@ -229,6 +258,100 @@ mod tests {
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode=mvcc; CREATE TABLE kept(id INTEGER PRIMARY KEY, value TEXT); CREATE INDEX kept_value ON kept(value); INSERT INTO kept VALUES(1,'retained')").unwrap();
         conn.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess fault-injection entry point"]
+    fn offline_marker_crash_child() {
+        let Some(path) = std::env::var_os("TURSO_OFFLINE_MARKER_CRASH_PATH") else {
+            return;
+        };
+        let point = if std::env::var("TURSO_OFFLINE_MARKER_CRASH_POINT").unwrap() == "committed" {
+            MarkerPoint::Committed
+        } else {
+            MarkerPoint::Checkpointed
+        };
+        let mut backend = OrdinaryOfflineBackend::open(
+            Path::new(&path),
+            OfflinePrerequisite::AllOlderWorkersStopped,
+        )
+        .unwrap();
+        backend.marker_hook = Some(Box::new(move |observed| {
+            if observed == point {
+                std::process::exit(73);
+            }
+        }));
+        let mut transition = super::super::OfflineModeChange::new(
+            backend,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+            64 * 1024 * 1024,
+        );
+        transition.upgrade().unwrap();
+        panic!("marker crash point was not reached");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires native Linux ext-family filesystem"
+    )]
+    fn offline_backend_resumes_committed_marker_without_recreating_namespace() {
+        for point in ["committed", "checkpointed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("interrupted.db");
+            create_mvcc(&path);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mvcc::mode_transition::ordinary::tests::offline_marker_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TURSO_OFFLINE_MARKER_CRASH_PATH", &path)
+                .env("TURSO_OFFLINE_MARKER_CRASH_POINT", point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let file = std::fs::File::open(&path).unwrap();
+            let id = super::super::identity(&file).unwrap();
+            let namespace = super::super::namespace_for(&path, id).unwrap();
+            let names = ["manifest", "ids-a", "ids-b", "ids-selector"];
+            let before = names.map(|name| std::fs::read(namespace.join(name)).unwrap());
+            resume_prepared_marker(
+                &path,
+                64 * 1024 * 1024,
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+            assert_eq!(
+                names.map(|name| std::fs::read(namespace.join(name)).unwrap()),
+                before
+            );
+            super::super::validate_shared_open(&path).unwrap();
+            let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+            let db = crate::Database::open(
+                io,
+                path.to_str().unwrap(),
+                crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                    .with_shared_mvcc_for_test(64 * 1024 * 1024),
+            )
+            .unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            let mut values = Vec::new();
+            conn.prepare("SELECT value FROM kept INDEXED BY kept_value WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    values.push(row.get::<&str>(0)?.to_owned());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(values, ["retained"]);
+        }
     }
 
     #[test]
