@@ -173,3 +173,38 @@ hash preservation, every missing sidecar, live authority unlink, wrong main
 identity, invalid manifest length, coordination permission denial and implicit-upgrade
 refusal. Local checks cover unsupported backend rejection and the filesystem
 policy. Native execution is pending for this new component.
+
+## Checkpoint admission gate
+
+The private `CheckpointAdmissionGate` uses byte 66 of the existing authority inode,
+after lifetime/publication bytes and the 64 snapshot-slot bytes. Its constructor
+opens two independent native descriptors without creation and checks both against
+the retained authority's identity. Shared admission and exclusive pause locks use
+separate open-file descriptions, so one process cannot accidentally convert its
+own admission lock into a checkpoint pause. Local atomic ownership rejects a
+second admission critical section or pause on the same object with `Busy`.
+Independent objects and hard-link aliases contend through kernel OFD locks.
+
+Admission takes `AdmissionGuard` before publication authority and retains it until
+snapshot registration and local transaction insertion finish. It then releases
+the gate; the token does not span the transaction lifetime. A checkpoint first
+takes `CheckpointPause`, then polls snapshot ownership under publication authority,
+releasing that authority between attempts. Existing transactions commit or roll
+back without taking the admission gate. The pause token itself does not establish
+quiescence or permission to checkpoint. Runtime integration must supply a deadline
+and retain the pause until checkpoint completion or cancellation.
+
+Production gate operations only attempt locks and return immediately on contention;
+there is no retry loop or sleeping. Process death releases the pause through the
+kernel rather than leaving a mapped request flag. A failed unlock poisons the
+object and future attempts fail closed. Opening never creates a missing authority
+or accepts a replacement inode. Native I/O, the already-validated authority, and
+filesystem capability checks remain constructor caller prerequisites.
+
+Focused Linux tests use independent processes and pipe barriers to exercise an
+existing registered writer finishing while admissions are paused, snapshot drainage,
+a killed pause owner, same-process aliases, concurrent local attempts, and missing
+or replaced files. `TURSO_CHECKPOINT_GATE_IGNORE_CONTENTION_CONTROL=1` is a test-only
+negative control: the alias test must fail when kernel contention is ignored.
+Native execution is pending for this component; the local platform rejection test
+alone does not validate OFD behavior.
