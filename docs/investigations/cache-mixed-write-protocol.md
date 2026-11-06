@@ -1,8 +1,7 @@
 # Bounded mixed-write followup protocol
 
-Status: detailed followup draft for review. The coordinator reviewed the gate/
-generation approach; implementation follows immutable screening and review of
-these commit/recovery controls. This is a test protocol for one controlled application process,
+Status: detailed protocol approved by the coordinator after review on 2026-11-06.
+Implementation follows immutable screening; no mutable-workload result is claimed. This is a test protocol for one controlled application process,
 not a general cache-consistency protocol for multiple applications or independent
 writers. All database mutation must pass through its writer gate.
 
@@ -35,7 +34,14 @@ The protocol cannot guarantee coherence for writes made outside its gate.
 
 ## Reference state and timing
 
-Each document has an explicit version and deterministic update content. The
+Each document has an explicit version and deterministic update content. Include
+an inventory/order transaction that decrements inventory and inserts an order
+carrying the same commit/version ID. The reference invariant is initial inventory
+minus current inventory equals committed order quantity for each tenant/product;
+there must be neither an order without its decrement nor a decrement without its
+order. Use sufficient initial stock or explicitly model insufficient-stock
+rejection. Change a document facet value in the same transaction so generation
+invalidation is tested for both point and facet responses. The
 reference model records successful commit order and expected document versions,
 including tenant and facet changes. Each read captures the model's visible
 commit generation while holding the same shared guard; its response is checked
@@ -60,7 +66,11 @@ request or elapsed-time cadence, recording attempts, busy results, elapsed time
 and completed work. Keep FULL commit durability unchanged. Report database/WAL
 size and system write counters before/after; distinguish full-run counters from
 per-operation device writes. A clean restart check compares all document versions
-and query results with the committed reference before allowing cache traffic.
+and query results with the committed reference before allowing cache traffic. For actual process
+restarts, a surviving independent controller or external acknowledgment ledger
+records attempted transaction IDs and observed success acknowledgments. It must
+survive the application process; the database under test cannot be its own oracle.
+Classify successful commit with lost acknowledgment explicitly from this ledger.
 
 At deterministic failure points, use the existing UnreliableIo harness to retain
 only synced DB/WAL bytes, then reopen with fresh PlatformIO. A crash before commit
@@ -78,3 +88,7 @@ prove namespace isolation. Only after these controls and sustained comparisons
 pass can this bounded single-application protocol support a mutable-workload
 comparison. It still does not establish multi-host or independent-writer cache
 removal safety.
+
+This harness exercises ordinary WAL transactions and WAL checkpoints. It does
+not validate the separate, unfinished multiprocess MVCC protocol tracked in #7,
+and its results must not be used as evidence that those lifecycle gaps are fixed.
