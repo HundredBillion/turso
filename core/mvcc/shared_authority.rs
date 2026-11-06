@@ -231,6 +231,31 @@ impl AuthorityGuard {
                 "shared MVCC authority does not require recovery".into(),
             ));
         }
+        self.store_prefix(prefix)?;
+        self.recovery_required = false;
+        Ok(())
+    }
+
+    pub(super) fn publish_committed(
+        &mut self,
+        durable: &super::commit_manifest::DurableManifest,
+    ) -> Result<()> {
+        self.advance_committed(durable.prefix())
+    }
+
+    fn advance_committed(&mut self, prefix: PublishedPrefix) -> Result<()> {
+        let previous = self.published()?;
+        if prefix.committed_timestamp <= previous.committed_timestamp
+            || prefix.end_offset <= previous.end_offset
+        {
+            return Err(LimboError::InvalidArgument(
+                "shared MVCC commit must advance timestamp and log boundary".into(),
+            ));
+        }
+        self.store_prefix(prefix)
+    }
+
+    fn store_prefix(&mut self, prefix: PublishedPrefix) -> Result<()> {
         if prefix.committed_timestamp >= MAX_TIMESTAMP
             || (prefix.end_offset == 0 && prefix.running_crc != 0)
             || (prefix.end_offset != 0
@@ -248,7 +273,6 @@ impl AuthorityGuard {
         self.authority.store(LOG_OFFSET, prefix.end_offset);
         self.authority
             .store(LOG_CRC_OFFSET, u64::from(prefix.running_crc));
-        self.recovery_required = false;
         Ok(())
     }
 
@@ -483,6 +507,48 @@ mod tests {
         drop(parent);
         assert_eq!(guard.oldest_snapshot().unwrap(), None);
         guard.finish().unwrap();
+    }
+
+    #[test]
+    fn authority_normal_publication_requires_recovery_and_advances_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = open(&dir.path().join("coordination"));
+        let mut guard = authority.try_acquire().unwrap();
+        let previous = PublishedPrefix {
+            committed_timestamp: 10,
+            end_offset: 128,
+            running_crc: 3,
+        };
+        let next = PublishedPrefix {
+            committed_timestamp: 20,
+            end_offset: 256,
+            running_crc: 4,
+        };
+        assert!(guard.advance_committed(next).is_err());
+        guard.recover(previous).unwrap();
+        for invalid in [
+            previous,
+            PublishedPrefix {
+                committed_timestamp: 9,
+                ..next
+            },
+            PublishedPrefix {
+                end_offset: 128,
+                ..next
+            },
+            PublishedPrefix {
+                committed_timestamp: MAX_TIMESTAMP,
+                ..next
+            },
+        ] {
+            assert!(guard.advance_committed(invalid).is_err());
+            assert_eq!(guard.published().unwrap(), previous);
+        }
+        guard.advance_committed(next).unwrap();
+        assert_eq!(guard.published().unwrap(), next);
+        assert!(guard.allocate_timestamp().unwrap() > next.committed_timestamp);
+        guard.finish().unwrap();
+        assert_eq!(authority.try_acquire().unwrap().published().unwrap(), next);
     }
 
     #[test]
