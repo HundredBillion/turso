@@ -10889,8 +10889,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     copy.push(version.clone());
                     // SkipMap entries pin lifetime, not a mutex. Retain references
                     // now so marking conflicts during publication is infallible.
-                    for tag in [version.begin(), version.end()] {
-                        if let Some(TxTimestampOrID::TxID(id)) = tag {
+                    for tag in [version.begin(), version.end()].into_iter().flatten() {
+                        if let TxTimestampOrID::TxID(id) = tag {
                             if let Some(tx) = self.txs.get(&id) {
                                 if tx.value().state.load() == TransactionState::Active { conflicts.push(tx); }
                             }
