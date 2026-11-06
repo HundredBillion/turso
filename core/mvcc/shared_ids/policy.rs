@@ -175,6 +175,30 @@ impl IdOperation {
                             return Err(invalid("ID owner has no live snapshot registration"));
                         }
                     }
+                    if let IdAction::ClaimExplicitRow {
+                        owner,
+                        domain,
+                        value,
+                    }
+                    | IdAction::ClaimSequence {
+                        owner,
+                        domain,
+                        value,
+                        ..
+                    } = self.action
+                    {
+                        if let Some(result) = existing_claim(
+                            &loaded,
+                            owner,
+                            Claim {
+                                key: ClaimKey::Domain(domain),
+                                value,
+                            },
+                        )? {
+                            self.stage = Stage::Retiring(loaded, result);
+                            continue;
+                        }
+                    }
                     if matches!(
                         self.action,
                         IdAction::ReserveRow { .. }
@@ -479,7 +503,20 @@ fn evaluate(loaded: &LoadedIds, action: IdAction, live: &[(u64, u64)]) -> Result
     })
 }
 
+fn existing_claim(loaded: &LoadedIds, owner: Owner, claim: Claim) -> Result<Option<IdResult>> {
+    Ok(loaded
+        .state
+        .matching_claim(owner, claim)?
+        .map(|ordinal| IdResult::Reserved {
+            id: ReservationId { owner, ordinal },
+            value: claim.value,
+        }))
+}
+
 fn claim(loaded: &LoadedIds, owner: Owner, claim: Claim) -> Result<Decision> {
+    if let Some(result) = existing_claim(loaded, owner, claim)? {
+        return Ok(Decision::Return(result));
+    }
     let ordinal = loaded.state.next_ordinal(owner)?;
     Ok(Decision::Append(
         Change::Claim {
