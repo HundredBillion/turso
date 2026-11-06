@@ -149,6 +149,16 @@ impl LoadedIds {
             })
     }
 
+    /// Includes room for a floor-only replacement bank before the selected bank can be reclaimed.
+    pub(in crate::mvcc) fn required_budget_bytes(&self) -> Result<u64> {
+        use crate::io::File;
+        let inactive = 1 - usize::from(self.selection.selected.bank);
+        let headroom = ((2 * PAGE_SIZE) as u64).saturating_sub(self.files.banks[inactive].size()?);
+        self.retained_bytes()?
+            .checked_add(headroom)
+            .ok_or(LimboError::TooBig)
+    }
+
     pub(in crate::mvcc) fn into_guard(self) -> AuthorityGuard {
         self.guard
     }
@@ -184,21 +194,14 @@ impl LoadedIds {
             .checked_add(PAGE_SIZE as u64)
             .ok_or(LimboError::TooBig)?;
         let bank = usize::from(selector.active.bank);
-        let mut required = self
-            .identity
-            .prefix
-            .end_offset
-            .checked_add(self.files.selector.size()?)
+        let physical_active = self.files.banks[bank].size()?;
+        let required = self
+            .required_budget_bytes()?
+            .checked_add(self.identity.prefix.end_offset)
+            .and_then(|bytes| {
+                bytes.checked_add(selector.active.end.saturating_sub(physical_active))
+            })
             .ok_or(LimboError::TooBig)?;
-        for index in 0..2 {
-            let physical = self.files.banks[index].size()?;
-            let size = if index == bank {
-                physical.max(selector.active.end)
-            } else {
-                physical
-            };
-            required = required.checked_add(size).ok_or(LimboError::TooBig)?;
-        }
         if required > self.files.history_budget {
             return Err(LimboError::Busy);
         }
@@ -1084,6 +1087,11 @@ mod tests {
             panic!("synchronous oracle");
         };
         assert_eq!(
+            outcome.required_budget_bytes,
+            outcome.retained_bytes
+                + ((2 * PAGE_SIZE) as u64).saturating_sub(f.unused.size().unwrap())
+        );
+        assert_eq!(
             outcome.retained_bytes,
             f.selector.size().unwrap() + f.bank.size().unwrap() + f.unused.size().unwrap()
         );
@@ -1625,7 +1633,39 @@ mod tests {
         f.unused.bytes.lock().resize(2 * PAGE_SIZE, 0);
         let loaded = loaded(&f);
         assert_eq!(loaded.retained_bytes().unwrap(), (7 * PAGE_SIZE) as u64);
+        assert_eq!(
+            loaded.required_budget_bytes().unwrap(),
+            (7 * PAGE_SIZE) as u64
+        );
         loaded.into_guard().finish().unwrap();
+    }
+
+    #[test]
+    fn id_append_preserves_floor_snapshot_headroom_at_a_fixed_budget() {
+        let mut f = writable_fixture();
+        Arc::get_mut(&mut f.files).unwrap().history_budget = (8 * PAGE_SIZE) as u64;
+        let mut current = loaded(&f);
+        for floor in [-200, -300] {
+            let mut append = current
+                .append(journal::Change::LogicalFloor(floor))
+                .unwrap();
+            let IOResult::Done(next) = append.poll().unwrap() else {
+                panic!("synchronous fixture");
+            };
+            current = next;
+        }
+        let before = f.bank.mutations.load(Ordering::Acquire);
+        assert!(
+            matches!(
+                current.append(journal::Change::LogicalFloor(-400)),
+                Err(LimboError::Busy)
+            ),
+            "append must leave capacity for the replacement floor snapshot"
+        );
+        assert_eq!(f.bank.mutations.load(Ordering::Acquire), before);
+        let physical =
+            f.bank.size().unwrap() + f.unused.size().unwrap() + f.selector.size().unwrap();
+        assert_eq!(f.files.history_budget - physical, (2 * PAGE_SIZE) as u64);
     }
 
     struct RetirementIo {
