@@ -551,7 +551,14 @@ pub(super) mod tests {
     #[cfg(target_os = "linux")]
     fn mode_transition_initializes_id_sidecars_before_publishing_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, _) = fixture(dir.path());
+        let path = dir.path().join("upgraded.db");
+        let backend = PagerBackend::create(&path);
+        let mut transition = OfflineModeChange::new(
+            backend,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+            64 * 1024,
+        );
+        transition.upgrade().unwrap();
         let file = File::open(&path).unwrap();
         let namespace = namespace_for(&path, identity(&file).unwrap()).unwrap();
         for name in ["ids-a", "ids-b", "ids-selector"] {
