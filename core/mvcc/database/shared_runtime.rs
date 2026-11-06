@@ -885,3 +885,98 @@ fn shared_oracle_native_keeps_outer_snapshot_and_rejects_unresolved_state() {
     guard.finish().unwrap();
     connection.execute("ROLLBACK").unwrap();
 }
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completion() {
+    use crate::state_machine::{StateTransition, TransitionResult};
+    use crate::storage::wal::CheckpointMode;
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let db = crate::Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    )
+    .unwrap();
+    let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+    let store = db.get_mv_store().as_ref().unwrap().clone();
+    let base_timestamp = store.last_committed_tx_ts.load(Ordering::Acquire);
+    connection
+        .execute("UPDATE preserved SET value='materialized shared row' WHERE id=1")
+        .unwrap();
+    let runtime = store.shared_runtime.get().unwrap();
+    let main_before = std::fs::read(&path).unwrap();
+    let logical_path = runtime.files.namespace.join("logical");
+    let log_before = std::fs::read(&logical_path).unwrap();
+    assert!(!log_before.is_empty());
+    let _pause = runtime.gate.try_pause_admission().unwrap();
+    let guard = runtime.files.authority.try_acquire().unwrap();
+    assert!(guard.live_registrations().unwrap().is_empty());
+    let mut load =
+        ManifestLoad::new(runtime.files.manifest.clone(), guard, runtime.database_id).unwrap();
+    let loaded = loop {
+        match load.poll().unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(loaded) => break loaded,
+        }
+    };
+    let prefix = loaded.record().prefix();
+    let mut publication = loaded.begin_checkpoint_intent(base_timestamp).unwrap();
+    let intent = loop {
+        match publication.poll().unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(intent) => break intent,
+        }
+    };
+    let main_binding = runtime.main.bind(intent.guard()).unwrap();
+    let wal_binding = runtime.wal.bind(intent.guard()).unwrap();
+    let mut checkpoint = CheckpointStateMachine::new(
+        connection.get_pager(),
+        store.clone(),
+        connection.clone(),
+        true,
+        crate::SyncMode::Full,
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    checkpoint
+        .authorize_shared_materialization(&intent)
+        .unwrap();
+    loop {
+        match checkpoint.step(&()).unwrap() {
+            TransitionResult::Continue => {}
+            TransitionResult::Io(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            TransitionResult::Done(_) => break,
+        }
+    }
+    assert_ne!(std::fs::read(&path).unwrap(), main_before);
+    assert_eq!(std::fs::read(&logical_path).unwrap(), log_before);
+    assert_eq!(store.storage.logical_log_offset(), prefix.end_offset);
+    assert_eq!(
+        store.durable_txid_max.load(Ordering::Acquire),
+        prefix.committed_timestamp
+    );
+    assert_eq!(std::fs::metadata(runtime.wal_path()).unwrap().len(), 0);
+    assert_eq!(intent.guard().published().unwrap(), prefix);
+    while !intent.guard().io_retired() {
+        io.wait_for_completion(intent.guard().retirement_completion())
+            .unwrap();
+    }
+    drop(main_binding);
+    drop(wal_binding);
+    intent.into_guard().finish().unwrap();
+    drop(_pause);
+    let reopened = crate::Database::open(
+        io,
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    );
+    assert!(
+        matches!(reopened, Err(LimboError::InvalidArgument(message)) if message.contains("checkpoint recovery"))
+    );
+}

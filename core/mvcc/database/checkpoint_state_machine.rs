@@ -1005,6 +1005,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
+    #[cfg(all(host_shared_wal, unix))]
+    #[allow(dead_code)]
+    pub(super) fn authorize_shared_materialization(
+        &mut self,
+        _intent: &crate::mvcc::commit_manifest::checkpoint_publication::MirroredCheckpointIntent,
+    ) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "shared checkpoint materialization not implemented".into(),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> CheckpointState {
         self.state
