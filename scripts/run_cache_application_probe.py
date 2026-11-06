@@ -190,11 +190,17 @@ def main():
                     service.wait(timeout=10)
                     service = None
     finally:
-        if service is not None:
-            service.terminate()
-            service.wait(timeout=10)
-        if started:
-            command(["docker", "stop", name], capture_output=True)
+        try:
+            if service is not None:
+                service.terminate()
+                try:
+                    service.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    service.kill()
+                    service.wait(timeout=10)
+        finally:
+            if started:
+                command(["docker", "stop", name], capture_output=True, timeout=30)
 
 
 if __name__ == "__main__":

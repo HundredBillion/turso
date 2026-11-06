@@ -187,6 +187,7 @@ fn serve(path: &Path, address: &str) -> Result<()> {
             let result = (|| -> Result<()> {
                 let mut local = Local::new(&path)?;
                 let mut reader = BufReader::new(stream);
+                reader.get_mut().write_all(b"READY\n")?;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line)? == 0 {
@@ -271,7 +272,13 @@ impl DatabasePath {
             let stream = TcpStream::connect(address)?;
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-            Ok(Self::Shared(BufReader::new(stream)))
+            let mut socket = BufReader::new(stream);
+            let mut ready = String::new();
+            socket.read_line(&mut ready)?;
+            if ready != "READY\n" {
+                return Err("database service did not complete preparation".into());
+            }
+            Ok(Self::Shared(socket))
         }
     }
     fn request(&mut self, request: Request) -> Result<Vec<u8>> {
@@ -508,12 +515,37 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn shared_connection_waits_for_server_preparation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            socket.write_all(b"READY\n").unwrap();
+        });
+        let client = std::thread::spawn(move || {
+            let connection = DatabasePath::new(Path::new("unused"), &address);
+            done_tx.send(connection.is_ok()).unwrap();
+        });
+        accepted_rx.recv().unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        client.join().unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(done_rx.recv().unwrap());
+    }
+    #[test]
     fn local_requests_match_independent_oracle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.db");
         initialize(&path, 100).unwrap();
         let mut local = Local::new(&path).unwrap();
-        for seq in 0..2000 {
+        for seq in 0..10000 {
             let request = scheduled_request(seq, 100, false);
             assert_eq!(local.request(request).unwrap(), oracle(request, 100));
         }

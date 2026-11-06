@@ -87,7 +87,7 @@ the experiment with a nonzero status; successful CSVs have no ignored failures.
 
 ## Current verification and remaining evidence
 
-The focused oracle check covers 2,000 generated requests and malformed request
+The focused oracle check covers 10,000 generated requests and malformed request
 shapes. A local functional matrix passed embedded/shared × Redis off/on ×
 cold/warm with eight workers and 500 scheduled requests per variant. The complete
 Python runner then passed all sixteen deployment/cache/warm/hot combinations
@@ -119,3 +119,17 @@ The runner validates trace counts, hit/miss totals, nonnegative service/lateness
 reported percentiles and completion of the offered-rate arrival horizon. A real
 scheduled trace passed this validation; removing a request was rejected. A hung
 startup child was rejected by the deadline in a focused control.
+
+Each shared connection now waits for an explicit READY response sent only after
+the service opens its connection and prepares every statement. The handshake
+regression failed before this synchronization and passed afterward, keeping
+server preparation outside cold-trial timing just as embedded preparation is.
+Earlier functional smoke traces predate this correction and are not performance
+evidence. Final hosted comparisons must use the handshake revision.
+
+The final handshake build passed all 32 functional variants with eight workers,
+100 rows and 100 requests: all sixteen deployment/cache/warm/hot combinations
+at both closed-loop and 1,000/s scheduled arrivals. Negative controls and trace
+validation ran in the same driver. The committed smoke metadata/trace now come
+from this final build. Independent review found no remaining methodology blocker
+within the stated immutable scope.

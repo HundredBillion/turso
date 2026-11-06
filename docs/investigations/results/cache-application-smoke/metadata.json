@@ -6,19 +6,24 @@
     8
   ],
   "rates": [
+    0,
     1000
   ],
   "deployments": [
+    "embedded",
     "shared"
   ],
   "cache_warm_hot_axes": [
     [
+      false,
       true
     ],
     [
+      false,
       true
     ],
     [
+      false,
       true
     ]
   ],
@@ -26,7 +31,7 @@
   "binaries": {
     "candidate": {
       "path": "/Users/davidlee/Projects/turso-php-storage/target/lib-release/examples/cache_application_probe",
-      "sha256": "d4313c968a0b08d89a736046b524c2088bc653385691e0186aa0684070363ac7"
+      "sha256": "a712d02f197187b4d7ff0b3b54e44605362aeade10ede795f52e5c0dcef25a68"
     }
   },
   "redis_image": "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99",
@@ -44,14 +49,14 @@
     "gcc_version": "14.2.0",
     "process_id": "1",
     "process_supervised": "no",
-    "run_id": "7e98138f1ea437fe4b3c863d479e653e142d50cc",
+    "run_id": "bcfc8dcdb7d7bbaf9c26266e7ac8e828cb973198",
     "tcp_port": "6379",
-    "server_time_usec": "1793981128475276",
+    "server_time_usec": "1793981530234928",
     "uptime_in_seconds": "0",
     "uptime_in_days": "0",
     "hz": "10",
     "configured_hz": "10",
-    "lru_clock": "15596232",
+    "lru_clock": "15596634",
     "executable": "/data/redis-server",
     "config_file": "",
     "io_threads_active": "0",
@@ -69,15 +74,15 @@
     "total_watched_keys": "0",
     "total_blocking_keys": "0",
     "total_blocking_keys_on_nokey": "0",
-    "used_memory": "1046728",
-    "used_memory_human": "1022.20K",
-    "used_memory_rss": "10551296",
-    "used_memory_rss_human": "10.06M",
-    "used_memory_peak": "1046728",
-    "used_memory_peak_human": "1022.20K",
+    "used_memory": "1046792",
+    "used_memory_human": "1022.26K",
+    "used_memory_rss": "10866688",
+    "used_memory_rss_human": "10.36M",
+    "used_memory_peak": "1046792",
+    "used_memory_peak_human": "1022.26K",
     "used_memory_peak_perc": "100.23%",
-    "used_memory_overhead": "981472",
-    "used_memory_startup": "981280",
+    "used_memory_overhead": "981536",
+    "used_memory_startup": "981344",
     "used_memory_dataset": "65256",
     "used_memory_dataset_perc": "99.71%",
     "allocator_allocated": "4095840",
@@ -106,10 +111,10 @@
     "allocator_frag_bytes": "4780448",
     "allocator_rss_ratio": "1.31",
     "allocator_rss_bytes": "3801088",
-    "rss_overhead_ratio": "0.66",
-    "rss_overhead_bytes": "-5373952",
-    "mem_fragmentation_ratio": "10.75",
-    "mem_fragmentation_bytes": "9569872",
+    "rss_overhead_ratio": "0.68",
+    "rss_overhead_bytes": "-5058560",
+    "mem_fragmentation_ratio": "11.07",
+    "mem_fragmentation_bytes": "9885200",
     "mem_not_counted_for_evict": "0",
     "mem_replication_backlog": "0",
     "mem_total_replication_buffers": "0",
@@ -132,7 +137,7 @@
     "current_save_keys_total": "0",
     "rdb_changes_since_last_save": "0",
     "rdb_bgsave_in_progress": "0",
-    "rdb_last_save_time": "1793981128",
+    "rdb_last_save_time": "1793981530",
     "rdb_last_bgsave_status": "ok",
     "rdb_last_bgsave_time_sec": "-1",
     "rdb_current_bgsave_time_sec": "-1",
@@ -207,7 +212,7 @@
     "reply_buffer_shrinks": "0",
     "reply_buffer_expands": "0",
     "eventloop_cycles": "6",
-    "eventloop_duration_sum": "455",
+    "eventloop_duration_sum": "486",
     "eventloop_duration_cmd_sum": "1",
     "instantaneous_eventloop_cycles_per_sec": "0",
     "instantaneous_eventloop_duration_usec": "0",
@@ -218,7 +223,7 @@
     "role": "master",
     "connected_slaves": "0",
     "master_failover_state": "no-failover",
-    "master_replid": "64be8450921c268e7f9a9dba369f8389646b16e0",
+    "master_replid": "92019d37c4ac08d3e601a5e678d4eb5264efdf3c",
     "master_replid2": "0000000000000000000000000000000000000000",
     "master_repl_offset": "0",
     "second_repl_offset": "-1",
@@ -226,12 +231,12 @@
     "repl_backlog_size": "1048576",
     "repl_backlog_first_byte_offset": "0",
     "repl_backlog_histlen": "0",
-    "used_cpu_sys": "0.006152",
-    "used_cpu_user": "0.008744",
-    "used_cpu_sys_children": "0.000040",
-    "used_cpu_user_children": "0.001105",
-    "used_cpu_sys_main_thread": "0.005773",
-    "used_cpu_user_main_thread": "0.008659",
+    "used_cpu_sys": "0.009195",
+    "used_cpu_user": "0.009195",
+    "used_cpu_sys_children": "0.000475",
+    "used_cpu_user_children": "0.000516",
+    "used_cpu_sys_main_thread": "0.008321",
+    "used_cpu_user_main_thread": "0.009362",
     "cluster_enabled": "0"
   }
 }
