@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9464d47442b667def9f7ff4c7413aa7f028258cc
+          ref: 16d52b9b4977dc3d47abf2526903f2a624249cec
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,18 +25,34 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9464d47442b667def9f7ff4c7413aa7f028258cc
+          test "$(git rev-parse HEAD)" = 16d52b9b4977dc3d47abf2526903f2a624249cec
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
-      - name: Coordinator missing implementation must fail
+      - name: Native coordinator publication and bounded quiescence
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_coordinator_native_publishes_target_without_reclaiming_log -- --ignored --test-threads=1 --nocapture 2>&1 | tee coordinator-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' coordinator-red.log
-          grep -q 'shared checkpoint coordinator is not implemented' coordinator-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_coordinator_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee coordinator-green.log
+          grep -q '3 passed; 0 failed' coordinator-green.log
+      - name: Completion and ID finalization failure boundaries
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_completion_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee completion.log
+          grep -q '3 passed; 0 failed' completion.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api id_checkpoint_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization.log
+          grep -q '3 passed; 0 failed' finalization.log
+      - name: Lease retention and private shared components
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api guarded_file:: -- --test-threads=1 --nocapture 2>&1 | tee guarded.log
+          grep -q '13 passed; 0 failed' guarded.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api process_ofd_lock_survives_abort_until_backend_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee ofd.log
+          grep -q '1 passed; 0 failed' ofd.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_ -- --test-threads=1 --nocapture 2>&1 | tee shared.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' shared.log
+      - name: Native materialization opening and commit regression
+        run: |
+          for selector in shared_checkpoint_native_ shared_open_native shared_commit_native_; do
+            cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
+            grep -q '2 passed; 0 failed' "$selector.log"
+          done
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
