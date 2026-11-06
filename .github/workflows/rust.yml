@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b5cc515163ff811cad060efa8d25cce9e31355e6
+          ref: 7cddfe4c1021098658c4580c63774718ed7f4e25
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,26 +25,20 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b5cc515163ff811cad060efa8d25cce9e31355e6
+          test "$(git rev-parse HEAD)" = 7cddfe4c1021098658c4580c63774718ed7f4e25
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Epoch identity and native reservation process recovery
+      - name: Interrupted marker has no recovery implementation yet
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_authority:: -- --test-threads=1 --nocapture 2>&1 | tee authority.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids:: -- --test-threads=1 --nocapture 2>&1 | tee ids.log
-          grep -q 'native_id_reservations_survive_death_compaction_and_reopen ... ok' ids.log
-      - name: Native opening SQL commits and admission after reconciliation
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee opening.log
-          grep -q '1 passed; 0 failed' opening.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commits.log
-          grep -q '2 passed; 0 failed' commits.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee vdbe.log
-          grep -q '6 passed; 0 failed' vdbe.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh_ -- --test-threads=1 --nocapture 2>&1 | tee refresh.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_resumes_committed_marker_without_recreating_namespace -- --test-threads=1 --nocapture 2>&1 | tee marker-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'prepared marker recovery is not wired' marker-red.log
+          grep -q '0 passed; 1 failed' marker-red.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
