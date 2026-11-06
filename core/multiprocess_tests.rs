@@ -3312,3 +3312,112 @@ fn sql_reopened_writer_grows_shared_index_with_old_reader() {
         .unwrap();
     assert_eq!(count_test_rows(&conn), 3);
 }
+
+#[test]
+#[ignore = "writes about 150 MB across two processes"]
+fn subprocess_reopened_writer_grows_shared_index_with_old_reader() {
+    let dir = tempfile::tempdir().expect("create test directory");
+    let path = dir.path().join("subprocess-growth.db");
+    let db_path = path.to_str().expect("UTF-8 database path");
+    let ready = dir.path().join("reader-ready");
+    let release = dir.path().join("reader-release");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), db_path).expect("open initial writer");
+        let conn = db
+            .connect(ConnectOpts::new())
+            .expect("connect initial writer");
+        conn.wal_auto_actions_disable();
+        conn.execute("PRAGMA page_size = 512")
+            .expect("set page size");
+        conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value BLOB)")
+            .expect("create table");
+        conn.execute("INSERT INTO test VALUES (1, X'616263')")
+            .expect("insert original row");
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "multiprocess_tests::multiprocess_growth_reader_child_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("TURSO_MULTIPROCESS_DB_PATH", &path)
+            .env("TURSO_MULTIPROCESS_READY_FILE", &ready)
+            .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start reader process");
+        wait_for_file(&ready);
+        drop(conn);
+        drop(db);
+        remove_file_from_database_registry(db_path);
+        let db = open_multiprocess_db(io, db_path).expect("reopen writer");
+        assert!(!db
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        let conn = db
+            .connect(ConnectOpts::new())
+            .expect("connect reopened writer");
+        conn.wal_auto_actions_disable();
+        conn.execute("INSERT INTO test VALUES (2, zeroblob(140000000))")
+            .expect("grow WAL beyond former capacity");
+        let authority = db
+            .shared_wal_coordination()
+            .expect("get authority")
+            .expect("shared authority");
+        assert!(authority.snapshot().max_frame > 262144);
+        assert!(!authority.frame_index_overflowed());
+        std::fs::write(&release, b"done").expect("release reader");
+        let output = child.wait_with_output().expect("wait for reader");
+        assert!(
+            output.status.success(),
+            "reader failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn multiprocess_growth_reader_child_process() {
+    let Some(path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE").expect("ready path");
+    let release = std::path::PathBuf::from(
+        std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE").expect("release path"),
+    );
+    let db = open_multiprocess_db(
+        multiprocess_test_io(),
+        path.to_str().expect("UTF-8 database path"),
+    )
+    .expect("open reader");
+    let conn = db.connect(ConnectOpts::new()).expect("connect reader");
+    conn.execute("BEGIN").expect("begin old snapshot");
+    assert_eq!(count_test_rows(&conn), 1);
+    std::fs::write(ready, b"ready").expect("announce snapshot");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not finish growth"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(count_test_rows(&conn), 1);
+    conn.execute("ROLLBACK").expect("release old snapshot");
+    assert_eq!(count_test_rows(&conn), 2);
+    assert_eq!(
+        get_rows(&conn, "SELECT length(value) FROM test WHERE id=2")[0][0]
+            .as_int()
+            .expect("blob length"),
+        140000000
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+}
