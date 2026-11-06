@@ -2,6 +2,7 @@ mod ordinary;
 pub(super) mod recovery;
 #[cfg(test)]
 mod recovery_integration_tests;
+mod staging_cleanup;
 
 use super::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
 use super::shared_authority::PublishedPrefix;
