@@ -1872,18 +1872,17 @@ impl StreamingLogicalLogReader {
     pub(crate) fn try_read_header_nonblock(&mut self) -> IOResultOr<HeaderReadResult> {
         self.refresh_file_size()?;
         if self.file_size < LOG_HDR_SIZE {
-            return Ok(IOResult::Done(HeaderReadResult::NoLog));
+            return self.missing_or_invalid_header(HeaderReadResult::NoLog);
         }
 
         let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
         // All-zero header means no durable log header yet (pre-fsync crash), not corruption.
         if header_bytes.iter().all(|&b| b == 0) {
-            return Ok(IOResult::Done(HeaderReadResult::NoLog));
+            return self.missing_or_invalid_header(HeaderReadResult::NoLog);
         }
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
-            self.set_invalid_header_state();
-            return Ok(IOResult::Done(HeaderReadResult::Invalid));
+            return self.missing_or_invalid_header(HeaderReadResult::Invalid);
         }
 
         match LogHeader::decode(&header_bytes) {
@@ -1899,11 +1898,26 @@ impl StreamingLogicalLogReader {
                 Ok(IOResult::Done(HeaderReadResult::Valid(header)))
             }
             Err(LimboError::Corrupt(_)) => {
-                self.set_invalid_header_state();
-                Ok(IOResult::Done(HeaderReadResult::Invalid))
+                self.missing_or_invalid_header(HeaderReadResult::Invalid)
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn missing_or_invalid_header(
+        &mut self,
+        result: HeaderReadResult,
+    ) -> IOResultOr<HeaderReadResult> {
+        if self.committed_prefix.is_some() {
+            return Err(LimboError::Corrupt(
+                "committed logical log header is missing or invalid".into(),
+            )
+            .into());
+        }
+        if matches!(result, HeaderReadResult::Invalid) {
+            self.set_invalid_header_state();
+        }
+        Ok(IOResult::Done(result))
     }
 
     fn set_invalid_header_state(&mut self) {
@@ -1931,6 +1945,9 @@ impl StreamingLogicalLogReader {
     /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self) -> IOResultOr<Option<Vec<ParsedOp>>> {
+        if self.committed_prefix.is_some() {
+            self.refresh_file_size()?;
+        }
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
@@ -3908,6 +3925,7 @@ mod tests {
     use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
+    use crate::LimboError;
     use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::sync::Once;
@@ -6414,6 +6432,278 @@ mod tests {
         assert!(reader.next_frame_blocking(&io).unwrap().is_none());
         assert_eq!(reader.last_valid_offset() as u64, end_offset);
         assert_eq!(reader.running_crc(), running_crc);
+    }
+
+    #[test]
+    fn committed_prefix_checks_generated_frame_boundaries() {
+        fn property(length: u16, selector: u16, encrypted: bool) -> bool {
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("prefix-boundaries.db-log", OpenFlags::Create, false)
+                .unwrap();
+            let encryption = encrypted.then(test_enc_ctx);
+            let mut log = LogicalLog::new(file.clone(), io.clone(), encryption.clone());
+            let value = "\u{1f980}".repeat(usize::from(length) % 2048);
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                10,
+                &[make_test_row_version((-2).into(), 1, &value, 10)],
+                None,
+            );
+            io.wait_for_completion(log.log_tx(tx).unwrap()).unwrap();
+            let end = log.offset;
+            let cut = match selector % 5 {
+                0 => LOG_HDR_SIZE as u64,
+                1 => end,
+                2 => end + 1,
+                3 => (LOG_HDR_SIZE - 1) as u64,
+                _ => LOG_HDR_SIZE as u64 + u64::from(selector) % (end - LOG_HDR_SIZE as u64),
+            };
+            let crc = if cut == LOG_HDR_SIZE as u64 {
+                derive_initial_crc(log.header().unwrap().salt)
+            } else {
+                log.running_crc
+            };
+            let reader =
+                StreamingLogicalLogReader::new(file, encryption).with_committed_prefix(cut, crc);
+            if cut < LOG_HDR_SIZE as u64 || cut > end {
+                return reader.is_err();
+            }
+            let mut reader = reader.unwrap();
+            reader.read_header(&io).unwrap();
+            if cut == LOG_HDR_SIZE as u64 {
+                return reader.next_frame_blocking(&io).unwrap().is_none()
+                    && reader.next_frame_blocking(&io).unwrap().is_none();
+            }
+            if cut == end {
+                return reader.next_frame_blocking(&io).unwrap().is_some()
+                    && reader.next_frame_blocking(&io).unwrap().is_none();
+            }
+            matches!(reader.next_frame_blocking(&io), Err(LimboError::Corrupt(_)))
+                && matches!(reader.next_frame_blocking(&io), Err(LimboError::Corrupt(_)))
+        }
+
+        quickcheck::QuickCheck::new()
+            .tests(100)
+            .quickcheck(property as fn(u16, u16, bool) -> bool);
+    }
+
+    #[test]
+    fn committed_prefix_rejects_wrong_checksum_before_returning_last_frame() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-checksum.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "committed", 10)],
+            None,
+        );
+        io.wait_for_completion(log.log_tx(tx).unwrap()).unwrap();
+        let mut reader = StreamingLogicalLogReader::new(file, None)
+            .with_committed_prefix(log.offset, log.running_crc ^ 1)
+            .unwrap();
+        reader.read_header(&io).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                reader.next_frame_blocking(&io),
+                Err(LimboError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn committed_prefix_rejects_torn_tail_that_recovery_tolerates() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-torn-tail.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "committed", 10)],
+            None,
+        );
+        io.wait_for_completion(log.log_tx(tx).unwrap()).unwrap();
+        let mut bytes = read_file_bytes(file.clone(), &io);
+        *bytes.last_mut().unwrap() ^= 1;
+        overwrite_file_bytes(file.clone(), &io, &bytes);
+
+        let mut ordinary = StreamingLogicalLogReader::new(file.clone(), None);
+        ordinary.read_header(&io).unwrap();
+        assert!(ordinary.next_frame_blocking(&io).unwrap().is_none());
+        let mut strict = StreamingLogicalLogReader::new(file.clone(), None)
+            .with_committed_prefix(log.offset, log.running_crc)
+            .unwrap();
+        strict.read_header(&io).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                strict.next_frame_blocking(&io),
+                Err(LimboError::Corrupt(_))
+            ));
+        }
+
+        let mut truncated = StreamingLogicalLogReader::new(file.clone(), None)
+            .with_committed_prefix(log.offset, log.running_crc)
+            .unwrap();
+        io.wait_for_completion(
+            file.truncate(LOG_HDR_SIZE as u64, Completion::new_trunc(|_| {}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            truncated.read_header(&io),
+            Err(LimboError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn committed_prefix_preserves_boundary_across_delayed_short_reads() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-delayed.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let first = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, &"x".repeat(9000), 10)],
+            None,
+        );
+        io.wait_for_completion(log.log_tx(first).unwrap()).unwrap();
+        let prefix = (log.offset, log.running_crc);
+        let second = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[make_test_row_version((-2).into(), 2, "unpublished", 20)],
+            None,
+        );
+        io.wait_for_completion(log.log_tx(second).unwrap()).unwrap();
+        let slow = Arc::new(SlowReadFile::new(read_file_bytes(file, &io), 67));
+        let mut reader = StreamingLogicalLogReader::new(slow.clone(), None)
+            .with_committed_prefix(prefix.0, prefix.1)
+            .unwrap();
+        loop {
+            match reader.try_read_header_nonblock().unwrap() {
+                IOResult::Done(HeaderReadResult::Valid(_)) => break,
+                IOResult::Done(other) => panic!("unexpected header: {other:?}"),
+                IOResult::IO(_) => assert!(slow.step()),
+            }
+        }
+        let mut frames = 0;
+        loop {
+            match reader.next_frame().unwrap() {
+                IOResult::Done(Some(_)) => frames += 1,
+                IOResult::Done(None) => break,
+                IOResult::IO(_) => assert!(slow.step()),
+            }
+            assert!(reader.offset as u64 <= prefix.0);
+        }
+        assert_eq!(frames, 1);
+        assert_eq!(
+            (reader.last_valid_offset as u64, reader.running_crc),
+            prefix
+        );
+    }
+
+    #[test]
+    fn committed_prefix_rejects_truncation_after_buffering() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-buffered.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        for id in 1..=2 {
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                id as u64,
+                &[make_test_row_version((-2).into(), id, "row", id as u64)],
+                None,
+            );
+            io.wait_for_completion(log.log_tx(tx).unwrap()).unwrap();
+        }
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None)
+            .with_committed_prefix(log.offset, log.running_crc)
+            .unwrap();
+        reader.read_header(&io).unwrap();
+        assert!(reader.next_frame_blocking(&io).unwrap().is_some());
+        io.wait_for_completion(
+            file.truncate(LOG_HDR_SIZE as u64, Completion::new_trunc(|_| {}))
+                .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                reader.next_frame_blocking(&io),
+                Err(LimboError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn committed_prefix_rejects_missing_header_without_tolerant_recovery_result() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-missing-header.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let valid_header = LogHeader::new(&io).encode();
+        let mut wrong_length = valid_header;
+        wrong_length[6] ^= 1;
+        let mut wrong_checksum = valid_header;
+        wrong_checksum[LOG_HDR_CRC_START] ^= 1;
+        for bytes in [[0; LOG_HDR_SIZE], wrong_length, wrong_checksum] {
+            overwrite_file_bytes(file.clone(), &io, &bytes);
+            let mut reader = StreamingLogicalLogReader::new(file.clone(), None)
+                .with_committed_prefix(LOG_HDR_SIZE as u64, 0)
+                .unwrap();
+            assert!(reader.try_read_header(&io).is_err());
+            assert!(reader.try_read_header(&io).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "conn_raw_api")]
+    fn committed_prefix_also_bounds_portable_frames() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-portable.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut prefix = (0, 0);
+        for id in 1..=2 {
+            let mut tx = crate::mvcc::database::LogRecord::for_test(
+                id as u64,
+                &[make_test_row_version((-2).into(), id, "row", id as u64)],
+                None,
+            );
+            tx.portable_changes_enabled = true;
+            io.wait_for_completion(log.log_tx(tx).unwrap()).unwrap();
+            if id == 1 {
+                prefix = (log.offset, log.running_crc);
+            }
+        }
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None)
+            .with_committed_prefix(prefix.0, prefix.1)
+            .unwrap();
+        reader.read_header(&io).unwrap();
+        let first = io
+            .block(|| reader.next_portable_change_frame())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.commit_ts, 1);
+        assert_eq!(first.end_offset, prefix.0);
+        assert!(io
+            .block(|| reader.next_portable_change_frame())
+            .unwrap()
+            .is_none());
+
+        let mut wrong_crc = StreamingLogicalLogReader::new(file, None)
+            .with_committed_prefix(prefix.0, prefix.1 ^ 1)
+            .unwrap();
+        wrong_crc.read_header(&io).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                io.block(|| wrong_crc.next_portable_change_frame()),
+                Err(LimboError::Corrupt(_))
+            ));
+        }
     }
 
     fn make_test_row_version(
