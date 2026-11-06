@@ -1,4 +1,4 @@
-name: Shared RELEASE cap lifecycle validation
+name: Integrated shared commits and VDBE lifecycle validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 93549f7a3258a59a28271cefea6b049fb9f7c8e1
+          ref: d901e63edf8e565285cbe631e57f1f061cf208ca
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,8 +25,12 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 93549f7a3258a59a28271cefea6b049fb9f7c8e1
+          test "$(git rev-parse HEAD)" = d901e63edf8e565285cbe631e57f1f061cf208ca
           rustc -Vv | tee rustc.txt
+      - name: Actual native shared commit publication and conflict
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-commit.log
+          grep -q '2 passed; 0 failed' native-commit.log
       - name: Shared RELEASE and COMMIT preservation
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee shared-green.log
@@ -39,7 +43,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-release-green
+          name: shared-native-union-d901
           path: |
             source.txt
             rustc.txt
