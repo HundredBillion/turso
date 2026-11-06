@@ -38,3 +38,13 @@ Tests: disjoint and conflicting independent writers; delayed append/sync/manifes
 ## Remaining required integration
 
 Global row/table/sequence reservations, checkpoint/reclamation and interrupted-checkpoint recovery, the concrete offline backend adapter, fresh-file initialization, the public PDO URI/capability path, and the complete independent PHP-worker acceptance suite remain required. No task above is equivalent to completion of issue #7.
+
+## Restart incarnation recovery
+
+Mapped authority bytes are coordination state, not a durable incarnation ledger. A machine failure can restore an older epoch and timestamp while acknowledged ID reservations survive. The behavioral regression restores those older bytes after all handles close and checks that the acknowledged owner cannot be issued again.
+
+Every exclusive lifetime acquisition clears incarnation readiness. No snapshot can register until bootstrap has recovered the manifest and logical prefix, loaded the matching durable ID journal, and reconciled the epoch. The journal maximum includes retired owner records and owners in every active or prepared bank retained by the selected witness. Reconciliation requires no live registrations and chooses an epoch strictly above that maximum, with checked overflow. A private protocol revision excludes older participants that do not enforce readiness.
+
+Before using this maximum, bootstrap must write and FULL-sync the selected ID witness to both selector slots and wait for physical I/O retirement. This matters after interrupted compaction: one newer floor-only selector may contain no owners while an older valid selector still names their journal. Merely reading the newer selector could permit identity reuse followed by later fallback to those old owners. Mirroring eliminates that fallback before admission. Completed quiescent compaction can then forget old owner identities because neither durable selector can select them.
+
+Cancellation or failure before the mirrored proof leaves admission disabled and recovery required. Successful reconciliation changes only coordination metadata; read-only database contents remain unchanged. Subsequent processes joining a live reconciled authority do not change its incarnation. The proof assumes the existing failure model of checksum-detected torn writes and successful FULL-sync durability; it does not treat process-kill tests as power-loss evidence.

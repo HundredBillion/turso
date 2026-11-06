@@ -6,6 +6,9 @@ use crate::mvcc::commit_manifest::{LoadedManifest, ManifestLoad};
 use crate::mvcc::guarded_file::{FileBinding, GuardedFile};
 use crate::mvcc::persistent_storage::Storage;
 use crate::mvcc::shared_files::SharedMvccFiles;
+use crate::mvcc::shared_ids::io_protocol::witness_mirror::IdWitnessMirror;
+use crate::mvcc::shared_ids::io_protocol::{IdLoad, RecoveryIdentity, SharedIds};
+use crate::mvcc::shared_ids::DatabaseGeneration;
 use crate::storage::shared_wal_coordination::MappedSharedWalCoordination;
 use crate::sync::Weak;
 use std::path::{Path, PathBuf};
@@ -17,6 +20,7 @@ pub(crate) struct SharedMvccRuntime {
     wal: Arc<GuardedFile>,
     logical: Arc<GuardedFile>,
     storage: Arc<Storage>,
+    ids: Arc<SharedIds>,
     replay: Mutex<Option<Arc<SharedReplayContext>>>,
     database_id: FileId,
     wal_path: PathBuf,
@@ -107,6 +111,15 @@ impl SharedMvccRuntime {
         let main = GuardedFile::new(files.main.clone(), &files.authority);
         let wal = GuardedFile::new(files.physical_wal.clone(), &files.authority);
         let logical = GuardedFile::new(files.logical.clone(), &files.authority);
+        let ids = SharedIds::open_existing(
+            files
+                .id_banks
+                .each_ref()
+                .map(|file| GuardedFile::new(file.clone(), &files.authority)),
+            GuardedFile::new(files.id_selector.clone(), &files.authority),
+            database_id,
+            history_limit,
+        )?;
         let storage = Arc::new(Storage::new(logical.clone(), io, None));
         let wal_path = files.namespace.join("physical-wal");
         Ok(Arc::new(Self {
@@ -116,6 +129,7 @@ impl SharedMvccRuntime {
             wal,
             logical,
             storage,
+            ids,
             replay: Mutex::new(None),
             database_id,
             wal_path,
@@ -301,6 +315,9 @@ pub(crate) struct SharedBootstrapState {
     connection: Option<Weak<Connection>>,
     reparse: crate::connection::ReparseSchemaState,
     base: super::shared_bootstrap::SharedBaseContextState,
+    persistent_timestamp: u64,
+    ids_load: Option<IdLoad>,
+    ids_mirror: Option<IdWitnessMirror>,
     post: Option<BootstrapState>,
     tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
 }
@@ -318,6 +335,7 @@ enum SharedBootstrapStage {
     Reparse,
     Base,
     Replay,
+    Incarnation,
     Post,
     Done,
     Failed,
@@ -378,6 +396,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                             return_if_io!(self
                                 .prepare_shared_base_context_nonblock(connection, &mut state.base));
                         let persistent = context.persistent_tx_ts_max;
+                        state.persistent_timestamp = persistent;
                         let observed = open.loaded.as_ref().unwrap().record();
                         if persistent > observed.prefix().committed_timestamp {
                             return Err(LimboError::Corrupt(
@@ -403,8 +422,39 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                     SharedBootstrapStage::Replay => {
                         let loaded =
                             return_if_io!(open.refresh.as_mut().unwrap().poll(self, connection));
-                        loaded.into_guard()?.finish()?;
+                        let record = loaded.record();
+                        let guard = loaded.into_guard()?;
                         open.refresh = None;
+                        if !guard.incarnation_ready()? {
+                            state.ids_load = Some(runtime.ids.load(
+                                guard,
+                                RecoveryIdentity {
+                                    database: DatabaseGeneration {
+                                        generation: record.log_generation(),
+                                        checkpoint_timestamp: state.persistent_timestamp,
+                                    },
+                                    prefix: record.prefix(),
+                                },
+                            )?);
+                            state.stage = SharedBootstrapStage::Incarnation;
+                            continue;
+                        }
+                        guard.finish()?;
+                        state.stage = SharedBootstrapStage::Incarnation;
+                    }
+                    SharedBootstrapStage::Incarnation => {
+                        if let Some(load) = state.ids_load.as_mut() {
+                            let loaded = return_if_io!(load.poll());
+                            state.ids_load = None;
+                            state.ids_mirror = Some(loaded.mirror_current_witness()?);
+                        }
+                        if let Some(mirror) = state.ids_mirror.as_mut() {
+                            let proof = return_if_io!(mirror.poll());
+                            state.ids_mirror = None;
+                            let (mut guard, maximum) = proof.into_guard_and_max_owner_epoch();
+                            guard.reconcile_incarnation(maximum.unwrap_or(0))?;
+                            guard.finish()?;
+                        }
                         open.bindings.clear();
                         open.admission = None;
                         connection.promote_to_regular_connection();
@@ -434,6 +484,8 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
             open.abort();
             state.stage = SharedBootstrapStage::Failed;
             state.post = None;
+            state.ids_load = None;
+            state.ids_mirror = None;
         }
         result
     }
