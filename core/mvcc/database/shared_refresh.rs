@@ -42,6 +42,11 @@ impl SharedReplayContext {
         loaded: LoadedManifest,
         file: Arc<dyn File>,
     ) -> Result<SharedRefresh> {
+        if loaded.record().checkpoint_intent().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "shared checkpoint recovery is required".into(),
+            ));
+        }
         let state = self.state.lock().take().ok_or(LimboError::Busy)?;
         let mut refresh = SharedRefresh {
             owner: self.clone(),

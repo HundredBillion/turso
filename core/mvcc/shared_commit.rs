@@ -50,7 +50,8 @@ impl SharedCommit {
         let selected = loaded.record();
         let prefix = selected.prefix();
         let guard = loaded.guard()?;
-        if guard.published()? != prefix
+        if selected.checkpoint_intent().is_some()
+            || guard.published()? != prefix
             || record.tx_timestamp <= prefix.committed_timestamp
             || record.tx_timestamp >= MAX_TIMESTAMP
             || record.buf.len() < LOG_RECORD_PREFIX_SIZE
@@ -425,6 +426,24 @@ mod tests {
             .unwrap()
         }
     }
+    #[test]
+    fn shared_commit_rejects_checkpoint_intent_before_submitting_bytes() {
+        let f = Fixture::new();
+        let intent = ManifestRecord::decode(&f.manifest.bytes.lock()[..128])
+            .unwrap()
+            .unwrap()
+            .begin_checkpoint(0)
+            .unwrap();
+        f.manifest.bytes.lock()[..128].copy_from_slice(&intent.encode());
+        assert!(
+            SharedCommit::new(f.loaded(), f.storage.clone(), f.file.clone(), f.record()).is_err()
+        );
+        assert!(f.log.bytes.lock().is_empty());
+        assert!(f.log.pending.lock().is_empty());
+        assert!(f.manifest.pending.lock().is_empty());
+        assert!(f.authority.try_acquire().unwrap().requires_recovery());
+    }
+
     #[test]
     fn shared_commit_orders_durability_and_waits_for_physical_retirement() {
         let f = Fixture::new();
