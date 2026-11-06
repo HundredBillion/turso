@@ -33,18 +33,25 @@ jobs:
         if: runner.os == 'Windows'
       - uses: Swatinem/rust-cache@v2
       - name: Shared coordination
-        run: cargo test --locked -p turso_core --lib storage::shared_wal_coordination::tests -- --test-threads=1
+        run: >-
+          cargo test --locked -p turso_core --lib storage::shared_wal_coordination::tests -- --test-threads=1
       - name: Independent process paths
-        run: cargo test --locked -p turso_core --lib multiprocess_tests:: -- --test-threads=1
+        run: >-
+          cargo test --locked -p turso_core --lib multiprocess_tests:: -- --test-threads=1
       - name: Page initialization and delayed close
-        run: cargo test --locked -p turso_core --lib --features io_memory_yield allocate_page1_tests -- --nocapture
+        run: >-
+          cargo test --locked -p turso_core --lib --features io_memory_yield allocate_page1_tests -- --nocapture
       - name: Registry options
-        run: cargo test --locked -p core_tester --test integration_tests registry_db_opts -- --nocapture
+        run: >-
+          cargo test --locked -p core_tester --test integration_tests registry_db_opts -- --nocapture
       - name: Reported Windows timeout case
         timeout-minutes: 10
-        run: cargo test --locked -p core_tester --test integration_tests failed_commit_with_materialized_view_leaves_no_rows_behind -- --nocapture
+        run: >-
+          cargo test --locked -p core_tester --test integration_tests failed_commit_with_materialized_view_leaves_no_rows_behind -- --nocapture
       - name: Large shared index with independent reader
         timeout-minutes: 10
-        run: cargo test --locked -p turso_core --lib multiprocess_tests::subprocess_reopened_writer_grows_shared_index_with_old_reader -- --ignored --exact --test-threads=1
+        run: >-
+          cargo test --locked -p turso_core --lib multiprocess_tests::subprocess_reopened_writer_grows_shared_index_with_old_reader -- --ignored --exact --test-threads=1
       - name: Sync protocol and ownership
-        run: cargo test --locked -p turso_sync_engine --lib
+        run: >-
+          cargo test --locked -p turso_sync_engine --lib
