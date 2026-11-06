@@ -1,0 +1,8 @@
+{
+  "binary": "/Users/davidlee/Projects/turso-php-storage/target/debug/examples/cache_mixed_write_probe",
+  "sha256": "f420c0886400dc0f75b5ad168247d8f5900d32c4a5e63e0ae25c9906a28d94bd",
+  "failure_model": "SIGKILL of application process; not power loss",
+  "redis_address": "127.0.0.1:32777",
+  "cache_restart_verified": true,
+  "timing_comparison": false
+}

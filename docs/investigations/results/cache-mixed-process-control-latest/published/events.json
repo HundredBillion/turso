@@ -1,0 +1,14 @@
+[
+  {
+    "event": "ready"
+  },
+  {
+    "event": "before_commit"
+  },
+  {
+    "event": "committed"
+  },
+  {
+    "event": "published"
+  }
+]
