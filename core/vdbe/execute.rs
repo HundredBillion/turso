@@ -22195,6 +22195,80 @@ mod shared_begin_tests {
     }
 
     #[test]
+    fn shared_vdbe_release_cap_busy_retains_named_savepoints_on_reset_or_drop() {
+        for reset in [true, false] {
+            let f =
+                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "a".repeat(90_000)
+                ))
+                .unwrap();
+            f.connection.execute("SAVEPOINT held").unwrap();
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "b".repeat(90_000)
+                ))
+                .unwrap();
+            f.connection.execute("SAVEPOINT nested").unwrap();
+            let tx = f.connection.get_mv_tx();
+            assert!(tx.is_some());
+            let names = || {
+                f.connection.with_named_savepoints(|frames| {
+                    frames
+                        .iter()
+                        .map(|frame| frame.name.clone())
+                        .collect::<Vec<_>>()
+                })
+            };
+            let mut release = f.connection.prepare("RELEASE held").unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    release.run_with_row_callback(|_| Ok(())),
+                    Err(LimboError::Busy)
+                ));
+                assert_eq!(names(), ["held", "nested"]);
+            }
+            if reset {
+                release.reset().unwrap();
+            }
+            drop(release);
+            assert_eq!(
+                f.connection.get_mv_tx(),
+                tx,
+                "cap Busy discarded RELEASE transaction"
+            );
+            assert!(!f.connection.get_auto_commit());
+            assert_eq!(names(), ["held", "nested"]);
+            assert!(matches!(
+                f.connection.execute("RELEASE held"),
+                Err(LimboError::Busy)
+            ));
+            assert_eq!(names(), ["held", "nested"]);
+            f.connection.execute("ROLLBACK TO held").unwrap();
+            assert_eq!(names(), ["held"]);
+            let mut rows = 0;
+            f.connection
+                .prepare("SELECT length(value), substr(value,1,1) FROM preserved")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    assert_eq!(row.get::<i64>(0)?, 90_000);
+                    assert_eq!(row.get::<&str>(1)?, "a");
+                    rows += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, 1);
+            f.connection.execute("RELEASE held").unwrap();
+            assert!(f.connection.get_auto_commit());
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(names().is_empty());
+        }
+    }
+
+    #[test]
     fn shared_vdbe_reset_during_admission_retains_physical_read_ownership() {
         let reads = Arc::new(DelayedReads::default());
         let io = Arc::new(DelayedIo {
