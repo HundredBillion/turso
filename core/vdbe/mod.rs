@@ -40,6 +40,9 @@ pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
 mod statement_lifecycle_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+mod shared_id_tests;
 pub mod vacuum;
 pub mod value;
 #[allow(unused_imports)] // for benchmarks
