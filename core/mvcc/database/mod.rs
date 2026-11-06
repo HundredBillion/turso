@@ -5695,6 +5695,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// MVCC table ids are always negative. Their corresponding rootpage entry in sqlite_schema
     /// is the same negative value if the table has not been checkpointed yet. Otherwise, the root page
     /// will be positive and corresponds to the actual physical page.
+    pub(crate) fn recovered_logical_id_floor(&self) -> Result<i64> {
+        let next = self.next_table_id.load(Ordering::SeqCst);
+        if next >= -1 {
+            return Err(LimboError::Corrupt(
+                "invalid recovered logical ID floor".into(),
+            ));
+        }
+        next.checked_add(1).ok_or(LimboError::DatabaseFull)
+    }
+
     pub fn get_next_table_id(&self) -> i64 {
         self.next_table_id.fetch_sub(1, Ordering::SeqCst)
     }
