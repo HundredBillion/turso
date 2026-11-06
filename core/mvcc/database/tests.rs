@@ -25697,7 +25697,7 @@ fn peer_import_savepoint_cleanup_preserves_committed_end_markers() {
     let tx_id = db.conn.get_mv_tx_id().unwrap();
     let peer_timestamp = db.mvcc_store.clock.get_timestamp(crate::mvcc::clock::no_op);
     let mut imported_ends = Vec::new();
-    let mut mark = |chain: &RowVersions, is_index| {
+    let mut mark = |chain: &RowVersions<crate::alloc::DynAllocator>, is_index| {
         let mut versions = chain.write();
         for version in versions.iter_mut() {
             if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
@@ -26312,7 +26312,7 @@ fn peer_import_delete_replaces_pending_end_and_rollback_preserves_it() {
         };
         let mut prepared = Some(PreparedRecoveryFrame {
             commit_timestamp: 20,
-            decoded_frame: vec![op],
+            decoded_frame: crate::alloc::vec![op],
             schema_rows_after: None,
             type_sqls_after: None,
             schema_after: None,

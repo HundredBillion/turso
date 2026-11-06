@@ -4306,7 +4306,7 @@ fn replay_frame_timestamp(frame: &[ParsedOp]) -> Result<u64> {
 
 struct PreparedRecoveryFrame {
     commit_timestamp: u64,
-    decoded_frame: Vec<StreamingResult>,
+    decoded_frame: crate::alloc::Vec<StreamingResult>,
     schema_rows_after: Option<HashMap<i64, ImmutableRecord>>,
     type_sqls_after: Option<BTreeMap<i64, String>>,
     schema_after: Option<Arc<Schema>>,
