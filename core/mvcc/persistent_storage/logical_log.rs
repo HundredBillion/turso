@@ -681,6 +681,35 @@ impl LogicalLog {
         self.header = Some(header);
     }
 
+    /// Adopt a validated manifest boundary while its authority is held and all physical writes
+    /// have retired. Tentative framing metadata is not part of the acknowledged prefix.
+    pub(crate) fn adopt_shared_prefix(
+        &mut self,
+        header: Option<LogHeader>,
+        offset: u64,
+        running_crc: u32,
+        committed_timestamp: u64,
+    ) -> Result<()> {
+        if self.pending_header_write.is_some() {
+            return Err(LimboError::Busy);
+        }
+        let valid = match &header {
+            None => offset == 0 && running_crc == 0,
+            Some(_) => offset >= LOG_HDR_SIZE as u64,
+        };
+        if !valid {
+            return Err(LimboError::InvalidArgument(
+                "invalid shared log prefix state".into(),
+            ));
+        }
+        self.header = header;
+        self.offset = offset;
+        self.running_crc = running_crc;
+        self.pending_running_crc = None;
+        self.max_appended_commit_ts = committed_timestamp;
+        Ok(())
+    }
+
     pub(crate) fn has_pending_write(&self) -> bool {
         self.pending_header_write.is_some() || self.pending_running_crc.is_some()
     }
@@ -6447,6 +6476,56 @@ mod tests {
         assert!(reader.next_frame_blocking(&io).unwrap().is_none());
         assert_eq!(reader.last_valid_offset() as u64, end_offset);
         assert_eq!(reader.running_crc(), running_crc);
+    }
+
+    #[test]
+    fn shared_prefix_adoption_retries_rejected_first_append_with_valid_crc() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("shared-prefix-retry", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let rejected = crate::mvcc::database::LogRecord::for_test(100, &[], None);
+        let reject = |_: SharedBufferData, _: LogTxFrameInfo| Err(LimboError::Busy);
+        assert!(log.log_tx_deferred_offset(rejected, Some(&reject)).is_err());
+        assert_eq!(file.size().unwrap(), 0);
+        log.adopt_shared_prefix(None, 0, 0, 0).unwrap();
+        let retry = crate::mvcc::database::LogRecord::for_test(1, &[], None);
+        io.wait_for_completion(log.log_tx(retry).unwrap()).unwrap();
+        let mut reader = StreamingLogicalLogReader::new(file, None)
+            .with_committed_prefix(log.offset, log.running_crc)
+            .unwrap();
+        reader.read_header(&io).unwrap();
+        assert_eq!(
+            io.block(|| reader.next_transaction_frame())
+                .unwrap()
+                .unwrap()
+                .commit_ts,
+            1
+        );
+        assert!(io
+            .block(|| reader.next_transaction_frame())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn shared_prefix_adoption_does_not_retain_rejected_future_frame() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("shared-prefix-reclaim", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file, io.clone(), None);
+        let rejected = crate::mvcc::database::LogRecord::for_test(100, &[], None);
+        let reject = |_: SharedBufferData, _: LogTxFrameInfo| Err(LimboError::Busy);
+        assert!(log.log_tx_deferred_offset(rejected, Some(&reject)).is_err());
+        log.adopt_shared_prefix(None, 0, 0, 0).unwrap();
+        let (completion, outcome) = log.truncate(0).unwrap();
+        assert_eq!(
+            outcome,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome::Truncated
+        );
+        io.wait_for_completion(completion).unwrap();
     }
 
     #[test]
