@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5941ea48c8e0ceca0bbc5c98bad5f216a1615fc2
+          ref: 51a4c12ddf1f3d177caac3dd4ddbd05d20f9583b
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5941ea48c8e0ceca0bbc5c98bad5f216a1615fc2
+          test "$(git rev-parse HEAD)" = 51a4c12ddf1f3d177caac3dd4ddbd05d20f9583b
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -36,8 +36,8 @@ jobs:
           grep -q '2 passed; 0 failed' facts.log
       - name: Shared checkpoint physical materialization retains acknowledged log
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_native_materializes_without_reclaiming_log_before_completion -- --ignored --test-threads=1 --nocapture 2>&1 | tee materialize.log
-          grep -q '1 passed; 0 failed' materialize.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee materialize.log
+          grep -q '2 passed; 0 failed' materialize.log
       - name: Integrated offline operations and staging cleanup
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::mode_transition -- --test-threads=1 --nocapture 2>&1 | tee offline.log
