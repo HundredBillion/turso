@@ -25455,3 +25455,150 @@ fn recovery_decodes_entire_frame_before_mutating_store_or_context() {
     assert!(Arc::ptr_eq(&before_schema, &db.conn.schema.read()));
     assert!(Arc::ptr_eq(&before_schema, &ctx.current_schema));
 }
+
+#[test]
+fn recovery_preparation_preserves_active_local_version_chains() {
+    let db = MvccTestDb::new();
+    let row = generate_simple_string_row((-22).into(), 1, "local uncommitted");
+    let rowid = row.id.clone();
+    db.mvcc_store
+        .insert_table_id_to_rootpage(rowid.table_id, None);
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store.insert(tx_id, row).unwrap();
+    let chain = db.mvcc_store.rows.get(&rowid).unwrap().value().clone();
+    let local_version_id = chain.read()[0].id;
+    let schema = db.conn.schema.read().clone();
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: schema.clone(),
+        index_infos: HashMap::default(),
+    };
+    let peer = generate_simple_string_row(rowid.table_id, 1, "peer committed");
+    let prepared = db
+        .mvcc_store
+        .prepare_recovery_frame(
+            &db.conn,
+            &ctx,
+            vec![ParsedOp::UpsertTable {
+                table_id: rowid.table_id,
+                rowid: rowid.clone(),
+                record_bytes: crate::types::value_blob_from_slice(peer.payload()).unwrap(),
+                commit_ts: 20,
+                btree_resident: false,
+            }],
+        )
+        .unwrap();
+    assert_eq!(prepared.decoded_frame.len(), 1);
+    assert!(Arc::ptr_eq(
+        &chain,
+        db.mvcc_store.rows.get(&rowid).unwrap().value()
+    ));
+    assert_eq!(chain.read().len(), 1);
+    assert_eq!(chain.read()[0].id, local_version_id);
+    assert_eq!(chain.read()[0].begin(), Some(TxTimestampOrID::TxID(tx_id)));
+    assert_eq!(chain.read()[0].end(), None);
+    assert!(Arc::ptr_eq(&schema, &db.conn.schema.read()));
+    assert_eq!(ctx.max_commit_ts_seen, 0);
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), &db.conn, 0);
+}
+
+#[test]
+fn recovery_preparation_rejects_logical_root_rebinding_before_installation() {
+    let db = MvccTestDb::new();
+    let table_id = MVTableId::from(-22);
+    db.mvcc_store
+        .insert_table_id_to_rootpage(table_id, Some(22));
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    let record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("peer_table")),
+            Value::Text(Text::new("peer_table")),
+            Value::from_i64(-22),
+            Value::Text(Text::new("CREATE TABLE peer_table(v TEXT)")),
+        ],
+        5,
+    )
+    .unwrap();
+    let frame = vec![ParsedOp::UpsertTable {
+        table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+        rowid: RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(1)),
+        record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+        commit_ts: 20,
+        btree_resident: false,
+    }];
+    assert!(db
+        .mvcc_store
+        .prepare_recovery_frame(&db.conn, &ctx, frame)
+        .is_err());
+    assert_eq!(db.mvcc_store.current_root_page(&table_id), Some(22));
+    assert!(ctx.schema_rows.is_empty());
+}
+
+#[test]
+fn recovery_preparation_rejects_empty_mixed_or_unrepresentable_timestamps() {
+    let db = MvccTestDb::new();
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    for timestamps in [vec![], vec![20, 21], vec![1 << 62]] {
+        let frame = timestamps
+            .into_iter()
+            .map(|commit_ts| ParsedOp::DeleteTable {
+                rowid: RowID::new((-22).into(), RowKey::Int(1)),
+                record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+                pk_record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+                commit_ts,
+                btree_resident: false,
+            })
+            .collect();
+        assert!(db
+            .mvcc_store
+            .prepare_recovery_frame(&db.conn, &ctx, frame)
+            .is_err());
+    }
+    assert_eq!(ctx.max_commit_ts_seen, 0);
+}
