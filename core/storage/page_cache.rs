@@ -739,6 +739,25 @@ impl PageCache {
         Err(CacheError::Full)
     }
 
+    /// Drop this cache's ownership without changing pages still held by old
+    /// readers or their backend callbacks. Configuration is retained.
+    #[allow(dead_code)] // Private generation installer is integrated separately.
+    pub(crate) fn detach_clean_pages(&mut self) -> Result<(), CacheError> {
+        for &entry_ptr in self.map.values() {
+            let page = &unsafe { &*entry_ptr }.page;
+            if page.is_dirty() {
+                return Err(CacheError::Dirty {
+                    pgno: page.get().id(),
+                });
+            }
+        }
+        self.map.clear();
+        self.queue.clear();
+        self.clock_hand = std::ptr::null_mut();
+        self.evictable_count = 0;
+        Ok(())
+    }
+
     pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
         // Check all pages are clean
         for &entry_ptr in self.map.values() {
