@@ -1,6 +1,6 @@
 use crate::io::{File, FileId, SharedWalLockKind, SharedWalMappedRegion};
 use crate::sync::atomic::{AtomicBool, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, Weak};
 use crate::{LimboError, Result, IO};
 use std::sync::atomic::AtomicU64 as MappedAtomic;
 
@@ -47,7 +47,63 @@ pub(super) struct SharedMvccAuthority {
 pub(super) struct AuthorityGuard {
     authority: Arc<SharedMvccAuthority>,
     recovery_required: bool,
+    lease: Arc<PublicationLease>,
+}
+
+struct LeaseState {
+    active: bool,
     owned: bool,
+}
+
+pub(super) struct PublicationLease {
+    authority: Arc<SharedMvccAuthority>,
+    state: Mutex<LeaseState>,
+}
+
+pub(super) struct IoPin {
+    _lease: Arc<PublicationLease>,
+}
+
+impl PublicationLease {
+    pub(super) fn pin(lease: &Weak<Self>) -> Result<IoPin> {
+        let lease = lease.upgrade().ok_or(LimboError::Busy)?;
+        {
+            let state = lease.state.lock();
+            if !state.active || !state.owned {
+                return Err(LimboError::Busy);
+            }
+        }
+        Ok(IoPin { _lease: lease })
+    }
+
+    fn release(&self, state: &mut LeaseState) -> Result<()> {
+        state.owned = false;
+        if let Err(error) = self
+            .authority
+            .file
+            .shared_wal_unlock_byte(PUBLICATION_LOCK, LOCK_KIND)
+        {
+            self.authority.store(RECOVERY_OFFSET, 1);
+            self.authority.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.authority
+            .publication_owned
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for PublicationLease {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if state.owned {
+            self.authority.store(RECOVERY_OFFSET, 1);
+            if let Err(error) = self.release(&mut state) {
+                tracing::error!(%error, "failed releasing shared MVCC publication ownership");
+            }
+        }
+    }
 }
 
 pub(super) struct SnapshotRegistration {
@@ -189,7 +245,13 @@ impl SharedMvccAuthority {
         Ok(AuthorityGuard {
             authority: self.clone(),
             recovery_required,
-            owned: true,
+            lease: Arc::new(PublicationLease {
+                authority: self.clone(),
+                state: Mutex::new(LeaseState {
+                    active: true,
+                    owned: true,
+                }),
+            }),
         })
     }
 
@@ -249,6 +311,16 @@ impl SharedMvccAuthority {
 }
 
 impl AuthorityGuard {
+    /// Observe backend retirement without consuming the guard; concurrent submissions may race it.
+    pub(super) fn io_retired(&self) -> bool {
+        let state = self.lease.state.lock();
+        state.active && state.owned && Arc::strong_count(&self.lease) == 1
+    }
+
+    pub(super) fn io_lease(&self) -> Weak<PublicationLease> {
+        Arc::downgrade(&self.lease)
+    }
+
     pub(super) fn requires_recovery(&self) -> bool {
         self.recovery_required
     }
@@ -403,14 +475,16 @@ impl AuthorityGuard {
         Ok(())
     }
 
-    pub(super) fn finish(mut self) -> Result<()> {
+    pub(super) fn finish(self) -> Result<()> {
         self.require_recovered()?;
-        self.authority.store(RECOVERY_OFFSET, 0);
-        if let Err(error) = self.release() {
-            self.authority.store(RECOVERY_OFFSET, 1);
-            return Err(error);
+        let mut state = self.lease.state.lock();
+        // Closing admission also rejects weak upgrades that race the final pin check.
+        state.active = false;
+        if Arc::strong_count(&self.lease) != 1 {
+            return Err(LimboError::Busy);
         }
-        Ok(())
+        self.authority.store(RECOVERY_OFFSET, 0);
+        self.lease.release(&mut state)
     }
 
     fn require_recovered(&self) -> Result<()> {
@@ -421,31 +495,14 @@ impl AuthorityGuard {
         }
         Ok(())
     }
-
-    fn release(&mut self) -> Result<()> {
-        if let Err(error) = self
-            .authority
-            .file
-            .shared_wal_unlock_byte(PUBLICATION_LOCK, LOCK_KIND)
-        {
-            self.authority.poisoned.store(true, Ordering::Release);
-            return Err(error);
-        }
-        self.owned = false;
-        self.authority
-            .publication_owned
-            .store(false, Ordering::Release);
-        Ok(())
-    }
 }
 
 impl Drop for AuthorityGuard {
     fn drop(&mut self) {
-        if self.owned {
+        let mut state = self.lease.state.lock();
+        state.active = false;
+        if state.owned {
             self.authority.store(RECOVERY_OFFSET, 1);
-            if let Err(error) = self.release() {
-                tracing::error!(%error, "failed releasing shared MVCC publication ownership");
-            }
         }
     }
 }
@@ -846,4 +903,28 @@ mod tests {
             let _ = self.0.wait();
         }
     }
+}
+
+#[cfg(all(test, not(shuttle)))]
+pub(super) fn authority_for_test(file: Arc<dyn File>) -> Arc<SharedMvccAuthority> {
+    struct Mapping(Box<[MappedAtomic; MAP_LEN / 8]>);
+    impl SharedWalMappedRegion for Mapping {
+        fn ptr(&self) -> std::ptr::NonNull<u8> {
+            std::ptr::NonNull::new(self.0.as_ptr().cast_mut().cast()).unwrap()
+        }
+        fn len(&self) -> usize {
+            MAP_LEN
+        }
+    }
+    let authority = Arc::new(SharedMvccAuthority {
+        file,
+        mapping: Box::new(Mapping(Box::new(std::array::from_fn(|_| {
+            MappedAtomic::new(0)
+        })))),
+        publication_owned: AtomicBool::new(false),
+        poisoned: AtomicBool::new(false),
+        local_slots: Mutex::new([false; SLOT_COUNT]),
+    });
+    authority.initialize(FileId { dev: 1, ino: 2 }, 1_000_000);
+    authority
 }
