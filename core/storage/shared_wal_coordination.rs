@@ -2977,8 +2977,8 @@ impl MappedSharedWalCoordination {
     }
 
     /// SAFETY: `base` must point to a live, 8-byte aligned header mapping.
-    unsafe fn magic_word<'a>(base: *mut u8) -> &'a AtomicU64 {
-        unsafe { AtomicU64::from_ptr(base.cast::<u64>()) }
+    unsafe fn magic_word<'a>(base: *mut u8) -> &'a std::sync::atomic::AtomicU64 {
+        unsafe { std::sync::atomic::AtomicU64::from_ptr(base.cast::<u64>()) }
     }
 
     fn validate_existing(
