@@ -209,5 +209,8 @@ existing registered writer finishing while admissions are paused, snapshot drain
 a killed pause owner, same-process aliases, concurrent local attempts, and missing
 or replaced files. `TURSO_CHECKPOINT_GATE_IGNORE_CONTENTION_CONTROL=1` is a test-only
 negative control: the alias test must fail when kernel contention is ignored.
-Native execution is pending for this component; the local platform rejection test
-alone does not validate OFD behavior.
+Hosted run [42267225780](https://github.com/HundredBillion/turso/actions/runs/42267225780)
+validated source `731886d37`: the contention-bypass control failed on the expected
+alias exclusion assertion, then all seven gate checks passed with the control
+unset. The same run repeated all eight retained-sidecar checks successfully. This
+proves the private gate behavior; complete checkpoint integration remains separate.
