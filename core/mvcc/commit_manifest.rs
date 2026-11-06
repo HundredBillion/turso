@@ -1,4 +1,4 @@
-use super::shared_authority::{AuthorityGuard, PublishedPrefix};
+use super::shared_authority::{AuthorityGuard, IoPin, PublicationLease, PublishedPrefix};
 use crate::io::FileId;
 use crate::io::{Buffer, Completion, File, FileSyncType};
 use crate::sync::{Arc, Mutex};
@@ -21,6 +21,19 @@ pub(super) struct ManifestRecord {
 }
 
 impl ManifestRecord {
+    pub(super) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub(super) fn database_id(&self) -> FileId {
+        self.database_id
+    }
+    pub(super) fn log_generation(&self) -> u64 {
+        self.log_generation
+    }
+    pub(super) fn log_salt(&self) -> u64 {
+        self.log_salt
+    }
+
     pub(super) fn prefix(&self) -> PublishedPrefix {
         self.prefix
     }
@@ -172,7 +185,15 @@ pub(super) fn select_latest(
 
 pub(super) const SLOT_SIZE: usize = 4096;
 
-struct ManifestLoad {
+fn pin_authority(ownership: &Mutex<Option<AuthorityGuard>>) -> Result<Option<IoPin>> {
+    ownership
+        .lock()
+        .as_ref()
+        .map(|guard| PublicationLease::pin(&guard.io_lease()))
+        .transpose()
+}
+
+pub(super) struct ManifestLoad {
     file: Arc<dyn File>,
     ownership: Arc<Mutex<Option<AuthorityGuard>>>,
     database_id: FileId,
@@ -186,7 +207,11 @@ struct ManifestLoad {
 }
 
 impl ManifestLoad {
-    fn new(file: Arc<dyn File>, guard: AuthorityGuard, database_id: FileId) -> Result<Self> {
+    pub(super) fn new(
+        file: Arc<dyn File>,
+        guard: AuthorityGuard,
+        database_id: FileId,
+    ) -> Result<Self> {
         Self::start(file, Some(guard), database_id)
     }
 
@@ -213,7 +238,7 @@ impl ManifestLoad {
         })
     }
 
-    fn poll(&mut self) -> Result<IOResult<LoadedManifest>> {
+    pub(super) fn poll(&mut self) -> Result<IOResult<LoadedManifest>> {
         use std::sync::atomic::{AtomicI32, Ordering};
         if self.terminated {
             return Err(LimboError::InvalidArgument(
@@ -263,9 +288,10 @@ impl ManifestLoad {
             let buffer = Arc::new(Buffer::new_temporary(expected - self.filled));
             let count = Arc::new(AtomicI32::new(-1));
             let read = count.clone();
+            let pin = pin_authority(&self.ownership)?;
             let ownership = self.ownership.clone();
             let completion = Completion::new_read(buffer.clone(), move |result| {
-                let _keep_alive = &ownership;
+                let _keep_alive = (&ownership, &pin);
                 if let Ok((_, n)) = result {
                     read.store(n, Ordering::Release);
                 }
@@ -279,7 +305,7 @@ impl ManifestLoad {
     }
 }
 
-struct LoadedManifest {
+pub(super) struct LoadedManifest {
     file: Arc<dyn File>,
     guard: Option<AuthorityGuard>,
     slot: usize,
@@ -297,7 +323,7 @@ impl DurableManifest {
         self.record.prefix
     }
 
-    fn publish(mut self) -> Result<AuthorityGuard> {
+    pub(super) fn publish(mut self) -> Result<AuthorityGuard> {
         let mut guard = self.guard.take().ok_or_else(|| {
             LimboError::InvalidArgument("manifest publication has no authority".into())
         })?;
@@ -306,7 +332,7 @@ impl DurableManifest {
     }
 }
 
-struct ManifestPublication {
+pub(super) struct ManifestPublication {
     file: Arc<dyn File>,
     ownership: Arc<Mutex<Option<AuthorityGuard>>>,
     slot: usize,
@@ -322,7 +348,29 @@ enum PublicationStage {
 }
 
 impl LoadedManifest {
-    fn publish(self, next: ManifestRecord) -> Result<ManifestPublication> {
+    pub(super) fn record(&self) -> ManifestRecord {
+        self.record
+    }
+
+    pub(super) fn guard(&self) -> Result<&AuthorityGuard> {
+        self.guard
+            .as_ref()
+            .ok_or_else(|| LimboError::InvalidArgument("manifest has no authority".into()))
+    }
+
+    pub(super) fn guard_mut(&mut self) -> Result<&mut AuthorityGuard> {
+        self.guard
+            .as_mut()
+            .ok_or_else(|| LimboError::InvalidArgument("manifest has no authority".into()))
+    }
+
+    pub(super) fn into_guard(mut self) -> Result<AuthorityGuard> {
+        self.guard
+            .take()
+            .ok_or_else(|| LimboError::InvalidArgument("manifest has no authority".into()))
+    }
+
+    pub(super) fn publish(self, next: ManifestRecord) -> Result<ManifestPublication> {
         if self.slot > 1 || self.record.sequence.checked_add(1) != Some(next.sequence) {
             return Err(LimboError::InvalidArgument(
                 "invalid next manifest sequence".into(),
@@ -340,7 +388,7 @@ impl LoadedManifest {
 }
 
 impl ManifestPublication {
-    fn poll(&mut self) -> Result<IOResult<DurableManifest>> {
+    pub(super) fn poll(&mut self) -> Result<IOResult<DurableManifest>> {
         use std::sync::atomic::{AtomicI32, Ordering};
         loop {
             match std::mem::replace(&mut self.stage, PublicationStage::Finished) {
@@ -350,10 +398,11 @@ impl ManifestPublication {
                     buffer.as_mut_slice()[..RECORD_SIZE].copy_from_slice(&self.record.encode());
                     let written = Arc::new(AtomicI32::new(-1));
                     let count = written.clone();
+                    let pin = pin_authority(&self.ownership)?;
                     let ownership = self.ownership.clone();
                     let completion = Completion::new_write(move |result| {
-                        // Keep authority until the backend retires the operation, even after abort.
-                        let _keep_alive = &ownership;
+                        // The pin survives successful guard handoff as well as caller abort.
+                        let _keep_alive = (&ownership, &pin);
                         if let Ok(n) = result {
                             count.store(n, Ordering::Release);
                         }
@@ -374,9 +423,10 @@ impl ManifestPublication {
                     if written.load(Ordering::Acquire) != SLOT_SIZE as i32 {
                         return Err(LimboError::Corrupt("short MVCC manifest write".into()));
                     }
+                    let pin = pin_authority(&self.ownership)?;
                     let ownership = self.ownership.clone();
                     let sync = Completion::new_sync(move |_| {
-                        let _keep_alive = &ownership;
+                        let _keep_alive = (&ownership, &pin);
                     });
                     let sync = self.file.sync(sync, FileSyncType::FullFsync)?;
                     self.stage = PublicationStage::Syncing(sync);
@@ -691,6 +741,17 @@ mod tests {
     }
 
     impl File for DelayedManifestFile {
+        fn shared_wal_try_lock_byte(
+            &self,
+            _: u64,
+            _: bool,
+            _: crate::io::SharedWalLockKind,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        fn shared_wal_unlock_byte(&self, _: u64, _: crate::io::SharedWalLockKind) -> Result<()> {
+            Ok(())
+        }
         fn lock_file(&self, _: bool) -> Result<()> {
             Ok(())
         }
@@ -786,6 +847,53 @@ mod tests {
         file.retire(0, true);
         assert!(publication.poll().is_err());
         assert!(publication.poll().is_err());
+    }
+
+    #[cfg(not(shuttle))]
+    #[test]
+    fn commit_manifest_success_handoff_retains_backend_ownership() {
+        use super::super::shared_authority::authority_for_test;
+        for retained_write in [true, false] {
+            let previous = record(1, 1, 123, 10, 100);
+            let next = record(2, 1, 123, 11, 200);
+            let file = DelayedManifestFile::initialized(previous);
+            let authority = authority_for_test(file.clone());
+            let mut guard = authority.try_acquire().unwrap();
+            guard.recover(previous.prefix()).unwrap();
+            let mut publication = LoadedManifest {
+                file: file.clone(),
+                guard: Some(guard),
+                slot: 0,
+                record: previous,
+            }
+            .publish(next)
+            .unwrap();
+            assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+            let mut retained =
+                retained_write.then(|| file.pending.lock().as_ref().unwrap().1.clone());
+            file.retire(SLOT_SIZE, false);
+            assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+            if !retained_write {
+                retained = Some(file.pending.lock().as_ref().unwrap().1.clone());
+            }
+            file.retire(0, false);
+            let IOResult::Done(durable) = publication.poll().unwrap() else {
+                panic!("sync completed")
+            };
+            let guard = durable.publish().unwrap();
+            drop(publication);
+            assert!(
+                !guard.io_retired(),
+                "successful handoff lost a backend lease pin"
+            );
+            drop(guard);
+            assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
+            drop(retained);
+            let mut guard = authority.try_acquire().unwrap();
+            assert!(guard.requires_recovery());
+            guard.recover(next.prefix()).unwrap();
+            guard.finish().unwrap();
+        }
     }
 
     #[cfg(all(target_os = "linux", target_pointer_width = "64", not(shuttle)))]
