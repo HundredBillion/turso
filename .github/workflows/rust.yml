@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 87db73608181fc6cb8692ba7dd4e6069c0ddcc95
+          ref: 93549f7a3258a59a28271cefea6b049fb9f7c8e1
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,21 +25,21 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 87db73608181fc6cb8692ba7dd4e6069c0ddcc95
+          test "$(git rev-parse HEAD)" = 93549f7a3258a59a28271cefea6b049fb9f7c8e1
           rustc -Vv | tee rustc.txt
-      - name: RELEASE reset must fail before preservation hook
+      - name: Shared RELEASE and COMMIT preservation
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_release_cap_busy -- --test-threads=1 --nocapture 2>&1 | tee release-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' release-red.log
-          grep -q 'cap Busy discarded RELEASE transaction' release-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee shared-green.log
+          grep -q '6 passed; 0 failed' shared-green.log
+      - name: Savepoint and abandoned-commit regressions
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api savepoint -- --test-threads=1 2>&1 | tee savepoint.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api abandoned -- --test-threads=1 2>&1 | tee abandoned.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-release-red
+          name: shared-release-green
           path: |
             source.txt
             rustc.txt
