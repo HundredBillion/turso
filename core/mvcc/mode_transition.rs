@@ -1,4 +1,5 @@
 mod ordinary;
+pub(super) mod recovery;
 
 use super::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
 use super::shared_authority::PublishedPrefix;
