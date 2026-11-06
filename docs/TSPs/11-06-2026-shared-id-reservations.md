@@ -88,6 +88,7 @@ struct IdOwner { epoch: u64, begin_timestamp: u64 }
 struct ReservationId { owner: IdOwner, ordinal: u64 }
 struct SavepointMark { owner: IdOwner, next_ordinal: u64 }
 enum DomainKind { Row, Sequence }
+enum SequenceDurability { OuterTransaction, AutonomousInner }
 struct IdDomain { database_generation: u64, table_id: MVTableId, kind: DomainKind }
 struct RecoveryIdentity {
     database_generation: u64,
@@ -97,7 +98,7 @@ struct RecoveryIdentity {
 enum IdAction {
     ReserveRow { owner: IdOwner, domain: IdDomain, autoincrement: bool },
     ClaimExplicitRow { owner: IdOwner, domain: IdDomain, value: i64 },
-    ReserveSequence { owner: IdOwner, domain: IdDomain },
+    ReserveSequence { owner: IdOwner, domain: IdDomain, durability: SequenceDurability },
     ReserveLogicalTable { owner: IdOwner },
     Savepoint { owner: IdOwner },
     ReleaseAfter { mark: SavepointMark },
@@ -145,7 +146,7 @@ enum IdResult {
 }
 ```
 
-`SequenceFacts` carries the existing descriptor's current value, `is_called`, increment, minimum, maximum and cycle behavior. It is not an ascending-only replacement for the current sequence contract. The operation owns the guard, oracle and bound files across yields. Success returns the guard to the enclosing transaction state machine; it does not call `finish` on its behalf. Failure/drop retains ownership through any submitted backend mutations using `GuardedFile`, and forces subsequent reconciliation rather than claiming an unpublished reservation succeeded.
+`SequenceFacts` carries the existing descriptor's current value, `is_called`, increment, minimum, maximum and cycle behavior. `SequenceDurability` comes from the existing execution path: an exclusive outer transaction (including ordinary `BEGIN`) skips the autonomous inner transaction and rolls sequence changes back; `BEGIN CONCURRENT` uses an independently committed inner transaction. The journal must preserve this distinction rather than turning all sequence values into permanent reservations. It is not an ascending-only replacement for the current sequence contract. The operation owns the guard, oracle and bound files across yields. Success returns the guard to the enclosing transaction state machine; it does not call `finish` on its behalf. Failure/drop retains ownership through any submitted backend mutations using `GuardedFile`, and forces subsequent reconciliation rather than claiming an unpublished reservation succeeded.
 
 Before evaluating an action, require exact equality between oracle identity, supplied recovered identity and the held authority's published prefix. An oracle behind the current manifest may neither release a dead owner's claims nor issue a replacement ID. The caller imports committed frames before constructing this view; the component rejects a stale view rather than silently querying an old transaction snapshot.
 
@@ -191,9 +192,9 @@ live registrations under the guard rather than trusting an external boolean.
 2. For a normal automatic row ID, use the greater of the committed current table maximum and every live claim for that table, then checked increment with the existing positive-row-ID rules. Do not turn normal row IDs into an AUTOINCREMENT historical floor. For AUTOINCREMENT also honor its durable committed backing-state floor; rollbacks cannot lower that committed floor.
 3. Explicit insertion claims participate in the same live claim set before local execution publishes their result. Another live owner's conflicting claim returns the defined write-conflict result. Existing committed-row existence and ordinary uniqueness checks still run; this journal is not an alternate unique index.
 4. On normal-row `i64::MAX`, use the existing bounded random-row-ID attempt policy. Check each candidate against the current committed oracle and every live explicit/automatic claim under the same authority before persisting it. AUTOINCREMENT exhaustion returns `DatabaseFull`; it never uses the random fallback.
-5. Sequence allocation uses the descriptor and all earlier journal allocation steps, with checked increment and the existing overflow/cycle semantics. Track live allocated values by owner even when sequence execution changes the backing row locally. Ascending non-CYCLE safe-scan watermarks are the minimum of the committed next boundary and all live allocated values across processes. Other sequence forms retain their existing conservative watermark rule; do not advertise an ascending-prefix guarantee for descending/CYCLE sequences.
+5. Sequence allocation uses the descriptor, the current committed backing state and live reservations, with checked increment and the existing overflow/cycle semantics. For `AutonomousInner`, register the outer owner claim durably BEFORE the inner transaction can publish the advanced backing state; the inner commit then persists that state independently of outer rollback. For `OuterTransaction`, rollback/savepoint release permits reuse according to the reverted backing state; never persist a stronger cursor floor merely because a journal reservation was once issued. Track live allocated values by owner even when sequence execution changes the backing row locally. Ascending non-CYCLE safe-scan watermarks are the minimum of the committed next boundary and all live allocated values across processes. Other sequence forms retain their existing conservative watermark rule; do not advertise an ascending-prefix guarantee for descending/CYCLE sequences.
 6. Persist a reservation change and synchronize both copies of its selector before returning its value. Gaps after cancellation or lost acknowledgement are allowed; returning the same live claim to another owner is not.
-7. Commit retirement first establishes the durable user-log/manifest outcome and refreshes the committed oracle, then releases owner claims. Rollback/savepoint release is journaled under authority before reporting completion. A failed release retains conservative claims until recovery; it must not report them released.
+7. Commit retirement first establishes the durable user-log/manifest outcome and refreshes the committed oracle, then releases owner claims. Rollback/savepoint release is journaled under authority before reporting completion. A failed release retains conservative claims until recovery; it must not report them released. A savepoint or rollback before the first ID claim is a successful no-op; the runtime must not append a release for an unknown journal owner merely because a transaction savepoint exists.
 8. Reclaiming dead or released row/sequence claims does not raise the negative logical-ID floor. Active sequence claims constrain watermarks until successful retirement or proven owner death.
 
 Per-owner ordinals and journal/bank generations fail with `DatabaseFull` on overflow. Invalid domains, mismatched registrations, conflicting mappings or stale generation proofs fail without submitting writes. Allocation failures during decoding/preparation occur before a new tail is published; retry sees the previous selected state.
@@ -223,7 +224,18 @@ A higher bank generation alone never overrides the selector witness, a missing c
 
 `CheckpointPause` and `AuthorityGuard` must both be retained, and the coordinator must prove no live registrations. Compaction rejects a live owner; it is not allowed to erase reservations merely because its own process has no transactions.
 
-Reconstruct a compact snapshot containing current live domains, required sequence state, AUTOINCREMENT floors and the persistent logical-ID floor. Check the complete mapping, fallible allocation budget and encoded size before touching the inactive bank. Truncate only the inactive bank, write/sync its snapshot, then publish/sync both copies of the selecting or prepared-successor witness. Retire the old active content only after the matching database generation is durable and both selector slots no longer reference that bank. If this work is same-generation garbage compaction, the generation proof remains unchanged.
+After committed recovery and proven quiescence, the compact snapshot stores only
+the persistent logical-ID floor, including when no claims remain. Every compacted
+bank must encode that preserved floor explicitly; an empty replay
+(default floor `-1`) is not a valid replacement for previously consumed IDs.
+Current row maxima, AUTOINCREMENT floors and
+sequence state remain authoritative in the synchronized DB/log through the exact
+recovered generation/prefix oracle; do not duplicate those counters into allocator
+authority. The coordinator still validates the complete domain remap and lowers
+the preserved floor below every consumed logical/physical-root-derived identity.
+Pending or unacknowledged autonomous inner sequence commits must be recovered
+before quiescence is accepted; lack of live registrations alone does not prove
+that their durable outcomes have been reconciled. Check the complete mapping, fallible allocation budget and encoded size before touching the inactive bank. Truncate only the inactive bank, write/sync its snapshot, then publish/sync both copies of the selecting or prepared-successor witness. Retire the old active content only after the matching database generation is durable and both selector slots no longer reference that bank. If this work is same-generation garbage compaction, the generation proof remains unchanged.
 
 The configured history budget accounts for both reservation bank sizes, selector bytes and the
 current recovered logical prefix end offset; calculate the total under authority,
@@ -298,3 +310,42 @@ This slice performs no runtime I/O and does not prove selector synchronization,
 reservation acknowledgement, record replay, compaction or global-ID integration.
 `slots_agree` reports matching read bytes only; it is not a durable bank-reuse proof.
 The remaining Task 1 record/replay checks and Tasks 2–4 remain open.
+
+## Sequence compatibility audit
+
+The preserved provenance-verified CLI (runtime `eda0afbc4`, same production runtime
+as `4ccf547a4`, SHA256
+`7f178cb517da8f7171f0a2ba8d8ba45007108ddb36f7dc4f40389aa70c0cfe5f`)
+confirmed these MVCC behaviors with fresh temporary databases:
+
+| Transaction | nextval, outer rollback, nextval | nextval, savepoint, nextval, rollback-to, nextval, outer rollback, nextval |
+| --- | --- | --- |
+| `BEGIN` | `1, 1` | `1, 2, 2, 1` |
+| `BEGIN CONCURRENT` | `1, 2` | `1, 2, 3, 4` |
+
+`op_sequence_begin_inner_tx` skips the autonomous transaction for an exclusive
+outer transaction. `op_sequence_register_allocation` attributes the in-flight
+value to the saved outer transaction before inner commit publication, while
+`op_sequence_track_allocation` updates the watermark afterward. Shared claims must
+preserve that ordering, including before an inner commit can become visible to
+another process. Releasing the outer claim changes the visibility watermark; it
+does not undo an already committed autonomous inner sequence value.
+
+## Neutral journal codec milestone evidence
+
+Sixteen focused local shared-ID tests pass after adding canonical claim/release
+record encoding and selected-prefix replay. The suite includes 2048 distinct table
+domains, cross-owner row collisions, repeated claims by one owner with partial
+savepoint release, owner retirement, non-reused ordinals, sequence claim minimums,
+selected-tail exclusion and rejection of live claims in a quiescent snapshot.
+Record tests cover signed boundaries, every truncated page length, every single-bit
+corruption position, stale generation and invalid record/owner order. Temporarily
+resetting the logical floor during savepoint release produced the expected
+`-1` versus `-100` failure; restoration passed the full suite. Focused clippy and
+formatting pass with the existing baseline lint allowances. Root independently
+reviewed this codec milestone and the sequence compatibility refinement.
+
+Replay state is private and discarded on error; its mutation helper is not an
+atomic live-state update API. No actual journal I/O, mirrored-sync acknowledgement,
+liveness reclamation or runtime allocation is enabled by these tests. Those remain
+Tasks 2–4, including real committed-oracle and checkpoint integration.
