@@ -2535,8 +2535,16 @@ impl Connection {
         if self.is_closed() {
             return Ok(());
         }
-        self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
+        // Live statements may still own page-1 IO; finish it before rollback releases init_lock.
+        pager.drain_page1_io()?;
+        self.with_all_attached_pagers_with_index(|pagers| {
+            for (_, pager) in pagers {
+                pager.drain_page1_io()?;
+            }
+            Ok::<(), LimboError>(())
+        })?;
+        self.closed.store(true, Ordering::SeqCst);
 
         match self.get_tx_state() {
             TransactionState::None => {

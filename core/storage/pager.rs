@@ -1844,6 +1844,7 @@ enum AllocatePage1State {
     Start,
     Writing {
         page: PageRef,
+        completion: Completion,
         /// Held [SharedPagerState::init_lock] until the state moves to `Done`
         /// or back to `Start` (in an `Arc` because the state is cloned).
         init_lock: Arc<ArcMutexGuard<()>>,
@@ -1852,6 +1853,7 @@ enum AllocatePage1State {
     /// WAL can never exist next to an empty (0-byte on disk) database file.
     Syncing {
         page: PageRef,
+        completion: Completion,
         init_lock: Arc<ArcMutexGuard<()>>,
     },
     Done,
@@ -5836,11 +5838,14 @@ impl Pager {
                 page1.pin();
                 *self.allocate_page1_state.write() = AllocatePage1State::Writing {
                     page: page1,
+                    completion: c.clone(),
                     init_lock: Arc::new(init_lock),
                 };
                 io_yield_one!(c);
             }
-            AllocatePage1State::Writing { page, init_lock } => {
+            AllocatePage1State::Writing {
+                page, init_lock, ..
+            } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
                 if self.wal.is_some() {
@@ -5858,13 +5863,18 @@ impl Pager {
                         self.syncing.clone(),
                         self.get_sync_type(),
                     )?;
-                    *self.allocate_page1_state.write() =
-                        AllocatePage1State::Syncing { page, init_lock };
+                    *self.allocate_page1_state.write() = AllocatePage1State::Syncing {
+                        page,
+                        completion: c.clone(),
+                        init_lock,
+                    };
                     io_yield_one!(c);
                 }
                 self.finish_allocate_page1(page)
             }
-            AllocatePage1State::Syncing { page, init_lock } => {
+            AllocatePage1State::Syncing {
+                page, init_lock, ..
+            } => {
                 tracing::trace!("allocate_page1(Syncing done)");
                 let result = self.finish_allocate_page1(page);
                 // Released only now that `init_page_1` has been cleared.
@@ -5901,6 +5911,18 @@ impl Pager {
             page.unpin();
             *state = AllocatePage1State::Start;
         }
+    }
+
+    pub(crate) fn drain_page1_io(&self) -> Result<()> {
+        let completion = match &*self.allocate_page1_state.read() {
+            AllocatePage1State::Writing { completion, .. }
+            | AllocatePage1State::Syncing { completion, .. } => Some(completion.clone()),
+            _ => None,
+        };
+        if let Some(completion) = completion {
+            self.io.drain_completions(&[completion])?;
+        }
+        Ok(())
     }
 
     pub fn allocating_page1(&self) -> bool {
@@ -7480,12 +7502,12 @@ mod ptrmap_tests {
 #[cfg(test)]
 mod allocate_page1_tests {
     use super::*;
-    use crate::io::MemoryIO;
+    use crate::io::{File, MemoryIO};
     use crate::vdbe::StepResult;
-    use crate::{ConnectOpts, Connection, Database, SqliteDialect, Value};
+    use crate::{ConnectOpts, Connection, Database, EngineDialect, Value};
 
     fn open_test_database(io: Arc<dyn IO>, path: &str) -> Arc<Database> {
-        Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap()
+        Database::open_file(io, path, Arc::new(EngineDialect)).unwrap()
     }
 
     #[cfg(feature = "io_memory_yield")]
@@ -7706,6 +7728,179 @@ mod allocate_page1_tests {
         assert!(!a.pager.load().allocating_page1());
         assert!(b.is_db_initialized());
         assert_eq!(query_single(&b, "PRAGMA integrity_check").to_string(), "ok");
+    }
+
+    #[test]
+    fn close_with_live_statement_cannot_overwrite_a_later_checkpoint() {
+        let io = Arc::new(DelayedFirstPageIO::new("page1_close_reordered.db"));
+        let db = open_test_database(io.clone(), "page1_close_reordered.db");
+        let a = db.connect(ConnectOpts::new()).unwrap();
+        let b = db.connect(ConnectOpts::new()).unwrap();
+        let mut stmt_a = a.prepare("CREATE TABLE abandoned(x)").unwrap();
+        assert!(matches!(stmt_a.step().unwrap(), StepResult::IO));
+        assert!(io.pending.lock().is_some());
+        a.close().unwrap();
+
+        b.execute("CREATE TABLE acknowledged(x)").unwrap();
+        b.execute("INSERT INTO acknowledged VALUES (42)").unwrap();
+        b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // A delayed write must not replace the newer page 1 after this checkpoint.
+        io.step().unwrap();
+        drop(stmt_a);
+        b.close().unwrap();
+        drop(a);
+        drop(b);
+        drop(db);
+
+        let reopened = open_test_database(io, "page1_close_reordered.db");
+        let conn = reopened.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            query_single(&conn, "SELECT x FROM acknowledged"),
+            Value::from_i64(42)
+        );
+        assert_eq!(
+            query_single(&conn, "PRAGMA integrity_check").to_string(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn failed_close_drain_keeps_init_lock_and_allows_retry() {
+        let io = Arc::new(DelayedFirstPageIO::new("page1_close_retry.db"));
+        let db = open_test_database(io.clone(), "page1_close_retry.db");
+        let a = db.connect(ConnectOpts::new()).unwrap();
+        let b = db.connect(ConnectOpts::new()).unwrap();
+        let mut stmt_a = a.prepare("CREATE TABLE abandoned(x)").unwrap();
+        assert!(matches!(stmt_a.step().unwrap(), StepResult::IO));
+        io.fail_next_step.store(true, Ordering::SeqCst);
+
+        assert!(
+            matches!(a.close(), Err(LimboError::InternalError(message)) if message == "injected step failure")
+        );
+        assert!(!a.is_closed());
+        assert!(a.pager.load().shared.is_init_locked());
+        assert!(io.pending.lock().is_some());
+        let mut stmt_b = b.prepare("CREATE TABLE acknowledged(x)").unwrap();
+        assert!(matches!(stmt_b.step().unwrap(), StepResult::Busy));
+        a.close().unwrap();
+        assert!(io.pending.lock().is_none());
+        assert!(!a.pager.load().shared.is_init_locked());
+        drop(stmt_a);
+        drop(stmt_b);
+        b.execute("CREATE TABLE acknowledged(x)").unwrap();
+        assert_eq!(query_single(&b, "PRAGMA integrity_check").to_string(), "ok");
+    }
+
+    type DelayedWrite = (Arc<dyn File>, u64, Arc<Buffer>, Completion);
+
+    struct DelayedFirstPageIO {
+        inner: MemoryIO,
+        path: &'static str,
+        pending: Arc<Mutex<Option<DelayedWrite>>>,
+        delay_next_write: Arc<AtomicBool>,
+        fail_next_step: AtomicBool,
+    }
+
+    impl DelayedFirstPageIO {
+        fn new(path: &'static str) -> Self {
+            Self {
+                inner: MemoryIO::new(),
+                path,
+                pending: Arc::new(Mutex::new(None)),
+                delay_next_write: Arc::new(AtomicBool::new(true)),
+                fail_next_step: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::io::Clock for DelayedFirstPageIO {
+        fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for DelayedFirstPageIO {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: crate::OpenFlags,
+            direct: bool,
+        ) -> Result<Arc<dyn File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            if path == self.path {
+                Ok(Arc::new(DelayedFirstPageFile {
+                    inner,
+                    pending: self.pending.clone(),
+                    delay_next_write: self.delay_next_write.clone(),
+                }))
+            } else {
+                Ok(inner)
+            }
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn file_id(&self, path: &str) -> Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+
+        fn step(&self) -> Result<()> {
+            if self.fail_next_step.swap(false, Ordering::SeqCst) {
+                return Err(LimboError::InternalError("injected step failure".into()));
+            }
+            let pending = self.pending.lock().take();
+            if let Some((file, pos, buffer, completion)) = pending {
+                let _ = file.pwrite(pos, buffer, completion)?;
+            }
+            Ok(())
+        }
+    }
+
+    struct DelayedFirstPageFile {
+        inner: Arc<dyn File>,
+        pending: Arc<Mutex<Option<DelayedWrite>>>,
+        delay_next_write: Arc<AtomicBool>,
+    }
+
+    impl File for DelayedFirstPageFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            if pos == 0 && self.delay_next_write.swap(false, Ordering::SeqCst) {
+                *self.pending.lock() = Some((self.inner.clone(), pos, buffer, c.clone()));
+                Ok(c)
+            } else {
+                self.inner.pwrite(pos, buffer, c)
+            }
+        }
+
+        fn sync(&self, c: Completion, sync_type: crate::io::FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
     }
 
     /// The busy handler applies to a first write that finds page 1 being
