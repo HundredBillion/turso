@@ -39,9 +39,9 @@
 
 - [ ] Add the smallest local admission/chain-lock mechanism required by the audit, with no process-wide transaction serialization.
 - [ ] Pre-create missing empty entries, resolve/deduplicate canonical chains, acquire guards in one order and revalidate map identity.
-- [ ] Stage all touched chain contents and metadata before publication, preserving active local versions and old-snapshot history.
+- [ ] Stage all touched chain contents and metadata before publication, preserving active local versions and old-snapshot history. Include schema/row counters, cursor mutation epochs, dirty-key tracking and row/sequence allocator bookkeeping in the preflight audit.
 - [ ] Apply prepared state without failure points, then publish the imported watermark/schema generation.
-- [ ] Inject allocation failures at each preparation stage; retry the same frame and prove no duplicate rows, ended versions, skipped operations or lost local writes.
+- [ ] Inject allocation failures at each preparation stage with active local TxID versions as well as committed rows; retry the same frame and prove no duplicate rows, ended versions, skipped operations or lost local writes.
 - [ ] Race local insert/delete/rollback/GC with import; prove old snapshots stay stable and later snapshots see the complete peer frame.
 
 ## Task 3: Yielding admission and commit integration

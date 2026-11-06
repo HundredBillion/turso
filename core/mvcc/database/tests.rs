@@ -25402,3 +25402,56 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
         TursoAllocator,
     )
 }
+
+#[test]
+fn recovery_decodes_entire_frame_before_mutating_store_or_context() {
+    let db = MvccTestDb::new();
+    let row = generate_simple_string_row((-22).into(), 1, "must not be installed");
+    let rowid = row.id.clone();
+    let before_schema = db.conn.schema.read().clone();
+    let mut ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 17,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: [123].into_iter().collect(),
+        current_schema: before_schema.clone(),
+        index_infos: HashMap::default(),
+    };
+    let frame = vec![
+        ParsedOp::UpsertTable {
+            table_id: rowid.table_id,
+            rowid: rowid.clone(),
+            record_bytes: crate::types::value_blob_from_slice(row.payload()).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+        ParsedOp::UpsertIndex {
+            table_id: (-999).into(),
+            payload: crate::types::value_blob_from_slice(&[0xff]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    assert!(db
+        .mvcc_store
+        .recover_process_frame(&db.conn, &mut ctx, frame)
+        .is_err());
+    assert!(db.mvcc_store.rows.get(&rowid).is_none());
+    assert!(db
+        .mvcc_store
+        .table_id_to_rootpage
+        .get(&rowid.table_id)
+        .is_none());
+    assert_eq!(ctx.max_commit_ts_seen, 17);
+    assert!(ctx.dropped_root_pages.contains(&123));
+    assert!(Arc::ptr_eq(&before_schema, &db.conn.schema.read()));
+    assert!(Arc::ptr_eq(&before_schema, &ctx.current_schema));
+}
