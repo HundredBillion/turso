@@ -4278,16 +4278,18 @@ pub enum OpTransactionState {
 pub(crate) enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
+    AfterSharedRowClaim,
 }
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
-    const POINT_COUNT: u8 = 2;
+    const POINT_COUNT: u8 = 3;
 
     fn ordinal(self) -> u8 {
         match self {
             TransactionYieldPoint::BeforeStart => 0,
             TransactionYieldPoint::BeforeMvccBegin => 1,
+            TransactionYieldPoint::AfterSharedRowClaim => 2,
         }
     }
 }
@@ -13196,6 +13198,18 @@ pub fn op_insert(
                                 .into());
                             }
                             state.reset_shared_id();
+                            state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
+                            #[cfg(any(test, injected_yields))]
+                            if let Some(IOResult::IO(io)) =
+                                crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                    program.connection.yield_injector().as_ref(),
+                                    0,
+                                    tx_id,
+                                    TransactionYieldPoint::AfterSharedRowClaim,
+                                )
+                            {
+                                return Ok(state.suspend_on_io(io));
+                            }
                         }
                     }
                 }
