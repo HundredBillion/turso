@@ -99,6 +99,10 @@ impl ManifestRecord {
                 "invalid shared checkpoint source".into(),
             ));
         }
+        // A checkpoint needs a successor sequence after its durable intent.
+        self.sequence
+            .checked_add(2)
+            .ok_or(LimboError::DatabaseFull)?;
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -544,6 +548,15 @@ impl LoadedManifest {
     }
 
     pub(super) fn publish(self, next: ManifestRecord) -> Result<ManifestPublication> {
+        if next.downgrade.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "downgrade publication requires quiescent materialization proof".into(),
+            ));
+        }
+        self.publish_record(next)
+    }
+
+    fn publish_record(self, next: ManifestRecord) -> Result<ManifestPublication> {
         if self.slot > 1 || self.record.sequence.checked_add(1) != Some(next.sequence) {
             return Err(LimboError::InvalidArgument(
                 "invalid next manifest sequence".into(),
@@ -692,6 +705,13 @@ mod tests {
         assert!(record(u64::MAX, 3, 0, 20, 0)
             .begin_downgrade(WAL_ID)
             .is_err());
+        assert_eq!(
+            record(u64::MAX - 1, 3, 0, 20, 0)
+                .begin_downgrade(WAL_ID)
+                .unwrap()
+                .sequence(),
+            u64::MAX
+        );
         let intent = source.begin_downgrade(WAL_ID).unwrap();
         for previous in [
             record(4, 3, 0, 20, 0),
@@ -765,6 +785,23 @@ mod tests {
         quickcheck::QuickCheck::new()
             .tests(200)
             .quickcheck(property as fn(u64, u64, u64, u64) -> bool);
+    }
+
+    #[test]
+    fn commit_manifest_checkpoint_intent_reserves_completion_sequence() {
+        assert!(record(u64::MAX - 1, 3, 0, 20, 0)
+            .begin_checkpoint(20)
+            .is_err());
+        assert!(record(u64::MAX, 3, 0, 20, 0).begin_checkpoint(20).is_err());
+        let source = record(u64::MAX - 2, 3, 0, 20, 0);
+        let intent = source.begin_checkpoint(20).unwrap();
+        let completed = record(u64::MAX, 4, 0, 20, 0);
+        assert_eq!(
+            select_latest([Some(intent), Some(completed)], DATABASE_ID)
+                .unwrap()
+                .1,
+            completed
+        );
     }
 
     #[test]
@@ -859,7 +896,7 @@ mod tests {
     #[test]
     fn commit_manifest_generated_checkpoint_intents_roundtrip() {
         fn property(sequence: u64, generation: u64, timestamp: u64, source: u64) -> bool {
-            let sequence = sequence.clamp(1, u64::MAX - 1);
+            let sequence = sequence.clamp(1, u64::MAX - 2);
             let generation = generation.clamp(1, u64::MAX - 1);
             let timestamp = timestamp & ((1 << 62) - 1);
             let normal = record(sequence, generation, 7, timestamp, 128);
