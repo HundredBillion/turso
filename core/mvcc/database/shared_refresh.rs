@@ -45,7 +45,7 @@ impl SharedReplayContext {
         let Some(state) = state.as_ref() else {
             return false;
         };
-        state.observed.checkpoint_intent().is_none()
+        !state.observed.requires_recovery()
             && state.observed.prefix() == identity.prefix
             && state.observed.log_generation() == identity.database.generation
             && state.context.persistent_tx_ts_max == identity.database.checkpoint_timestamp
@@ -57,9 +57,9 @@ impl SharedReplayContext {
         loaded: LoadedManifest,
         file: Arc<dyn File>,
     ) -> Result<SharedRefresh> {
-        if loaded.record().checkpoint_intent().is_some() {
+        if loaded.record().requires_recovery() {
             return Err(LimboError::InvalidArgument(
-                "shared checkpoint recovery is required".into(),
+                "shared manifest recovery is required".into(),
             ));
         }
         let state = self.state.lock().take().ok_or(LimboError::Busy)?;

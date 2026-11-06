@@ -210,10 +210,10 @@ impl SharedOpenState {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(loaded)) => {
                 self.load = None;
-                if loaded.record().checkpoint_intent().is_some() {
+                if loaded.record().requires_recovery() {
                     self.failed = true;
                     return Err(LimboError::InvalidArgument(
-                        "shared checkpoint recovery is required".into(),
+                        "shared manifest recovery is required".into(),
                     )
                     .into());
                 }
@@ -1138,7 +1138,7 @@ fn run_shared_checkpoint_fixture(
         crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
     );
     assert!(
-        matches!(reopened, Err(LimboError::InvalidArgument(message)) if message.contains("checkpoint recovery"))
+        matches!(reopened, Err(LimboError::InvalidArgument(message)) if message.contains("shared manifest recovery is required"))
     );
     None
 }

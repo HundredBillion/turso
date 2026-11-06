@@ -50,7 +50,7 @@ impl SharedCommit {
         let selected = loaded.record();
         let prefix = selected.prefix();
         let guard = loaded.guard()?;
-        if selected.checkpoint_intent().is_some()
+        if selected.requires_recovery()
             || guard.published()? != prefix
             || record.tx_timestamp <= prefix.committed_timestamp
             || record.tx_timestamp >= MAX_TIMESTAMP
