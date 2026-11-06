@@ -1227,33 +1227,43 @@ impl MappedSharedWalCoordination {
 
     /// Read a consistent snapshot of the shared coordination header.
     pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
-        let header = self.header();
         loop {
-            let seq_before = header.snapshot_seq.load(Ordering::Acquire);
-            if seq_before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let snapshot = SharedWalCoordinationHeader {
-                max_frame: header.max_frame.load(Ordering::Acquire),
-                nbackfills: header.nbackfills.load(Ordering::Acquire),
-                transaction_count: header.transaction_count.load(Ordering::Acquire),
-                visibility_generation: header.visibility_generation.load(Ordering::Acquire),
-                checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
-                checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
-                page_size: header.page_size.load(Ordering::Acquire),
-                salt_1: header.salt_1.load(Ordering::Acquire),
-                salt_2: header.salt_2.load(Ordering::Acquire),
-                checksum_1: header.checksum_1.load(Ordering::Acquire),
-                checksum_2: header.checksum_2.load(Ordering::Acquire),
-                reader_slot_count: header.reader_slot_count,
-            };
-            let seq_after = header.snapshot_seq.load(Ordering::Acquire);
-            if seq_before == seq_after {
+            if let Some(snapshot) = self.try_snapshot() {
                 return snapshot;
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// Attempt one header read. Offline validation must reject an interrupted
+    /// publication rather than spin waiting for an absent publisher.
+    pub(crate) fn try_snapshot(&self) -> Option<SharedWalCoordinationHeader> {
+        let header = self.header();
+        let seq_before = header.snapshot_seq.load(Ordering::Acquire);
+        if seq_before & 1 != 0 {
+            return None;
+        }
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: header.max_frame.load(Ordering::Acquire),
+            nbackfills: header.nbackfills.load(Ordering::Acquire),
+            transaction_count: header.transaction_count.load(Ordering::Acquire),
+            visibility_generation: header.visibility_generation.load(Ordering::Acquire),
+            checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
+            checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
+            page_size: header.page_size.load(Ordering::Acquire),
+            salt_1: header.salt_1.load(Ordering::Acquire),
+            salt_2: header.salt_2.load(Ordering::Acquire),
+            checksum_1: header.checksum_1.load(Ordering::Acquire),
+            checksum_2: header.checksum_2.load(Ordering::Acquire),
+            reader_slot_count: header.reader_slot_count,
+        };
+        let seq_after = header.snapshot_seq.load(Ordering::Acquire);
+        (seq_before == seq_after).then_some(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_snapshot_for_test(&self) {
+        self.header().snapshot_seq.fetch_or(1, Ordering::Release);
     }
 
     pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
@@ -3811,6 +3821,7 @@ mod tests {
             "test must acquire the snapshot write sequence"
         );
 
+        assert!(mapped.try_snapshot().is_none());
         let reader = mapped.clone();
         let handle = std::thread::spawn(move || reader.snapshot());
         std::thread::sleep(std::time::Duration::from_millis(10));
