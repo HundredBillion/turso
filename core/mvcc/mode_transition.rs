@@ -60,7 +60,14 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
             ));
         }
         self.upgrade()?;
-        StagedDatabase::validate(self.backend.path(), destination)?.publish()
+        let cleanup = staging_cleanup::StagingCleanup::capture(self.backend.path(), destination)?;
+        StagedDatabase::validate(self.backend.path(), destination)?.publish()?;
+        drop(self.backend);
+        cleanup.finish().map_err(|error| {
+            LimboError::InvalidArgument(format!(
+                "destination was published but staging cleanup failed: {error}"
+            ))
+        })
     }
 
     pub(super) fn upgrade(&mut self) -> Result<()> {
