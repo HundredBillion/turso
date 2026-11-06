@@ -11,6 +11,20 @@ This implementation provides SQLite3 API compatibility for Turso, allowing exist
 3. Maps SQLite operations to equivalent Turso operations
 4. Maintains API compatibility with SQLite
 
+## Shared MVCC URI options
+
+The binding reserves `turso_mvcc=shared` and
+`turso_mvcc_history_limit=<positive decimal bytes>` for the planned PHP PDO mode.
+The default history limit is 64 MiB. The limit requires the explicit opt-in;
+duplicate settings, unknown shared-mode options, memory databases and VFS
+overrides are rejected. `mode=ro` is valid configuration, with coordination
+metadata governed separately from read-only database contents.
+
+Shared MVCC activation is not available in this build. An opted-in URI returns
+an error before opening or creating database files; it must never silently open
+an ordinary database. Existing URI options retain their ordinary behavior.
+This parsing support does not establish cross-process transaction support.
+
 ## Testing Strategy
 
 We employ a dual-testing approach to ensure complete compatibility with SQLite:
@@ -102,4 +116,4 @@ When adding new features or fixing bugs:
 
 ## Status
 
-This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status. 
+This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status.
