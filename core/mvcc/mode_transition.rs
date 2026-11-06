@@ -36,6 +36,15 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
     }
 
     pub(super) fn publish_new(mut self, destination: &Path) -> Result<()> {
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(LimboError::InvalidArgument(
+                    "new database destination already exists".into(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fs_error(error)),
+        }
         if canonical_parent(self.backend.path())? != canonical_parent(destination)? {
             return Err(LimboError::InvalidArgument(
                 "new database staging must use the destination directory".into(),
@@ -469,6 +478,7 @@ mod tests {
         calls: Vec<&'static str>,
         fail_materialize: bool,
         fail_marker: bool,
+        materialized: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl PagerBackend {
@@ -489,6 +499,7 @@ mod tests {
                 calls: vec![],
                 fail_materialize: false,
                 fail_marker: false,
+                materialized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
@@ -498,6 +509,8 @@ mod tests {
             &self.path
         }
         fn recover_materialize_sync(&mut self) -> Result<u64> {
+            self.materialized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             self.calls.push("materialize");
             if self.fail_materialize {
                 return Err(LimboError::Busy);
@@ -605,6 +618,25 @@ mod tests {
             .unwrap();
         validate_shared_open(&destination).unwrap();
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn mode_transition_new_creation_rejects_visible_destination_before_backend_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("visible.db");
+        let mut backend = PagerBackend::create(&path);
+        backend.recover_materialize_sync().unwrap();
+        let touched = backend.materialized.clone();
+        touched.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = fs::read(&path).unwrap();
+        assert!(
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192)
+                .publish_new(&path)
+                .is_err()
+        );
+        assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
+        require_marker(&File::open(&path).unwrap(), 2).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
