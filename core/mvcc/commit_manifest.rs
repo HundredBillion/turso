@@ -147,7 +147,9 @@ fn select_latest(
         || newest.prefix.committed_timestamp < previous.prefix.committed_timestamp
         || (newest.log_generation == previous.log_generation
             && (newest.log_salt != previous.log_salt
-                || newest.prefix.end_offset < previous.prefix.end_offset))
+                || newest.prefix.end_offset < previous.prefix.end_offset
+                || (newest.prefix.end_offset == previous.prefix.end_offset
+                    && newest.prefix != previous.prefix)))
     {
         return Err(LimboError::Corrupt(
             "MVCC commit manifest rewinds committed history".into(),
@@ -325,6 +327,23 @@ mod tests {
         assert_eq!(
             select_latest([Some(previous), Some(checkpointed)], DATABASE_ID).unwrap(),
             (1, checkpointed)
+        );
+    }
+
+    #[test]
+    fn commit_manifest_unchanged_log_boundary_preserves_timestamp_and_crc() {
+        let previous = record(4, 3, 123, 10, 100);
+        let advanced_timestamp = record(5, 3, 123, 11, 100);
+        let mut changed_crc = record(5, 3, 123, 10, 100);
+        changed_crc.prefix.running_crc ^= 1;
+        for invalid in [advanced_timestamp, changed_crc] {
+            assert!(select_latest([Some(previous), Some(invalid)], DATABASE_ID).is_err());
+            assert!(select_latest([Some(invalid), Some(previous)], DATABASE_ID).is_err());
+        }
+        let identical_boundary = record(5, 3, 123, 10, 100);
+        assert_eq!(
+            select_latest([Some(previous), Some(identical_boundary)], DATABASE_ID).unwrap(),
+            (1, identical_boundary)
         );
     }
 

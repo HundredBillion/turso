@@ -4,7 +4,7 @@
 
 **Goal:** Preserve a verifiable acknowledged-log boundary independently of transient mapped fields.
 
-**Architecture:** A separate manifest has two fixed128-byte records. A publisher writes and synchronizes only the inactive record after synchronizing the logical log, then publishes shared state and acknowledges. Recovery chooses a valid latest record, validates the durable checkpoint boundary and referenced log prefix, and only then considers a tentative suffix.
+**Architecture:** A separate manifest has two 128-byte records in separate 4096-byte aligned blocks. A publisher writes and synchronizes only the inactive record after synchronizing the logical log, then publishes shared state and acknowledges. Recovery chooses a valid latest record, validates the durable checkpoint boundary and referenced log prefix, and only then considers a tentative suffix.
 
 **Tech Stack:** Existing File/Completion/IOResult state machines, CRC32C, MemoryIO, forced-short-I/O fixtures and real Linux subprocesses.
 
@@ -13,7 +13,8 @@
 - Existing modes remain unchanged and all public cross-process MVCC guards stay enabled.
 - A valid manifest is mandatory once the new on-disk mode marker is durable.
 - Initial upgrade synchronizes its first manifest record before publishing the mode marker.
-- Never overwrite the current valid record while publishing its successor.
+- Never overwrite the current valid record while publishing its successor. Slot offsets are 0 and 4096; each write is confined to its own aligned 4096-byte block. The supported storage failure model permits a torn in-flight block write but preserves previously synchronized, separately addressed blocks. Media corruption or devices that violate successful synchronization are outside this guarantee.
+- Within one log generation an unchanged end offset must retain both the committed timestamp and running CRC.
 - Successful logical-log synchronization precedes manifest write; successful manifest synchronization precedes shared publication and acknowledgement.
 - A short write, failed sync or dropped publishing state cannot return a successful publication token.
 - Checkpoint-aware recovery must distinguish an acknowledged prefix already materialized in the database from one still required in the logical log.
