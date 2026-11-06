@@ -7,6 +7,7 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Database<A, F
     pub(crate) fn shared_oracle_pager(
         &self,
         source: &Pager,
+        expected_runtime: &Arc<crate::mvcc::database::SharedMvccRuntime>,
         main: Arc<dyn io::File>,
         physical_wal: Arc<dyn io::File>,
     ) -> Result<Arc<Pager>> {
@@ -18,6 +19,11 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Database<A, F
         let runtime = self.shared_mvcc_runtime.as_ref().ok_or_else(|| {
             LimboError::InvalidArgument("oracle pager requires shared MVCC runtime".into())
         })?;
+        if !Arc::ptr_eq(runtime, expected_runtime) {
+            return Err(LimboError::InvalidArgument(
+                "oracle runtime belongs to another database instance".into(),
+            ));
+        }
         let main_id = runtime.main_file().file_id()?.ok_or_else(|| {
             LimboError::InvalidArgument("oracle main file has no retained identity".into())
         })?;
@@ -104,24 +110,52 @@ mod tests {
         .unwrap();
         foreign.set_page_size(source.get_page_size().unwrap());
         foreign.set_reserved_space_bytes(source.get_reserved_space().unwrap());
-        let error =
-            db.shared_oracle_pager(&foreign, runtime.main_file(), runtime.physical_wal_file());
+        let error = db.shared_oracle_pager(
+            &foreign,
+            runtime,
+            runtime.main_file(),
+            runtime.physical_wal_file(),
+        );
         assert!(
             matches!(error, Err(LimboError::InvalidArgument(message)) if message.contains("source pager"))
+        );
+        let other = Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(crate::dialect::engine::EngineDialect))
+                .flags(OpenFlags::ReadOnly)
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let other_runtime = other.shared_mvcc_runtime.as_ref().unwrap();
+        let error = db.shared_oracle_pager(
+            &source,
+            other_runtime,
+            runtime.main_file(),
+            runtime.physical_wal_file(),
+        );
+        assert!(
+            matches!(error, Err(LimboError::InvalidArgument(message)) if message.contains("oracle runtime"))
         );
         let before = source.holds_read_lock();
         assert!(db
             .shared_oracle_pager(
                 &source,
+                runtime,
                 runtime.physical_wal_file(),
                 runtime.physical_wal_file()
             )
             .is_err());
         assert!(db
-            .shared_oracle_pager(&source, runtime.main_file(), runtime.main_file())
+            .shared_oracle_pager(&source, runtime, runtime.main_file(), runtime.main_file())
             .is_err());
         let oracle = db
-            .shared_oracle_pager(&source, runtime.main_file(), runtime.physical_wal_file())
+            .shared_oracle_pager(
+                &source,
+                runtime,
+                runtime.main_file(),
+                runtime.physical_wal_file(),
+            )
             .unwrap();
         assert!(!Arc::ptr_eq(&source, &oracle));
         assert_eq!(oracle.get_page_size(), source.get_page_size());
