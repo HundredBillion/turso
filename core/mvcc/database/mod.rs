@@ -10951,6 +10951,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .try_get_or_insert(id.clone(), AtomicU64::new(0))?,
             );
         }
+        let schema_after = frame
+            .schema_after
+            .as_ref()
+            .map(|schema| -> Result<_> {
+                let mut schema = crate::alloc::TryClone::try_clone(schema.as_ref())?;
+                schema.dropped_root_pages.clone_from(&dropped_roots);
+                Ok(Arc::new(schema))
+            })
+            .transpose()?;
         self.clock.publish_observed(timestamp, || -> Result<()> {
             for tx in self.txs.iter() {
                 match tx.value().state.load() {
@@ -11038,8 +11047,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             for (allocator, rowid) in &allocators { allocator.insert_row_id_maybe_update(*rowid); }
             for id in &roots { self.bump_next_table_id_below(*id, None); }
             if let Some(header) = header { self.global_header.write().replace(header); }
-            let schema_changed = prepared.schema_after.is_some();
-            if let Some(schema) = prepared.schema_after {
+            let schema_changed = schema_after.is_some();
+            if let Some(schema) = schema_after {
                 *connection.schema.write() = schema.clone();
                 *connection.db.schema.lock() = schema.clone();
                 ctx.current_schema = schema;

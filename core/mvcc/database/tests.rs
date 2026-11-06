@@ -26415,3 +26415,56 @@ fn peer_import_rejects_commit_paused_before_clock_lock() {
         .iter()
         .any(|version| version.begin() == Some(TxTimestampOrID::Timestamp(20))));
 }
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_publishes_dropped_physical_roots_for_checkpoint() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    store.insert_table_id_to_rootpage((-42).into(), Some(42));
+    let mut ctx = empty_peer_context(store, &db.conn);
+    let record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("ephemeral")),
+            Value::Text(Text::new("ephemeral")),
+            Value::from_i64(42),
+            Value::Text(Text::new("CREATE TABLE ephemeral(v TEXT)")),
+        ],
+        5,
+    )
+    .unwrap();
+    let id = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(900));
+    let frame = vec![
+        ParsedOp::UpsertTable {
+            table_id: id.table_id,
+            rowid: id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+        ParsedOp::DeleteTable {
+            rowid: id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+            pk_record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    let mut prepared = Some(store.prepare_recovery_frame(&db.conn, &ctx, frame).unwrap());
+    store
+        .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+        .unwrap();
+    assert!(!ctx.schema_rows.contains_key(&900));
+    assert!(ctx.dropped_root_pages.contains(&42));
+    assert!(db.conn.db.schema.lock().dropped_root_pages.contains(&42));
+    let chain = store.rows.get(&id).unwrap().value().clone();
+    let versions = chain.read();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].begin(), Some(TxTimestampOrID::Timestamp(20)));
+    assert_eq!(versions[0].end(), Some(TxTimestampOrID::Timestamp(20)));
+    assert_eq!(
+        versions[0].data.as_deref().unwrap(),
+        record.as_blob().as_slice()
+    );
+}
