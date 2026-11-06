@@ -344,7 +344,8 @@ mod tests {
         assert_eq!(
             sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
             SQLITE_OK,
-            "{sql:?}"
+            "{sql:?}: {}",
+            std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy()
         );
         stmt
     }
@@ -1644,6 +1645,8 @@ mod tests {
                 "SELECT sum(agg(x)) FROM t",
                 "SELECT agg(agg(x)) FROM t",
                 "SELECT x FROM t WHERE agg(x)>0",
+                "SELECT x FROM t WHERE (SELECT agg(t.x))>0",
+                "SELECT sum((SELECT agg(t.x))) FROM t",
             ] {
                 let sql = std::ffi::CString::new(sql).unwrap();
                 assert_eq!(
@@ -1658,6 +1661,23 @@ mod tests {
             }
             scalar_query(db, "SELECT abs(agg(x)) FROM t", 77);
             scalar_query(db, "SELECT max(a) FROM (SELECT agg(x) AS a FROM t)", 77);
+            scalar_query(db, "SELECT (SELECT agg(t.x)) FROM t", 77);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE e(x)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            scalar_query(
+                db,
+                "SELECT coalesce((SELECT agg(t.x) FROM e), -1) FROM t",
+                -1,
+            );
+            scalar_query(db, "SELECT (SELECT agg(t.x) FROM t AS u) FROM t", 77);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
@@ -5435,7 +5455,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "sqlite3"))]
-    fn test_uri_legacy_reader_writer_open_busy_retry() {
+    fn test_uri_legacy_reader_defers_writer_activation_until_first_write() {
         unsafe {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("legacy.db");
@@ -5475,10 +5495,19 @@ mod tests {
                 SQLITE_OK
             );
             let mut writer = ptr::null_mut();
-            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_BUSY);
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
             assert!(!writer.is_null());
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_BUSY
+            );
             assert_eq!(sqlite3_errcode(writer), SQLITE_BUSY);
-            assert_eq!(sqlite3_close(writer), SQLITE_OK);
             assert_eq!(
                 sqlite3_exec(
                     reader,
@@ -5489,7 +5518,6 @@ mod tests {
                 ),
                 SQLITE_OK
             );
-            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
             assert_eq!(
                 sqlite3_exec(
                     writer,

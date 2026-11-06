@@ -6,7 +6,7 @@ use crate::types::IOCompletions;
 use crate::IOResult;
 use crate::{LimboError, Result};
 
-const RECORD_SIZE: usize = 128;
+pub(super) const RECORD_SIZE: usize = 128;
 const MAGIC: [u8; 8] = *b"TMVCCM01";
 const VERSION: u32 = 1;
 const CHECKSUM_OFFSET: usize = 124;
@@ -21,6 +21,10 @@ pub(super) struct ManifestRecord {
 }
 
 impl ManifestRecord {
+    pub(super) fn prefix(&self) -> PublishedPrefix {
+        self.prefix
+    }
+
     pub(super) fn new(
         sequence: u64,
         database_id: FileId,
@@ -115,7 +119,7 @@ impl ManifestRecord {
     }
 }
 
-fn select_latest(
+pub(super) fn select_latest(
     records: [Option<ManifestRecord>; 2],
     database_id: FileId,
 ) -> Result<(usize, ManifestRecord)> {
@@ -162,7 +166,7 @@ fn select_latest(
     Ok((slot, newest))
 }
 
-const SLOT_SIZE: usize = 4096;
+pub(super) const SLOT_SIZE: usize = 4096;
 
 struct ManifestLoad {
     file: Arc<dyn File>,

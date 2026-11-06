@@ -35,3 +35,47 @@ jobs:
       - name: Durable manifest and cancellation ownership
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest -- --test-threads=1 --nocapture
+
+      - name: Offline mode transitions and atomic publication
+        run: >-
+          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --test-threads=1 --nocapture
+  php-controls:
+    if: github.repository == 'HundredBillion/turso'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-php-controls
+          cache-on-failure: true
+      - name: Install PHP and build exact Turso library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php-cli php-sqlite3
+          cargo build --locked -p turso_sqlite3 --lib
+      - name: Supervisor and stock SQLite controls
+        run: |
+          python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py'
+          php -l bindings/c/tests/php_workers/worker.php
+          mkdir -p php-results
+          python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output php-results/stock-pdo
+          python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api sqlite3 --output php-results/stock-sqlite3
+      - name: Fresh Turso PDO control and unsupported shared capability
+        run: |
+          mkdir -p php-loader
+          ln -s "$PWD/target/debug/libturso_sqlite3.so" php-loader/libsqlite3.so.0
+          export LD_LIBRARY_PATH="$PWD/php-loader:$PWD/target/debug"
+          sha256sum target/debug/libturso_sqlite3.so > php-results/library.sha256
+          python3 bindings/c/tests/php_workers/run.py --profile turso-single-worker-control --api pdo --library "$PWD/target/debug/libturso_sqlite3.so" --output php-results/turso-pdo
+          set +e
+          python3 bindings/c/tests/php_workers/run.py --profile shared-acceptance --api pdo --library "$PWD/target/debug/libturso_sqlite3.so" --output php-results/shared-expected-unsupported
+          result=$?
+          set -e
+          test "$result" -eq 78
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: php-worker-controls
+          path: php-results/
