@@ -23,7 +23,8 @@ jobs:
       - name: Verify JSON semantics
         env:
           QUICKCHECK_TESTS: "500"
-        run: cargo test --locked -p turso_core --lib json:: -- --test-threads=1
+        run: >-
+          cargo test --locked -p turso_core --lib json:: -- --test-threads=1
       - name: Compare current main and both extraction variants
         run: python3 scripts/diagnose_json_canonical.py
       - uses: actions/upload-artifact@v4
