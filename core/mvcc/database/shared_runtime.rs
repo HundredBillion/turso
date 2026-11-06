@@ -203,6 +203,13 @@ impl SharedOpenState {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(loaded)) => {
                 self.load = None;
+                if loaded.record().checkpoint_intent().is_some() {
+                    self.failed = true;
+                    return Err(LimboError::InvalidArgument(
+                        "shared checkpoint recovery is required".into(),
+                    )
+                    .into());
+                }
                 let bindings = (|| {
                     let guard = loaded.guard()?;
                     Ok::<_, LimboError>(vec![

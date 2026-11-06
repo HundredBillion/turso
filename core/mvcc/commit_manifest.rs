@@ -9,6 +9,7 @@ use crate::{LimboError, Result};
 pub(super) const RECORD_SIZE: usize = 128;
 const MAGIC: [u8; 8] = *b"TMVCCM01";
 const VERSION: u32 = 1;
+const CHECKPOINT_INTENT_VERSION: u32 = 2;
 const CHECKSUM_OFFSET: usize = 124;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +19,13 @@ pub(super) struct ManifestRecord {
     log_generation: u64,
     log_salt: u64,
     prefix: PublishedPrefix,
+    checkpoint: Option<CheckpointIntent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CheckpointIntent {
+    pub source_checkpoint_timestamp: u64,
+    pub target_generation: u64,
 }
 
 impl ManifestRecord {
@@ -36,6 +44,34 @@ impl ManifestRecord {
 
     pub(super) fn prefix(&self) -> PublishedPrefix {
         self.prefix
+    }
+
+    pub(super) fn checkpoint_intent(&self) -> Option<CheckpointIntent> {
+        self.checkpoint
+    }
+
+    pub(super) fn begin_checkpoint(mut self, source_checkpoint_timestamp: u64) -> Result<Self> {
+        if self.checkpoint.is_some()
+            || source_checkpoint_timestamp > self.prefix.committed_timestamp
+            || (self.prefix.end_offset == 0
+                && source_checkpoint_timestamp != self.prefix.committed_timestamp)
+        {
+            return Err(LimboError::InvalidArgument(
+                "invalid shared checkpoint source".into(),
+            ));
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        self.checkpoint = Some(CheckpointIntent {
+            source_checkpoint_timestamp,
+            target_generation: self
+                .log_generation
+                .checked_add(1)
+                .ok_or(LimboError::DatabaseFull)?,
+        });
+        Ok(self)
     }
 
     pub(super) fn new(
@@ -62,13 +98,19 @@ impl ManifestRecord {
             log_generation,
             log_salt,
             prefix,
+            checkpoint: None,
         })
     }
 
     pub(super) fn encode(self) -> [u8; RECORD_SIZE] {
         let mut bytes = [0; RECORD_SIZE];
         bytes[..8].copy_from_slice(&MAGIC);
-        bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        let version = if self.checkpoint.is_some() {
+            CHECKPOINT_INTENT_VERSION
+        } else {
+            VERSION
+        };
+        bytes[8..12].copy_from_slice(&version.to_le_bytes());
         bytes[12..16].copy_from_slice(&(RECORD_SIZE as u32).to_le_bytes());
         for (offset, value) in [
             (16, self.sequence),
@@ -82,6 +124,10 @@ impl ManifestRecord {
             bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
         bytes[72..76].copy_from_slice(&self.prefix.running_crc.to_le_bytes());
+        if let Some(intent) = self.checkpoint {
+            bytes[80..88].copy_from_slice(&intent.source_checkpoint_timestamp.to_le_bytes());
+            bytes[88..96].copy_from_slice(&intent.target_generation.to_le_bytes());
+        }
         let checksum = crc32c::crc32c(&bytes[..CHECKSUM_OFFSET]);
         bytes[CHECKSUM_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
         bytes
@@ -100,20 +146,23 @@ impl ManifestRecord {
         if crc32c::crc32c(&bytes[..CHECKSUM_OFFSET]) != checksum {
             return Ok(None);
         }
-        if bytes[..8] != MAGIC || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != VERSION {
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if bytes[..8] != MAGIC || !matches!(version, VERSION | CHECKPOINT_INTENT_VERSION) {
             return Err(LimboError::InvalidArgument(
                 "incompatible MVCC commit manifest format".into(),
             ));
         }
         if u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != RECORD_SIZE as u32
-            || bytes[76..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
+            || bytes[76..80].iter().any(|byte| *byte != 0)
+            || bytes[96..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
+            || (version == VERSION && bytes[80..96].iter().any(|byte| *byte != 0))
         {
             return Err(LimboError::Corrupt(
                 "invalid MVCC manifest record layout".into(),
             ));
         }
         let read_u64 = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        Self::new(
+        let mut record = Self::new(
             read_u64(16),
             FileId {
                 dev: read_u64(24),
@@ -127,8 +176,23 @@ impl ManifestRecord {
                 running_crc: u32::from_le_bytes(bytes[72..76].try_into().unwrap()),
             },
         )
-        .map(Some)
-        .map_err(|_| LimboError::Corrupt("invalid MVCC manifest record values".into()))
+        .map_err(|_| LimboError::Corrupt("invalid MVCC manifest record values".into()))?;
+        if version == CHECKPOINT_INTENT_VERSION {
+            let source_checkpoint_timestamp = read_u64(80);
+            let target_generation = read_u64(88);
+            if record.log_generation.checked_add(1) != Some(target_generation)
+                || source_checkpoint_timestamp > record.prefix.committed_timestamp
+                || (record.prefix.end_offset == 0
+                    && source_checkpoint_timestamp != record.prefix.committed_timestamp)
+            {
+                return Err(LimboError::Corrupt("invalid MVCC checkpoint intent".into()));
+            }
+            record.checkpoint = Some(CheckpointIntent {
+                source_checkpoint_timestamp,
+                target_generation,
+            });
+        }
+        Ok(Some(record))
     }
 }
 
@@ -164,6 +228,32 @@ pub(super) fn select_latest(
         [Some(first), Some(second)] if first.sequence > second.sequence => (0, first, second),
         [Some(first), Some(second)] => (1, second, first),
     };
+    let valid_checkpoint_transition = match (previous.checkpoint, newest.checkpoint) {
+        (None, None) => true,
+        (None, Some(_)) => {
+            newest.log_generation == previous.log_generation
+                && newest.log_salt == previous.log_salt
+                && newest.prefix == previous.prefix
+        }
+        (Some(old), Some(new)) => {
+            old == new
+                && newest.log_generation == previous.log_generation
+                && newest.log_salt == previous.log_salt
+                && newest.prefix == previous.prefix
+        }
+        (Some(intent), None) => {
+            newest.log_generation == intent.target_generation
+                && newest.prefix.committed_timestamp == previous.prefix.committed_timestamp
+                && newest.prefix.end_offset == 0
+                && newest.prefix.running_crc == 0
+                && newest.log_salt == 0
+        }
+    };
+    if !valid_checkpoint_transition {
+        return Err(LimboError::Corrupt(
+            "invalid MVCC checkpoint manifest transition".into(),
+        ));
+    }
     // An empty generation has no log header yet. Its first durable append
     // establishes the salt without replacing any acknowledged log bytes.
     let initializes_empty_log =
@@ -460,6 +550,114 @@ mod tests {
     use super::*;
 
     const DATABASE_ID: FileId = FileId { dev: 1, ino: 2 };
+
+    #[test]
+    fn commit_manifest_checkpoint_intent_roundtrip_retains_old_base_and_exact_target() {
+        let normal = record(5, 3, 7, 20, 128);
+        let intent = normal.begin_checkpoint(12).unwrap();
+        assert_eq!(
+            intent.checkpoint_intent(),
+            Some(CheckpointIntent {
+                source_checkpoint_timestamp: 12,
+                target_generation: 4,
+            })
+        );
+        assert_eq!(intent.prefix(), normal.prefix());
+        assert_eq!(intent.sequence(), normal.sequence() + 1);
+        assert_eq!(
+            ManifestRecord::decode(&intent.encode()).unwrap(),
+            Some(intent)
+        );
+    }
+
+    #[test]
+    fn commit_manifest_checkpoint_intent_only_completes_at_its_materialized_boundary() {
+        let normal = record(5, 3, 7, 20, 128);
+        let intent = normal.begin_checkpoint(12).unwrap();
+        let completed = record(7, 4, 0, 20, 0);
+        assert_eq!(
+            select_latest([Some(intent), Some(completed)], DATABASE_ID)
+                .unwrap()
+                .1,
+            completed
+        );
+        for invalid in [
+            record(7, 3, 7, 21, 200),
+            record(7, 5, 0, 20, 0),
+            record(7, 4, 0, 21, 0),
+            record(7, 4, 7, 20, 128),
+        ] {
+            assert!(select_latest([Some(intent), Some(invalid)], DATABASE_ID).is_err());
+        }
+        assert!(intent.begin_checkpoint(12).is_err());
+        assert!(normal.begin_checkpoint(21).is_err());
+    }
+
+    #[test]
+    fn commit_manifest_mirrored_intent_survives_loss_of_either_copy() {
+        let normal = record(5, 3, 7, 20, 128);
+        let intent = normal.begin_checkpoint(12).unwrap();
+        let encoded = intent.encode();
+        assert_eq!(
+            u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
+            CHECKPOINT_INTENT_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes(normal.encode()[8..12].try_into().unwrap()),
+            VERSION
+        );
+        for cut in 0..RECORD_SIZE {
+            let torn = ManifestRecord::decode(&encoded[..cut]).unwrap();
+            assert_eq!(
+                select_latest([Some(normal), torn], DATABASE_ID).unwrap().1,
+                normal
+            );
+            assert_eq!(
+                select_latest([Some(intent), torn], DATABASE_ID).unwrap().1,
+                intent
+            );
+            assert_eq!(
+                select_latest([torn, Some(intent)], DATABASE_ID).unwrap().1,
+                intent
+            );
+        }
+        for byte in 0..RECORD_SIZE {
+            for bit in 0..8 {
+                let mut torn = encoded;
+                torn[byte] ^= 1 << bit;
+                let torn = ManifestRecord::decode(&torn).unwrap();
+                assert_eq!(
+                    select_latest([Some(intent), torn], DATABASE_ID).unwrap().1,
+                    intent
+                );
+            }
+        }
+        for offset in [80, 88] {
+            let mut malformed = encoded;
+            malformed[offset..offset + 8].fill(255);
+            fix_checksum(&mut malformed);
+            assert!(ManifestRecord::decode(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn commit_manifest_generated_checkpoint_intents_roundtrip() {
+        fn property(sequence: u64, generation: u64, timestamp: u64, source: u64) -> bool {
+            let sequence = sequence.clamp(1, u64::MAX - 1);
+            let generation = generation.clamp(1, u64::MAX - 1);
+            let timestamp = timestamp & ((1 << 62) - 1);
+            let normal = record(sequence, generation, 7, timestamp, 128);
+            let intent = normal.begin_checkpoint(source % (timestamp + 1)).unwrap();
+            ManifestRecord::decode(&intent.encode()).unwrap() == Some(intent)
+                && select_latest([Some(normal), Some(intent)], DATABASE_ID)
+                    .unwrap()
+                    .1
+                    == intent
+        }
+        quickcheck::QuickCheck::new()
+            .tests(200)
+            .quickcheck(property as fn(u64, u64, u64, u64) -> bool);
+    }
 
     #[test]
     fn commit_manifest_round_trip_preserves_the_acknowledged_boundary() {
@@ -1032,7 +1230,7 @@ mod tests {
             PublishedPrefix {
                 committed_timestamp: timestamp,
                 end_offset: offset,
-                running_crc: 17,
+                running_crc: if offset == 0 { 0 } else { 17 },
             },
         )
         .unwrap()
