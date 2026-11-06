@@ -55,6 +55,12 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
     }
 
     pub(super) fn upgrade(&mut self) -> Result<()> {
+        if self.history_limit == 0 {
+            return Err(LimboError::InvalidArgument(
+                "shared MVCC history limit must be positive".into(),
+            ));
+        }
+        require_linux_platform()?;
         let file = File::open(self.backend.path()).map_err(fs_error)?;
         let old_marker = read_marker(&file)?;
         if !matches!(old_marker, 1 | 2 | 255) {
@@ -76,6 +82,7 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
     }
 
     pub(super) fn downgrade(&mut self) -> Result<()> {
+        require_linux_platform()?;
         let prefix = validate_shared_open(self.backend.path())?;
         let file = File::open(self.backend.path()).map_err(fs_error)?;
         let namespace = namespace_for(self.backend.path(), identity(&file)?)?;
@@ -228,22 +235,21 @@ fn sync_directory(path: &Path) -> Result<()> {
         .map_err(fs_error)
 }
 
+fn require_linux_platform() -> Result<()> {
+    if !cfg!(all(target_os = "linux", target_pointer_width = "64")) {
+        return Err(LimboError::InvalidArgument(
+            "offline shared MVCC transitions require 64-bit Linux".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_namespace(
     namespace: &Path,
     id: FileId,
     timestamp: u64,
     history_limit: u64,
 ) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        return Err(LimboError::InvalidArgument(
-            "offline shared MVCC transitions require 64-bit Linux".into(),
-        ));
-    }
-    if history_limit == 0 {
-        return Err(LimboError::InvalidArgument(
-            "shared MVCC history limit must be positive".into(),
-        ));
-    }
     let record = ManifestRecord::new(
         1,
         id,
@@ -618,6 +624,32 @@ mod tests {
             .unwrap();
         validate_shared_open(&destination).unwrap();
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn mode_transition_invalid_limit_rejects_before_backend_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.db");
+        let backend = PagerBackend::create(&path);
+        let touched = backend.materialized.clone();
+        let mut transition =
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 0);
+        let error = transition.upgrade().unwrap_err();
+        assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.to_string().contains("history limit"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn mode_transition_unsupported_platform_rejects_before_backend_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.db");
+        let backend = PagerBackend::create(&path);
+        let touched = backend.materialized.clone();
+        let mut transition =
+            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 8192);
+        assert!(transition.upgrade().is_err());
+        assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
