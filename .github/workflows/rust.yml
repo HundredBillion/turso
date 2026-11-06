@@ -1,30 +1,40 @@
-name: Cache application comparison screening
+name: Sustained immutable cache application comparison
 on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - name: Build same-path upstream, current fork and candidate controls
-        run: python3 scripts/build_cache_application_controls.py
-      - name: Compare immutable application requests and Redis cache paths
+      - name: Fetch verified screening binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 42251159125 --repo HundredBillion/turso --name cache-application-results --dir application-controls
+          chmod +x application-controls/binaries/upstream application-controls/binaries/fork application-controls/binaries/candidate
+          python3 - <<'PYCODE'
+          import hashlib,json
+          from pathlib import Path
+          p=Path('application-controls');m=json.loads((p/'build-metadata.json').read_text())
+          for name,expected in m['binaries'].items():
+              assert hashlib.sha256((p/'binaries'/name).read_bytes()).hexdigest()==expected,name
+          PYCODE
+      - name: Compare thirty-second offered-load trials
         run: >-
           python3 scripts/run_cache_application_probe.py
-          --binary upstream=application-results/binaries/upstream
-          --binary fork=application-results/binaries/fork
-          --binary candidate=application-results/binaries/candidate
-          --output application-results/screening
-          --rows 1000 --requests 2000 --workers 1,8,32 --rates 0,2000 --repeats 3
+          --binary upstream=application-controls/binaries/upstream
+          --binary fork=application-controls/binaries/fork
+          --binary candidate=application-controls/binaries/candidate
+          --output sustained-results
+          --rows 1000 --requests 60000 --workers 8 --rates 2000
+          --deployments embedded,shared --cache false,true --warm true --hot true --repeats 3
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cache-application-results
-          path: application-results/
+          name: sustained-cache-application-results
+          path: sustained-results/
           retention-days: 14
