@@ -531,3 +531,34 @@ These deterministic component tests do not prove native multi-process operation,
 real committed-oracle integration, or cross-generation checkpoint remapping. The
 prepared-successor/finalization protocol and complete domain remap remain required
 parts of Task 3; this helper cannot substitute for them.
+
+
+## Incarnation recovery witness
+
+Mapped authority epoch/timestamp bytes alone are not a durable incarnation witness.
+After exclusive lifetime acquisition, runtime must keep admission disabled until it
+loads the selected ID journal under publication authority, freshly synchronizes
+both selector copies, waits for physical I/O retirement, and reconciles the next
+epoch above every owner epoch in the currently referenced banks. Retired owners
+count; when a prepared bank exists, both active and prepared banks count.
+
+`LoadedIds::mirror_current_witness` returns an owned `IdWitnessMirror`. Only its
+successful terminal result constructs `MirroredIds`, whose
+`into_guard_and_max_owner_epoch` hands the continuously held authority and maximum
+to bootstrap. The helper does not set incarnation readiness. Failure or cancellation
+cannot authorize admission; retained backend callbacks continue to hold authority.
+
+This mirroring step is necessary even after selecting a floor-only compacted bank.
+An interrupted compaction can leave one newer selector naming the owner-free bank
+and another older selector naming retired owners. Without durable mirroring, losing
+the newer selector later could revive forgotten owner keys after epoch reuse.
+Synchronizing both current references before readiness removes that fallback.
+
+The focused suite passes 55 tests. The new helper first failed against a stub; four
+mirror tests cover both selector synchronizations and retirement, cancellation at
+every mutation, retired epochs in active/prepared banks, and interrupted compaction
+followed by single-selector corruption. Test clippy passes with explicit allowances
+for existing unused imports/lint expectations and baseline needless-borrow, type
+complexity, redundant-clone, and detached-future diagnostics. Native runtime
+readiness recovery and the cancellation assertion with readiness initially false
+remain integration checks; these component tests do not establish them.
