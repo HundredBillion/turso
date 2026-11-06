@@ -154,6 +154,24 @@ impl LoadedIds {
         self.selection.selector.prepared.is_some()
     }
 
+    pub(in crate::mvcc) fn pending_checkpoint_source(&self) -> Option<DatabaseGeneration> {
+        self.selection
+            .selector
+            .prepared
+            .filter(|prepared| {
+                self.selection.selected == *prepared && self.identity.database == prepared.database
+            })
+            .map(|_| self.selection.selector.active.database)
+    }
+
+    pub(in crate::mvcc) fn selected_logical_floor(&self) -> i64 {
+        self.state.logical_floor
+    }
+
+    pub(in crate::mvcc) fn identity(&self) -> RecoveryIdentity {
+        self.identity
+    }
+
     fn max_owner_epoch(&self) -> Result<Option<u64>> {
         let mut maximum = self.state.max_owner_epoch();
         if let Some(prepared) = self.selection.selector.prepared {
@@ -1778,6 +1796,35 @@ mod tests {
             generation: f.identity.database.generation + 1,
             checkpoint_timestamp: f.identity.prefix.committed_timestamp,
         }
+    }
+
+    #[test]
+    fn id_checkpoint_recovery_metadata_requires_the_selected_prepared_target() {
+        let mut f = writable_fixture();
+        let source = f.identity.database;
+        let current = loaded(&f);
+        assert!(current.pending_checkpoint_source().is_none());
+        assert_eq!(current.selected_logical_floor(), -100);
+        assert_eq!(current.identity(), f.identity);
+        let target = checkpoint_target(&f);
+        let mut prepare = current.prepare_checkpoint(target, -200).unwrap();
+        let IOResult::Done(prepared) = prepare.poll().unwrap() else {
+            panic!("synchronous preparation")
+        };
+        let (suspended, guard) = prepared.suspend();
+        drop(suspended);
+        guard.finish().unwrap();
+        let old = loaded(&f);
+        assert!(old.has_pending_checkpoint());
+        assert!(old.pending_checkpoint_source().is_none());
+        assert_eq!(old.selected_logical_floor(), -100);
+        old.into_guard().finish().unwrap();
+        f.identity.database = target;
+        let recovered = loaded(&f);
+        assert_eq!(recovered.pending_checkpoint_source(), Some(source));
+        assert_eq!(recovered.selected_logical_floor(), -200);
+        assert_eq!(recovered.identity(), f.identity);
+        recovered.into_guard().finish().unwrap();
     }
 
     #[test]
