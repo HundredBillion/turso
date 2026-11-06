@@ -14,6 +14,7 @@ pub(super) struct GuardedFile {
 struct LeaseSlot {
     lease: Weak<PublicationLease>,
     bound: bool,
+    pin_reads: bool,
 }
 
 pub(super) struct FileBinding {
@@ -30,11 +31,25 @@ impl GuardedFile {
             lease: Mutex::new(LeaseSlot {
                 lease: Weak::new(),
                 bound: false,
+                pin_reads: false,
             }),
         })
     }
 
     pub(super) fn bind(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
+        self.bind_with_reads(guard, false)
+    }
+
+    /// Checkpoint admission is paused and all participants are quiescent before this binding.
+    pub(super) fn bind_checkpoint(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
+        self.bind_with_reads(guard, true)
+    }
+
+    fn bind_with_reads(
+        self: &Arc<Self>,
+        guard: &AuthorityGuard,
+        pin_reads: bool,
+    ) -> Result<FileBinding> {
         let mut current = self.lease.lock();
         if current.lease.upgrade().is_some() {
             return Err(LimboError::Busy);
@@ -48,6 +63,7 @@ impl GuardedFile {
         PublicationLease::pin(&lease)?;
         current.lease = lease.clone();
         current.bound = true;
+        current.pin_reads = pin_reads;
         Ok(FileBinding {
             file: self.clone(),
             lease,
@@ -121,7 +137,28 @@ impl File for GuardedFile {
         self.inner.unlock_file()
     }
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        self.inner.pread(pos, c)
+        let pin = {
+            let slot = self.lease.lock();
+            if slot.bound && slot.pin_reads {
+                Some(PublicationLease::pin(&slot.lease).inspect_err(|_| c.abort())?)
+            } else {
+                None
+            }
+        };
+        let Some(pin) = pin else {
+            return self.inner.pread(pos, c);
+        };
+        let caller = c.clone();
+        let physical = Completion::new_read(c.as_read().buf_arc(), move |result| {
+            let _pin = &pin;
+            match result {
+                Ok((_, count)) => caller.complete(count),
+                Err(error) => caller.error(error),
+            }
+            None
+        });
+        let _physical = self.inner.pread(pos, physical).inspect_err(|_| c.abort())?;
+        Ok(c)
     }
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         let expected = buffer.len();
@@ -190,6 +227,7 @@ mod tests {
     use crate::LimboError;
 
     enum Operation {
+        Read,
         Write(u64, Arc<Buffer>),
         Sync,
         Truncate(u64),
@@ -206,6 +244,7 @@ mod tests {
     struct DelayedFile {
         locked: AtomicBool,
         pending: Mutex<Vec<Pending>>,
+        delay_reads: AtomicBool,
         bytes: Mutex<Vec<u8>>,
         syncs: crate::sync::atomic::AtomicUsize,
         fail_submission: crate::sync::atomic::AtomicUsize,
@@ -239,6 +278,7 @@ mod tests {
             let operation = &pending[index];
             if result >= 0 {
                 match &operation.operation {
+                    Operation::Read => {}
                     Operation::Write(offset, buffer) => {
                         let mut bytes = self.bytes.lock();
                         let count = (result as usize).min(buffer.len());
@@ -277,8 +317,12 @@ mod tests {
             Ok(())
         }
         fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
-            c.complete(0);
-            Ok(c)
+            if self.delay_reads.load(Ordering::SeqCst) {
+                self.submit(c, Operation::Read)
+            } else {
+                c.complete(0);
+                Ok(c)
+            }
         }
         fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
             self.submit(c, Operation::Write(pos, buffer))
@@ -397,6 +441,41 @@ mod tests {
         backend.retire();
         assert!(waiter.finished());
         assert!(authority.try_acquire().unwrap().requires_recovery());
+    }
+
+    #[test]
+    fn checkpoint_read_binding_retains_backend_ownership_after_cancellation() {
+        for cancel in [false, true] {
+            let backend = Arc::new(DelayedFile::default());
+            backend.delay_reads.store(true, Ordering::SeqCst);
+            let authority = authority_for_test(backend.clone());
+            let mut guard = authority.try_acquire().unwrap();
+            guard.recover(PublishedPrefix::default()).unwrap();
+            let file = GuardedFile::new(backend.clone(), &authority);
+            let binding = file.bind_checkpoint(&guard).unwrap();
+            let caller = file
+                .pread(
+                    0,
+                    Completion::new_read(Arc::new(Buffer::new(vec![0; 8])), |_| None),
+                )
+                .unwrap();
+            if cancel {
+                caller.abort();
+            }
+            drop(caller);
+            drop(binding);
+            drop(guard);
+            assert!(
+                matches!(authority.try_acquire(), Err(LimboError::Busy)),
+                "checkpoint read released authority before backend retirement"
+            );
+            backend.complete_without_retiring(0);
+            assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
+            backend.retire();
+            let mut guard = authority.try_acquire().unwrap();
+            guard.recover(PublishedPrefix::default()).unwrap();
+            guard.finish().unwrap();
+        }
     }
 
     #[test]
