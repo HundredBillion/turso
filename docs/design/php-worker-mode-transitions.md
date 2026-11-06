@@ -134,3 +134,42 @@ checkpoint. The same run passed 7 authority, 8 committed-prefix and 15 manifest
 checks. These are component results; the public shared transaction protocol is
 still disabled, and real MvStore offline materialization is not supplied by the
 test backend.
+
+## Retained runtime files
+
+The private `SharedMvccFiles::open_existing` component accepts a retained main
+file and its expected native identity, a canonical path, native I/O, the history
+limit, and a read-only-content flag. It opens all sidecars without `Create`,
+retains their actual handles, and compares each with a native descriptor identity.
+The main marker and manifest size must validate before coordination admission.
+Physical coordination and logical authority use their strict existing-only
+constructors; missing or invalid state cannot fall back to basename files.
+The returned handles are not a recovered snapshot: later admission must load and
+validate the committed prefix while holding the required authority. Reading manifest
+checksums without that guard could observe slots across concurrent publications;
+the constructor deliberately does not interpret their mutable bytes.
+
+Initial filesystem support is the ext family identified by Linux `fstatfs` magic
+`0xef53`; that magic does not distinguish ext2, ext3 and ext4. Every actual native
+file descriptor is checked, and all sidecars must share the database's device.
+Unknown filesystems, FUSE, network types, overlay and tmpfs are rejected pending
+validation. Existing coordination constructors exercise actual OFD locks and
+shared mappings. This is stricter than a platform-only capability boolean or the
+ordinary WAL network-filesystem exclusion list. The native Linux fixtures print
+their detected filesystem magic so validation records the environment actually
+used.
+
+Read-only participants receive read-only logical-log and physical-WAL handles.
+Main-file read-only opening and custom durable-storage rejection remain caller
+preconditions. Manifest, authority and physical coordination must be writable
+metadata; unavailable permission fails explicitly. Opening reads/validates content
+and may perform valid coordination epoch/recovery bookkeeping, but never repairs,
+truncates, creates or writes database/WAL/log content. Namespace symlinks and
+nonregular sidecar files are rejected. Capability and identity checks precede
+coordination metadata changes.
+
+Native tests cover retained handle identity, read-only write rejection and content
+hash preservation, every missing sidecar, live authority unlink, wrong main
+identity, invalid manifest length, coordination permission denial and implicit-upgrade
+refusal. Local checks cover unsupported backend rejection and the filesystem
+policy. Native execution is pending for this new component.

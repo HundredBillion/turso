@@ -1,4 +1,4 @@
-name: Peer import allocator regression validation
+name: Existing shared MVCC files validation
 on:
   workflow_dispatch:
 permissions:
@@ -8,7 +8,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
 jobs:
-  stable-peer-import:
+  shared-files:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -18,23 +18,9 @@ jobs:
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Peer import on stable allocator aliases
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_ -- --test-threads=1 --nocapture
-  nightly-peer-import:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2025-12-17
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-nightly-peer-import
-          cache-on-failure: true
-      - name: Peer import with fallible chain allocations
-        env:
-          RUSTFLAGS: --cfg nightly
-        run: >-
-          cargo +nightly-2025-12-17 test --locked -p turso_core --lib --features conn_raw_api peer_import_ -- --test-threads=1 --nocapture
+      - name: Native identity, filesystem and read-only content boundaries
+        run: |
+          test "$(id -u)" -ne 0
+          stat -f -c 'workspace filesystem: %T (%t)' .
+          stat -f -c 'temporary filesystem: %T (%t)' /tmp
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files -- --test-threads=1 --nocapture

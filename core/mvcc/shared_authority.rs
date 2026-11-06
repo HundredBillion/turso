@@ -59,6 +59,10 @@ pub(super) struct SnapshotRegistration {
 }
 
 impl SharedMvccAuthority {
+    pub(super) fn file_id(&self) -> Result<Option<FileId>> {
+        self.file.file_id()
+    }
+
     pub(super) fn open(
         io: &Arc<dyn IO>,
         path: &str,

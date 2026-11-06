@@ -46,6 +46,9 @@ pub mod portable_logical;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 mod shared_authority;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_files;
 #[cfg(any(test, injected_yields))]
 pub(crate) mod yield_hooks;
 pub mod yield_points;

@@ -394,7 +394,7 @@ fn identity(file: &File) -> Result<FileId> {
     })
 }
 
-fn require_marker(file: &File, marker: u8) -> Result<()> {
+pub(super) fn require_marker(file: &File, marker: u8) -> Result<()> {
     let mut file = file.try_clone().map_err(fs_error)?;
     file.seek(SeekFrom::Start(0)).map_err(fs_error)?;
     let mut header = [0; 100];
@@ -474,7 +474,7 @@ fn fs_error(error: std::io::Error) -> LimboError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::util::IOExt;
 
@@ -685,7 +685,7 @@ mod tests {
         backend.conn.execute("SELECT * FROM preserved").unwrap();
     }
 
-    fn fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    pub(in crate::mvcc) fn fixture(dir: &Path) -> (PathBuf, PathBuf) {
         let path = dir.join("staged.db");
         let destination = dir.join("published.db");
         let io: crate::sync::Arc<dyn crate::IO> =
