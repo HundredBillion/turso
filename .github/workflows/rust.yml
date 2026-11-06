@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9fc647339e53e9181b183150213af26ef595211e
+          ref: 3ea66031a81c65564b1c1a3541febacf66571341
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,20 +25,23 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9fc647339e53e9181b183150213af26ef595211e
+          test "$(git rev-parse HEAD)" = 3ea66031a81c65564b1c1a3541febacf66571341
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Required sidecar regression must fail before initialization
+      - name: Offline publication now includes ID journals
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --test-threads=1 --nocapture 2>&1 | tee mode-green.log
+      - name: Missing ID files must expose the old strict-opener gap
         run: |
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_initializes_id_sidecars -- --test-threads=1 --nocapture 2>&1 | tee namespace-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files_missing_sidecars -- --test-threads=1 --nocapture 2>&1 | tee files-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q '0 passed; 1 failed' namespace-red.log
-          grep -q 'required ID sidecar missing: ids-a' namespace-red.log
+          grep -q '0 passed; 1 failed' files-red.log
+          grep -q 'assertion failed: SharedMvccFiles::open_existing' files-red.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
