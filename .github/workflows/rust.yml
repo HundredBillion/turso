@@ -1,4 +1,4 @@
-name: Shared MVCC commit and I/O lease validation
+name: Shared MVCC native runtime admission validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c908cfb99398d9700968f27a6d941744ce8422c8
+          ref: cce5e625394d58f6f0378f2724cce78b2d6f1355
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,11 +25,19 @@ jobs:
       - name: Record exact runtime and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = c908cfb99398d9700968f27a6d941744ce8422c8
+          test "$(git rev-parse HEAD)" = cce5e625394d58f6f0378f2724cce78b2d6f1355
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
+      - name: Native retained shared open and independent readonly handles
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared-open-native.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-open-native.log
+      - name: Guarded replay, global snapshot and materialized base
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database::shared_ -- --test-threads=1 --nocapture 2>&1 | tee shared-runtime.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-runtime.log
       - name: Portable physical-retirement, failure and binding checks
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::guarded_file::tests --
@@ -63,6 +71,8 @@ jobs:
         with:
           name: shared-mvcc-commit-leases
           path: |
+            shared-open-native.log
+            shared-runtime.log
             source.txt
             rustc.txt
             guarded-file.log
