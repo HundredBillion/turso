@@ -411,6 +411,21 @@ mod tests {
         not(target_os = "linux"),
         ignore = "requires native Linux ext-family filesystem"
     )]
+    fn offline_backend_rejects_main_log_alias_before_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("fresh.db-log");
+        assert!(OrdinaryOfflineBackend::create_staged(&staging).is_err());
+        assert!(
+            !staging.exists(),
+            "self-aliasing staging database was created"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires native Linux ext-family filesystem"
+    )]
     fn offline_backend_initializes_and_publishes_fresh_database_without_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("staging.db");
