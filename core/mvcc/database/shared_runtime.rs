@@ -491,11 +491,16 @@ pub(crate) fn materialize_marked_fixture(path: &Path) -> u64 {
 
 #[cfg(all(test, target_os = "linux", not(shuttle)))]
 pub(crate) fn shared_runtime_fixture(dir: &Path) -> (PathBuf, u64) {
+    let limit = 64 * 1024 * 1024;
+    (shared_runtime_fixture_with_limit(dir, limit), limit)
+}
+
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+pub(crate) fn shared_runtime_fixture_with_limit(dir: &Path, limit: u64) -> PathBuf {
     let path = dir.join("shared.db");
     let timestamp = materialize_marked_fixture(&path);
-    let limit = 64 * 1024 * 1024;
     crate::mvcc::mode_transition::prepare_test_namespace(&path, timestamp, limit).unwrap();
-    (path, limit)
+    path
 }
 
 #[cfg(all(test, not(shuttle)))]
@@ -510,5 +515,145 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[18..20], &[SHARED_MVCC_VERSION; 2]);
         assert!(!bytes.is_empty());
+    }
+}
+
+pub(super) struct SharedTransactionCommit {
+    runtime: Arc<SharedMvccRuntime>,
+    load: Option<ManifestLoad>,
+    refresh: Option<SharedRefresh>,
+    loaded: Option<LoadedManifest>,
+    driver: Option<crate::mvcc::shared_commit::SharedCommit>,
+    guard: Option<crate::mvcc::shared_authority::AuthorityGuard>,
+    timestamp: Option<u64>,
+    durable: bool,
+}
+
+impl SharedTransactionCommit {
+    pub(super) fn new(runtime: Arc<SharedMvccRuntime>) -> Result<Self> {
+        let guard = runtime.files.authority.try_acquire()?;
+        let load = ManifestLoad::new(runtime.files.manifest.clone(), guard, runtime.database_id)?;
+        Ok(Self {
+            runtime,
+            load: Some(load),
+            refresh: None,
+            loaded: None,
+            driver: None,
+            guard: None,
+            timestamp: None,
+            durable: false,
+        })
+    }
+
+    fn poll_refresh<C: LogicalClock, A: ConcurrentAllocator>(
+        &mut self,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+        local: bool,
+    ) -> IOResultOr<()> {
+        if self.loaded.is_some() {
+            return Ok(IOResult::Done(()));
+        }
+        if self.refresh.is_none() {
+            let loaded = return_if_io!(self.load.as_mut().unwrap().poll());
+            self.load = None;
+            let replay = self.runtime.replay.lock().clone().ok_or_else(|| {
+                LimboError::InvalidArgument("shared commit lacks replay context".into())
+            })?;
+            let refresh = replay.refresh(loaded, self.runtime.logical.clone())?;
+            self.refresh = Some(if local {
+                refresh.observe_local_commit(self.timestamp.unwrap())?
+            } else {
+                refresh
+            });
+        }
+        let loaded = return_if_io!(self.refresh.as_mut().unwrap().poll(store, connection));
+        self.refresh = None;
+        self.loaded = Some(loaded);
+        Ok(IOResult::Done(()))
+    }
+
+    pub(super) fn poll_prepare<C: LogicalClock, A: ConcurrentAllocator>(
+        &mut self,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+    ) -> IOResultOr<u64> {
+        if let Some(timestamp) = self.timestamp {
+            return Ok(IOResult::Done(timestamp));
+        }
+        return_if_io!(self.poll_refresh(store, connection, false));
+        let timestamp = self
+            .loaded
+            .as_mut()
+            .unwrap()
+            .guard_mut()?
+            .allocate_timestamp()?;
+        self.timestamp = Some(timestamp);
+        Ok(IOResult::Done(timestamp))
+    }
+
+    pub(super) fn begin_write(&mut self, record: LogRecord) -> Result<()> {
+        self.driver = Some(crate::mvcc::shared_commit::SharedCommit::new(
+            self.loaded.take().ok_or_else(|| {
+                LimboError::InvalidArgument("shared commit prefix already consumed".into())
+            })?,
+            self.runtime.storage(),
+            self.runtime.logical.clone(),
+            record,
+        )?);
+        Ok(())
+    }
+
+    pub(super) fn poll_write(&mut self) -> IOResultOr<()> {
+        let driver = self.driver.as_mut().unwrap();
+        let result = driver.poll();
+        self.durable |= driver.is_durable();
+        match result? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(guard) => {
+                self.guard = Some(guard);
+                self.driver = None;
+                Ok(IOResult::Done(()))
+            }
+        }
+    }
+
+    pub(super) fn preflight_rejected(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(|driver| driver.preflight_rejected())
+    }
+
+    pub(super) fn is_durable(&self) -> bool {
+        self.durable
+            || self
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.is_durable())
+    }
+
+    pub(super) fn finish_without_append(mut self) -> Result<()> {
+        self.loaded
+            .take()
+            .ok_or_else(|| LimboError::InvalidArgument("shared read commit lost authority".into()))?
+            .into_guard()?
+            .finish()
+    }
+
+    pub(super) fn poll_finish<C: LogicalClock, A: ConcurrentAllocator>(
+        &mut self,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+    ) -> IOResultOr<()> {
+        if let Some(guard) = self.guard.take() {
+            self.load = Some(ManifestLoad::new(
+                self.runtime.files.manifest.clone(),
+                guard,
+                self.runtime.database_id,
+            )?);
+        }
+        return_if_io!(self.poll_refresh(store, connection, true));
+        self.loaded.take().unwrap().into_guard()?.finish()?;
+        Ok(IOResult::Done(()))
     }
 }
