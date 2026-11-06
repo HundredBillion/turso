@@ -1120,6 +1120,8 @@ pub struct ProgramState {
     pub query_deadline: Option<crate::MonotonicInstant>,
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) shared_begin: crate::mvcc::database::SharedBeginState,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -1303,6 +1305,8 @@ impl ProgramState {
             execution_state: ProgramExecutionState::Init,
             query_deadline: None,
             explicit_checkpoint_guard: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_begin: Default::default(),
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1400,7 +1404,24 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
+    pub(crate) fn reset_shared_begin(&mut self) {
+        #[cfg(all(host_shared_wal, unix))]
+        self.shared_begin.reset();
+    }
+
+    pub(crate) fn captured_shared_schema_generation(&self) -> Option<Option<u64>> {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.shared_begin.captured_expected_schema_generation()
+        }
+        #[cfg(not(all(host_shared_wal, unix)))]
+        {
+            None
+        }
+    }
+
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        self.reset_shared_begin();
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -3565,6 +3586,7 @@ impl Program {
         state.extension_state = crate::native_ext::ExtensionState::None;
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
+        state.reset_shared_begin();
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.
