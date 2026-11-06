@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f5ae5a9f3edcd9c6a39cb385a57255e049b1cda0
+          ref: 9c5af231ca98586b79c69bda82277f07faabc968
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,43 +25,21 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = f5ae5a9f3
+          test "$(git rev-parse --short=9 HEAD)" = 9c5af231c
           rustc -Vv | tee rustc.txt
-      - name: Native recovery controls
+      - name: Fresh publication orphan regression must fail
         run: |
-          set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_integration -- --test-threads=1 --nocapture 2>&1 | tee recovery-green.log
-          grep -q '3 passed; 0 failed' recovery-green.log
-      - name: Removing materialized proof guards must fail the negative tests
-        run: |
-          cp core/mvcc/mode_transition/ordinary.rs /tmp/ordinary-verified.rs
-          python3 - <<'PYCODE'
-          p='core/mvcc/mode_transition/ordinary.rs'
-          s=open(p).read()
-          for condition in ['proof.logical_floor() > physical_floor', 'timestamp != Some(proof.timestamp())']:
-              original='if '+condition+' {'
-              assert s.count(original)==1
-              s=s.replace(original,'if false && ('+condition+') {')
-          open(p,'w').write(s)
-          PYCODE
           set +e
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_integration_rejects -- --test-threads=1 --nocapture 2>&1 | tee recovery-negative.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup_fresh -- --test-threads=1 --nocapture 2>&1 | tee cleanup-red.log
           status=${PIPESTATUS[0]}
           set -e
-          cp /tmp/ordinary-verified.rs core/mvcc/mode_transition/ordinary.rs
           test "$status" -ne 0
-          grep -q '0 passed; 2 failed' recovery-negative.log
-          grep -q 'unwrap_err()' recovery-negative.log
-      - name: Restored exact source passes
-        run: |
-          git diff --exit-code
-          set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_integration -- --test-threads=1 --nocapture 2>&1 | tee recovery-restored.log
-          grep -q '3 passed; 0 failed' recovery-restored.log
+          grep -q '0 passed; 1 failed' cleanup-red.log
+          grep -q 'owned staging sidecar remained after publication' cleanup-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marker-recovery-controls
+          name: staging-cleanup-red
           path: |
             source.txt
             rustc.txt
