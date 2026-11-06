@@ -68,3 +68,9 @@ jobs:
       - name: Sync protocol and ownership
         run: >-
           cargo test --locked -p turso_sync_engine --features "${{ matrix.sync_features }}" --lib
+      - name: PHP readonly header lifecycle
+        run: >-
+          cargo test --locked -p core_tester --features "${{ matrix.test_features }}" --test integration_tests storage::header_version -- --nocapture
+      - name: PostgreSQL refuses legacy SQLite without changing storage
+        run: >-
+          cargo test --locked -p turso_pg_tests --features "${{ matrix.test_features }}" --test integration_tests test_postgres_refuses_a_database_file_whose_tables_are_in_no_schema -- --nocapture
