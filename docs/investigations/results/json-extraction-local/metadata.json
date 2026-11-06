@@ -1,0 +1,70 @@
+{
+  "recorded_utc": "2026-11-06T15:24:11.834377+00:00",
+  "status": "Shared-host wall-clock measurements; not performance acceptance evidence. Allocation counts and correctness checked separately.",
+  "host": {
+    "cpu": "Apple M5 Pro",
+    "logical_cpus": 18,
+    "ram_bytes": 68719476736,
+    "os": "macOS 26.5.2 (25F84)"
+  },
+  "background_activity": "Several unrelated Python workers near83%CPU each plus endpoint security activity were present. No unrelated processes were stopped.",
+  "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: aarch64-apple-darwin\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "profile": {
+    "name": "lib-release",
+    "opt_level": 3,
+    "codegen_units": 16,
+    "lto": false,
+    "debug": false,
+    "bench_panic": "unwind"
+  },
+  "upstream_revision": "2709799dad2ebb0f1749cfa62fa28514f568da28",
+  "fork_revision": "78a77aac11310d4d928bff623195d34b33242dd5",
+  "candidate_description": "Candidate production source was measured before commit; identical source was committed as candidate_source_commit. Embedded git source-id therefore still identifies candidate_compiled_head. Exact diff and executable hashes are retained.",
+  "candidate_source_diff_sha256": "579ead7bc0327bf56d0f6716bb72bed16cb4c2bd8cfcfc28cb2e4fa3b94f7725",
+  "fixture_sha256": {
+    "benches/json_benchmark.rs": "a935b5ac689f56a1bb601fab4500a9d1d771430dd97348ad8eadfa7f36b2efb0",
+    "benches/json_extract_allocations.rs": "eefb9a6da41ffa11aef9c43023c07a1a9efccf12a53dab3dd88a59562acb798b",
+    "benches/Cargo.toml": "99dbe76400d69fa716255c49d2a40f027fea46097295a036c709f60c27f4c45b"
+  },
+  "binary_sha256": {
+    "json-benchmark-main": "3fd2ef730b38562440a0b74c1da5e36ce71a1efb3795833c179dc2d97a75ccf8",
+    "json-benchmark-upstream": "b1e3b655e1c07d17ad6a623dbb4465f685b4f83f57b9d80b4d91f80bc656760c",
+    "json-benchmark-sized-result": "8f546a0181b7faaeeb626764e78ef76f9ae8e1f7b7d65090bba2a641cd318459",
+    "json-allocations-upstream": "1e736bcaf9cee70280658d7b6fb5d1c44dd096cbf16a297d9b57dbfe687cee76",
+    "json-allocations-sized-result": "5d571ae4c48c0a285b927723ef9777b4aadde0cb18e649ca1a6848a1c42253d1"
+  },
+  "criterion": {
+    "warmup_seconds": 0.2,
+    "measurement_seconds": 0.5,
+    "samples": 30,
+    "resamples": 10000,
+    "repeats": 3,
+    "cases": 38,
+    "orders": [
+      [
+        "fork",
+        "candidate",
+        "upstream"
+      ],
+      [
+        "candidate",
+        "upstream",
+        "fork"
+      ],
+      [
+        "upstream",
+        "fork",
+        "candidate"
+      ]
+    ]
+  },
+  "summary": "Median of three Criterion slope estimates (mean when no slope); per-run confidence intervals and raw samples preserved in samples.json. This is not an aggregate confidence interval.",
+  "allocations": {
+    "allocator": "divan::AllocProfiler<mimalloc::MiMalloc>",
+    "samples": 100,
+    "iterations_per_sample": 100,
+    "timings": "Not used for acceptance; allocator differs from Criterion System allocator."
+  },
+  "candidate_source_commit": "aca4e63537e0cdef06610db7738c3c217ae0de81",
+  "candidate_compiled_head": "78a77aac11310d4d928bff623195d34b33242dd5"
+}
