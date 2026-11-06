@@ -8,9 +8,9 @@ concurrency:
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: 2
-  CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
   RUST_BACKTRACE: 1
   CC_x86_64_pc_windows_msvc: cl.exe
 jobs:
