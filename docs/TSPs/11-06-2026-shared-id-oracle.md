@@ -147,3 +147,12 @@ The native fixture now separates two schedules. One keeps the old outer snapshot
 across the peer commit and tests row visibility. The other performs the peer
 commit before the outer begins, allowing its pending DDL while testing that the
 committed oracle excludes that table. No BUSY retry or engine behavior changed.
+
+Hosted Linux validation 42296783743 completed successfully on the integrated
+5941ea48c source: both actual fact/cancellation tests passed, as did the earlier
+factory/context checks, physical materializer, shared SQL regression union, and
+library lint. The facts test uses the corrected separate schedules described
+above. Raw evidence is retained in the root workspace at
+`.local/issue-resolution/oracle-materializer-594-green.log`. This validates the
+private oracle component and its composed read lifetime; it does not establish
+completed checkpoint integration or enable public shared mode.
