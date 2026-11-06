@@ -52,6 +52,9 @@ pub mod portable_logical;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 mod shared_authority;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod shared_commit;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
 mod shared_files;
