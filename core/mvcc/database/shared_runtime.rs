@@ -963,6 +963,7 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
     checkpoint
         .authorize_shared_materialization(&intent)
         .unwrap();
+    assert!(checkpoint.materialized_checkpoint_proof(&intent).is_err());
     loop {
         match checkpoint.step(&()).unwrap() {
             TransitionResult::Continue => {}
@@ -970,6 +971,15 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
             TransitionResult::Done(_) => break,
         }
     }
+    let materialized = loop {
+        match checkpoint.materialized_checkpoint_proof(&intent).unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(proof) => break proof,
+        }
+    };
+    assert!(materialized.matches_intent(&intent));
+    assert!(materialized.physical_floor() < 0);
+    assert!(checkpoint.materialized_checkpoint_proof(&intent).is_err());
     let materialized_main = std::fs::read(&path).unwrap();
     assert_ne!(materialized_main, main_before);
     assert!(

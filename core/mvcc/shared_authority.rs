@@ -399,6 +399,31 @@ impl AuthorityGuard {
         self.advance_committed(durable.prefix())
     }
 
+    pub(super) fn publish_checkpoint(
+        &mut self,
+        proof: &super::commit_manifest::checkpoint_publication::CompletedCheckpointProof,
+    ) -> Result<()> {
+        let target = proof.target_identity();
+        let previous = self.published()?;
+        if !proof.matches_lease(self)
+            || target.prefix.end_offset != 0
+            || target.prefix.running_crc != 0
+            || target.prefix.committed_timestamp != previous.committed_timestamp
+            || proof
+                .source_identity()
+                .is_some_and(|source| source.prefix != previous)
+            || (proof.source_identity().is_none() && previous != target.prefix)
+        {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint authority proof differs".into(),
+            ));
+        }
+        if !self.live_registrations()?.is_empty() {
+            return Err(LimboError::Busy);
+        }
+        self.store_prefix(target.prefix)
+    }
+
     fn advance_committed(&mut self, prefix: PublishedPrefix) -> Result<()> {
         let previous = self.published()?;
         if prefix.committed_timestamp <= previous.committed_timestamp
