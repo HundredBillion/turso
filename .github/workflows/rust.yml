@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5cadd17f48f949a99f654ac86ee492eb87208f7b
+          ref: 22fabf2b3a35b78e841a9536b08b9a5d71568546
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5cadd17f48f949a99f654ac86ee492eb87208f7b
+          test "$(git rev-parse HEAD)" = 22fabf2b3a35b78e841a9536b08b9a5d71568546
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -35,14 +35,15 @@ jobs:
           mkdir "$RUNNER_TEMP/shared-probe"
           TURSO_SHARED_PROBE_DIR="$RUNNER_TEMP/shared-probe" cargo test --locked -p turso_core --lib --features conn_raw_api shared_runtime_export_fixture_for_release_probe -- --ignored --test-threads=1 --nocapture 2>&1 | tee fixture.log
           grep -q '1 passed; 0 failed' fixture.log
-      - name: Production library must reproduce duplicate mapping rejection
+      - name: Production library reuses coordination and reopens after drop
         run: |
-          set +e
-          cargo run --locked -p turso_core --features test_helper --example shared_open_probe -- "$RUNNER_TEMP/shared-probe/shared.db" 67108864 2>&1 | tee production-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'duplicate same-process shared WAL coordination open' production-red.log
+          cargo run --locked -p turso_core --features test_helper --example shared_open_probe -- "$RUNNER_TEMP/shared-probe/shared.db" 67108864 2>&1 | tee production-green.log
+          grep -q 'production-library shared open probe passed' production-green.log
+      - name: Native strict file and independent mapping checks
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files -- --test-threads=1 --nocapture 2>&1 | tee shared-files.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_runtime_native_database_open -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-open.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
