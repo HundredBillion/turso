@@ -30,10 +30,6 @@ jobs:
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Native shared commit publication
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commit-native.log
-          grep -q '2 passed; 0 failed' commit-native.log
       - name: Explicit COMMIT cap reset regression must fail before hook
         run: |
           set +e
@@ -43,6 +39,10 @@ jobs:
           test "$status" -ne 0
           grep -q '0 passed; 1 failed' cap-red.log
           grep -q 'cap Busy discarded explicit transaction' cap-red.log
+      - name: Native shared commit publication
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commit-native.log
+          grep -q '2 passed; 0 failed' commit-native.log
       - name: Preserve exact source and controls
         if: always()
         uses: actions/upload-artifact@v4
