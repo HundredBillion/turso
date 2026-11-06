@@ -657,3 +657,17 @@ impl SharedTransactionCommit {
         Ok(IOResult::Done(()))
     }
 }
+
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+#[test]
+#[ignore = "exports a fixture for the normal-library diagnostic binary"]
+fn shared_runtime_export_fixture_for_release_probe() {
+    let directory =
+        std::env::var_os("TURSO_SHARED_PROBE_DIR").expect("dedicated fixture directory required");
+    let directory = Path::new(&directory);
+    assert!(directory.is_dir());
+    assert!(!directory.join("shared.db").exists());
+    let (path, limit) = shared_runtime_fixture(directory);
+    std::fs::write(directory.join("history-limit"), limit.to_string()).unwrap();
+    println!("prepared fixture {}", path.display());
+}
