@@ -1,3 +1,4 @@
+pub(super) mod operation;
 mod ordinary;
 pub(super) mod recovery;
 #[cfg(test)]

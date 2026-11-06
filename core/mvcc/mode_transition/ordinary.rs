@@ -440,13 +440,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("staging.db");
         let destination = dir.path().join("published.db");
-        let backend = OrdinaryOfflineBackend::create_staged(&staging).unwrap();
-        super::super::OfflineModeChange::new(
-            backend,
+        super::super::operation::execute_offline(
+            super::super::operation::OfflineOperation::PublishNew {
+                staging: &staging,
+                destination: &destination,
+            },
             OfflinePrerequisite::AllOlderWorkersStopped,
             64 * 1024 * 1024,
         )
-        .publish_new(&destination)
         .unwrap();
         assert!(!staging.exists());
         super::super::validate_shared_open(&destination).unwrap();
