@@ -1781,6 +1781,78 @@ mod tests {
     }
 
     #[test]
+    fn id_checkpoint_preflight_reserves_preparation_and_finalization_sequences() {
+        for sequence in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let f = writable_fixture();
+            let mut current = loaded(&f);
+            current.selection.selector.sequence = sequence;
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            let preflight = current.preflight_checkpoint(checkpoint_target(&f));
+            if sequence == u64::MAX - 2 {
+                assert!(preflight.is_ok());
+            } else {
+                assert!(matches!(preflight, Err(LimboError::DatabaseFull)));
+            }
+            let result = current.prepare_checkpoint(checkpoint_target(&f), -200);
+            if sequence == u64::MAX - 2 {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    matches!(result, Err(LimboError::DatabaseFull)),
+                    "sequence {sequence}"
+                );
+            }
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+        }
+    }
+
+    #[test]
+    fn id_checkpoint_loaded_handoff_keeps_preflight_state_without_rebinding() {
+        for reacquire in [false, true] {
+            let f = writable_fixture();
+            let current = loaded(&f);
+            current.preflight_checkpoint(checkpoint_target(&f)).unwrap();
+            let before = [&f.bank, &f.unused, &f.selector].map(|file| file.bytes.lock().clone());
+            let original = current.guard.io_lease();
+            let (suspended, guard) = current.suspend();
+            assert_eq!(suspended.source_identity(), f.identity);
+            assert!(matches!(
+                f.files.selector.bind(&guard),
+                Err(LimboError::Busy)
+            ));
+            let guard = if reacquire {
+                drop(guard);
+                let mut guard = f.authority.try_acquire().unwrap();
+                guard.recover(f.identity.prefix).unwrap();
+                guard
+            } else {
+                guard
+            };
+            let result = suspended.rejoin_source(guard);
+            if reacquire {
+                assert!(result.is_err());
+            } else {
+                let loaded = result.unwrap();
+                assert!(crate::sync::Weak::ptr_eq(
+                    &original,
+                    &loaded.guard.io_lease()
+                ));
+                loaded.preflight_checkpoint(checkpoint_target(&f)).unwrap();
+                loaded.into_guard().finish().unwrap();
+            }
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector].map(|file| file.bytes.lock().clone())
+            );
+        }
+    }
+
+    #[test]
     fn id_checkpoint_prepare_handoff_retains_bindings_and_exact_source_lease() {
         let f = writable_fixture();
         let mut prepare = loaded(&f)
