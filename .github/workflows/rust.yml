@@ -1,4 +1,4 @@
-name: Prepared marker recovery token validation
+name: Private shared ID opcode regression
 on:
   workflow_dispatch:
 permissions:
@@ -8,63 +8,37 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  RUST_BACKTRACE: "1"
 jobs:
-  release:
+  ids:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 8c3500e86df75d12f1702d9d758069bb47fcea29
+          ref: 1e6fbaa2b1aa9be95ace5da9857e16c44419e0ef
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Record exact source
+      - name: Record source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = 8c3500e86
           rustc -Vv | tee rustc.txt
-      - name: Manifest codec and publication checks
+      - name: Existing allocators must expose cross-instance collisions
         run: |
-          set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest -- --test-threads=1 --nocapture 2>&1 | tee manifest-green.log
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-green.log
-          grep -q '1 passed; 0 failed' fence-green.log
-      - name: Bypassing intent fences must fail native admission control
-        run: |
-          cp core/mvcc/database/shared_runtime.rs /tmp/runtime-verified.rs
-          cp core/mvcc/database/shared_refresh.rs /tmp/refresh-verified.rs
-          python3 - <<'PYCODE'
-          for p in ['core/mvcc/database/shared_runtime.rs','core/mvcc/database/shared_refresh.rs']:
-              s=open(p).read()
-              guard='loaded.record().requires_recovery()'
-              assert s.count(guard)==1
-              s=s.replace(guard,'loaded.record().checkpoint_intent().is_some()')
-              open(p,'w').write(s)
-          PYCODE
           set +e
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-negative.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-red.log
           status=${PIPESTATUS[0]}
           set -e
-          cp /tmp/runtime-verified.rs core/mvcc/database/shared_runtime.rs
-          cp /tmp/refresh-verified.rs core/mvcc/database/shared_refresh.rs
           test "$status" -ne 0
-          grep -q '0 passed; 1 failed' fence-negative.log
-          grep -q 'assertion failed' fence-negative.log
-      - name: Restored exact source passes
-        run: |
-          git diff --exit-code
-          set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-restored.log
-          grep -q '1 passed; 0 failed' fence-restored.log
-          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings 2>&1 | tee clippy.log
+          grep -q 'independent stores allocated the same live rowid' ids-red.log
+          grep -q "allocator ignored a peer's live explicit key" ids-red.log
+          grep -q 'test result: FAILED' ids-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: downgrade-intent-proof
+          name: shared-id-opcode-regression
           path: |
             source.txt
             rustc.txt
