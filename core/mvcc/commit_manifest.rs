@@ -1,3 +1,5 @@
+pub(super) mod checkpoint_publication;
+
 use super::shared_authority::{AuthorityGuard, IoPin, PublicationLease, PublishedPrefix};
 use crate::io::FileId;
 use crate::io::{Buffer, Completion, File, FileSyncType};
@@ -967,7 +969,7 @@ mod tests {
             Ok(c)
         }
         fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
-            assert_eq!(pos, SLOT_SIZE as u64);
+            assert!(pos == 0 || pos == SLOT_SIZE as u64);
             assert_eq!(buffer.len(), SLOT_SIZE);
             assert!(self
                 .pending
@@ -997,6 +999,102 @@ mod tests {
         }
         .publish(next)
         .unwrap()
+    }
+
+    #[cfg(not(shuttle))]
+    #[test]
+    fn commit_manifest_checkpoint_intent_proof_waits_for_both_syncs_and_retirement() {
+        use super::super::shared_authority::authority_for_test;
+        let previous = record(1, 1, 123, 10, 100);
+        let file = DelayedManifestFile::initialized(previous);
+        let authority = authority_for_test(file.clone());
+        let mut guard = authority.try_acquire().unwrap();
+        guard.recover(previous.prefix()).unwrap();
+        let mut publication = LoadedManifest {
+            file: file.clone(),
+            guard: Some(guard),
+            slot: 0,
+            record: previous,
+        }
+        .begin_checkpoint_intent(0)
+        .unwrap();
+        for step in 0..4 {
+            assert!(
+                matches!(publication.poll().unwrap(), IOResult::IO(_)),
+                "proof escaped at step {step}"
+            );
+            if step == 3 {
+                let retained = file.pending.lock().as_ref().unwrap().1.clone();
+                file.retire(0, false);
+                let IOResult::IO(waiter) = publication.poll().unwrap() else {
+                    panic!("backend retirement still pending")
+                };
+                assert!(!waiter.0.finished());
+                drop(retained);
+            } else {
+                file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
+            }
+        }
+        let IOResult::Done(proof) = publication.poll().unwrap() else {
+            panic!("both mirrored copies are durable")
+        };
+        assert_eq!(file.syncs.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let bytes = file.bytes.lock();
+        for offset in [0, SLOT_SIZE] {
+            assert_eq!(
+                ManifestRecord::decode(&bytes[offset..offset + RECORD_SIZE]).unwrap(),
+                Some(proof.record())
+            );
+        }
+        assert_eq!(proof.guard().published().unwrap(), previous.prefix());
+        proof.into_guard().finish().unwrap();
+    }
+
+    #[cfg(not(shuttle))]
+    #[test]
+    fn commit_manifest_checkpoint_intent_failure_and_abort_never_release_early() {
+        use super::super::shared_authority::authority_for_test;
+        for boundary in 0..4 {
+            for abort in [false, true] {
+                let previous = record(1, 1, 123, 10, 100);
+                let file = DelayedManifestFile::initialized(previous);
+                let authority = authority_for_test(file.clone());
+                let mut guard = authority.try_acquire().unwrap();
+                guard.recover(previous.prefix()).unwrap();
+                let mut publication = LoadedManifest {
+                    file: file.clone(),
+                    guard: Some(guard),
+                    slot: 0,
+                    record: previous,
+                }
+                .begin_checkpoint_intent(0)
+                .unwrap();
+                for step in 0..=boundary {
+                    let IOResult::IO(waiter) = publication.poll().unwrap() else {
+                        panic!("early intent proof");
+                    };
+                    if step == boundary {
+                        if abort {
+                            waiter.0.abort();
+                            drop(publication);
+                            assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
+                            file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
+                        } else {
+                            file.retire(0, true);
+                            assert!(publication.poll().is_err());
+                            assert!(publication.poll().is_err());
+                            drop(publication);
+                        }
+                        drop(waiter);
+                        let guard = authority.try_acquire().unwrap();
+                        assert!(guard.requires_recovery());
+                        break;
+                    }
+                    drop(waiter);
+                    file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
+                }
+            }
+        }
     }
 
     #[test]
