@@ -4,7 +4,7 @@ function check(bool $condition, string $message): void {
     if (!$condition) { throw new RuntimeException($message); }
 }
 function openDb(string $path): PDO {
-    return new PDO('sqlite:'.$path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    return new PDO('sqlite:'.$path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 0]);
 }
 $engine = $argv[1];
 $path = $argv[2];
@@ -49,5 +49,61 @@ try {
     throw new RuntimeException('missing parent opened');
 } catch (PDOException $e) {
     check((int)$e->errorInfo[1] === 14, 'failed-open error code');
+}
+function storageBytes(string $path): array {
+    $result = [];
+    foreach (glob($path.'*') as $file) { $result[basename($file)] = hash_file('sha256', $file); }
+    ksort($result);
+    return $result;
+}
+foreach (['legacy', 'wal', 'mvcc'] as $mode) {
+    if ($mode === 'mvcc' && $engine !== 'turso') { continue; }
+    foreach (['reader-first', 'writer-first'] as $closeOrder) {
+        $file = $path.'.'.$mode.'.'.$closeOrder.'.db';
+        $setup = openDb($file);
+        if ($mode !== 'legacy') {
+            check(strtolower((string)$setup->query('PRAGMA journal_mode='.$mode)->fetchColumn()) === $mode, 'fixture journal mode');
+        }
+        $setup->exec('CREATE TABLE sample(x)');
+        $setup->exec('INSERT INTO sample VALUES(1)');
+        $setup = null;
+        $bytes = storageBytes($file);
+        $reader = openDb('file:'.$file.'?mode=ro');
+        $pending = openDb($file);
+        $pending->exec('CREATE TEMP TABLE private_temp(x)');
+        $pending->exec('INSERT INTO private_temp VALUES(1)');
+        $pending = null;
+        check(storageBytes($file) === $bytes, 'unused writer and TEMP changed persistent bytes');
+        $reader->exec('BEGIN');
+        check((int)$reader->query('SELECT count(*) FROM sample')->fetchColumn() === 1, 'initial snapshot');
+        $writer = openDb($file);
+        if ($mode === 'legacy') {
+            try {
+                $writer->exec('INSERT INTO sample VALUES(2)');
+                throw new RuntimeException('legacy write ignored active reader');
+            } catch (PDOException $e) {
+                check((int)$e->errorInfo[1] === 5, 'legacy write must return BUSY');
+            }
+            $reader->exec('COMMIT');
+        }
+        $writer->exec('INSERT INTO sample VALUES(2)');
+        if ($mode !== 'legacy') {
+            check((int)$reader->query('SELECT count(*) FROM sample')->fetchColumn() === 1, 'old snapshot changed');
+            $reader->exec('COMMIT');
+        }
+        check((int)$reader->query('SELECT count(*) FROM sample')->fetchColumn() === 2, 'fresh reader snapshot');
+        try {
+            $reader->exec('INSERT INTO sample VALUES(99)');
+            throw new RuntimeException('promotion made readonly connection writable');
+        } catch (PDOException $e) {
+            check((int)$e->errorInfo[1] === 8, 'readonly policy after promotion');
+        }
+        if ($closeOrder === 'reader-first') { $reader = null; $writer = null; }
+        else { $writer = null; $reader = null; }
+        $reopened = openDb($file);
+        check((int)$reopened->query('SELECT count(*) FROM sample')->fetchColumn() === 2, 'reopened committed rows');
+        $reopened = null;
+        echo $engine.' '.$mode.' '.$closeOrder." passed\n";
+    }
 }
 echo $engine." PHP storage/callback probes passed\n";
