@@ -47,7 +47,8 @@ The exact oracle's EQP must conversely contain no index method.
 | Exactness, mutation and tenant tests | Passed in WAL and MVCC | tests/integration/index_method/dense_ivf.rs |
 | Concurrent writers and injected failures | Focused scenarios passed | Existing QueuedIo and UnreliableIo harnesses |
 | Synthetic 100k recall and latency sweep | Local debug and hosted optimized runs passed | evidence/dense-ivf-100k-hosted.txt |
-| Independent branch review | Pending | Parent agent review |
+| Synthetic 1m recall and latency sweep | Hosted optimized run passed | evidence/dense-ivf-1m-hosted.txt |
+| Independent branch review | Parent reviewed query core; proposal reviewed separately | No production approval |
 
 Initial tests correctly failed: the planner took a scan before equality and
 rowid matching existed; reading a borrowed record blob caught vector alignment
@@ -178,9 +179,41 @@ probe count; [metadata](evidence/dense-ivf-100k-hosted-metadata.md) retains CPU,
 compiler, binary hash, lifecycle results and resource counters. The resource
 usage permits a separate 1m-row follow-up on the same implementation.
 
+## Hosted optimized 1m result
+
+[Run 42245689959](https://github.com/HundredBillion/turso/actions/runs/42245689959)
+succeeded with the same implementation and optimized configuration. Validation
+revision `32100d451` changes only the workflow relative to source `5f3a98f0b`.
+All-cluster exactness and candidate-count assertions passed at one million rows.
+
+| Method | 800,000-row tenant p50 / p95 (ms) | Recall@10 | 1,000-row tenant p50 / p95 (ms) | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| Exact filtered full scan | 450.401 / 457.335 | 1.000 | 92.317 / 93.082 | 1.000 |
+| Exact with tenant B-tree | 566.640 / 572.322 | 1.000 | 2.838 / 2.942 | 1.000 |
+| IVF nprobe=1 | 7.016 / 7.679 | 0.675 | 0.073 / 0.138 | 0.150 |
+| IVF nprobe=4 | 30.361 / 30.917 | 0.995 | 0.132 / 0.212 | 0.380 |
+| IVF nprobe=8 | 60.831 / 62.606 | 1.000 | 0.242 / 0.330 | 0.665 |
+| IVF nprobe=16 | 122.259 / 123.863 | 1.000 | 0.383 / 0.476 | 0.885 |
+| IVF nprobe=32 | 244.540 / 246.492 | 1.000 | 0.631 / 0.686 | 1.000 |
+
+Training took 10.155 ms; base ingestion took 4.976 seconds. Builds took
+13.651–14.398 seconds. The base database used 152,379,392 bytes and the index
+added 159,449,088 allocated bytes. Replacing 1,000 rows took 12.006–12.653 ms
+and generated 716,912 WAL bytes; reopen plus first query took 9.583–252.034 ms.
+Whole-process peak RSS was 582,196 KiB; the complete sweep took 149.73 seconds,
+excluding compilation. [Raw measurement](evidence/dense-ivf-1m-hosted.txt) and
+[metadata](evidence/dense-ivf-1m-hosted-metadata.md) retain the full evidence.
+
+Both scales use 32 dimensions and only 20 queries per tenant in one run. Their
+p95/p99 estimates are sparse; synthetic recall does not establish RAG quality.
+Queries are generated after the corpus from the same RNG, so the 1m and 100k
+runs have different held-out queries. Each individual sweep compares every
+method against identical queries, but the cross-scale numbers are not a paired
+same-query scaling experiment. The corpus/training prefix is shared.
+
 ## Limits
 
-The 1m follow-up is pending. No
+The measured experiments are complete at 100k and 1m, within the scope above. No
 representative embeddings were supplied and no recall loss has been accepted.
 The crash test covers torn checkpoint writeback under FULL synchronous mode;
 it is not an exhaustive commit-phase, syscall-failure, or simulator seed sweep.
