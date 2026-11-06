@@ -642,7 +642,10 @@ mod journal {
     }
     impl Owner {
         fn validate(self) -> Result<()> {
-            if self.epoch == 0 || self.begin == 0 || self.begin >= (1 << 62) {
+            if self.epoch == 0
+                || self.begin == 0
+                || self.begin >= super::super::shared_authority::MAX_TIMESTAMP
+            {
                 return Err(corrupt("invalid ID reservation owner"));
             }
             Ok(())
@@ -1237,6 +1240,42 @@ mod journal {
             changes.push(Change::ReleaseOwner { owner: A });
             changes.push(claim(B, 1, DOMAIN, 7));
             assert_eq!(load(&changes).unwrap().claims(B).count(), 1);
+        }
+        #[test]
+        fn live_owner_cannot_use_reserved_authority_timestamp() {
+            let maximum = super::super::super::shared_authority::MAX_TIMESTAMP;
+            let valid = Record {
+                sequence: 1,
+                change: claim(
+                    Owner {
+                        begin: maximum - 1,
+                        ..A
+                    },
+                    1,
+                    DOMAIN,
+                    1,
+                ),
+            };
+            assert_eq!(Record::decode(&valid.encode().unwrap()).unwrap(), valid);
+            assert!(Record {
+                sequence: 1,
+                change: claim(
+                    Owner {
+                        begin: maximum,
+                        ..A
+                    },
+                    1,
+                    DOMAIN,
+                    1
+                )
+            }
+            .encode()
+            .is_err());
+            let mut invalid = valid.encode().unwrap();
+            put_u64(&mut invalid, 40, maximum);
+            let crc = crc32c::crc32c(&invalid[..CRC_OFFSET]);
+            invalid[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+            assert!(Record::decode(&invalid).is_err());
         }
     }
 }
