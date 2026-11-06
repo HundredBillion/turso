@@ -562,3 +562,23 @@ for existing unused imports/lint expectations and baseline needless-borrow, type
 complexity, redundant-clone, and detached-future diagnostics. Native runtime
 readiness recovery and the cancellation assertion with readiness initially false
 remain integration checks; these component tests do not establish them.
+
+
+## Native reservation test handoff
+
+The native component fixture runs two independent processes with real authority
+registrations and existing-only retained ID files. Both reserve before either
+registration ends; their implicit row IDs and permanent logical IDs must differ.
+Killing one child releases its row claim through kernel liveness reconciliation,
+while its acknowledged logical floor remains consumed. The surviving child exits,
+then quiescent compaction and a full reopen must preserve the decreasing floor.
+Every fresh incarnation loads and durably mirrors the selected witness before
+reconciling its epoch. The fixture uses a fixed empty committed oracle, so it does
+not stand in for real database/VM/PHP integration or transactional cursor tests.
+
+The body compiles on macOS and is explicitly ignored outside 64-bit Linux. Local
+checks pass 55 shared-ID tests with this one native test ignored; the broader
+`shared_` filter passes 139 tests with three explicit ignores. The witness abort
+test now starts with incarnation readiness false and confirms that it remains
+false after delayed callbacks retire, with snapshot admission still rejected.
+Native process execution remains a hosted Linux check.
