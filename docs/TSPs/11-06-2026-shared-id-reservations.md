@@ -636,3 +636,60 @@ selectable only once its complete snapshot is referenced. Test clippy passes wit
 the previously documented baseline allowances; changed-file formatting passes.
 Finalization, abort proof consumption, and real checkpoint recovery remain pending
 coordinator integration.
+
+
+## Committed oracle adapter proposal
+
+The adapter belongs in `database/shared_id_oracle.rs`; it implements the existing
+`CommittedIdOracle` identity/poll interface. It must read the latest imported
+committed prefix, never the requester's older transaction snapshot or its local
+uncommitted writes. `MvccLazyCursor::new` already takes an explicit TxID, so no
+connection transaction-pointer swap is required. A dedicated temporary read
+transaction and pager read mark remain owned by the adapter. Cleanup calls the
+parent's `rollback_tx_inner(tx_id, None, db)` so it cannot clear the requesting
+connection's transaction or reset its local schema.
+
+Before construction, the coordinator supplies an exact refresh proof matching
+`RecoveryIdentity` and the held authority. Unresolved local `Preparing`
+transactions require recovery/BUSY: ordinary MVCC visibility deliberately permits
+speculative Preparing versions and registers commit dependencies, so merely
+choosing a high timestamp does not make that cursor a committed oracle. A new
+global snapshot registration under the same authority protects the temporary
+read; its lifetime and local read transaction end together after cursors retire.
+
+`RowExists` uses exact rowid seek, and `RowFacts.maximum` uses the committed table
+cursor's last row. Domain resolution must use committed schema/root identity from
+this temporary snapshot, not the outer connection schema. AUTOINCREMENT lookup
+must preserve the existing sqlite_sequence scan rules: the first matching row in
+rowid order, NOCASE name comparison, and AddImm-compatible integer coercion
+(`vdbe::execute::extract_int_value`). It must not replace these with a maximum over
+duplicate rows or reject noninteger values accepted by ordinary execution. The
+committed schema also supplies logical/physical root bounds for `LogicalFloor`;
+uncommitted root-map entries are not a substitute for committed schema facts.
+
+The remaining construction seam is a dedicated pager whose main-file AND WAL
+read submissions pin the supplied publication lease before submission, retaining
+the pin through physical completion destruction. Adding a pin to a cursor's
+returned Completion is too late: CompletionGroup::add requires linkage before
+submission and before completion. Blanket read gating on shared GuardedFile would
+interfere with unrelated readers, so the binding must be scoped to this dedicated
+reader. The coordinator/pager owner must supply that seam before implementation
+can claim cancellation safety.
+
+Required checks: outer uncommitted insert/delete and schema changes are excluded;
+a newer imported committed row is included despite the outer old snapshot;
+unresolved Preparing versions cannot yield a reservation; empty, negative-only,
+and maximum-rowid tables preserve policy; sqlite_sequence duplicate/case/type
+behavior matches ordinary execution; cancellation and delayed main/WAL callbacks
+retain authority and read state until physical retirement; cleanup leaves the
+outer transaction and pager unchanged. These are adapter requirements, not yet
+implemented or accepted runtime behavior.
+
+
+Hosted run `42289956214` passed all 56 shared-ID tests on Linux, including the
+corrected independent-process reservation/death/reopen fixture and deterministic
+startup-BUSY barriers. Authority, basic-open, and actual-commit checks also passed
+in that run. The workflow later failed because a separate VDBE selector requested
+ignored tests and selected zero; that failure does not invalidate the executed ID
+test evidence and does not make the complete workflow successful. This hosted
+run predates the six cross-generation preparation tests.
