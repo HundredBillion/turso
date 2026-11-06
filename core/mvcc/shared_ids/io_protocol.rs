@@ -143,6 +143,14 @@ pub(in crate::mvcc) struct LoadedIds {
 }
 
 impl LoadedIds {
+    pub(in crate::mvcc) fn guard(&self) -> &AuthorityGuard {
+        &self.guard
+    }
+
+    pub(in crate::mvcc) fn has_pending_checkpoint(&self) -> bool {
+        self.selection.selector.prepared.is_some()
+    }
+
     fn max_owner_epoch(&self) -> Result<Option<u64>> {
         let mut maximum = self.state.max_owner_epoch();
         if let Some(prepared) = self.selection.selector.prepared {
