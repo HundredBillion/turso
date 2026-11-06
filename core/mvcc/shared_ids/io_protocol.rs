@@ -1,3 +1,6 @@
+#[path = "witness_mirror.rs"]
+pub(in crate::mvcc) mod witness_mirror;
+
 #[path = "compaction.rs"]
 pub(in crate::mvcc) mod compaction;
 
@@ -140,6 +143,26 @@ pub(in crate::mvcc) struct LoadedIds {
 }
 
 impl LoadedIds {
+    fn max_owner_epoch(&self) -> Result<Option<u64>> {
+        let mut maximum = self.state.max_owner_epoch();
+        if let Some(prepared) = self.selection.selector.prepared {
+            let other = if self.selection.selected.bank == prepared.bank {
+                self.selection.selector.active
+            } else {
+                prepared
+            };
+            let state = replay_selected(
+                SelectedIds {
+                    selected: other,
+                    ..self.selection
+                },
+                [&self.banks[0], &self.banks[1]],
+            )?;
+            maximum = maximum.into_iter().chain(state.max_owner_epoch()).max();
+        }
+        Ok(maximum)
+    }
+
     pub(in crate::mvcc) fn retained_bytes(&self) -> Result<u64> {
         use crate::io::File;
         self.guard.published()?;
@@ -522,7 +545,7 @@ mod tests {
                     0
                 }
                 Mutation::Sync => {
-                    *self.durable.lock() = self.bytes.lock().clone();
+                    self.durable.lock().clone_from(&self.bytes.lock());
                     0
                 }
             };
@@ -1961,6 +1984,214 @@ mod tests {
         );
     }
 
+    #[test]
+    fn id_witness_proof_waits_for_both_syncs_and_backend_retirement() {
+        let f = writable_fixture();
+        let owner = journal::Owner {
+            epoch: 91,
+            begin: 3,
+        };
+        let mut current = loaded(&f);
+        for change in [
+            journal::Change::Claim {
+                owner,
+                ordinal: 1,
+                claim: journal::Claim {
+                    key: journal::ClaimKey::LogicalTable,
+                    value: -200,
+                },
+            },
+            journal::Change::ReleaseOwner { owner },
+        ] {
+            let mut append = current.append(change).unwrap();
+            let IOResult::Done(next) = append.poll().unwrap() else {
+                panic!("synchronous append");
+            };
+            current = next;
+        }
+        let bank_mutations = f.bank.mutations.load(Ordering::Acquire);
+        f.selector.delay_mutations.store(true, Ordering::Release);
+        let mut mirror = current.mirror_current_witness().unwrap();
+        for _ in 0..4 {
+            let IOResult::IO(waiter) = mirror.poll().unwrap() else {
+                panic!("mirror mutation must wait");
+            };
+            assert!(!waiter.0.finished());
+            f.selector.complete_mutation(true);
+        }
+        let IOResult::IO(waiter) = mirror.poll().unwrap() else {
+            panic!("mirror callbacks remain live");
+        };
+        assert!(!waiter.0.finished());
+        assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+        f.selector.retire();
+        let IOResult::Done(proof) = mirror.poll().unwrap() else {
+            panic!("mirror callbacks retired");
+        };
+        let (guard, max_epoch) = proof.into_guard_and_max_owner_epoch();
+        assert_eq!(max_epoch, Some(91));
+        assert_eq!(f.bank.mutations.load(Ordering::Acquire), bank_mutations);
+        guard.finish().unwrap();
+    }
+
+    fn retired_epoch_journal(f: &Fixture) -> LoadedIds {
+        let owner = journal::Owner {
+            epoch: 91,
+            begin: 3,
+        };
+        let mut current = loaded(f);
+        for change in [
+            journal::Change::Claim {
+                owner,
+                ordinal: 1,
+                claim: journal::Claim {
+                    key: journal::ClaimKey::LogicalTable,
+                    value: -200,
+                },
+            },
+            journal::Change::ReleaseOwner { owner },
+        ] {
+            let mut append = current.append(change).unwrap();
+            let IOResult::Done(next) = append.poll().unwrap() else {
+                panic!("synchronous append");
+            };
+            current = next;
+        }
+        current
+    }
+    #[test]
+    fn id_witness_proof_covers_owner_epochs_in_both_active_and_prepared_banks() {
+        let mut f = writable_fixture();
+        retired_epoch_journal(&f).into_guard().finish().unwrap();
+        let target = DatabaseGeneration {
+            generation: 2,
+            checkpoint_timestamp: 0,
+        };
+        let mut bytes = InitialIds::new(f.files.database_id, target, -500)
+            .unwrap()
+            .bank_a;
+        bytes[..PAGE_SIZE].copy_from_slice(
+            &BankHeader {
+                database_id: f.files.database_id,
+                database: target,
+                bank_generation: 2,
+            }
+            .encode()
+            .unwrap(),
+        );
+        let prepared = BankRef {
+            bank: 1,
+            bank_generation: 2,
+            database: target,
+            end: bytes.len() as u64,
+            snapshot_end: bytes.len() as u64,
+            running_crc: crc32c::crc32c(&bytes),
+        };
+        *f.unused.bytes.lock() = bytes;
+        let mut selector = IdSelector::decode(&f.selector.bytes.lock()[..PAGE_SIZE])
+            .unwrap()
+            .unwrap();
+        selector.sequence += 1;
+        selector.prepared = Some(prepared);
+        let encoded = selector.encode().unwrap();
+        f.selector.bytes.lock()[..PAGE_SIZE].copy_from_slice(&encoded);
+        f.selector.bytes.lock()[PAGE_SIZE..].copy_from_slice(&encoded);
+        f.identity.database = target;
+        let current = loaded(&f);
+        assert_eq!(current.state.max_owner_epoch(), None);
+        let mut mirror = current.mirror_current_witness().unwrap();
+        let IOResult::Done(proof) = mirror.poll().unwrap() else {
+            panic!("synchronous witness mirror");
+        };
+        let (guard, epoch) = proof.into_guard_and_max_owner_epoch();
+        assert_eq!(
+            epoch,
+            Some(91),
+            "still-referenced active bank retains retired epochs"
+        );
+        assert_eq!(
+            IdSelector::decode(&f.selector.durable.lock()[..PAGE_SIZE])
+                .unwrap()
+                .unwrap(),
+            selector
+        );
+        guard.finish().unwrap();
+    }
+    #[test]
+    fn id_witness_proof_prevents_fallback_to_forgotten_owner_epochs() {
+        let f = writable_fixture();
+        let current = retired_epoch_journal(&f);
+        let step = Arc::new(AtomicUsize::new(0));
+        for file in [&f.bank, &f.unused, &f.selector] {
+            *file.fault.lock() = Some((step.clone(), 10));
+        }
+        let mut compact = current.compact_floor_only(f.identity, -1).unwrap();
+        assert!(compact.poll().is_err());
+        drop(compact);
+        for file in [&f.bank, &f.unused, &f.selector] {
+            *file.fault.lock() = None;
+        }
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(f.identity.prefix).unwrap();
+        let mut load = f.files.load(guard, f.identity).unwrap();
+        let IOResult::Done(current) = load.poll().unwrap() else {
+            panic!("synchronous load");
+        };
+        assert_eq!(current.state.max_owner_epoch(), None);
+        let mut mirror = current.mirror_current_witness().unwrap();
+        let IOResult::Done(proof) = mirror.poll().unwrap() else {
+            panic!("synchronous witness mirror");
+        };
+        let (guard, epoch) = proof.into_guard_and_max_owner_epoch();
+        assert_eq!(epoch, None);
+        let mut slots = f.selector.durable.lock().clone();
+        slots[0] ^= 1;
+        let a = f.bank.durable.lock();
+        let b = f.unused.durable.lock();
+        let selected = select(
+            [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+            [&a, &b],
+            f.files.database_id,
+            f.identity.database,
+        )
+        .unwrap();
+        let state = replay_selected(selected, [&a, &b]).unwrap();
+        assert_eq!(
+            state.max_owner_epoch(),
+            None,
+            "older retired owner cannot become selectable after readiness"
+        );
+        assert_eq!(state.logical_floor, -200);
+        guard.finish().unwrap();
+    }
+    #[test]
+    fn id_witness_abort_never_releases_authority_before_backend_retirement() {
+        for cancel_at in 0..4 {
+            let f = writable_fixture();
+            f.selector.delay_mutations.store(true, Ordering::Release);
+            let mut mirror = loaded(&f).mirror_current_witness().unwrap();
+            for step in 0..=cancel_at {
+                let IOResult::IO(waiter) = mirror.poll().unwrap() else {
+                    panic!("mirror mutation pending");
+                };
+                if step == cancel_at {
+                    waiter.0.abort();
+                    assert!(mirror.poll().is_err());
+                    drop(mirror);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    f.selector.complete_mutation(true);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    f.selector.retire();
+                    let mut guard = f.authority.try_acquire().unwrap();
+                    guard.recover(f.identity.prefix).unwrap();
+                    guard.finish().unwrap();
+                    break;
+                }
+                f.selector.complete_mutation(false);
+            }
+        }
+    }
+
     struct RetirementIo {
         inner: crate::MemoryIO,
         backend: Arc<TestFile>,
@@ -2014,7 +2245,7 @@ mod tests {
         );
         let io = RetirementIo {
             inner: crate::MemoryIO::new(),
-            backend: f.selector.clone(),
+            backend: f.selector,
             steps: AtomicUsize::new(0),
         };
         io.wait_for_completion(waiter.0).unwrap();

@@ -539,7 +539,7 @@ mod codec {
         assert!(select([&low, &high], [&old, &corrupt_header], ID, DATABASE).is_err());
         assert!(select([&high, &high], [&old, &corrupt_header], ID, DATABASE).is_err());
         assert!(select([&low, &high], [&old, &new[..100]], ID, DATABASE).is_err());
-        let mut extended = new.clone();
+        let mut extended = new;
         extended.extend_from_slice(&[17; PAGE_SIZE]);
         let reference = BankRef {
             end: extended.len() as u64,
@@ -1044,6 +1044,9 @@ pub(super) mod journal {
             Ok(())
         }
 
+        pub(super) fn max_owner_epoch(&self) -> Option<u64> {
+            self.owners.keys().map(|owner| owner.epoch).max()
+        }
         pub(super) fn next_ordinal(&self, owner: Owner) -> Result<u64> {
             match self.owners.get(&owner) {
                 Some(claims) if claims.retired => Err(corrupt("ID owner is retired")),
@@ -1120,6 +1123,25 @@ pub(super) mod journal {
             table: -2,
             sequence: false,
         };
+        #[test]
+        fn owner_epoch_summary_includes_retired_keys_until_compaction() {
+            let owner = Owner {
+                epoch: 91,
+                begin: 3,
+            };
+            let state =
+                load(&[claim(owner, 1, DOMAIN, 1), Change::ReleaseOwner { owner }]).unwrap();
+            assert_eq!(state.max_owner_epoch(), Some(91));
+            let snapshot = Record {
+                sequence: 1,
+                change: Change::LogicalFloor(-200),
+            }
+            .encode()
+            .unwrap();
+            let compacted = State::replay_snapshot(&snapshot, 1, PAGE_SIZE).unwrap();
+            assert_eq!(compacted.max_owner_epoch(), None);
+            assert_eq!(compacted.logical_floor, -200);
+        }
         fn claim(owner: Owner, ordinal: u64, domain: Domain, value: i64) -> Change {
             Change::Claim {
                 owner,
