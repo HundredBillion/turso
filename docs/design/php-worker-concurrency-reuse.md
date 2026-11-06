@@ -24,7 +24,7 @@ With Node 24.22.2, matched fresh-process debug builds failed the unchanged 16 Mi
 
 A modern replay of seed `4849548719320319367` with `turso_whopper --mode fts-merge --max-steps 60000` passed in both WAL and MVCC modes. The original report lacks its full workload configuration and scheduling coordinates, so this is additional coverage, not proof that the historical mismatch is repaired.
 
-The branch additionally contains the independently reviewed aggregate misuse guard and matching C header version from the PHP compatibility follow-up. Invalid registered aggregate placement now returns an error instead of aborting the host. These changes do not resolve the separate deferred writer-activation or read-only startup hashing review findings.
+The branch includes the independently reviewed aggregate misuse guard and matching C header version from the PHP compatibility follow-up, now merged separately to fork main in [fork PR #10](https://github.com/HundredBillion/turso/pull/10). Invalid registered aggregate placement now returns an error instead of aborting the host. The expanded [Linux and Windows validation](https://github.com/HundredBillion/turso/actions/runs/42179131016) also passes the formerly failing header-lifecycle and PostgreSQL read-only probe cases. These changes do not resolve the separate deferred writer-activation or read-only startup hashing review findings.
 
 ## Already present
 
