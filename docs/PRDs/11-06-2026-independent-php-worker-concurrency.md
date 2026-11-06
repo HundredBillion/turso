@@ -43,6 +43,7 @@ Provide opt-in embedded cross-process MVCC, reachable through PHP's C compatibil
 - Start with globally quiescent checkpoints. Pause new transaction admission while waiting within a bounded busy deadline for active transactions to finish. Preserve readers rather than silently aborting them.
 - Enforce a configurable retained-log limit. If active snapshots prevent reclamation, additional commits return bounded `BUSY`; history must not grow without bound. Reject a transaction larger than the limit before appending any of it.
 - Read-only participants in this explicit mode may write coordination metadata while database, WAL and logical-log contents remain read-only. Reject the opt-in when coordination metadata cannot be written. Existing ordinary read-only opens retain their current guarantees.
+- Use a versioned on-disk mode marker for the explicit opt-in so older binaries reject the new mode, including read-only opens. Continue reading all existing database formats. An opted-in database requires explicit safe downgrade before older binaries can reopen it; upgrade and downgrade must preserve acknowledged commits across crashes.
 
 The source-level protocol proposal and delivery boundaries are in
 `docs/design/php-worker-mvcc-protocol.md`. These policies do not imply that the

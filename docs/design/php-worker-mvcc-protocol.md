@@ -81,6 +81,39 @@ modes. Opening a new sidecar alone does not accomplish this: the ordinary
 database lifetime lock and existing coordination-file version checks must be
 included in the proof. Test an old executable as an independent participant.
 
+### Old binaries and persistent mode selection
+
+Existing fork binaries inspect the physical `.tshm` lifetime lock even for
+ordinary read-only opens, through
+`Database::reject_live_multiprocess_wal_for_legacy_open`. Retaining that lifetime
+mapping can exclude those binaries. Binaries predating that check cannot be
+excluded from read-only access by multiple workers holding shared database locks.
+
+A persistent new `RawVersion` value is proposed to exclude those older readers:
+`Database` already rejects unknown header read/write versions before MVCC
+bootstrap. All existing versions remain readable by the new implementation.
+An opted-in database requires explicit safe downgrade before older binaries can
+reopen it. The user approved this compatibility policy on 2026-11-06. No header
+value has yet been allocated or changed in the implementation.
+
+Upgrade and downgrade must follow these transitions:
+
+| Transition | Required ownership and durable action | Crash recovery |
+| --- | --- | --- |
+| Start upgrade | Exclusive ordinary database lock, no legacy or protocol participants | Before any durable marker, ordinary old-format recovery remains valid |
+| Prepare upgrade | Finish ordinary MVCC recovery/checkpoint; synchronize database and sidecars | Reopen through ordinary recovery if the marker is still old |
+| Publish new marker | Write matching read/write versions through the pager and synchronize the complete checkpoint | Old readers reject a durable new marker; new readers reconcile incomplete physical WAL work |
+| Enable protocol admission | Create/validate coordination epoch only after marker durability | No shared-mode commit can precede durable old-reader exclusion |
+| Start downgrade | Close admission, wait for all transactions, acquire exclusive ordinary database ownership | Marker remains new; only protocol-aware recovery is allowed |
+| Materialize downgrade | Checkpoint all acknowledged commits, synchronize main database, clear logical history and finish WAL cleanup | Marker remains new until every committed row is represented in old-readable storage |
+| Publish old marker | Update read/write versions through ordinary pager commit and complete its synchronization | A surviving old marker is safe because materialization preceded it; ordinary WAL recovery handles the marker transaction |
+| Finish downgrade | Remove only unused logical coordination metadata after all protocol handles leave | Idle old-generation workers must fail mode validation before any new operation |
+
+The upgrade/downgrade commands and error mapping need explicit tests with an old
+executable, including an old read-only handle already open at upgrade start.
+Changing a marker directly with a byte write is not an implementation of this
+transition protocol.
+
 ## Begin and live replay
 
 Under admission and commit coordination, capture a complete committed prefix
@@ -163,6 +196,35 @@ logical metadata without trusting a half-published mapping. Reclamation and
 generation publication need a concrete crash-state table before implementation;
 the existing checkpoint callback pair alone is not that protocol.
 
+### Checkpoint crash-state table
+
+The following transitions run with transaction admission closed and global
+commit ownership held. No active transaction remains. The existing checkpoint
+states `SyncDbFile`, `TruncateLogicalLog`, `FsyncLogicalLog` and `TruncateWal`
+establish the durable order; a shared epoch cannot replace their synchronization.
+
+| Last completed transition | Durable evidence after owner death | Recovery before reopening admission |
+| --- | --- | --- |
+| Admission closed; no checkpoint writes | Old main database and complete logical prefix | Recover abandoned ownership, import old prefix, reopen admission |
+| Physical WAL frames written without commit | Old main database, incomplete WAL transaction, retained logical prefix | Discard uncommitted WAL tail and replay the full logical prefix |
+| Physical WAL commit synchronized | Committed WAL includes materialized rows and checkpoint timestamp; logical prefix retained | Complete WAL recovery, retaining the logical log until database sync succeeds |
+| Database backfill synchronized | Main database contains checkpoint timestamp and rows; WAL and logical prefix may both remain | Skip logical frames at or below checkpoint timestamp; continue reclamation |
+| Logical log truncated but truncation not synchronized | Main database durable; old, short or empty logical file may survive | Reconstruct from durable database/WAL metadata; never treat the old mapped offset as an append position |
+| Logical truncation synchronized, WAL retained | Durable checkpoint plus empty logical log | Complete WAL cleanup before publishing the next generation |
+| WAL cleanup completed, shared epoch not published | Durable database checkpoint; logical log empty | Rebuild local store and publish a fresh epoch under global ownership |
+| New epoch published | Completed checkpoint and coherent mapped epoch | Idle workers discard prior generation state before beginning |
+
+An empty logical file after checkpoint is represented by a zero-length prefix;
+the committed-prefix decoder is constructed only after a complete header exists.
+The first writer creates that header under global ownership. A read-only worker
+must not create it merely to represent an empty log.
+
+Each transition needs a process-kill point both before and after its completion
+is observed, plus short-write/sync-failure injection. A failed checkpoint must
+not publish a newer shared epoch until recovery has reconciled physical and
+logical files. If recovery itself fails, admission stays closed and callers
+receive the error within their deadline.
+
 ## Delivery and verification sequence
 
 | Stage | Deliverable | Required negative and positive evidence |
@@ -198,9 +260,10 @@ process cannot substitute for this evidence.
 ## Current execution limits
 
 The development host is macOS. The approved initial target is Linux, so native
-macOS success cannot establish support. Linux process/crash validation needs a
-Linux runner or VM. Heavy build and benchmark resources are coordinated with the
-storage agent; no concurrency build has been started by this proposal.
+macOS success cannot establish support. A local Docker Linux aarch64 runner is
+available. Heavy builds and benchmarks are coordinated with the storage agent.
+The committed-prefix reader has native unit-test evidence; that evidence does
+not establish Linux cross-process support.
 
 Storage issue #14 currently owns changes to read-only activation and I/O guards.
 Integrate its verified commit before final combined runtime validation. Do not
