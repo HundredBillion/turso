@@ -123,3 +123,18 @@ and each completed query leave no context pin blocking ID I/O retirement. Native
 execution of this new regression remains pending; the earlier factory/context
 Linux union passed in run 42295119883. Portable ID policy tests remain green
 (55 passed, one native-process test ignored on macOS).
+
+The followup native cancellation fixture wraps the retained main file through a
+forwarding test IO backend and arms a deferred pread only after ordinary open and
+outer snapshot registration. Both explicit completion abort and dropping a
+pending query remove the temporary transaction without changing the outer read
+mark. Competing authority remains blocked before the physical callback and after
+callback execution while the backend retains its completion; only retirement
+releases it. This exercises the composed oracle/main-pager lifetime, separately
+from the WAL routing tests. The membership fixture also checks a missing row
+between existing rows, not only a key above the maximum.
+
+Both native adapter test bodies typecheck on macOS with temporarily widened test
+fixture cfgs; those cfg edits are restored before publication, and no native
+execution is claimed. Their production selector remains Linux-only and ignored
+for explicit hosted execution.
