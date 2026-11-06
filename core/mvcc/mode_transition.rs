@@ -1032,3 +1032,16 @@ pub(super) mod tests {
         assert!(second.exists());
     }
 }
+
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+pub(crate) fn prepare_test_namespace(
+    path: &Path,
+    timestamp: u64,
+    history_limit: u64,
+) -> Result<()> {
+    let file = File::open(path).map_err(fs_error)?;
+    require_marker(&file, SHARED_MVCC_VERSION)?;
+    let id = identity(&file)?;
+    let namespace = namespace_for(path, id)?;
+    prepare_namespace(&namespace, id, timestamp, history_limit)
+}

@@ -305,6 +305,12 @@ pub(crate) struct SharedBootstrapState {
     tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
 }
 
+impl SharedBootstrapState {
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self.stage, SharedBootstrapStage::Done)
+    }
+}
+
 #[derive(Default)]
 enum SharedBootstrapStage {
     #[default]
@@ -430,5 +436,79 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
             state.post = None;
         }
         result
+    }
+}
+
+#[cfg(all(test, not(shuttle)))]
+pub(crate) fn materialize_marked_fixture(path: &Path) -> u64 {
+    use crate::io::OpenFlags;
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let db = crate::Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        crate::DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(crate::EngineDialect),
+    )
+    .unwrap();
+    let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+    connection.execute("CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO preserved VALUES(1,'durable payload')").unwrap();
+    connection
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let timestamp = db
+        .get_mv_store()
+        .as_ref()
+        .unwrap()
+        .durable_txid_max
+        .load(Ordering::Acquire);
+    assert!(timestamp > 0);
+    connection.demote_to_mvcc_connection();
+    connection.reparse_schema().unwrap();
+    *db.schema.lock() = connection.schema.read().clone();
+    connection.execute("BEGIN IMMEDIATE").unwrap();
+    let pager = connection.pager.load().clone();
+    io.block(|| {
+        pager.with_header_mut(|header| {
+            header.read_version = crate::storage::sqlite3_ondisk::RawVersion(SHARED_MVCC_VERSION);
+            header.write_version = crate::storage::sqlite3_ondisk::RawVersion(SHARED_MVCC_VERSION);
+        })
+    })
+    .unwrap();
+    connection.execute("COMMIT").unwrap();
+    connection
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    connection.close().unwrap();
+    drop(connection);
+    drop(pager);
+    drop(db);
+    timestamp
+}
+
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+pub(crate) fn shared_runtime_fixture(dir: &Path) -> (PathBuf, u64) {
+    let path = dir.join("shared.db");
+    let timestamp = materialize_marked_fixture(&path);
+    let limit = 64 * 1024 * 1024;
+    crate::mvcc::mode_transition::prepare_test_namespace(&path, timestamp, limit).unwrap();
+    (path, limit)
+}
+
+#[cfg(all(test, not(shuttle)))]
+mod tests {
+    use super::*;
+    #[test]
+    fn shared_fixture_materializes_metadata_and_marker_through_pager() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marked.db");
+        let timestamp = materialize_marked_fixture(&path);
+        assert!(timestamp > 0);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[18..20], &[SHARED_MVCC_VERSION; 2]);
+        assert!(!bytes.is_empty());
     }
 }
