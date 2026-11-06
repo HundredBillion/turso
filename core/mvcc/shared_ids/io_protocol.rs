@@ -1,3 +1,6 @@
+#[path = "compaction.rs"]
+pub(in crate::mvcc) mod compaction;
+
 use super::*;
 use crate::mvcc::guarded_file::{FileBinding, GuardedFile};
 use crate::mvcc::shared_authority::{AuthorityGuard, PublicationLease, PublishedPrefix};
@@ -1142,6 +1145,7 @@ mod tests {
     }
     fn writable_fixture() -> Fixture {
         let f = fixture();
+        f.unused.writable.store(true, Ordering::Release);
         f.bank.writable.store(true, Ordering::Release);
         f.selector.writable.store(true, Ordering::Release);
         f
@@ -1666,6 +1670,295 @@ mod tests {
         let physical =
             f.bank.size().unwrap() + f.unused.size().unwrap() + f.selector.size().unwrap();
         assert_eq!(f.files.history_budget - physical, (2 * PAGE_SIZE) as u64);
+    }
+
+    #[test]
+    fn id_compaction_reclaims_space_without_reusing_the_permanent_floor() {
+        let mut f = writable_fixture();
+        Arc::get_mut(&mut f.files).unwrap().history_budget = (8 * PAGE_SIZE) as u64;
+        let mut current = loaded(&f);
+        for floor in [-200, -300] {
+            let mut append = current
+                .append(journal::Change::LogicalFloor(floor))
+                .unwrap();
+            let IOResult::Done(next) = append.poll().unwrap() else {
+                panic!("synchronous fixture");
+            };
+            current = next;
+        }
+        let mut compact = current.compact_floor_only(f.identity, -250).unwrap();
+        let IOResult::Done(current) = compact.poll().unwrap() else {
+            panic!("synchronous compactor");
+        };
+        assert_eq!(current.state.logical_floor, -300);
+        assert_eq!(current.state.last_record, 1);
+        assert_eq!(current.retained_bytes().unwrap(), INITIAL_RETAINED_BYTES);
+        assert_eq!(
+            current.required_budget_bytes().unwrap(),
+            MIN_ID_BUDGET_BYTES
+        );
+        assert_eq!(f.bank.size().unwrap(), 0);
+        let mut append = current.append(journal::Change::LogicalFloor(-400)).unwrap();
+        let IOResult::Done(current) = append.poll().unwrap() else {
+            panic!("capacity reclaimed");
+        };
+        current.into_guard().finish().unwrap();
+        let current = loaded(&f);
+        assert_eq!(current.state.logical_floor, -400);
+        current.into_guard().finish().unwrap();
+    }
+
+    fn compaction_file(f: &Fixture, step: usize) -> &Arc<TestFile> {
+        match step {
+            0..=3 | 8..=11 => &f.selector,
+            4 | 12..=13 => &f.bank,
+            5..=7 => &f.unused,
+            _ => unreachable!(),
+        }
+    }
+    #[test]
+    fn id_compaction_rejects_live_readers_stale_identity_and_invalid_floor_before_writes() {
+        for case in 0..4 {
+            let f = writable_fixture();
+            let _reader = (case == 0).then(|| registration(&f));
+            if case == 3 {
+                let mut selector = IdSelector::decode(&f.selector.bytes.lock()[..PAGE_SIZE])
+                    .unwrap()
+                    .unwrap();
+                selector.sequence = u64::MAX;
+                let page = selector.encode().unwrap();
+                let mut bytes = f.selector.bytes.lock();
+                bytes[..PAGE_SIZE].copy_from_slice(&page);
+                bytes[PAGE_SIZE..].copy_from_slice(&page);
+            }
+            let mut identity = f.identity;
+            if case == 1 {
+                identity.database.generation += 1;
+            }
+            let result = loaded(&f).compact_floor_only(identity, if case == 2 { 0 } else { -200 });
+            if case == 0 {
+                assert!(matches!(result, Err(LimboError::Busy)));
+            } else {
+                assert!(result.is_err());
+            }
+            for file in [&f.bank, &f.unused, &f.selector] {
+                assert_eq!(file.mutations.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+    #[test]
+    fn id_compaction_failure_boundaries_preserve_a_complete_durable_floor() {
+        for fail_at in 0..14 {
+            let f = writable_fixture();
+            let step = Arc::new(AtomicUsize::new(0));
+            for file in [&f.bank, &f.unused, &f.selector] {
+                *file.fault.lock() = Some((step.clone(), fail_at));
+            }
+            let mut compact = loaded(&f).compact_floor_only(f.identity, -200).unwrap();
+            assert!(compact.poll().is_err(), "failure boundary {fail_at}");
+            assert!(compact.poll().is_err());
+            drop(compact);
+            let slots = f.selector.durable.lock();
+            let old = f.bank.durable.lock();
+            let next = f.unused.durable.lock();
+            let selected = select(
+                [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+                [&old, &next],
+                f.files.database_id,
+                f.identity.database,
+            )
+            .unwrap();
+            assert_eq!(
+                replay_selected(selected, [&old, &next])
+                    .unwrap()
+                    .logical_floor,
+                if fail_at >= 10 { -200 } else { -100 },
+                "failure boundary {fail_at}"
+            );
+        }
+    }
+    #[test]
+    fn id_compaction_waits_for_every_mutation_and_all_backend_callbacks() {
+        let f = writable_fixture();
+        for file in [&f.bank, &f.unused, &f.selector] {
+            file.delay_mutations.store(true, Ordering::Release);
+        }
+        let mut compact = loaded(&f).compact_floor_only(f.identity, -200).unwrap();
+        for step in 0..14 {
+            let IOResult::IO(waiter) = compact.poll().unwrap() else {
+                panic!("step {step} must wait");
+            };
+            assert!(!waiter.0.finished());
+            assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+            compaction_file(&f, step).complete_mutation(true);
+        }
+        let IOResult::IO(waiter) = compact.poll().unwrap() else {
+            panic!("retirement must wait");
+        };
+        assert!(!waiter.0.finished());
+        f.bank.retire();
+        f.unused.retire();
+        assert!(!waiter.0.finished());
+        f.selector.retire();
+        assert!(waiter.0.finished());
+        let IOResult::Done(result) = compact.poll().unwrap() else {
+            panic!("all callbacks retired");
+        };
+        result.into_guard().finish().unwrap();
+    }
+    #[test]
+    fn id_compaction_abort_at_each_mutation_keeps_authority_until_retirement() {
+        for cancel_at in 0..14 {
+            let f = writable_fixture();
+            for file in [&f.bank, &f.unused, &f.selector] {
+                file.delay_mutations.store(true, Ordering::Release);
+            }
+            let mut compact = loaded(&f).compact_floor_only(f.identity, -200).unwrap();
+            for step in 0..=cancel_at {
+                let IOResult::IO(waiter) = compact.poll().unwrap() else {
+                    panic!("step {step} must wait");
+                };
+                let file = compaction_file(&f, step);
+                if step == cancel_at {
+                    waiter.0.abort();
+                    assert!(compact.poll().is_err());
+                    drop(compact);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    file.complete_mutation(true);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    file.retire();
+                    let mut guard = f.authority.try_acquire().unwrap();
+                    assert!(guard.requires_recovery());
+                    guard.recover(PublishedPrefix::default()).unwrap();
+                    guard.finish().unwrap();
+                    break;
+                }
+                file.complete_mutation(false);
+            }
+        }
+    }
+    #[test]
+    fn id_compaction_repeatedly_bounds_bytes_and_retains_inode_identities() {
+        let mut f = writable_fixture();
+        Arc::get_mut(&mut f.files).unwrap().history_budget = (8 * PAGE_SIZE) as u64;
+        let ids = [
+            f.bank.file_id().unwrap(),
+            f.unused.file_id().unwrap(),
+            f.selector.file_id().unwrap(),
+        ];
+        let mut current = loaded(&f);
+        let mut floor = -100;
+        for _ in 0..4 {
+            for _ in 0..2 {
+                floor -= 1;
+                let mut append = current
+                    .append(journal::Change::LogicalFloor(floor))
+                    .unwrap();
+                let IOResult::Done(next) = append.poll().unwrap() else {
+                    panic!("synchronous append");
+                };
+                current = next;
+            }
+            let mut compact = current.compact_floor_only(f.identity, -1).unwrap();
+            let IOResult::Done(next) = compact.poll().unwrap() else {
+                panic!("synchronous compactor");
+            };
+            current = next;
+            assert_eq!(current.state.logical_floor, floor);
+            assert_eq!(current.retained_bytes().unwrap(), INITIAL_RETAINED_BYTES);
+            assert_eq!(
+                ids,
+                [
+                    f.bank.file_id().unwrap(),
+                    f.unused.file_id().unwrap(),
+                    f.selector.file_id().unwrap()
+                ]
+            );
+        }
+        current.into_guard().finish().unwrap();
+    }
+
+    #[test]
+    fn id_compaction_syncs_both_current_witnesses_before_reusing_the_other_bank() {
+        let f = writable_fixture();
+        let previous = f.bank.bytes.lock().clone();
+        *f.unused.bytes.lock() = previous.clone();
+        *f.unused.durable.lock() = previous;
+        let mut current = IdSelector::decode(&f.selector.bytes.lock()[..PAGE_SIZE])
+            .unwrap()
+            .unwrap();
+        let mut old = current;
+        old.active.bank = 1;
+        current.sequence = 2;
+        current.active.bank_generation = 2;
+        f.bank.bytes.lock()[..PAGE_SIZE].copy_from_slice(
+            &BankHeader {
+                database_id: f.files.database_id,
+                bank_generation: 2,
+                database: f.identity.database,
+            }
+            .encode()
+            .unwrap(),
+        );
+        current.active.running_crc = crc32c::crc32c(&f.bank.bytes.lock());
+        *f.bank.durable.lock() = f.bank.bytes.lock().clone();
+        {
+            let mut slots = f.selector.bytes.lock();
+            slots[..PAGE_SIZE].copy_from_slice(&current.encode().unwrap());
+            slots[PAGE_SIZE..].copy_from_slice(&old.encode().unwrap());
+            *f.selector.durable.lock() = slots.clone();
+        }
+        for file in [&f.bank, &f.unused, &f.selector] {
+            file.delay_mutations.store(true, Ordering::Release);
+        }
+        let mut compact = loaded(&f).compact_floor_only(f.identity, -200).unwrap();
+        let mut stopped_before_successor = false;
+        for _ in 0..20 {
+            assert!(matches!(compact.poll().unwrap(), IOResult::IO(_)));
+            let file = [&f.bank, &f.unused, &f.selector]
+                .into_iter()
+                .find(|file| file.pending_mutation.lock().is_some())
+                .unwrap();
+            let successor_write = match file.pending_mutation.lock().as_ref().unwrap() {
+                (Mutation::Write(0, bytes), _) if Arc::ptr_eq(file, &f.selector) => {
+                    IdSelector::decode(bytes.as_slice())
+                        .unwrap()
+                        .unwrap()
+                        .sequence
+                        == 3
+                }
+                _ => false,
+            };
+            if successor_write {
+                let (_, completion) = file.pending_mutation.lock().take().unwrap();
+                completion.error(crate::error::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "stop before successor selector",
+                ));
+                assert!(compact.poll().is_err());
+                stopped_before_successor = true;
+                break;
+            }
+            file.complete_mutation(false);
+        }
+        assert!(stopped_before_successor);
+        drop(compact);
+        let mut slots = f.selector.durable.lock().clone();
+        slots[0] ^= 1;
+        let a = f.bank.durable.lock();
+        let b = f.unused.durable.lock();
+        let selected = select(
+            [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+            [&a, &b],
+            f.files.database_id,
+            f.identity.database,
+        )
+        .unwrap();
+        assert_eq!(selected.selector.sequence, 2);
+        assert_eq!(
+            replay_selected(selected, [&a, &b]).unwrap().logical_floor,
+            -100
+        );
     }
 
     struct RetirementIo {
