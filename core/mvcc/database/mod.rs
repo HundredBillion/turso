@@ -1939,13 +1939,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     pub(crate) fn can_preserve_shared_preflight(&self) -> bool {
         #[cfg(all(host_shared_wal, unix))]
         {
-            return self.shared_preflight_preservable
+            self.shared_preflight_preservable
                 && self.shared_commit.is_none()
                 && self.tx_entry.as_ref().is_some_and(|entry| {
                     !entry.is_removed()
                         && entry.value().state.load() == TransactionState::Active
                         && !entry.value().log_appended.load(Ordering::Acquire)
-                });
+                })
         }
         #[cfg(not(all(host_shared_wal, unix)))]
         {
