@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 43e04947da6c171a993f219877ea51bf6a7dcc45
+          ref: 88c5fc910314289b3c99f9c9e9e2da85dee2e769
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,20 +25,20 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 43e04947da6c171a993f219877ea51bf6a7dcc45
+          test "$(git rev-parse HEAD)" = 88c5fc910314289b3c99f9c9e9e2da85dee2e769
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Lost mapped epoch reproduces reused durable owner identity
+      - name: Concrete ordinary offline upgrade has no implementation yet
         run: |
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api authority_incarnation_does_not_reuse_durable_owner_after_mapped_state_loss -- --test-threads=1 --nocapture 2>&1 | tee epoch-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_upgrades_real_mvcc_data -- --test-threads=1 --nocapture 2>&1 | tee offline-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'assertion failed: snapshot.epoch > acknowledged_owner.0' epoch-red.log
-          grep -q '0 passed; 1 failed' epoch-red.log
+          grep -q 'ordinary offline backend is not implemented' offline-red.log
+          grep -q '0 passed; 1 failed' offline-red.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
