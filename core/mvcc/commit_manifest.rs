@@ -1,4 +1,5 @@
 pub(super) mod checkpoint_publication;
+pub(super) mod downgrade_publication;
 
 use super::shared_authority::{AuthorityGuard, IoPin, PublicationLease, PublishedPrefix};
 use crate::io::FileId;
@@ -1307,6 +1308,155 @@ mod tests {
                     file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn commit_manifest_downgrade_cannot_use_generic_commit_publication() {
+        let previous = record(1, 1, 0, 10, 0);
+        let next = previous.begin_downgrade(WAL_ID).unwrap();
+        let file = DelayedManifestFile::initialized(previous);
+        assert!(LoadedManifest {
+            file,
+            guard: None,
+            slot: 0,
+            record: previous
+        }
+        .publish(next)
+        .is_err());
+    }
+
+    #[cfg(not(shuttle))]
+    #[test]
+    fn commit_manifest_downgrade_publication_waits_for_both_syncs_and_retirement() {
+        use super::super::shared_authority::authority_for_test;
+        let previous = record(1, 1, 0, 10, 0);
+        let file = DelayedManifestFile::initialized(previous);
+        let authority = authority_for_test(file.clone());
+        let mut guard = authority.try_acquire().unwrap();
+        guard.recover(previous.prefix()).unwrap();
+        let mut publication = downgrade_publication::DowngradeIntentPublication::synthetic(
+            LoadedManifest {
+                file: file.clone(),
+                guard: Some(guard),
+                slot: 0,
+                record: previous,
+            },
+            WAL_ID,
+        )
+        .unwrap();
+        for step in 0..4 {
+            assert!(
+                matches!(publication.poll().unwrap(), IOResult::IO(_)),
+                "early proof at {step}"
+            );
+            if step == 3 {
+                let retained = file.pending.lock().as_ref().unwrap().1.clone();
+                file.retire(0, false);
+                let IOResult::IO(waiter) = publication.poll().unwrap() else {
+                    panic!("backend pin not retired")
+                };
+                assert!(!waiter.0.finished());
+                drop(retained);
+            } else {
+                file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
+            }
+        }
+        let IOResult::Done(proof) = publication.poll().unwrap() else {
+            panic!("both copies retired")
+        };
+        assert_eq!(file.syncs.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(proof.record().downgrade_intent().is_some());
+        assert_eq!(proof.guard().published().unwrap(), previous.prefix());
+        assert!(proof.guard().io_retired());
+        let bytes = file.bytes.lock();
+        for offset in [0, SLOT_SIZE] {
+            assert_eq!(
+                ManifestRecord::decode(&bytes[offset..offset + RECORD_SIZE]).unwrap(),
+                Some(proof.record())
+            );
+        }
+        drop(bytes);
+        assert!(publication.poll().is_err());
+        drop(proof);
+        assert!(authority.try_acquire().unwrap().requires_recovery());
+    }
+
+    #[cfg(not(shuttle))]
+    #[test]
+    fn commit_manifest_downgrade_publication_failure_abort_and_short_write_retain_ownership() {
+        use super::super::shared_authority::authority_for_test;
+        for boundary in 0..4 {
+            for abort in [false, true] {
+                let previous = record(1, 1, 0, 10, 0);
+                let file = DelayedManifestFile::initialized(previous);
+                let authority = authority_for_test(file.clone());
+                let mut guard = authority.try_acquire().unwrap();
+                guard.recover(previous.prefix()).unwrap();
+                let mut publication = downgrade_publication::DowngradeIntentPublication::synthetic(
+                    LoadedManifest {
+                        file: file.clone(),
+                        guard: Some(guard),
+                        slot: 0,
+                        record: previous,
+                    },
+                    WAL_ID,
+                )
+                .unwrap();
+                for step in 0..=boundary {
+                    let IOResult::IO(waiter) = publication.poll().unwrap() else {
+                        panic!("early proof")
+                    };
+                    if step == boundary {
+                        if abort {
+                            waiter.0.abort();
+                            drop(publication);
+                            assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
+                            file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
+                        } else {
+                            file.retire(0, true);
+                            assert!(publication.poll().is_err());
+                            drop(publication);
+                        }
+                        drop(waiter);
+                        assert!(authority.try_acquire().unwrap().requires_recovery());
+                        break;
+                    }
+                    drop(waiter);
+                    file.retire(if step % 2 == 0 { SLOT_SIZE } else { 0 }, false);
+                }
+            }
+        }
+        for boundary in [0, 2] {
+            let previous = record(1, 1, 0, 10, 0);
+            let file = DelayedManifestFile::initialized(previous);
+            let authority = authority_for_test(file.clone());
+            let mut guard = authority.try_acquire().unwrap();
+            guard.recover(previous.prefix()).unwrap();
+            let mut publication = downgrade_publication::DowngradeIntentPublication::synthetic(
+                LoadedManifest {
+                    file: file.clone(),
+                    guard: Some(guard),
+                    slot: 0,
+                    record: previous,
+                },
+                WAL_ID,
+            )
+            .unwrap();
+            for step in 0..=boundary {
+                assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+                file.retire(
+                    if step == boundary {
+                        SLOT_SIZE - 1
+                    } else if step % 2 == 0 {
+                        SLOT_SIZE
+                    } else {
+                        0
+                    },
+                    false,
+                );
+            }
+            assert!(publication.poll().is_err());
         }
     }
 
