@@ -138,6 +138,17 @@ pub(super) struct SnapshotRegistration {
     slot: usize,
 }
 
+impl std::fmt::Debug for SnapshotRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotRegistration")
+            .field("begin_timestamp", &self.begin_timestamp)
+            .field("epoch", &self.epoch)
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SharedMvccAuthority {
     pub(super) fn file_id(&self) -> Result<Option<FileId>> {
         self.file.file_id()
@@ -461,10 +472,25 @@ impl AuthorityGuard {
         Err(LimboError::Busy)
     }
 
+    /// Return incarnation and begin timestamp while publication ownership excludes new admissions.
+    pub(super) fn live_registrations(&self) -> Result<Vec<(u64, u64)>> {
+        let mut live = Vec::new();
+        live.try_reserve_exact(SLOT_COUNT)?;
+        self.visit_live_registrations(|epoch, timestamp| live.push((epoch, timestamp)))?;
+        Ok(live)
+    }
+
     pub(super) fn oldest_snapshot(&self) -> Result<Option<u64>> {
+        let mut oldest = None;
+        self.visit_live_registrations(|_, timestamp| {
+            oldest = Some(oldest.map_or(timestamp, |old: u64| old.min(timestamp)));
+        })?;
+        Ok(oldest)
+    }
+
+    fn visit_live_registrations(&self, mut visit: impl FnMut(u64, u64)) -> Result<()> {
         self.require_recovered()?;
         let slots = self.authority.local_slots.lock();
-        let mut oldest = None;
         for (slot, locally_owned) in slots.iter().enumerate() {
             if !locally_owned
                 && self.authority.file.shared_wal_try_lock_byte(
@@ -486,10 +512,19 @@ impl AuthorityGuard {
             }
             let timestamp = self.authority.load(slot_offset(slot));
             if timestamp != 0 {
-                oldest = Some(oldest.map_or(timestamp, |old: u64| old.min(timestamp)));
+                let epoch = self.authority.load(slot_offset(slot) + 8);
+                if timestamp >= MAX_TIMESTAMP
+                    || epoch == 0
+                    || epoch != self.authority.load(EPOCH_OFFSET)
+                {
+                    return Err(LimboError::Corrupt(
+                        "invalid live shared MVCC registration".into(),
+                    ));
+                }
+                visit(epoch, timestamp);
             }
         }
-        Ok(oldest)
+        Ok(())
     }
 
     pub(super) fn allocate_timestamp(&mut self) -> Result<u64> {
@@ -737,6 +772,15 @@ mod tests {
         assert_ne!(parent.epoch, 0);
         assert_eq!(parent.prefix, PublishedPrefix::default());
         assert_eq!(guard.oldest_snapshot().unwrap(), Some(child_timestamp));
+        let mut live = guard.live_registrations().unwrap();
+        live.sort_unstable();
+        assert_eq!(
+            live,
+            vec![
+                (parent.epoch, child_timestamp),
+                (parent.epoch, parent.begin_timestamp)
+            ]
+        );
         guard.finish().unwrap();
         child.kill();
         let guard = authority.try_acquire().unwrap();
@@ -745,8 +789,13 @@ mod tests {
             guard.oldest_snapshot().unwrap(),
             Some(parent.begin_timestamp)
         );
+        assert_eq!(
+            guard.live_registrations().unwrap(),
+            vec![(parent.epoch, parent.begin_timestamp)]
+        );
         drop(parent);
         assert_eq!(guard.oldest_snapshot().unwrap(), None);
+        assert!(guard.live_registrations().unwrap().is_empty());
         guard.finish().unwrap();
     }
 
@@ -969,5 +1018,6 @@ pub(super) fn authority_for_test(file: Arc<dyn File>) -> Arc<SharedMvccAuthority
         local_slots: Mutex::new([false; SLOT_COUNT]),
     });
     authority.initialize(FileId { dev: 1, ino: 2 }, 1_000_000);
+    authority.store(EPOCH_OFFSET, 1);
     authority
 }
