@@ -1,22 +1,26 @@
-name: Canonical JSON regression diagnosis
+name: Matched-host JSON artifact diagnosis
 on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - name: Build same-path controls and compare targeted cases
-        run: python3 scripts/diagnose_json_canonical.py
+      - name: Fetch preserved executable controls
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 42243464027 --repo HundredBillion/turso --name json-performance-comparison --dir comparison-inputs/original
+          gh run download 42250171490 --repo HundredBillion/turso --name canonical-json-results --dir comparison-inputs/canonical
+      - name: Alternate original and canonical binaries on one host
+        run: python3 scripts/compare_json_artifacts.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: canonical-json-results
-          path: canonical-results/
+          name: matched-json-artifact-results
+          path: artifact-comparison-results/
           retention-days: 14
