@@ -2,7 +2,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    sync::{mpsc, Arc, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 use turso_core::{Connection, Value};
@@ -462,6 +465,13 @@ fn namespace() -> Result<String> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
+struct CheckpointSample {
+    threshold: usize,
+    started: Instant,
+    ended: Instant,
+    observed: usize,
+    result: String,
+}
 struct Sample {
     sequence: usize,
     kind: usize,
@@ -470,6 +480,7 @@ struct Sample {
     gate: u128,
     service: u128,
     model_update: u128,
+    finished: u128,
     hit: bool,
 }
 fn run(path: &Path, rows: usize) -> Result<()> {
@@ -500,19 +511,24 @@ fn run(path: &Path, rows: usize) -> Result<()> {
     let namespace = namespace()?;
     let mut checkpointer = Backend::new(path, &address)?;
     let (completed_tx, completed_rx) = mpsc::channel();
-    let checkpoint_thread = std::thread::spawn(move || -> Result<Vec<(usize, u128, String)>> {
+    let completed_count = Arc::new(AtomicUsize::new(0));
+    let checkpoint_count = completed_count.clone();
+    let checkpoint_thread = std::thread::spawn(move || -> Result<Vec<CheckpointSample>> {
         let mut count = 0;
         let mut checkpoints = Vec::new();
         while completed_rx.recv().is_ok() {
             count += 1;
             if count % checkpoint_every == 0 {
                 let started = Instant::now();
+                let observed = checkpoint_count.load(Ordering::Relaxed);
                 let result = checkpointer.checkpoint()?;
-                checkpoints.push((
-                    count,
-                    started.elapsed().as_nanos(),
-                    String::from_utf8(result)?,
-                ));
+                checkpoints.push(CheckpointSample {
+                    threshold: count,
+                    started,
+                    ended: Instant::now(),
+                    observed,
+                    result: String::from_utf8(result)?,
+                });
             }
         }
         Ok(checkpoints)
@@ -528,6 +544,7 @@ fn run(path: &Path, rows: usize) -> Result<()> {
         let state = state.clone();
         let ready = ready_tx.clone();
         let completed = completed_tx.clone();
+        let completed_count = completed_count.clone();
         let (start_tx, start_rx) = mpsc::channel();
         starters.push(start_tx);
         threads.push(std::thread::spawn(move || -> Result<Vec<Sample>> {
@@ -602,6 +619,7 @@ fn run(path: &Path, rows: usize) -> Result<()> {
                     late: started.saturating_duration_since(due).as_nanos(),
                     gate: app.gate_wait.as_nanos(),
                     service: finished.duration_since(started).as_nanos(),
+                    finished: finished.duration_since(origin).as_nanos(),
                     hit,
                     model_update: if is_write {
                         app.model_update.as_nanos()
@@ -609,6 +627,7 @@ fn run(path: &Path, rows: usize) -> Result<()> {
                         0
                     },
                 });
+                completed_count.fetch_add(1, Ordering::Relaxed);
                 completed.send(())?;
             }
             Ok(samples)
@@ -648,12 +667,12 @@ fn run(path: &Path, rows: usize) -> Result<()> {
         let mut file = std::fs::File::create(path)?;
         writeln!(
             file,
-            "sequence,kind,arrival_latency_ns,late_start_ns,gate_wait_ns,service_ns,model_update_ns,cache_hit"
+            "sequence,kind,arrival_latency_ns,late_start_ns,gate_wait_ns,service_ns,model_update_ns,cache_hit,finished_ns"
         )?;
         for sample in &samples {
             writeln!(
                 file,
-                "{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{}",
                 sample.sequence,
                 sample.kind,
                 sample.latency,
@@ -661,13 +680,29 @@ fn run(path: &Path, rows: usize) -> Result<()> {
                 sample.gate,
                 sample.service,
                 sample.model_update,
-                sample.hit
+                sample.hit,
+                sample.finished
             )?;
         }
     }
-    for (count, elapsed, result) in &checkpoints {
-        eprintln!("checkpoint completed_requests={count} elapsed_ns={elapsed} busy:log:checkpointed={result}");
+    for CheckpointSample {
+        threshold: count,
+        started,
+        ended,
+        observed,
+        result,
+    } in &checkpoints
+    {
+        let elapsed = ended.duration_since(*started).as_nanos();
+        let start_ns = started.duration_since(start).as_nanos();
+        let end_ns = ended.duration_since(start).as_nanos();
+        eprintln!("checkpoint completed_requests={count} elapsed_ns={elapsed} busy:log:checkpointed={result} start_ns={start_ns} end_ns={end_ns} observed_completed={observed}");
     }
+    let request_end_ns = samples
+        .iter()
+        .map(|sample| sample.finished)
+        .max()
+        .ok_or("empty samples")?;
     let percentile = |values: &mut Vec<u128>, percent: usize| -> f64 {
         if values.is_empty() {
             return 0.0;
@@ -707,8 +742,8 @@ fn run(path: &Path, rows: usize) -> Result<()> {
         .collect::<Vec<_>>();
     let mut late = samples.iter().map(|sample| sample.late).collect::<Vec<_>>();
     let mut gate = samples.iter().map(|sample| sample.gate).collect::<Vec<_>>();
-    println!("path,cache,warm,hot,workers,rate,requests,write_every,writes,elapsed_s,drained_s,throughput,p50_us,p95_us,p99_us,late_p99_us,gate_p99_us,hits,misses,checkpoints");
-    println!("{address},{},{warm},{hot},{workers},{rate},{requests},{write_every},{writes},{request_elapsed:.6},{drained_elapsed:.6},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{hits},{},{}",!redis.is_empty(),requests as f64/request_elapsed,percentile(&mut latency,50),percentile(&mut latency,95),percentile(&mut latency,99),percentile(&mut late,99),percentile(&mut gate,99),requests-writes-hits,checkpoints.len());
+    println!("path,cache,warm,hot,workers,rate,requests,write_every,writes,elapsed_s,drained_s,throughput,p50_us,p95_us,p99_us,late_p99_us,gate_p99_us,hits,misses,checkpoints,request_end_ns");
+    println!("{address},{},{warm},{hot},{workers},{rate},{requests},{write_every},{writes},{request_elapsed:.6},{drained_elapsed:.6},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{hits},{},{},{request_end_ns}",!redis.is_empty(),requests as f64/request_elapsed,percentile(&mut latency,50),percentile(&mut latency,95),percentile(&mut latency,99),percentile(&mut late,99),percentile(&mut gate,99),requests-writes-hits,checkpoints.len());
     Ok(())
 }
 
