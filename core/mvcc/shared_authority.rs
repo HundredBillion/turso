@@ -613,6 +613,22 @@ impl AuthorityGuard {
         Ok(())
     }
 
+    pub(super) fn check_append_size_with_metadata(
+        &self,
+        bytes: u64,
+        retained_metadata: u64,
+        minimum_metadata: u64,
+    ) -> Result<()> {
+        let prefix = self.published()?;
+        check_combined_history(
+            prefix.end_offset,
+            bytes,
+            retained_metadata,
+            minimum_metadata,
+            self.authority.load(HISTORY_LIMIT_OFFSET),
+        )
+    }
+
     pub(super) fn finish(self) -> Result<()> {
         self.require_recovered()?;
         let mut state = self.lease.state.lock();
@@ -1173,4 +1189,52 @@ fn shared_authority_rejects_pre_reservation_protocol_without_reinitialization() 
             .is_err());
         assert_eq!(authority.load(VERSION_OFFSET), version);
     }
+}
+
+fn check_combined_history(
+    log: u64,
+    bytes: u64,
+    metadata: u64,
+    minimum: u64,
+    limit: u64,
+) -> Result<()> {
+    if metadata < minimum {
+        return Err(LimboError::InvalidArgument(
+            "history metadata budget is below its compact minimum".into(),
+        ));
+    }
+    if bytes.checked_add(minimum).is_none_or(|size| size > limit) {
+        return Err(LimboError::TooBig);
+    }
+    if log
+        .checked_add(bytes)
+        .and_then(|size| size.checked_add(metadata))
+        .is_none_or(|size| size > limit)
+    {
+        return Err(LimboError::Busy);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn shared_history_budget_counts_metadata_and_compaction_headroom() {
+    assert!(check_combined_history(100, 50, 40, 20, 190).is_ok());
+    assert!(matches!(
+        check_combined_history(100, 51, 40, 20, 190),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        check_combined_history(0, 171, 40, 20, 190),
+        Err(LimboError::TooBig)
+    ));
+    assert!(matches!(
+        check_combined_history(u64::MAX, 1, 20, 20, u64::MAX),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        check_combined_history(0, u64::MAX, 20, 20, u64::MAX),
+        Err(LimboError::TooBig)
+    ));
+    assert!(check_combined_history(0, 1, 19, 20, 190).is_err());
 }

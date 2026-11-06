@@ -623,6 +623,8 @@ pub(super) struct SharedTransactionCommit {
     guard: Option<crate::mvcc::shared_authority::AuthorityGuard>,
     timestamp: Option<u64>,
     durable: bool,
+    id_load: Option<IdLoad>,
+    id_budget: Option<u64>,
 }
 
 impl SharedTransactionCommit {
@@ -638,6 +640,8 @@ impl SharedTransactionCommit {
             guard: None,
             timestamp: None,
             durable: false,
+            id_load: None,
+            id_budget: None,
         })
     }
 
@@ -677,6 +681,29 @@ impl SharedTransactionCommit {
         if let Some(timestamp) = self.timestamp {
             return Ok(IOResult::Done(timestamp));
         }
+        if self.id_budget.is_none() {
+            if self.id_load.is_none() {
+                return_if_io!(self.poll_refresh(store, connection, false));
+                let replay = self.runtime.replay.lock().clone().ok_or(LimboError::Busy)?;
+                let identity = replay.identity()?;
+                let guard = self.loaded.take().unwrap().into_guard()?;
+                self.id_load = Some(self.runtime.ids.load(guard, identity)?);
+            }
+            let ids = return_if_io!(self.id_load.as_mut().unwrap().poll());
+            self.id_load = None;
+            if ids.has_pending_checkpoint() {
+                return Err(LimboError::InvalidArgument(
+                    "shared checkpoint recovery is required".into(),
+                )
+                .into());
+            }
+            self.id_budget = Some(ids.required_budget_bytes()?);
+            self.load = Some(ManifestLoad::new(
+                self.runtime.files.manifest.clone(),
+                ids.into_guard(),
+                self.runtime.database_id,
+            )?);
+        }
         return_if_io!(self.poll_refresh(store, connection, false));
         let timestamp = self
             .loaded
@@ -696,6 +723,9 @@ impl SharedTransactionCommit {
             self.runtime.storage(),
             self.runtime.logical.clone(),
             record,
+            self.id_budget.ok_or_else(|| {
+                LimboError::InvalidArgument("shared commit lacks ID budget preflight".into())
+            })?,
         )?);
         Ok(())
     }

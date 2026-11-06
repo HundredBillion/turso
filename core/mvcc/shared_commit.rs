@@ -25,6 +25,7 @@ pub(super) struct SharedCommit {
     pending_owned: bool,
     durable: bool,
     preflight_rejected: bool,
+    id_budget: u64,
 }
 
 enum Stage {
@@ -46,7 +47,13 @@ impl SharedCommit {
         storage: Arc<Storage>,
         file: Arc<GuardedFile>,
         record: LogRecord,
+        id_budget: u64,
     ) -> Result<Self> {
+        if id_budget < crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES {
+            return Err(invalid(
+                "commit lacks the minimum reservation metadata budget",
+            ));
+        }
         let selected = loaded.record();
         let prefix = selected.prefix();
         let guard = loaded.guard()?;
@@ -113,6 +120,7 @@ impl SharedCommit {
             pending_owned: false,
             durable: false,
             preflight_rejected: false,
+            id_budget,
         })
     }
 
@@ -163,7 +171,11 @@ impl SharedCommit {
                         {
                             return Err(invalid("shared frame does not extend selected prefix"));
                         }
-                        if let Err(error) = loaded.guard()?.check_append_size(len) {
+                        if let Err(error) = loaded.guard()?.check_append_size_with_metadata(
+                            len,
+                            self.id_budget,
+                            crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES,
+                        ) {
                             preflight_rejected.set(true);
                             return Err(error);
                         }
@@ -422,6 +434,7 @@ mod tests {
                 self.storage.clone(),
                 self.file.clone(),
                 self.record(),
+                crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES,
             )
             .unwrap()
         }
@@ -435,9 +448,14 @@ mod tests {
             .begin_checkpoint(0)
             .unwrap();
         f.manifest.bytes.lock()[..128].copy_from_slice(&intent.encode());
-        assert!(
-            SharedCommit::new(f.loaded(), f.storage.clone(), f.file.clone(), f.record()).is_err()
-        );
+        assert!(SharedCommit::new(
+            f.loaded(),
+            f.storage.clone(),
+            f.file.clone(),
+            f.record(),
+            crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES
+        )
+        .is_err());
         assert!(f.log.bytes.lock().is_empty());
         assert!(f.log.pending.lock().is_empty());
         assert!(f.manifest.pending.lock().is_empty());
@@ -506,8 +524,14 @@ mod tests {
         f.storage
             .serialize_row_version(&mut record, &row.id, &version, None)
             .unwrap();
-        let mut commit =
-            SharedCommit::new(f.loaded(), f.storage.clone(), f.file.clone(), record).unwrap();
+        let mut commit = SharedCommit::new(
+            f.loaded(),
+            f.storage.clone(),
+            f.file.clone(),
+            record,
+            crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES,
+        )
+        .unwrap();
         assert!(matches!(commit.poll(), Err(LimboError::TooBig)));
         assert!(!commit.is_durable());
         assert!(f.log.pending.lock().is_empty());
@@ -517,6 +541,28 @@ mod tests {
         let mut retry = f.start();
         assert!(matches!(retry.poll().unwrap(), IOResult::IO(_)));
         assert_eq!(f.log.pending.lock().len(), 1);
+    }
+
+    #[test]
+    fn shared_commit_metadata_pressure_rejects_before_submitting_log_bytes() {
+        let f = Fixture::new();
+        let mut commit = SharedCommit::new(
+            f.loaded(),
+            f.storage.clone(),
+            f.file.clone(),
+            f.record(),
+            999_999,
+        )
+        .unwrap();
+        assert!(matches!(commit.poll(), Err(LimboError::Busy)));
+        assert!(commit.preflight_rejected());
+        assert!(!commit.is_durable());
+        assert!(f.log.pending.lock().is_empty());
+        assert!(f.manifest.pending.lock().is_empty());
+        assert_eq!(f.storage.logical_log_offset(), 0);
+        drop(commit);
+        let mut retry = f.start();
+        assert!(matches!(retry.poll().unwrap(), IOResult::IO(_)));
     }
 
     #[test]
@@ -568,7 +614,14 @@ mod tests {
                 )),
             };
             assert!(
-                SharedCommit::new(loaded, storage, f.file.clone(), record).is_err(),
+                SharedCommit::new(
+                    loaded,
+                    storage,
+                    f.file.clone(),
+                    record,
+                    crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES
+                )
+                .is_err(),
                 "case {case}"
             );
             assert!(f.log.pending.lock().is_empty());
@@ -659,7 +712,14 @@ mod tests {
         let mut record = f.record();
         record.tx_timestamp = 2;
         record.portable_changes_required = true;
-        assert!(SharedCommit::new(loaded, f.storage.clone(), f.file.clone(), record).is_err());
+        assert!(SharedCommit::new(
+            loaded,
+            f.storage.clone(),
+            f.file.clone(),
+            record,
+            crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES
+        )
+        .is_err());
         assert_eq!(*f.log.bytes.lock(), before);
         assert!(f.log.pending.lock().is_empty());
         assert!(f.manifest.pending.lock().is_empty());
@@ -712,8 +772,14 @@ mod tests {
             let old = f.log.bytes.lock().clone();
             let mut record = f.record();
             record.tx_timestamp = timestamp;
-            let mut commit =
-                SharedCommit::new(loaded, f.storage.clone(), f.file.clone(), record).unwrap();
+            let mut commit = SharedCommit::new(
+                loaded,
+                f.storage.clone(),
+                f.file.clone(),
+                record,
+                crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES,
+            )
+            .unwrap();
             assert!(matches!(commit.poll().unwrap(), IOResult::IO(_)));
             f.log.complete(0);
             assert!(matches!(commit.poll().unwrap(), IOResult::IO(_)));
