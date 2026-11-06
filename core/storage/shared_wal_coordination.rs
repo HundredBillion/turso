@@ -871,6 +871,11 @@ impl MappedSharedWalCoordination {
         ))
     }
 
+    #[cfg(unix)]
+    pub(crate) fn file_id(&self) -> Result<Option<crate::io::FileId>> {
+        self.file.file_id()
+    }
+
     /// Open (or create) the `.tshm` coordination file at `path`.
     ///
     /// On first open within a host, the file is created, sized, and
