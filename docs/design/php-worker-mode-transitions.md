@@ -172,7 +172,10 @@ Native tests cover retained handle identity, read-only write rejection and conte
 hash preservation, every missing sidecar, live authority unlink, wrong main
 identity, invalid manifest length, coordination permission denial and implicit-upgrade
 refusal. Local checks cover unsupported backend rejection and the filesystem
-policy. Native execution is pending for this new component.
+policy. Hosted run [42263464842](https://github.com/HundredBillion/turso/actions/runs/42263464842)
+validated source `f4a3f067f`: all eight focused checks passed on an unprivileged
+Linux runner whose actual filesystem magic was `0xef53`. This validates the
+component boundaries, not the still-separate full runtime admission protocol.
 
 ## Checkpoint admission gate
 
