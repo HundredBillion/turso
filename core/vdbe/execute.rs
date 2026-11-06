@@ -5694,9 +5694,8 @@ pub fn op_savepoint(
             .map_err(Into::into)
         }
         SavepointOp::Release => {
-            // A RELEASE that commits the transaction may suspend on I/O inside
-            // op_auto_commit after the savepoint was already removed. On
-            // re-entry, resume that commit instead of looking up the savepoint again.
+            // Outermost RELEASE retains its savepoints until commit succeeds.
+            // If commit suspended, resume it without restarting the release path.
             if !matches!(state.commit_state, CommitState::Ready) {
                 return op_auto_commit(program, state, &release_commit_insn(), pager);
             }
