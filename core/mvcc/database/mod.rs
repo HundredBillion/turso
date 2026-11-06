@@ -81,7 +81,9 @@ pub(crate) const SHARED_MVCC_VERSION: u8 = crate::mvcc::mode_transition::SHARED_
 mod shared_runtime;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
-pub(crate) use shared_runtime::{SharedBeginState, SharedMvccRuntime, SharedOpenState};
+pub(crate) use shared_runtime::{
+    SharedBeginState, SharedBootstrapState, SharedMvccRuntime, SharedOpenState,
+};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
