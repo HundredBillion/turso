@@ -549,6 +549,21 @@ pub(super) mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn mode_transition_initializes_id_sidecars_before_publishing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = fixture(dir.path());
+        let file = File::open(&path).unwrap();
+        let namespace = namespace_for(&path, identity(&file).unwrap()).unwrap();
+        for name in ["ids-a", "ids-b", "ids-selector"] {
+            assert!(
+                namespace.join(name).is_file(),
+                "required ID sidecar missing: {name}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn mode_transition_offline_upgrade_and_downgrade_preserve_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("existing.db");
