@@ -24,3 +24,16 @@ jobs:
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_files -- --test-threads=1 --nocapture
+
+      - name: Prove ignored lock contention breaks admission isolation
+        run: |
+          set +e
+          TURSO_CHECKPOINT_GATE_IGNORE_CONTENTION_CONTROL=1 cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::checkpoint_gate::native_tests::checkpoint_gate_aliases_and_local_attempts_do_not_self_upgrade -- --exact --nocapture > gate-negative.log 2>&1
+          result=$?
+          set -e
+          cat gate-negative.log
+          test "$result" -eq 101
+          grep -q 'assertion failed' gate-negative.log
+      - name: Admission pause, active writer drainage and owner death
+        run: >-
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::checkpoint_gate:: -- --test-threads=1 --nocapture
