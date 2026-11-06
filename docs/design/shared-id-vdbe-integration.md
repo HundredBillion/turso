@@ -32,3 +32,13 @@ The owner will supply the actual API and latest-committed oracle. The opcode lay
 6. Capacity rejection before physical I/O is distinguishable from an uncertain durable append; only the proven safe case may be retried as such.
 
 No claim of full allocation acceptance is made until the runtime API, opcode routing and independent-worker tests run together.
+
+## Initial native evidence and remaining boundaries
+
+The test-only source `1e6fbaa2b` ran on native Linux in [run42302197993](https://github.com/HundredBillion/turso/actions/runs/42302197993). All three tests failed at their intended behavioral assertions: two independent stores allocated rowid2, two pending schema transactions allocated logical table−4, and generated allocation ignored a peer's explicit live key100. The workflow requires those assertion messages, so compilation failures do not satisfy this RED evidence. These tests are not yet passing with the new runtime.
+
+The owner confirmed the initial runtime API rejects a shared database ID other than main before I/O, because the checked oracle currently uses the main connection/pager. Ordinary nonshared attached/TEMP behavior remains on its original path; shared ATTACH support is a remaining integration gate.
+
+The owner also confirmed sequence claims use the backing table's logical ID (including implicit AUTOINCREMENT sequences). Wrapped inner preclaims use the saved outer transaction and `autonomous=true`. The authoritative policy will make repeated owner/domain/value claims idempotent at their earliest ordinal. Opcode polling still must retain the explicit claim→insert phase boundary, so a later cursor yield does not restart a completed claim.
+
+Publishing shared sequence claims is not sufficient to certify `sequence_watermark_experimental()`: its reader currently consults process-local allocations. A shared lowest-live-claim read or explicit unsupported-mode guard is still required. Transaction/savepoint cleanup, cancellation, capacity and actual independent-worker acceptance remain outstanding until the runtime and VDBE run together.
