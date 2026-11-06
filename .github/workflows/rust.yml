@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 02af09c92a599a5912c3d055836fd5958a590c3c
+          ref: 594418dc1cc7eb079e8ccb0341386f9505940dbc
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,24 +25,17 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 02af09c92a599a5912c3d055836fd5958a590c3c
+          test "$(git rev-parse HEAD)" = 594418dc1cc7eb079e8ccb0341386f9505940dbc
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Fresh initialization creates its required sidecars
+      - name: Ordinary backend and recovery controls
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_initializes_and_publishes_fresh_database_without_replacement -- --test-threads=1 --nocapture 2>&1 | tee fresh-green.log
-          grep -q '1 passed; 0 failed' fresh-green.log
-      - name: Self-aliasing staging path must reproduce unwanted file creation
-        run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_rejects_main_log_alias_before_creating -- --test-threads=1 --nocapture 2>&1 | tee alias-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'self-aliasing staging database was created' alias-red.log
-          grep -q '0 passed; 1 failed' alias-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::mode_transition -- --test-threads=1 --nocapture 2>&1 | tee mode-green.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' mode-green.log
+      - name: Strict core lint
+        run: cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
