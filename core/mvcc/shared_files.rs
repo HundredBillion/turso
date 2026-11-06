@@ -3,12 +3,20 @@ use super::mode_transition::{namespace_for, require_marker, SHARED_MVCC_VERSION}
 use super::shared_authority::SharedMvccAuthority;
 use crate::io::{File, FileId};
 use crate::storage::shared_wal_coordination::MappedSharedWalCoordination;
-use crate::sync::Arc;
-use crate::{LimboError, OpenFlags, Result, IO};
+use crate::sync::{Arc, LazyLock, Mutex, Weak};
+use crate::{HashMap, LimboError, OpenFlags, Result, IO};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const EXT_FAMILY_MAGIC: i64 = 0xef53;
+
+struct PhysicalCoordinationEntry {
+    database_id: FileId,
+    mapping: Weak<MappedSharedWalCoordination>,
+}
+
+static PHYSICAL_COORDINATION: LazyLock<Mutex<HashMap<FileId, PhysicalCoordinationEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 
 pub(super) struct SharedMvccFiles {
     pub main: Arc<dyn File>,
@@ -141,13 +149,12 @@ impl SharedMvccFiles {
             content_flags,
             wal_native.id,
         )?;
-        let physical_coordination = Arc::new(
-            MappedSharedWalCoordination::open_existing(&io, &namespace.join("physical-tshm"), 64)?
-                .ok_or_else(|| {
-                    LimboError::Corrupt("published physical coordination is missing".into())
-                })?,
-        );
-        require_identity(physical_coordination.file_id()?, coordination_native.id)?;
+        let physical_coordination = open_physical_coordination(
+            &io,
+            &namespace.join("physical-tshm"),
+            coordination_native.id,
+            database_id,
+        )?;
         let authority = SharedMvccAuthority::open_existing(
             &io,
             path_string(&namespace.join("authority"))?,
@@ -167,6 +174,44 @@ impl SharedMvccFiles {
             id_selector,
         })
     }
+}
+
+fn open_physical_coordination(
+    io: &Arc<dyn IO>,
+    path: &Path,
+    coordination_id: FileId,
+    database_id: FileId,
+) -> Result<Arc<MappedSharedWalCoordination>> {
+    // Reader ownership and local lock counts must belong to the same mapping.
+    // Keep database instances independent so their content permissions stay separate.
+    let mut mappings = PHYSICAL_COORDINATION.lock();
+    if let Some(entry) = mappings.get(&coordination_id) {
+        if let Some(mapping) = entry.mapping.upgrade() {
+            if entry.database_id != database_id {
+                return Err(LimboError::InvalidArgument(
+                    "physical coordination belongs to another database".into(),
+                ));
+            }
+            require_identity(mapping.file_id()?, coordination_id)?;
+            return Ok(mapping);
+        }
+    }
+    mappings.retain(|_, entry| entry.mapping.strong_count() != 0);
+    mappings.try_reserve(1)?;
+    let mapping = Arc::new(
+        MappedSharedWalCoordination::open_existing(io, path, 64)?.ok_or_else(|| {
+            LimboError::Corrupt("published physical coordination is missing".into())
+        })?,
+    );
+    require_identity(mapping.file_id()?, coordination_id)?;
+    mappings.insert(
+        coordination_id,
+        PhysicalCoordinationEntry {
+            database_id,
+            mapping: Arc::downgrade(&mapping),
+        },
+    );
+    Ok(mapping)
 }
 
 fn open_verified(
@@ -316,6 +361,55 @@ mod tests {
             Some(
                 crate::io::get_file_id(namespace.join("physical-tshm").to_str().unwrap()).unwrap()
             )
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_files_reuses_only_matching_database_coordination_until_last_drop() {
+        let (_dir, path, io, main, id) = native_fixture();
+        let first =
+            SharedMvccFiles::open_existing(io.clone(), main.clone(), id, &path, 65536, true)
+                .unwrap();
+        let second =
+            SharedMvccFiles::open_existing(io.clone(), main.clone(), id, &path, 65536, false)
+                .unwrap();
+        assert!(Arc::ptr_eq(
+            &first.physical_coordination,
+            &second.physical_coordination
+        ));
+        assert!(!Arc::ptr_eq(&first.logical, &second.logical));
+        let weak = Arc::downgrade(&first.physical_coordination);
+
+        let (_other_dir, other_path, other_io, other_main, other_id) = native_fixture();
+        let other_namespace = namespace_for(&other_path, other_id).unwrap();
+        let other_coordination = other_namespace.join("physical-tshm");
+        std::fs::remove_file(&other_coordination).unwrap();
+        std::fs::hard_link(first.namespace.join("physical-tshm"), &other_coordination).unwrap();
+        let before = std::fs::read(&other_coordination).unwrap();
+        let error = SharedMvccFiles::open_existing(
+            other_io,
+            other_main,
+            other_id,
+            &other_path,
+            65536,
+            true,
+        )
+        .err()
+        .expect("another database must not reuse a live coordination mapping");
+        assert!(error
+            .to_string()
+            .contains("physical coordination belongs to another database"));
+        assert_eq!(std::fs::read(&other_coordination).unwrap(), before);
+
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
+        let reopened = SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).unwrap();
+        assert_eq!(
+            reopened.physical_coordination.file_id().unwrap(),
+            Some(crate::io::get_file_id(other_coordination.to_str().unwrap()).unwrap())
         );
     }
 
