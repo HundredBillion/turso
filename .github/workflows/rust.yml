@@ -72,3 +72,17 @@ jobs:
           $env:PATH = "$(Resolve-Path target/debug);$env:PATH"
           cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: PHP storage and callbacks with stock SQLite and fresh Turso
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y php-cli php-sqlite3 sqlite3
+          probe_dir=$(mktemp -d)
+          sqlite3 "$probe_dir/control.db" 'CREATE TABLE sample(x); INSERT INTO sample VALUES(1);'
+          cp "$probe_dir/control.db" "$probe_dir/candidate.db"
+          php .github/scripts/php-storage-probe.php sqlite "$probe_dir/control.db"
+          mkdir "$probe_dir/lib"
+          ln -s "$PWD/target/debug/libturso_sqlite3.so" "$probe_dir/lib/libsqlite3.so.0"
+          sha256sum target/debug/libturso_sqlite3.so
+          LD_LIBRARY_PATH="$probe_dir/lib:$PWD/target/debug" php .github/scripts/php-storage-probe.php turso "$probe_dir/candidate.db"
