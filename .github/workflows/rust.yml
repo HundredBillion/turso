@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fca0428f6a5253ac8ac8355e59ef0de8509e9b5a
+          ref: 3a39704eb479823b9b49d7104d25a8b9757ea710
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,20 +25,20 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = fca0428f6a5253ac8ac8355e59ef0de8509e9b5a
+          test "$(git rev-parse HEAD)" = 3a39704eb479823b9b49d7104d25a8b9757ea710
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Fresh offline initialization has no implementation yet
+      - name: Existing incarnation must not bypass persisted ID validation
         run: |
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_initializes_and_publishes_fresh_database_without_replacement -- --test-threads=1 --nocapture 2>&1 | tee fresh-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_validates_ids_when_incarnation_is_already_ready -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-ids-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'fresh offline initialization is not implemented' fresh-red.log
-          grep -q '0 passed; 1 failed' fresh-red.log
+          grep -q 'live authority readiness bypassed durable ID validation' ready-ids-red.log
+          grep -q '0 passed; 1 failed' ready-ids-red.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
