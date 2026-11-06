@@ -310,14 +310,27 @@ Read-only participants can inspect reservation watermarks and liveness under aut
 - [ ] Repeatedly compact a bounded live dataset and assert bounded allocated/file bytes with no inode changes; test insufficient peak budget without destroying old state.
 - [ ] Run native independent-process reservation/death/restart tests and focused I/O fault tests, then commit.
 
-### Task 4: Coordinated private integration and acceptance
+### Task 4a: Offline initialization and strict sidecar preparation
 
-**Blocked by:** Tasks 1–3 and owner review. This is an integration-owner task, not permission for this component agent to edit engine/VM files.
+**Blocked by:** Validated selector/record codecs, `InitialIds` initialization API and owner review.
+This private namespace preparation does not depend on completed compaction and does not enable
+runtime allocation. Root owns `mode_transition.rs` and `shared_files.rs`; this component agent
+continues to own shared-ID codecs/policy.
 
-**Files:** Offline mode initialization, `shared_files`, checkpoint coordinator, row-ID/sequence/DDL call sites and PHP acceptance harness.
+**Files:** Offline mode initialization and `shared_files`.
 
 - [ ] Introduce all three sidecars and protocol revision atomically in offline initialization/strict reopen. Marked files missing either bank or the selector fail closed; no compatibility fallback creates them.
-- [ ] Wire real imported committed oracle, transaction registration ownership, savepoints, commit/rollback retirement and bounded checkpoint requests.
+- [ ] Obtain a validated logical-ID floor from the materialization backend, with no unsafe default for upgrades; initialize both mirrored selector slots through the canonical codec helper.
+- [ ] Preflight `INITIAL_RETAINED_BYTES` before materialization or destructive stale-namespace cleanup; retain identity-checked files for runtime adapters.
+- [ ] Record focused native initialization/open and old-binary/crash evidence without claiming global-ID allocation is enabled.
+
+### Task 4b: Full private runtime integration and acceptance
+
+**Blocked by:** Tasks 1–3, Task 4a and owner review. This is an integration-owner task, not permission for this component agent to edit engine/VM files.
+
+**Files:** Checkpoint coordinator, row-ID/sequence/DDL call sites and PHP acceptance harness.
+
+- [ ] Wire real imported committed oracle, transaction registration ownership, savepoints, commit/rollback retirement and bounded checkpoint requests. Logical-log commits and ID appends use the same combined retained-byte budget.
 - [ ] Verify with simultaneous independent PHP writers before either commit, explicit IDs, rollback, process death, restart, DDL/checkpoint remapping and a delayed lower sequence commit.
 - [ ] Record exact source/runtime identities and native evidence. Private component tests alone cannot close the global-ID or full shared-mode acceptance requirement.
 
@@ -460,3 +473,20 @@ Root reviewed row/logical decisions and required the distinction between a numer
 claim minimum and the engine's complete sequence scan boundary. Native multi-process
 acceptance, the real database oracle/VM hooks, coordinated sidecar initialization and
 quiescent compaction remain required before enabling the feature.
+
+
+## Offline initialization helper
+
+`InitialIds::new(database_id, generation, logical_floor)` creates a canonical
+8192-byte bank A snapshot and 8192-byte mirrored selector; bank B is an existing
+empty inode. `INITIAL_RETAINED_BYTES` is 16KiB. The helper uses the same codecs and
+validation as reopen, accepts a caller-supplied materialized floor, and performs no
+I/O. Its stub failed the roundtrip test before implementation. All 42 focused tests
+pass, including invalid floor rejection and accounting for both retained bank tails.
+
+`LoadedIds::retained_bytes` reports physical ID metadata bytes under its held guard;
+`IdOutcome` carries that count through policy handoff to avoid rebinding the same
+files to a still-live lease. It excludes logical bytes. Operation admission will
+add separate floor-only compaction headroom; a namespace that fits 16KiB alone
+need not have enough budget to reserve or compact. Task 4a may consume these helpers
+without claiming Task 4b or compaction is complete.

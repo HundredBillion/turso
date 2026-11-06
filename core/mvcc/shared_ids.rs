@@ -1,10 +1,62 @@
-mod io_protocol;
-mod policy;
+pub(super) mod io_protocol;
+pub(super) mod policy;
 
 use crate::io::FileId;
 use crate::{LimboError, Result};
 
 const PAGE_SIZE: usize = 4096;
+pub(super) const INITIAL_RETAINED_BYTES: u64 = (4 * PAGE_SIZE) as u64;
+
+pub(super) struct InitialIds {
+    pub bank_a: Vec<u8>,
+    pub selector: Vec<u8>,
+}
+impl InitialIds {
+    /// Bank B is an existing empty file. The caller synchronizes both banks and selector
+    /// before publishing the marked database, and supplies the materialized logical floor.
+    pub(super) fn new(
+        database_id: FileId,
+        database: DatabaseGeneration,
+        logical_floor: i64,
+    ) -> Result<Self> {
+        let header = BankHeader {
+            database_id,
+            bank_generation: 1,
+            database,
+        }
+        .encode()?;
+        let floor = journal::Record {
+            sequence: 1,
+            change: journal::Change::LogicalFloor(logical_floor),
+        }
+        .encode()?;
+        let mut bank_a = Vec::new();
+        bank_a.try_reserve_exact(2 * PAGE_SIZE)?;
+        bank_a.extend_from_slice(&header);
+        bank_a.extend_from_slice(&floor);
+        let selected = BankRef {
+            bank: 0,
+            bank_generation: 1,
+            database,
+            end: bank_a.len() as u64,
+            snapshot_end: bank_a.len() as u64,
+            running_crc: crc32c::crc32c(&bank_a),
+        };
+        let record = IdSelector {
+            sequence: 1,
+            database_id,
+            active: selected,
+            prepared: None,
+        }
+        .encode()?;
+        let mut selector = Vec::new();
+        selector.try_reserve_exact(2 * PAGE_SIZE)?;
+        selector.extend_from_slice(&record);
+        selector.extend_from_slice(&record);
+        Ok(Self { bank_a, selector })
+    }
+}
+
 const SELECTOR_SIZE: usize = PAGE_SIZE;
 const SELECTOR_CRC: usize = SELECTOR_SIZE - 4;
 const BANK_HEADER_SIZE: usize = 128;
@@ -332,6 +384,37 @@ fn corrupt(message: &str) -> LimboError {
 
 #[cfg(test)]
 mod codec {
+    #[test]
+    fn initial_ids_mirror_a_valid_quiescent_floor_snapshot() {
+        let id = crate::io::FileId { dev: 17, ino: 23 };
+        let generation = super::DatabaseGeneration {
+            generation: 9,
+            checkpoint_timestamp: 31,
+        };
+        let initial = super::InitialIds::new(id, generation, -700).unwrap();
+        assert_eq!(
+            (initial.bank_a.len() + initial.selector.len()) as u64,
+            super::INITIAL_RETAINED_BYTES
+        );
+        let selected = super::select(
+            [
+                &initial.selector[..super::PAGE_SIZE],
+                &initial.selector[super::PAGE_SIZE..],
+            ],
+            [&initial.bank_a, &[]],
+            id,
+            generation,
+        )
+        .unwrap();
+        assert!(selected.slots_agree);
+        let state = super::replay_selected(selected, [&initial.bank_a, &[]]).unwrap();
+        assert_eq!(state.logical_floor, -700);
+        assert_eq!(state.last_record, 1);
+        assert_eq!(state.active_owners().count(), 0);
+        for floor in [0, 1, i64::MIN] {
+            assert!(super::InitialIds::new(id, generation, floor).is_err());
+        }
+    }
     use super::*;
     const ID: FileId = FileId { dev: 3, ino: 7 };
     const DATABASE: DatabaseGeneration = DatabaseGeneration {
@@ -636,7 +719,7 @@ mod codec {
     }
 }
 
-mod journal {
+pub(super) mod journal {
     use super::*;
     use std::collections::HashMap;
 
@@ -644,7 +727,7 @@ mod journal {
     const CRC_OFFSET: usize = PAGE_SIZE - 4;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub(super) struct Owner {
+    pub(in crate::mvcc) struct Owner {
         pub epoch: u64,
         pub begin: u64,
     }
@@ -660,7 +743,7 @@ mod journal {
         }
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub(super) struct Domain {
+    pub(in crate::mvcc) struct Domain {
         pub generation: u64,
         pub table: i64,
         pub sequence: bool,
