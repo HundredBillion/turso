@@ -1,3 +1,6 @@
+#[path = "checkpoint_finalize.rs"]
+pub(in crate::mvcc) mod finalize;
+
 use super::*;
 
 impl LoadedIds {

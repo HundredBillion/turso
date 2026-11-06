@@ -735,3 +735,28 @@ rejoins only the original live lease and source prefix. Prepared handoff reuses
 that payload rather than maintaining a second ownership representation. The
 actual physical floor is supplied after materialization; this early capacity
 check makes no claim about that later value.
+
+### Completed-target ID finalization
+
+`SuspendedPreparedIds::finalize` requires the coordinator-owned
+`CompletedCheckpointProof` and its exact live guard after the typed target-prefix
+reset. It verifies source/target generations, available live source identity,
+lease identity, empty target prefix, absence of live registrations, and the
+prepared floor against both the old permanent floor and materialized bound.
+There is no raw-identity completion constructor.
+
+The finalizer writes and FULL-syncs both selector copies selecting only the target
+bank before truncating and FULL-syncing the old bank. It waits for all physical
+callbacks to retire. Only then does it return opaque `FinalizedIds`, retaining both
+`LoadedIds` and the completed proof for subsequent log reclamation and local
+reload. Source rejoin remains incapable of accepting a changed prefix.
+
+Native tests consume a real mirrored intent, physical materialization, ID
+preparation, and completed manifest from the engine fixture. A test IO wrapper
+arms after proof creation and records only fsync-covered ID images. Tests cover
+all six mutation failures plus success, all six cancellation/retirement boundaries,
+and foreign proofs or reacquired leases rejected before mutation. The native
+bodies typecheck with temporary local cfg widening; those edits are restored.
+Hosted execution and the deliberate early-reclaim negative control remain pending.
+This milestone does not implement the recovered completed-generation entry or
+prove end-to-end runtime checkpoint acceptance.
