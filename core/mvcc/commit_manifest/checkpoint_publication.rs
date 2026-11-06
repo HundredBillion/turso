@@ -104,7 +104,7 @@ impl MirroredCheckpointIntent {
 /// Only completed publication may construct this value; selecting an intent is insufficient.
 pub(in crate::mvcc) struct CompletedCheckpointProof {
     source: Option<crate::mvcc::shared_ids::io_protocol::RecoveryIdentity>,
-    source_database: crate::mvcc::shared_ids::DatabaseGeneration,
+    source_database: Option<crate::mvcc::shared_ids::DatabaseGeneration>,
     target: crate::mvcc::shared_ids::io_protocol::RecoveryIdentity,
     lease: crate::sync::Weak<PublicationLease>,
     materialized_floor: i64,
@@ -116,7 +116,9 @@ impl CompletedCheckpointProof {
     ) -> Option<crate::mvcc::shared_ids::io_protocol::RecoveryIdentity> {
         self.source
     }
-    pub(in crate::mvcc) fn source_database(&self) -> crate::mvcc::shared_ids::DatabaseGeneration {
+    pub(in crate::mvcc) fn source_database(
+        &self,
+    ) -> Option<crate::mvcc::shared_ids::DatabaseGeneration> {
         self.source_database
     }
     pub(in crate::mvcc) fn target_identity(
@@ -275,7 +277,7 @@ impl CheckpointCompletionPublication {
                 return Ok(IOResult::Done(MirroredCheckpointCompletion {
                     proof: CompletedCheckpointProof {
                         source: Some(self.source),
-                        source_database: self.source.database,
+                        source_database: Some(self.source.database),
                         target: self.target,
                         lease: self.token.lease.clone(),
                         materialized_floor: self.materialized_floor,
