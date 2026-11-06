@@ -83,7 +83,7 @@ impl ReadRequest {
         )
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Model {
     versions: Vec<usize>,
     inventory: Vec<i64>,
@@ -332,6 +332,32 @@ impl Backend {
             }
         }
     }
+    fn verify(&mut self, model: &Model) -> Result<()> {
+        match self {
+            Self::Embedded(engine) => verify(&engine.connection(), model),
+            Self::Shared(socket) => {
+                let mut values = vec![model.versions.len(), model.orders.len()];
+                for (generation, id) in &model.orders {
+                    values.extend([*generation, *id]);
+                }
+                if verification_model(&values)? != *model {
+                    return Err("model state differs from its independent order history".into());
+                }
+                let command = format!(
+                    "V {}",
+                    values
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if Self::send(socket, &command)? != b"VERIFIED" {
+                    return Err("invalid verification response".into());
+                }
+                Ok(())
+            }
+        }
+    }
     fn checkpoint(&mut self) -> Result<Vec<u8>> {
         match self {
             Self::Embedded(engine) => checkpoint(&engine.connection()),
@@ -363,28 +389,48 @@ fn serve(path: &Path, address: &str) -> Result<()> {
         stream.set_nodelay(true)?;
         let path = path.to_owned();
         std::thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let mut engine = immutable::Engine::new(&path)?;
-                let mut socket = BufReader::new(stream);
-                socket.get_mut().write_all(b"READY\n")?;
-                loop {
-                    let mut line = String::new();
-                    if socket.read_line(&mut line)? == 0 {
-                        break;
-                    }
-                    let response = service_request(&mut engine, &line)
-                        .unwrap_or_else(|error| format!("ERROR {error}").into_bytes());
-                    writeln!(socket.get_mut(), "{}", response.len())?;
-                    socket.get_mut().write_all(&response)?;
-                }
-                Ok(())
-            })();
+            let result = serve_connection(&path, stream);
             if let Err(error) = result {
                 eprintln!("mixed service connection failed: {error}");
             }
         });
     }
     Ok(())
+}
+fn serve_connection(path: &Path, stream: TcpStream) -> Result<()> {
+    let mut engine = immutable::Engine::new(path)?;
+    let mut socket = BufReader::new(stream);
+    socket.get_mut().write_all(b"READY\n")?;
+    loop {
+        let mut line = String::new();
+        if socket.read_line(&mut line)? == 0 {
+            break;
+        }
+        let response = service_request(&mut engine, &line)
+            .unwrap_or_else(|error| format!("ERROR {error}").into_bytes());
+        writeln!(socket.get_mut(), "{}", response.len())?;
+        socket.get_mut().write_all(&response)?;
+    }
+    Ok(())
+}
+fn verification_model(values: &[usize]) -> Result<Model> {
+    let [count, orders, history @ ..] = values else {
+        return Err("missing verification model".into());
+    };
+    if !(100..=10000).contains(count) || *orders > 100000 || history.len() != orders * 2 {
+        return Err("invalid verification model size".into());
+    }
+    let mut model = Model::new(*count);
+    let mut previous_generation = 1;
+    for pair in history.chunks_exact(2) {
+        let (generation, id) = (pair[0], pair[1]);
+        if generation <= previous_generation || generation >= 1000000 || id >= *count {
+            return Err("invalid verification order history".into());
+        }
+        model.apply(id, generation);
+        previous_generation = generation;
+    }
+    Ok(model)
 }
 fn service_request(engine: &mut immutable::Engine, line: &str) -> Result<Vec<u8>> {
     let mut parts = line.split_whitespace();
@@ -406,6 +452,10 @@ fn service_request(engine: &mut immutable::Engine, line: &str) -> Result<Vec<u8>
             Ok(format!("COMMITTED {generation}").into_bytes())
         }
         ("C", []) => checkpoint(&engine.connection()),
+        ("V", _) => {
+            verify(&engine.connection(), &verification_model(&values)?)?;
+            Ok(b"VERIFIED".to_vec())
+        }
         _ => Err("invalid mixed command".into()),
     }
 }
@@ -504,10 +554,7 @@ fn run(path: &Path, rows: usize) -> Result<()> {
         return Err("invalid mixed workload size".into());
     }
     let state = Arc::new(RwLock::new(State::new(rows)));
-    verify(
-        &immutable::Engine::new(path)?.connection(),
-        &state.read().map_err(|_| "poisoned gate")?.model,
-    )?;
+    Backend::new(path, &address)?.verify(&state.read().map_err(|_| "poisoned gate")?.model)?;
     let namespace = namespace()?;
     let mut checkpointer = Backend::new(path, &address)?;
     let (completed_tx, completed_rx) = mpsc::channel();
@@ -654,7 +701,7 @@ fn run(path: &Path, rows: usize) -> Result<()> {
         .map_err(|_| "checkpoint worker panicked")??;
     let drained_elapsed = start.elapsed().as_secs_f64();
     let final_model = state.read().map_err(|_| "poisoned gate")?.model.clone();
-    verify(&immutable::Engine::new(path)?.connection(), &final_model)?;
+    Backend::new(path, &address)?.verify(&final_model)?;
     let writes = samples.iter().filter(|sample| sample.kind == 3).count();
     if samples.len() != requests
         || writes != requests.div_ceil(write_every)
@@ -1018,6 +1065,39 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_service_verifies_independent_model_and_rejects_wrong_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.db");
+        initialize(&path, 100).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            serve_connection(&path, stream).unwrap();
+        });
+        let absent_local_path = dir.path().join("client-must-not-open.db");
+        let mut backend = Backend::new(&absent_local_path, &address).unwrap();
+        let mut expected = Model::new(100);
+        backend.verify(&expected).unwrap();
+        backend.update(3, 3, 2).unwrap();
+        expected.apply(3, 2);
+        backend.verify(&expected).unwrap();
+        assert!(backend.verify(&Model::new(100)).is_err());
+        let mut wrong = Model::new(100);
+        wrong.apply(13, 2);
+        assert!(backend.verify(&wrong).is_err());
+        let mut inconsistent = expected.clone();
+        inconsistent.versions[3] = 99;
+        assert!(backend.verify(&inconsistent).is_err());
+        backend.verify(&expected).unwrap();
+        assert!(!absent_local_path.exists());
+        drop(backend);
+        server.join().unwrap();
+    }
     #[test]
     fn synced_commit_recovers_atomic_inventory_and_orders_after_crash() {
         use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
