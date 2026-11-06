@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64 as MappedAtomic;
 
 const MAP_LEN: usize = 4096;
 const MAGIC: u64 = u64::from_le_bytes(*b"TMVCC001");
-const VERSION: u64 = 1;
+const VERSION: u64 = 3;
 const SLOT_COUNT: usize = 64;
 const SLOT_START: usize = 128;
 const SLOT_WIDTH: usize = 32;
@@ -28,6 +28,7 @@ const LOG_CRC_OFFSET: usize = 64;
 const RECOVERY_OFFSET: usize = 72;
 const HISTORY_LIMIT_OFFSET: usize = 80;
 const SLOT_COUNT_OFFSET: usize = 88;
+const INCARNATION_READY_OFFSET: usize = 96;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct PublishedPrefix {
@@ -229,6 +230,7 @@ impl SharedMvccAuthority {
             }
             authority.validate_header(database_id, history_limit)?;
             if exclusive {
+                authority.store(INCARNATION_READY_OFFSET, 0);
                 let epoch = authority
                     .load(EPOCH_OFFSET)
                     .checked_add(1)
@@ -441,12 +443,40 @@ impl AuthorityGuard {
         })
     }
 
-    #[allow(dead_code)]
-    pub(super) fn reconcile_incarnation(&mut self, _durable_owner_epoch: u64) -> Result<()> {
-        self.require_recovered()
+    pub(super) fn incarnation_ready(&self) -> Result<bool> {
+        self.require_recovered()?;
+        match self.authority.load(INCARNATION_READY_OFFSET) {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(LimboError::Corrupt(
+                "invalid shared incarnation readiness".into(),
+            )),
+        }
+    }
+
+    /// The caller first mirrors the selected durable ID witness and waits for I/O retirement.
+    /// Its maximum includes retired owners and every bank retained by that witness.
+    pub(super) fn reconcile_incarnation(&mut self, durable_owner_epoch: u64) -> Result<()> {
+        if self.incarnation_ready()? || !self.live_registrations()?.is_empty() {
+            return Err(LimboError::InvalidArgument(
+                "shared incarnation reconciliation requires fresh quiescent authority".into(),
+            ));
+        }
+        let next = durable_owner_epoch
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        let epoch = self.authority.load(EPOCH_OFFSET).max(next);
+        self.authority.store(EPOCH_OFFSET, epoch);
+        self.authority.store(INCARNATION_READY_OFFSET, 1);
+        Ok(())
     }
 
     pub(super) fn register_snapshot(&mut self) -> Result<SnapshotRegistration> {
+        if !self.incarnation_ready()? {
+            return Err(LimboError::InvalidArgument(
+                "shared incarnation requires durable ID reconciliation before admission".into(),
+            ));
+        }
         let prefix = self.published()?;
         let begin_timestamp = self.allocate_timestamp()?;
         let epoch = self.authority.load(EPOCH_OFFSET);
@@ -651,8 +681,9 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         let authority = open(&path);
-        initialize(&authority);
         let mut guard = authority.try_acquire().unwrap();
+        guard.recover(PublishedPrefix::default()).unwrap();
+        assert!(guard.register_snapshot().is_err());
         guard.reconcile_incarnation(acknowledged_owner.0).unwrap();
         let snapshot = guard.register_snapshot().unwrap();
         assert!(snapshot.epoch > acknowledged_owner.0);
@@ -660,6 +691,32 @@ mod tests {
             (snapshot.epoch, snapshot.begin_timestamp),
             acknowledged_owner
         );
+        guard.finish().unwrap();
+    }
+
+    #[test]
+    fn authority_incarnation_reconciliation_requires_quiescence_and_checked_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = open(&dir.path().join("coordination"));
+        let mut guard = authority.try_acquire().unwrap();
+        guard.recover(PublishedPrefix::default()).unwrap();
+        let original = authority.load(EPOCH_OFFSET);
+        assert!(!guard.incarnation_ready().unwrap());
+        assert!(matches!(
+            guard.reconcile_incarnation(u64::MAX),
+            Err(LimboError::DatabaseFull)
+        ));
+        assert_eq!(authority.load(EPOCH_OFFSET), original);
+        assert!(!guard.incarnation_ready().unwrap());
+        guard.reconcile_incarnation(40).unwrap();
+        assert_eq!(authority.load(EPOCH_OFFSET), 41);
+        assert!(guard.incarnation_ready().unwrap());
+        assert!(guard.reconcile_incarnation(50).is_err());
+        let snapshot = guard.register_snapshot().unwrap();
+        authority.store(INCARNATION_READY_OFFSET, 0);
+        assert!(guard.reconcile_incarnation(50).is_err());
+        assert_eq!(snapshot.epoch, authority.load(EPOCH_OFFSET));
+        authority.store(INCARNATION_READY_OFFSET, 1);
         guard.finish().unwrap();
     }
 
@@ -912,6 +969,7 @@ mod tests {
             running_crc: 17,
         };
         guard.recover(prefix).unwrap();
+        guard.reconcile_incarnation(0).unwrap();
         assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
         assert!(guard.check_append_size(24).is_ok());
         assert!(matches!(guard.check_append_size(25), Err(LimboError::Busy)));
@@ -996,6 +1054,7 @@ mod tests {
         let mut guard = authority.try_acquire().unwrap();
         assert!(guard.requires_recovery());
         guard.recover(PublishedPrefix::default()).unwrap();
+        guard.reconcile_incarnation(0).unwrap();
         guard.finish().unwrap();
     }
 
@@ -1043,6 +1102,13 @@ mod tests {
 
 #[cfg(all(test, not(shuttle)))]
 pub(super) fn authority_for_test(file: Arc<dyn File>) -> Arc<SharedMvccAuthority> {
+    let authority = authority_for_test_unreconciled(file);
+    authority.store(INCARNATION_READY_OFFSET, 1);
+    authority
+}
+
+#[cfg(all(test, not(shuttle)))]
+pub(super) fn authority_for_test_unreconciled(file: Arc<dyn File>) -> Arc<SharedMvccAuthority> {
     struct Mapping(Box<[MappedAtomic; MAP_LEN / 8]>);
     impl SharedWalMappedRegion for Mapping {
         fn ptr(&self) -> std::ptr::NonNull<u8> {
@@ -1064,4 +1130,22 @@ pub(super) fn authority_for_test(file: Arc<dyn File>) -> Arc<SharedMvccAuthority
     authority.initialize(FileId { dev: 1, ino: 2 }, 1_000_000);
     authority.store(EPOCH_OFFSET, 1);
     authority
+}
+
+#[cfg(all(test, not(shuttle)))]
+#[test]
+fn shared_authority_rejects_pre_reservation_protocol_without_reinitialization() {
+    use crate::IO;
+    let io = crate::MemoryIO::new();
+    let file = io
+        .open_file("old-authority", crate::io::OpenFlags::Create, false)
+        .unwrap();
+    let authority = authority_for_test(file);
+    for version in [1, 2] {
+        authority.store(VERSION_OFFSET, version);
+        assert!(authority
+            .validate_header(FileId { dev: 1, ino: 2 }, 1_000_000)
+            .is_err());
+        assert_eq!(authority.load(VERSION_OFFSET), version);
+    }
 }

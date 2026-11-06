@@ -184,6 +184,7 @@ mod native_tests {
             SharedMvccAuthority::open(&io(), path.to_str().unwrap(), DATABASE_ID, 1024).unwrap();
         let mut guard = authority.try_acquire().unwrap();
         guard.recover(PublishedPrefix::default()).unwrap();
+        guard.reconcile_incarnation(0).unwrap();
         guard.finish().unwrap();
         authority
     }
