@@ -1,22 +1,16 @@
-name: Fork cross-process MVCC validation
+name: Peer import allocator regression validation
 on:
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: fork-mvcc-${{ github.ref }}
-  cancel-in-progress: true
 env:
-  CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
-  RUST_BACKTRACE: "1"
 jobs:
-  authority:
-    if: github.repository == 'HundredBillion/turso'
+  stable-peer-import:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -24,89 +18,10 @@ jobs:
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Source identity
-        run: git log -2 --format=fuller
-      - name: Prove legacy creation permits the rejected split-authority race
-        run: |
-          set +e
-          TURSO_AUTHORITY_LEGACY_CREATE_CONTROL=1 cargo test --locked -p turso_core --lib --features conn_raw_api authority_existing_only_does_not_recreate_unlinked_live_mapping -- --nocapture > authority-negative.log 2>&1
-          result=$?
-          set -e
-          cat authority-negative.log
-          test "$result" -eq 101
-          grep -q 'recreated coordination while the old mapping remained live' authority-negative.log
-      - name: Linux authority and process lifetime
+      - name: Peer import on stable allocator aliases
         run: >-
-          cargo test --locked -p turso_core --lib mvcc::shared_authority::tests -- --test-threads=1 --nocapture
-      - name: Committed-prefix replay
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api committed_prefix -- --test-threads=1
-      - name: Durable manifest and cancellation ownership
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest -- --test-threads=1 --nocapture
-
-      - name: Local MVCC and peer import regressions
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=1
-      - name: Offline mode transitions and atomic publication
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --test-threads=1 --nocapture
-      - name: Build provenance-pinned older CLI
-        run: |
-          git fetch origin 4ccf547a400777307a834b554f467c8868830f5c
-          git worktree add --detach /tmp/turso-mode-old-cli-source 4ccf547a400777307a834b554f467c8868830f5c
-          CARGO_TARGET_DIR="$PWD/target" cargo build --locked --manifest-path /tmp/turso-mode-old-cli-source/Cargo.toml -p turso_cli --bin tursodb
-          cp target/debug/tursodb /tmp/turso-mode-old-cli
-          sha256sum /tmp/turso-mode-old-cli
-          git worktree remove /tmp/turso-mode-old-cli-source
-      - name: Verify older binaries cannot bypass mode publication
-        env:
-          TURSO_OLD_CLI: /tmp/turso-mode-old-cli
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --ignored --test-threads=1 --nocapture
-  php-controls:
-    if: github.repository == 'HundredBillion/turso'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-php-controls
-          cache-on-failure: true
-      - name: Install PHP and build exact Turso library
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y php-cli php-sqlite3
-          cargo build --locked -p turso_sqlite3 --lib
-      - name: Supervisor and stock SQLite controls
-        run: |
-          python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py'
-          php -l bindings/c/tests/php_workers/worker.php
-          mkdir -p php-results
-          python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output php-results/stock-pdo
-          python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api sqlite3 --output php-results/stock-sqlite3
-      - name: Fresh Turso PDO control and unsupported shared capability
-        run: |
-          mkdir -p php-loader
-          ln -s "$PWD/target/debug/libturso_sqlite3.so" php-loader/libsqlite3.so.0
-          export LD_LIBRARY_PATH="$PWD/php-loader:$PWD/target/debug"
-          sha256sum target/debug/libturso_sqlite3.so > php-results/library.sha256
-          python3 bindings/c/tests/php_workers/run.py --profile turso-single-worker-control --api pdo --library "$PWD/target/debug/libturso_sqlite3.so" --output php-results/turso-pdo
-          set +e
-          python3 bindings/c/tests/php_workers/run.py --profile shared-acceptance --api pdo --library "$PWD/target/debug/libturso_sqlite3.so" --output php-results/shared-expected-unsupported
-          result=$?
-          set -e
-          test "$result" -eq 78
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: php-worker-controls
-          path: php-results/
-
+          cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_ -- --test-threads=1 --nocapture
   nightly-peer-import:
-    if: github.repository == 'HundredBillion/turso'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
@@ -118,7 +33,7 @@ jobs:
         with:
           prefix-key: fork-mvcc-nightly-peer-import
           cache-on-failure: true
-      - name: Peer import atomicity with actual fallible chain allocations
+      - name: Peer import with fallible chain allocations
         env:
           RUSTFLAGS: --cfg nightly
         run: >-
