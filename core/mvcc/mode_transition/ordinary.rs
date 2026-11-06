@@ -181,7 +181,7 @@ fn path_string(path: &Path) -> Result<&str> {
         .ok_or_else(|| LimboError::InvalidArgument("offline path must be UTF-8".into()))
 }
 
-fn open_native(path: &Path) -> Result<std::fs::File> {
+pub(super) fn open_native(path: &Path) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -201,7 +201,7 @@ fn open_native(path: &Path) -> Result<std::fs::File> {
 }
 
 #[cfg(target_os = "linux")]
-fn lock_exclusive(file: &std::fs::File) -> Result<()> {
+pub(super) fn lock_exclusive(file: &std::fs::File) -> Result<()> {
     use std::os::fd::AsRawFd;
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
     lock.l_type = libc::F_WRLCK as _;
@@ -213,7 +213,7 @@ fn lock_exclusive(file: &std::fs::File) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_exclusive(_: &std::fs::File) -> Result<()> {
+pub(super) fn lock_exclusive(_: &std::fs::File) -> Result<()> {
     super::require_linux_platform()
 }
 #[cfg(test)]
