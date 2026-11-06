@@ -37,6 +37,21 @@ impl SharedReplayContext {
         })
     }
 
+    pub(super) fn matches_oracle_identity(
+        &self,
+        identity: crate::mvcc::shared_ids::io_protocol::RecoveryIdentity,
+    ) -> bool {
+        let state = self.state.lock();
+        let Some(state) = state.as_ref() else {
+            return false;
+        };
+        state.observed.checkpoint_intent().is_none()
+            && state.observed.prefix() == identity.prefix
+            && state.observed.log_generation() == identity.database.generation
+            && state.context.persistent_tx_ts_max == identity.database.checkpoint_timestamp
+            && state.context.max_commit_ts_seen == identity.prefix.committed_timestamp
+    }
+
     pub(super) fn refresh(
         self: &Arc<Self>,
         loaded: LoadedManifest,

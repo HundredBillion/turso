@@ -43,15 +43,15 @@ pub mod database;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 mod guarded_file;
-#[cfg(host_shared_wal)]
-#[allow(dead_code)]
-mod read_pinned_file;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
 mod mode_transition;
 pub mod persistent_storage;
 #[cfg(feature = "conn_raw_api")]
 pub mod portable_logical;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod read_pinned_file;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 mod shared_authority;
