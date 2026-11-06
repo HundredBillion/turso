@@ -1945,43 +1945,50 @@ impl StreamingLogicalLogReader {
     /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self) -> IOResultOr<Option<Vec<ParsedOp>>> {
+        loop {
+            let Some(frame) = return_if_io!(self.next_transaction_frame()) else {
+                return Ok(IOResult::Done(None));
+            };
+            if !frame.ops.is_empty() {
+                return Ok(IOResult::Done(Some(frame.ops)));
+            }
+        }
+    }
+
+    /// Returns transaction metadata even when a committed frame contains no row operations.
+    pub(crate) fn next_transaction_frame(&mut self) -> IOResultOr<Option<ParsedFrame>> {
         if self.committed_prefix.is_some() {
             self.refresh_file_size()?;
         }
-        loop {
-            match self.state {
-                StreamingState::NeedTransactionStart => {
-                    // EOF fast-path, only meaningful when starting a fresh frame.
-                    // When a frame is in progress we must resume it regardless of
-                    // how few bytes remain from the latest checkpoint (e.g. only
-                    // the 8-byte trailer is left), so gate the guard on
-                    // `frame_in_progress.is_none()`. Rewind to the frame anchor
-                    // first so a mid-frame `buffer_offset` does not undercount
-                    // `remaining_bytes()`. `parse_next_transaction` rewinds again
-                    // (idempotent).
-                    if self.frame_in_progress.is_none() {
-                        self.buffer_offset = self.frame_anchor;
-                        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-                            self.validate_committed_prefix(true)?;
-                            return Ok(IOResult::Done(None));
-                        }
+        match self.state {
+            StreamingState::NeedTransactionStart => {
+                // EOF fast-path, only meaningful when starting a fresh frame.
+                // When a frame is in progress we must resume it regardless of
+                // how few bytes remain from the latest checkpoint (e.g. only
+                // the 8-byte trailer is left), so gate the guard on
+                // `frame_in_progress.is_none()`. Rewind to the frame anchor
+                // first so a mid-frame `buffer_offset` does not undercount
+                // `remaining_bytes()`. `parse_next_transaction` rewinds again
+                // (idempotent).
+                if self.frame_in_progress.is_none() {
+                    self.buffer_offset = self.frame_anchor;
+                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+                        self.validate_committed_prefix(true)?;
+                        return Ok(IOResult::Done(None));
                     }
-
-                    let ops = match return_if_io!(self.parse_next_transaction()) {
-                        ParseResult::Frame(frame) => frame.ops,
-                        ParseResult::Eof | ParseResult::InvalidFrame => {
-                            self.validate_committed_prefix(true)?;
-                            return Ok(IOResult::Done(None));
-                        }
-                    };
-
-                    self.validate_committed_prefix(false)?;
-
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    return Ok(IOResult::Done(Some(ops)));
                 }
+
+                let frame = match return_if_io!(self.parse_next_transaction()) {
+                    ParseResult::Frame(frame) => frame,
+                    ParseResult::Eof | ParseResult::InvalidFrame => {
+                        self.validate_committed_prefix(true)?;
+                        return Ok(IOResult::Done(None));
+                    }
+                };
+
+                self.validate_committed_prefix(false)?;
+
+                Ok(IOResult::Done(Some(frame)))
             }
         }
     }
@@ -3872,7 +3879,7 @@ enum ParseResult {
 
 #[cfg_attr(test, derive(Debug))]
 pub struct ParsedFrame {
-    ops: Vec<ParsedOp>,
+    pub(crate) ops: Vec<ParsedOp>,
     pub portable_changes: Vec<u8>,
     pub extension_record_count: u32,
     pub frame_flags: u32,
@@ -6432,6 +6439,41 @@ mod tests {
         assert!(reader.next_frame_blocking(&io).unwrap().is_none());
         assert_eq!(reader.last_valid_offset() as u64, end_offset);
         assert_eq!(reader.running_crc(), running_crc);
+    }
+
+    #[test]
+    fn committed_prefix_transaction_metadata_includes_empty_frames() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("prefix-empty-frame", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        for timestamp in [10, 20] {
+            let record = crate::mvcc::database::LogRecord::for_test(timestamp, &[], None);
+            io.wait_for_completion(log.log_tx(record).unwrap()).unwrap();
+        }
+        let (end, crc) = (log.offset, log.running_crc);
+        let tail = crate::mvcc::database::LogRecord::for_test(30, &[], None);
+        io.wait_for_completion(log.log_tx(tail).unwrap()).unwrap();
+        let mut reader = StreamingLogicalLogReader::new(file, None)
+            .with_committed_prefix(end, crc)
+            .unwrap();
+        reader.read_header(&io).unwrap();
+        for timestamp in [10, 20] {
+            let frame = io
+                .block(|| reader.next_transaction_frame())
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.commit_ts, timestamp);
+            assert!(frame.ops.is_empty());
+            assert!(frame.end_offset as u64 <= end);
+        }
+        assert!(io
+            .block(|| reader.next_transaction_frame())
+            .unwrap()
+            .is_none());
+        assert_eq!(reader.last_valid_offset() as u64, end);
+        assert_eq!(reader.running_crc(), crc);
     }
 
     #[test]
