@@ -151,10 +151,14 @@ pub(super) fn select_latest(
         [Some(first), Some(second)] if first.sequence > second.sequence => (0, first, second),
         [Some(first), Some(second)] => (1, second, first),
     };
+    // An empty generation has no log header yet. Its first durable append
+    // establishes the salt without replacing any acknowledged log bytes.
+    let initializes_empty_log =
+        previous.prefix.end_offset == 0 && previous.log_salt == 0 && newest.prefix.end_offset > 0;
     if newest.log_generation < previous.log_generation
         || newest.prefix.committed_timestamp < previous.prefix.committed_timestamp
         || (newest.log_generation == previous.log_generation
-            && (newest.log_salt != previous.log_salt
+            && ((newest.log_salt != previous.log_salt && !initializes_empty_log)
                 || newest.prefix.end_offset < previous.prefix.end_offset
                 || (newest.prefix.end_offset == previous.prefix.end_offset
                     && newest.prefix != previous.prefix)))
@@ -540,6 +544,39 @@ mod tests {
             FileId { dev: 2, ino: 2 }
         )
         .is_err());
+    }
+
+    #[test]
+    fn commit_manifest_initializes_salt_only_after_an_empty_prefix() {
+        let empty = ManifestRecord::new(
+            1,
+            DATABASE_ID,
+            7,
+            0,
+            PublishedPrefix {
+                committed_timestamp: 10,
+                end_offset: 0,
+                running_crc: 0,
+            },
+        )
+        .unwrap();
+        let initialized = record(2, 7, 123, 11, 100);
+        assert_eq!(
+            select_latest([Some(empty), Some(initialized)], DATABASE_ID).unwrap(),
+            (1, initialized)
+        );
+        let rebound = record(3, 7, 456, 12, 200);
+        assert!(select_latest([Some(initialized), Some(rebound)], DATABASE_ID).is_err());
+        let mut invalid_empty = empty;
+        invalid_empty.log_salt = 99;
+        assert!(select_latest([Some(invalid_empty), Some(initialized)], DATABASE_ID).is_err());
+        let mut no_bytes = empty;
+        no_bytes.sequence = 2;
+        no_bytes.log_salt = 123;
+        assert!(select_latest([Some(empty), Some(no_bytes)], DATABASE_ID).is_err());
+        let mut regressed = initialized;
+        regressed.prefix.committed_timestamp = 9;
+        assert!(select_latest([Some(empty), Some(regressed)], DATABASE_ID).is_err());
     }
 
     #[test]
