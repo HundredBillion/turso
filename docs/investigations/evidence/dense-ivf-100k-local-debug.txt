@@ -1,0 +1,71 @@
+
+running 1 test
+test index_method::dense_ivf::dense_ivf_recall_probe ... DENSE_SETUP rows=100000 dimensions=32 clusters=32 queries=100 seed=19937 train_ms=39.434 insert_ms=1170.694 base_bytes=15204352 corpus=synthetic_boundary_mixture
+DENSE_EXACT tenant=0 p50_ms=158.737 p95_ms=170.646 p99_ms=172.149
+DENSE_EXACT_TENANT_INDEX tenant=0 p50_ms=226.809 p95_ms=242.748 p99_ms=247.247
+DENSE_EXACT tenant=1 p50_ms=45.020 p95_ms=47.730 p99_ms=49.758
+DENSE_EXACT_TENANT_INDEX tenant=1 p50_ms=28.378 p95_ms=32.843 p99_ms=32.896
+DENSE_EXACT tenant=2 p50_ms=45.588 p95_ms=49.021 p99_ms=55.583
+DENSE_EXACT_TENANT_INDEX tenant=2 p50_ms=28.180 p95_ms=30.337 p99_ms=31.164
+DENSE_EXACT tenant=3 p50_ms=29.639 p95_ms=31.505 p99_ms=31.635
+DENSE_EXACT_TENANT_INDEX tenant=3 p50_ms=1.107 p95_ms=1.200 p99_ms=1.344
+DENSE_EXACT tenant=4 p50_ms=28.932 p95_ms=31.178 p99_ms=31.308
+DENSE_EXACT_TENANT_INDEX tenant=4 p50_ms=0.472 p95_ms=0.532 p99_ms=0.554
+DENSE_STORAGE nprobe=1 build_ms=5585.702 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=55.979 update_wal_bytes=733392 reopen_first_query_ms=10.154
+DENSE_RECALL nprobe=1 tenant=0 recall_at_10=0.725000 candidate_visits_mean=2513.0 p50_ms=3.335 p95_ms=3.681 p99_ms=4.015
+DENSE_RECALL nprobe=1 tenant=1 recall_at_10=0.695000 candidate_visits_mean=317.9 p50_ms=0.772 p95_ms=0.914 p99_ms=0.988
+DENSE_RECALL nprobe=1 tenant=2 recall_at_10=0.680000 candidate_visits_mean=311.6 p50_ms=0.640 p95_ms=0.820 p99_ms=1.007
+DENSE_RECALL nprobe=1 tenant=3 recall_at_10=0.100000 candidate_visits_mean=2.5 p50_ms=0.220 p95_ms=0.415 p99_ms=0.434
+DENSE_RECALL nprobe=1 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.179 p95_ms=0.296 p99_ms=0.379
+DENSE_STORAGE nprobe=2 build_ms=6269.270 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=46.282 update_wal_bytes=733392 reopen_first_query_ms=11.394
+DENSE_RECALL nprobe=2 tenant=0 recall_at_10=0.955000 candidate_visits_mean=5008.6 p50_ms=5.515 p95_ms=5.759 p99_ms=6.102
+DENSE_RECALL nprobe=2 tenant=1 recall_at_10=0.900000 candidate_visits_mean=631.6 p50_ms=0.832 p95_ms=0.997 p99_ms=1.068
+DENSE_RECALL nprobe=2 tenant=2 recall_at_10=0.920000 candidate_visits_mean=625.0 p50_ms=0.752 p95_ms=0.843 p99_ms=0.846
+DENSE_RECALL nprobe=2 tenant=3 recall_at_10=0.200000 candidate_visits_mean=5.0 p50_ms=0.110 p95_ms=0.158 p99_ms=0.185
+DENSE_RECALL nprobe=2 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.098 p95_ms=0.115 p99_ms=0.128
+DENSE_STORAGE nprobe=4 build_ms=5626.580 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=49.205 update_wal_bytes=733392 reopen_first_query_ms=16.621
+DENSE_RECALL nprobe=4 tenant=0 recall_at_10=0.995000 candidate_visits_mean=10003.5 p50_ms=10.460 p95_ms=11.045 p99_ms=11.453
+DENSE_RECALL nprobe=4 tenant=1 recall_at_10=0.980000 candidate_visits_mean=1250.0 p50_ms=1.499 p95_ms=1.686 p99_ms=1.704
+DENSE_RECALL nprobe=4 tenant=2 recall_at_10=0.955000 candidate_visits_mean=1234.7 p50_ms=1.413 p95_ms=1.531 p99_ms=1.592
+DENSE_RECALL nprobe=4 tenant=3 recall_at_10=0.295000 candidate_visits_mean=8.8 p50_ms=0.144 p95_ms=0.258 p99_ms=0.322
+DENSE_RECALL nprobe=4 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.108 p95_ms=0.147 p99_ms=0.178
+DENSE_STORAGE nprobe=8 build_ms=5701.030 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=50.432 update_wal_bytes=733392 reopen_first_query_ms=31.417
+DENSE_RECALL nprobe=8 tenant=0 recall_at_10=1.000000 candidate_visits_mean=20078.5 p50_ms=23.609 p95_ms=25.155 p99_ms=25.238
+DENSE_RECALL nprobe=8 tenant=1 recall_at_10=0.990000 candidate_visits_mean=2526.6 p50_ms=3.403 p95_ms=3.624 p99_ms=3.890
+DENSE_RECALL nprobe=8 tenant=2 recall_at_10=0.985000 candidate_visits_mean=2483.3 p50_ms=3.390 p95_ms=3.584 p99_ms=4.045
+DENSE_RECALL nprobe=8 tenant=3 recall_at_10=0.535000 candidate_visits_mean=22.5 p50_ms=0.433 p95_ms=0.592 p99_ms=0.616
+DENSE_RECALL nprobe=8 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.211 p95_ms=0.320 p99_ms=0.438
+DENSE_STORAGE nprobe=16 build_ms=6941.992 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=46.903 update_wal_bytes=733392 reopen_first_query_ms=52.220
+DENSE_RECALL nprobe=16 tenant=0 recall_at_10=1.000000 candidate_visits_mean=40068.8 p50_ms=51.312 p95_ms=55.177 p99_ms=57.502
+DENSE_RECALL nprobe=16 tenant=1 recall_at_10=1.000000 candidate_visits_mean=5035.1 p50_ms=6.939 p95_ms=7.474 p99_ms=7.591
+DENSE_RECALL nprobe=16 tenant=2 recall_at_10=0.995000 candidate_visits_mean=4953.9 p50_ms=6.860 p95_ms=7.286 p99_ms=7.701
+DENSE_RECALL nprobe=16 tenant=3 recall_at_10=0.840000 candidate_visits_mean=45.0 p50_ms=0.555 p95_ms=0.646 p99_ms=0.783
+DENSE_RECALL nprobe=16 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.279 p95_ms=0.351 p99_ms=0.511
+DENSE_STORAGE nprobe=32 build_ms=5750.577 file_bytes=31465472 allocated_bytes=31465472 incremental_allocated_bytes=16261120 update_1000_ms=48.636 update_wal_bytes=733392 reopen_first_query_ms=102.490
+DENSE_RECALL nprobe=32 tenant=0 recall_at_10=1.000000 candidate_visits_mean=80000.0 p50_ms=88.533 p95_ms=94.559 p99_ms=96.039
+DENSE_RECALL nprobe=32 tenant=1 recall_at_10=1.000000 candidate_visits_mean=10000.0 p50_ms=12.502 p95_ms=13.953 p99_ms=14.073
+DENSE_RECALL nprobe=32 tenant=2 recall_at_10=1.000000 candidate_visits_mean=9900.0 p50_ms=12.017 p95_ms=12.625 p99_ms=13.000
+DENSE_RECALL nprobe=32 tenant=3 recall_at_10=1.000000 candidate_visits_mean=100.0 p50_ms=0.638 p95_ms=0.762 p99_ms=0.779
+DENSE_RECALL nprobe=32 tenant=4 recall_at_10=1.000000 candidate_visits_mean=0.0 p50_ms=0.311 p95_ms=0.425 p99_ms=0.444
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1329 filtered out; finished in 61.30s
+
+       61.31 real        60.00 user         0.81 sys
+           103038976  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                8767  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 415  voluntary context switches
+               51673  involuntary context switches
+        957020562379  instructions retired
+        250571804867  cycles elapsed
+            59064824  peak memory footprint
