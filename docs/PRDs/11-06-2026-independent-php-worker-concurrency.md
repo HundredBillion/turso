@@ -37,6 +37,17 @@ Provide opt-in embedded cross-process MVCC, reachable through PHP's C compatibil
 - Start verification on supported 64-bit Linux and local filesystems. Do not advertise unverified Windows, IOCP or network-filesystem operation. Existing supported configurations remain covered by regression checks.
 - Keep this work on its own fork branch. The PHP compatibility PR receives only fixes to its own regressions; new concurrency imports and protocol work are reviewed separately.
 
+### Approved initial protocol policies (2026-11-06)
+
+- Expose the opt-in through a validated URI parameter usable by the C/PHP interface.
+- Start with globally quiescent checkpoints. Pause new transaction admission while waiting within a bounded busy deadline for active transactions to finish. Preserve readers rather than silently aborting them.
+- Enforce a configurable retained-log limit. If active snapshots prevent reclamation, additional commits return bounded `BUSY`; history must not grow without bound. Reject a transaction larger than the limit before appending any of it.
+- Read-only participants in this explicit mode may write coordination metadata while database, WAL and logical-log contents remain read-only. Reject the opt-in when coordination metadata cannot be written. Existing ordinary read-only opens retain their current guarantees.
+
+The source-level protocol proposal and delivery boundaries are in
+`docs/design/php-worker-mvcc-protocol.md`. These policies do not imply that the
+runtime protocol is implemented or verified.
+
 ## Testing Decisions
 
 Use public C/PHP operations and real independent child processes as the main acceptance boundary. Existing native subprocess, yielded-I/O and deterministic scheduling facilities support narrowly minimized storage regressions. Thread-only success is insufficient for the cross-process claim.
