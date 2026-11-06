@@ -25602,3 +25602,157 @@ fn recovery_preparation_rejects_empty_mixed_or_unrepresentable_timestamps() {
     }
     assert_eq!(ctx.max_commit_ts_seen, 0);
 }
+
+#[test]
+fn peer_import_preparation_pairs_schema_with_incoming_header_cookie() {
+    for schema_change in [false, true] {
+        let db = MvccTestDb::new();
+        let before = db.conn.schema.read().clone();
+        let ctx = RecoverCtx {
+            reader: Box::new(StreamingLogicalLogReader::new(
+                db.mvcc_store.get_logical_log_file(),
+                None,
+            )),
+            preserved_table_valued_functions: Vec::new(),
+            cookie: 0,
+            persistent_tx_ts_max: 0,
+            replay_cutoff_ts: 0,
+            max_commit_ts_seen: 0,
+            schema_rows: HashMap::default(),
+            type_sqls: BTreeMap::new(),
+            dropped_root_pages: HashSet::default(),
+            current_schema: before.clone(),
+            index_infos: HashMap::default(),
+        };
+        let mut frame = Vec::new();
+        if schema_change {
+            let record = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")),
+                    Value::Text(Text::new("peer_table")),
+                    Value::Text(Text::new("peer_table")),
+                    Value::from_i64(-22),
+                    Value::Text(Text::new("CREATE TABLE peer_table(v TEXT)")),
+                ],
+                5,
+            )
+            .unwrap();
+            frame.push(ParsedOp::UpsertTable {
+                table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+                rowid: RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(1)),
+                record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+                commit_ts: 20,
+                btree_resident: false,
+            });
+        }
+        let mut header = DatabaseHeader::default();
+        header.schema_cookie = 77.into();
+        frame.push(ParsedOp::UpdateHeader {
+            header,
+            commit_ts: 20,
+        });
+        let prepared = db
+            .mvcc_store
+            .prepare_recovery_frame(&db.conn, &ctx, frame)
+            .unwrap();
+        assert_eq!(
+            prepared
+                .schema_after
+                .as_ref()
+                .map(|schema| schema.schema_version),
+            Some(77)
+        );
+        assert!(Arc::ptr_eq(&before, &db.conn.schema.read()));
+        assert_eq!(ctx.current_schema.schema_version, before.schema_version);
+    }
+}
+
+#[test]
+fn peer_import_savepoint_cleanup_preserves_committed_end_markers() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES(1, 'before')")
+        .unwrap();
+    db.conn.execute("BEGIN CONCURRENT").unwrap();
+    db.conn.execute("SAVEPOINT before_delete").unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let peer_timestamp = db.mvcc_store.clock.get_timestamp(crate::mvcc::clock::no_op);
+    let mut imported_ends = Vec::new();
+    let mut mark = |chain: &RowVersions, is_index| {
+        let mut versions = chain.write();
+        for version in versions.iter_mut() {
+            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                version.set_end(Some(TxTimestampOrID::Timestamp(peer_timestamp)));
+                imported_ends.push((chain.clone(), version.id, is_index));
+            }
+        }
+    };
+    for entry in db.mvcc_store.rows.iter() {
+        mark(entry.value(), false);
+    }
+    for index in db.mvcc_store.index_rows.iter() {
+        for entry in index.value().iter() {
+            mark(entry.value(), true);
+        }
+    }
+    assert!(imported_ends.iter().any(|(_, _, index)| !index));
+    assert!(imported_ends.iter().any(|(_, _, index)| *index));
+    db.conn.execute("ROLLBACK TO before_delete").unwrap();
+    let changed: Vec<_> = imported_ends
+        .into_iter()
+        .filter_map(|(chain, id, is_index)| {
+            let versions = chain.read();
+            let version = versions.iter().find(|version| version.id == id).unwrap();
+            (version.end() != Some(TxTimestampOrID::Timestamp(peer_timestamp))).then_some(is_index)
+        })
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "committed ends erased (true=index): {changed:?}"
+    );
+    db.conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn peer_import_header_cookie_change_does_not_hide_unknown_index() {
+    let db = MvccTestDb::new();
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+    let frame = vec![
+        ParsedOp::UpdateHeader {
+            header,
+            commit_ts: 20,
+        },
+        ParsedOp::UpsertIndex {
+            table_id: (-999).into(),
+            payload: crate::types::value_blob_from_slice(&[0xff]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    assert!(db
+        .mvcc_store
+        .prepare_recovery_frame(&db.conn, &ctx, frame)
+        .is_err());
+}

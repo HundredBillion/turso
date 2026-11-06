@@ -19,6 +19,8 @@
 - Prepare replacement contents while chain mutation is excluded. Preserve local TxID versions and the existing chain Arcs referenced by transaction write sets.
 - Missing logical root IDs may be pre-created with no physical root. Existing physical bindings remain unchanged until quiescent checkpoint. Schema drops retain backing/root mappings needed by old snapshots.
 - Complete all decoding, schema validation, payload/index-info allocation, chain cloning/capacity allocation, and bookkeeping preparation before modifying visible version contents. Empty pre-created entries are the only permitted preflight residue.
+- A peer commit may conflict with a pending local end=TxID marker. Mark that local writer conflicted before replacing its marker; fail it explicitly with WriteWriteConflict before further results or commit. Recheck conflict state under each mutation chain lock so an operation paused after an initial state check cannot overwrite an imported committed end. Do not perform rollback while holding importer chain guards.
+- Full and savepoint rollback may clear only end markers still owned by the rolling-back TxID. Committed peer timestamps survive cleanup. Read-only snapshots remain live; conflicting writers retain registrations until normal rollback cleanup.
 - Publication has no I/O, fallible allocation or schema parsing. Update local imported boundary only after all chain contents/header/schema state are installed.
 - Shared authority remains owned throughout import and actual transaction insertion/commit validation. Do not expose the public opt-in until the entire protocol is connected and acceptance passes.
 
@@ -43,6 +45,7 @@
 - [ ] Apply prepared state without failure points, then publish the imported watermark/schema generation.
 - [ ] Inject allocation failures at each preparation stage with active local TxID versions as well as committed rows; retry the same frame and prove no duplicate rows, ended versions, skipped operations or lost local writes.
 - [ ] Race local insert/delete/rollback/GC with import; prove old snapshots stay stable and later snapshots see the complete peer frame.
+- [ ] Deterministically pause a writer after its initial transaction-state check and before chain-lock acquisition; import a conflicting peer commit, resume it, and require a defined conflict without stale mutation. Exercise table/index updates and savepoint cleanup.
 
 ## Task 3: Yielding admission and commit integration
 

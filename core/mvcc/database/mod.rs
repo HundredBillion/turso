@@ -7302,9 +7302,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
                 return false;
             }
-            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-                version.set_end(None);
-            }
+            version.clear_end_if_owned_by(tx_id);
             true
         });
         (before - versions.len(), restores_rowid)
@@ -7609,7 +7607,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 for rv in versions.iter_mut() {
                     if rv.id == version_id {
                         restored_rowid = rollback_restores_rowid(tx_id, rv);
-                        rv.set_end(None);
+                        rv.clear_end_if_owned_by(tx_id);
                         tracing::debug!(
                             "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                             rowid.table_id,
@@ -7631,7 +7629,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
                         if rv.id == version_id {
-                            rv.set_end(None);
+                            rv.clear_end_if_owned_by(tx_id);
                             tracing::debug!(
                                 "rollback_savepoint: restored index version(table_id={}, version_id={})",
                                 table_id,
@@ -9968,6 +9966,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         frame: Vec<ParsedOp>,
     ) -> Result<PreparedRecoveryFrame> {
         let commit_timestamp = replay_frame_timestamp(&frame)?;
+        let incoming_schema_cookie = frame.iter().rev().find_map(|op| match op {
+            ParsedOp::UpdateHeader { header, .. } => Some(header.schema_cookie.get()),
+            _ => None,
+        });
         let schema_rows = &ctx.schema_rows;
         let type_sqls = &ctx.type_sqls;
         let current_schema = ctx.current_schema.clone();
@@ -10094,7 +10096,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // schema_rows_after is Some if the frame changes the schema
         let schema_rows_after = schema_rows_after;
 
-        let schema_after = match schema_rows_after.as_ref() {
+        let mut schema_after = match schema_rows_after.as_ref() {
             Some(schema_rows_after) => {
                 let type_sqls_after = type_sqls_after.as_ref().unwrap_or(type_sqls);
                 Some(self.recover_build_schema(
@@ -10108,6 +10110,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             None => None,
         };
 
+        if let Some(cookie) = incoming_schema_cookie {
+            let prepared_cookie = schema_after
+                .as_ref()
+                .unwrap_or(&current_schema)
+                .schema_version;
+            if prepared_cookie != cookie {
+                let schema = schema_after.get_or_insert_with(|| current_schema.clone());
+                Schema::try_make_mut(schema)?.schema_version = cookie;
+            }
+        }
+
         if schema_rows_after.is_some() {
             // Cached IndexInfo values are tied to a specific schema. Clear
             // before decoding a schema-changing frame so this frame chooses
@@ -10117,6 +10130,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         {
             let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
+                if schema_rows_after.is_none() {
+                    return false;
+                }
                 let Some(schema_after) = schema_after.as_ref() else {
                     return false;
                 };
@@ -10166,14 +10182,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // - If the frame does not change schema, `current_schema` is
                 //   both the before and after schema.
                 let index_info = match op_kind {
-                        IndexOpKind::Upsert if schema_after.is_some() => after,
-                        IndexOpKind::Delete if schema_after.is_some() => before,
+                        IndexOpKind::Upsert if schema_rows_after.is_some() => after,
+                        IndexOpKind::Delete if schema_rows_after.is_some() => before,
                         IndexOpKind::Upsert | IndexOpKind::Delete => before,
                     }
                     .ok_or_else(|| {
                         let expected_schema = match op_kind {
-                            IndexOpKind::Upsert if schema_after.is_some() => "post-frame",
-                            IndexOpKind::Delete if schema_after.is_some() => "pre-frame",
+                            IndexOpKind::Upsert if schema_rows_after.is_some() => "post-frame",
+                            IndexOpKind::Delete if schema_rows_after.is_some() => "pre-frame",
                             IndexOpKind::Upsert | IndexOpKind::Delete => "current",
                         };
                         LimboError::InternalError(format!(
@@ -10551,6 +10567,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // The frame may have decoded DROP INDEX entries using the
                 // pre-frame schema. Do not carry those IndexInfo values into
                 // later frames after current_schema has changed.
+                index_infos.clear();
+            } else if let Some(schema_after) = schema_after {
+                install_schema(schema_after.clone());
+                current_schema = schema_after;
                 index_infos.clear();
             }
 
@@ -11048,6 +11068,12 @@ impl RowVersion {
         // A delete (or any end change) means the B-tree no longer reflects this version's current
         // state until a checkpoint re-materializes it; the GC must not reclaim it before then.
         self.materialized_at = WalPos::ORIGIN;
+    }
+
+    fn clear_end_if_owned_by(&mut self, tx_id: TxID) {
+        if self.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+            self.set_end(None);
+        }
     }
 
     /// Replace `begin`/`end` references to `tx_id` with the committed
