@@ -6,6 +6,10 @@ use crate::{LimboError, Result};
 
 const PAGE_SIZE: usize = 4096;
 pub(super) const INITIAL_RETAINED_BYTES: u64 = (4 * PAGE_SIZE) as u64;
+/// Offline minimum: initial files, replacement snapshot, one claim and a small logical frame.
+pub(super) const MIN_HISTORY_LIMIT: u64 = (8 * PAGE_SIZE) as u64;
+/// Minimum ID metadata admission cost after compaction, excluding a new claim or logical frame.
+pub(super) const MIN_ID_BUDGET_BYTES: u64 = (6 * PAGE_SIZE) as u64;
 
 pub(super) struct InitialIds {
     pub bank_a: Vec<u8>,

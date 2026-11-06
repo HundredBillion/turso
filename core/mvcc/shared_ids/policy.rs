@@ -89,6 +89,8 @@ pub(in crate::mvcc) struct IdOutcome {
     pub result: IdResult,
     /// Physical ID metadata bytes sampled while this returned guard remains held.
     pub retained_bytes: u64,
+    /// Physical metadata plus reserved replacement-bank capacity, excluding the logical log.
+    pub required_budget_bytes: u64,
 }
 impl SharedIds {
     pub(in crate::mvcc) fn start(
@@ -239,10 +241,12 @@ impl IdOperation {
                         return Ok(IOResult::IO(IOCompletions(completion)));
                     }
                     let retained_bytes = loaded.retained_bytes()?;
+                    let required_budget_bytes = loaded.required_budget_bytes()?;
                     return Ok(IOResult::Done(IdOutcome {
                         guard: loaded.guard,
                         result,
                         retained_bytes,
+                        required_budget_bytes,
                     }));
                 }
                 Stage::Finished => return Err(invalid("ID operation already terminated")),

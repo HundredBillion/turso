@@ -259,6 +259,19 @@ The configured history budget accounts for both reservation bank sizes, selector
 current recovered logical prefix end offset; calculate the total under authority,
 using the supplied `RecoveryIdentity` rather than a stale process-local estimate. Before exceeding it, return bounded contention and request a quiescent checkpoint; do not silently grow an unlimited reservation tail. If the irreducible compact state itself exceeds the configured budget, return an explicit resource error. This is a tunable byte budget, not a permanent number-of-tables limit. Peak compaction allowance includes both old and new snapshots; preflight must not start a transition that cannot retain the last complete bank.
 
+Operation admission also reserves `max(0, 8192 - inactive_bank_physical_bytes)` for a
+floor-only replacement bank. This is separate from factual retained bytes; already
+retained inactive-bank space counts toward the same total and is not reserved twice.
+Both ID appends and logical-log commit preflight must use `required_budget_bytes`
+plus the prospective logical prefix. Without this reserve an active bank could fill
+the cap and make quiescent compaction permanently impossible. Offline initialization requires a separate `MIN_HISTORY_LIMIT` of 32KiB: the
+16KiB initial files, 8KiB replacement capacity, one 4KiB claim and a small 4KiB
+logical frame. This does not guarantee any-sized write fits. `MIN_ID_BUDGET_BYTES`
+is 24KiB after compaction, before adding a claim or logical frame. A single frame
+that cannot fit even that empty-generation minimum returns TooBig; retained-history
+pressure returns bounded BUSY. Neither error promises that checkpointing can always
+make room. The factual namespace footprint remains 16KiB.
+
 The ordinary append preflight conservatively counts existing physical tail bytes, including
 abandoned unacknowledged bytes, before truncation. It can therefore return BUSY before it
 can reclaim that tail. Recovery or quiescent compaction must provide bounded reclamation;
