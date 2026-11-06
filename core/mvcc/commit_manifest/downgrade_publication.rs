@@ -134,7 +134,7 @@ fn commit_manifest_downgrade_native_fences_new_open_and_idle_admission() {
         .unwrap();
     let guard = files.authority.try_acquire().unwrap();
     let mut load = ManifestLoad::new(files.manifest.clone(), guard, database_id).unwrap();
-    let mut loaded = io.block(|| load.poll()).unwrap();
+    let mut loaded = io.block(|| Ok(load.poll()?)).unwrap();
     let prefix = loaded.record().prefix();
     if loaded.guard().unwrap().requires_recovery() {
         loaded.guard_mut().unwrap().recover(prefix).unwrap();
@@ -142,7 +142,7 @@ fn commit_manifest_downgrade_native_fences_new_open_and_idle_admission() {
     // This synthetic publication tests the admission fence, not materialization.
     let mut publication =
         DowngradeIntentPublication::synthetic(loaded, wal.file_id().unwrap().unwrap()).unwrap();
-    let proof = io.block(|| publication.poll()).unwrap();
+    let proof = io.block(|| Ok(publication.poll()?)).unwrap();
     assert!(proof.record().requires_recovery());
     drop(proof);
     let reopened = Database::open(io.clone(), path.to_str().unwrap(), options());
