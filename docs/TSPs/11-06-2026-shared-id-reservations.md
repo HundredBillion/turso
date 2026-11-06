@@ -73,7 +73,7 @@ An idle process rechecks bank generation and selected tail under authority befor
 
 `IdDomain` contains `(database_generation, logical_table_id, kind)`, where `kind` distinguishes table row IDs and a sequence backing table. Names are not identities: DROP/CREATE of the same name must not inherit reservations. The current engine reconstructs a checkpointed table ID as the negative physical root number, so a bare table ID is insufficient across generations.
 
-At a quiescent checkpoint the coordinator supplies a complete old-to-new mapping for every live table and sequence domain. Targets must be unique; dropped domains are explicitly retired. The replacement bank snapshot is bound to the target database generation and checkpoint boundary. It cannot serve old-generation callers merely because its allocator bank generation is higher. The recovered manifest/checkpoint transition selects when that remap becomes usable. Old idle handles must observe the new generation before another allocation.
+At a quiescent checkpoint the coordinator validates a complete old-to-new mapping for every live table and sequence domain. The floor-only allocator snapshot has no live claims or per-domain counters to rewrite; mapping validation stays with the materialized root/schema coordinator. Targets must be unique; dropped domains are explicitly retired. The replacement bank snapshot is bound to the target database generation and checkpoint boundary. It cannot serve old-generation callers merely because its allocator bank generation is higher. The recovered manifest/checkpoint transition selects when that remap becomes usable. Old idle handles must observe the new generation before another allocation.
 
 The global logical-ID floor is independent of these per-generation domains. It is the numerically lowest consumed negative ID, moves only downward, and includes successful reservations even when their transaction later rolls back or dies. The next ID is below both this durable floor and all logical/physical-root-derived IDs reported by checkpoint reconciliation. `i64::MIN` exhaustion returns `DatabaseFull`; never wrap, reuse an ID, or replace a previously established floor with a higher one.
 
@@ -592,3 +592,47 @@ downgrades to its shared lifetime lock. The fixture now retries only startup
 exclusive lifetime lock forces both child processes to report this startup
 contention before the parent releases the lock. Reservation and commit operations
 are not retried. Native green evidence still requires the hosted rerun.
+
+
+## Cross-generation preparation seam
+
+`LoadedIds::prepare_checkpoint(target, committed_floor)` requires the selected
+finalized source generation, no live registrations, a strictly newer target
+generation, and a target checkpoint timestamp equal to the continuously held
+committed prefix timestamp. The floor is the minimum of the journal floor and the
+coordinator's prefix-matched committed floor. Before reusing the inactive bank, it
+freshly synchronizes both copies of the current witness. It then writes and
+synchronizes the target floor snapshot and both selector copies referencing the
+old active bank plus the prepared target. It retains the old selected bank.
+
+The owned result `PreparedIds` exposes the source identity, target generation and
+an immutable authority borrow while retaining the file bindings. It does not
+create a completion proof, enable allocation in a pending generation, or expose
+unrestricted mutable authority. Finalization remains dependent on the
+coordinator-owned opaque `CompletedCheckpointProof`: materialization FULL sync
+and both completed-generation manifest copies must be durable before it can
+authorize removal of the old allocator reference. Abort requires a separate proof
+of the old normal generation with no durable checkpoint intent. Intent must itself
+be mirrored before materialization so losing one selector cannot make started
+materialization appear unstarted. These ownership-transfer and recovery hooks
+remain coordinator integration work, not evidence supplied by preparation alone.
+
+The coordinator order is mirrored durable intent, materialization and FULL sync,
+then allocator preparation using the actual materialized physical-root/page bound,
+then mirrored completed manifest, and finally allocator finalization. Preparing
+before materialization could miss a newly allocated lower root-derived logical
+floor. The intent retains the source generation/checkpoint base and committed
+prefix, allowing recovery to load the old allocator bank even after main-file
+materialization advanced. Preparation's API remains unchanged by this ordering.
+
+Preparation's initial retained-bank test failed against the stub, then passed with
+the owned state machine. The full focused suite passes 61 tests with the native
+process test explicitly ignored on macOS. Six preparation tests cover a nonempty
+committed prefix, inactive-bank reuse after fresh witness mirroring, rejection of
+invalid target/floor/live-reader/budget inputs before writes, all twelve mutation
+failure boundaries, and cancellation/physical callback retirement at each boundary.
+The source bank remains valid at every durable failure image; the target is
+selectable only once its complete snapshot is referenced. Test clippy passes with
+the previously documented baseline allowances; changed-file formatting passes.
+Finalization, abort proof consumption, and real checkpoint recovery remain pending
+coordinator integration.

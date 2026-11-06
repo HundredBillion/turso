@@ -1,3 +1,6 @@
+#[path = "checkpoint_prepare.rs"]
+pub(in crate::mvcc) mod checkpoint_prepare;
+
 #[path = "witness_mirror.rs"]
 pub(in crate::mvcc) mod witness_mirror;
 
@@ -1708,6 +1711,233 @@ mod tests {
     }
 
     #[test]
+    fn id_checkpoint_prepare_retains_old_bank_until_completed_generation_proof() {
+        let mut f = writable_fixture();
+        f.identity.prefix = PublishedPrefix {
+            committed_timestamp: 10,
+            end_offset: PAGE_SIZE as u64,
+            running_crc: 123,
+        };
+        drop(f.authority.try_acquire().unwrap());
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(f.identity.prefix).unwrap();
+        guard.finish().unwrap();
+        let old_bytes = f.bank.bytes.lock().clone();
+        let target = DatabaseGeneration {
+            generation: 2,
+            checkpoint_timestamp: f.identity.prefix.committed_timestamp,
+        };
+        let mut prepare = loaded(&f).prepare_checkpoint(target, -200).unwrap();
+        let IOResult::Done(prepared) = prepare.poll().unwrap() else {
+            panic!("synchronous preparation");
+        };
+        assert_eq!(*f.bank.bytes.lock(), old_bytes);
+        let durable_selector = f.selector.durable.lock().clone();
+        let selector = select(
+            [
+                &durable_selector[..PAGE_SIZE],
+                &durable_selector[PAGE_SIZE..],
+            ],
+            [&f.bank.durable.lock(), &f.unused.durable.lock()],
+            f.files.database_id,
+            f.identity.database,
+        )
+        .unwrap();
+        assert_eq!(selector.selected.database, f.identity.database);
+        assert_eq!(selector.selector.prepared.unwrap().database, target);
+        let target_selection = select(
+            [
+                &durable_selector[..PAGE_SIZE],
+                &durable_selector[PAGE_SIZE..],
+            ],
+            [&f.bank.durable.lock(), &f.unused.durable.lock()],
+            f.files.database_id,
+            target,
+        )
+        .unwrap();
+        let state = replay_selected(
+            target_selection,
+            [&f.bank.durable.lock(), &f.unused.durable.lock()],
+        )
+        .unwrap();
+        assert_eq!(state.logical_floor, -200);
+        assert_eq!(prepared.guard().published().unwrap(), f.identity.prefix);
+        assert_eq!(prepared.source_identity(), f.identity);
+        assert_eq!(prepared.target(), target);
+        drop(prepared);
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(f.identity.prefix).unwrap();
+        guard.finish().unwrap();
+        assert!(loaded(&f)
+            .append(journal::Change::LogicalFloor(-300))
+            .is_err());
+    }
+
+    fn checkpoint_target(f: &Fixture) -> DatabaseGeneration {
+        DatabaseGeneration {
+            generation: f.identity.database.generation + 1,
+            checkpoint_timestamp: f.identity.prefix.committed_timestamp,
+        }
+    }
+
+    #[test]
+    fn id_checkpoint_prepare_rejects_invalid_target_floor_live_readers_and_budget() {
+        for case in 0..7 {
+            let mut f = writable_fixture();
+            let _reader = (case == 0).then(|| registration(&f));
+            let mut target = checkpoint_target(&f);
+            if case == 1 {
+                target.generation = f.identity.database.generation;
+            }
+            if case == 2 {
+                target.checkpoint_timestamp += 1;
+            }
+            if case == 5 {
+                Arc::get_mut(&mut f.files).unwrap().history_budget = INITIAL_RETAINED_BYTES;
+            }
+            if case == 6 {
+                Arc::get_mut(&mut f.files).unwrap().history_budget = 1_000_000;
+                let mut append = loaded(&f)
+                    .append(journal::Change::LogicalFloor(-200))
+                    .unwrap();
+                let IOResult::Done(current) = append.poll().unwrap() else {
+                    panic!("sync append")
+                };
+                current.into_guard().finish().unwrap();
+                Arc::get_mut(&mut f.files).unwrap().history_budget = MIN_ID_BUDGET_BYTES;
+            }
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            let floor = match case {
+                3 => 0,
+                4 => i64::MIN,
+                _ => -200,
+            };
+            let result = loaded(&f).prepare_checkpoint(target, floor);
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+        }
+    }
+
+    #[test]
+    fn id_checkpoint_prepare_failure_boundaries_preserve_a_complete_durable_floor() {
+        for fail_at in 0..12 {
+            let f = writable_fixture();
+            let step = Arc::new(AtomicUsize::new(0));
+            for file in [&f.bank, &f.unused, &f.selector] {
+                *file.fault.lock() = Some((step.clone(), fail_at));
+            }
+            let mut compact = loaded(&f)
+                .prepare_checkpoint(checkpoint_target(&f), -200)
+                .unwrap();
+            assert!(compact.poll().is_err(), "failure boundary {fail_at}");
+            assert!(compact.poll().is_err());
+            drop(compact);
+            let slots = f.selector.durable.lock();
+            let old = f.bank.durable.lock();
+            let next = f.unused.durable.lock();
+            let selected = select(
+                [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+                [&old, &next],
+                f.files.database_id,
+                f.identity.database,
+            )
+            .unwrap();
+            assert_eq!(selected.selector.prepared.is_some(), fail_at >= 10);
+            if let Some(prepared) = selected.selector.prepared {
+                let target = select(
+                    [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+                    [&old, &next],
+                    f.files.database_id,
+                    prepared.database,
+                )
+                .unwrap();
+                assert_eq!(
+                    replay_selected(target, [&old, &next])
+                        .unwrap()
+                        .logical_floor,
+                    -200
+                );
+            }
+            assert_eq!(
+                replay_selected(selected, [&old, &next])
+                    .unwrap()
+                    .logical_floor,
+                -100,
+                "failure boundary {fail_at}"
+            );
+        }
+    }
+    #[test]
+    fn id_checkpoint_prepare_waits_for_every_mutation_and_all_backend_callbacks() {
+        let f = writable_fixture();
+        for file in [&f.bank, &f.unused, &f.selector] {
+            file.delay_mutations.store(true, Ordering::Release);
+        }
+        let mut compact = loaded(&f)
+            .prepare_checkpoint(checkpoint_target(&f), -200)
+            .unwrap();
+        for step in 0..12 {
+            let IOResult::IO(waiter) = compact.poll().unwrap() else {
+                panic!("step {step} must wait");
+            };
+            assert!(!waiter.0.finished());
+            assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+            compaction_file(&f, step).complete_mutation(true);
+        }
+        let IOResult::IO(waiter) = compact.poll().unwrap() else {
+            panic!("retirement must wait");
+        };
+        assert!(!waiter.0.finished());
+        f.bank.retire();
+        f.unused.retire();
+        assert!(!waiter.0.finished());
+        f.selector.retire();
+        assert!(waiter.0.finished());
+        let IOResult::Done(result) = compact.poll().unwrap() else {
+            panic!("all callbacks retired");
+        };
+        assert_eq!(result.target(), checkpoint_target(&f));
+        drop(result);
+    }
+    #[test]
+    fn id_checkpoint_prepare_abort_at_each_mutation_keeps_authority_until_retirement() {
+        for cancel_at in 0..12 {
+            let f = writable_fixture();
+            for file in [&f.bank, &f.unused, &f.selector] {
+                file.delay_mutations.store(true, Ordering::Release);
+            }
+            let mut compact = loaded(&f)
+                .prepare_checkpoint(checkpoint_target(&f), -200)
+                .unwrap();
+            for step in 0..=cancel_at {
+                let IOResult::IO(waiter) = compact.poll().unwrap() else {
+                    panic!("step {step} must wait");
+                };
+                let file = compaction_file(&f, step);
+                if step == cancel_at {
+                    waiter.0.abort();
+                    assert!(compact.poll().is_err());
+                    drop(compact);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    file.complete_mutation(true);
+                    assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                    file.retire();
+                    let mut guard = f.authority.try_acquire().unwrap();
+                    assert!(guard.requires_recovery());
+                    guard.recover(PublishedPrefix::default()).unwrap();
+                    guard.finish().unwrap();
+                    break;
+                }
+                file.complete_mutation(false);
+            }
+        }
+    }
+    #[test]
     fn id_compaction_reclaims_space_without_reusing_the_permanent_floor() {
         let mut f = writable_fixture();
         Arc::get_mut(&mut f.files).unwrap().history_budget = (8 * PAGE_SIZE) as u64;
@@ -1947,6 +2177,91 @@ mod tests {
             file.delay_mutations.store(true, Ordering::Release);
         }
         let mut compact = loaded(&f).compact_floor_only(f.identity, -200).unwrap();
+        let mut stopped_before_successor = false;
+        for _ in 0..20 {
+            assert!(matches!(compact.poll().unwrap(), IOResult::IO(_)));
+            let file = [&f.bank, &f.unused, &f.selector]
+                .into_iter()
+                .find(|file| file.pending_mutation.lock().is_some())
+                .unwrap();
+            let successor_write = match file.pending_mutation.lock().as_ref().unwrap() {
+                (Mutation::Write(0, bytes), _) if Arc::ptr_eq(file, &f.selector) => {
+                    IdSelector::decode(bytes.as_slice())
+                        .unwrap()
+                        .unwrap()
+                        .sequence
+                        == 3
+                }
+                _ => false,
+            };
+            if successor_write {
+                let (_, completion) = file.pending_mutation.lock().take().unwrap();
+                completion.error(crate::error::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "stop before successor selector",
+                ));
+                assert!(compact.poll().is_err());
+                stopped_before_successor = true;
+                break;
+            }
+            file.complete_mutation(false);
+        }
+        assert!(stopped_before_successor);
+        drop(compact);
+        let mut slots = f.selector.durable.lock().clone();
+        slots[0] ^= 1;
+        let a = f.bank.durable.lock();
+        let b = f.unused.durable.lock();
+        let selected = select(
+            [&slots[..PAGE_SIZE], &slots[PAGE_SIZE..]],
+            [&a, &b],
+            f.files.database_id,
+            f.identity.database,
+        )
+        .unwrap();
+        assert_eq!(selected.selector.sequence, 2);
+        assert_eq!(
+            replay_selected(selected, [&a, &b]).unwrap().logical_floor,
+            -100
+        );
+    }
+
+    #[test]
+    fn id_checkpoint_prepare_syncs_both_current_witnesses_before_reusing_the_other_bank() {
+        let f = writable_fixture();
+        let previous = f.bank.bytes.lock().clone();
+        *f.unused.bytes.lock() = previous.clone();
+        *f.unused.durable.lock() = previous;
+        let mut current = IdSelector::decode(&f.selector.bytes.lock()[..PAGE_SIZE])
+            .unwrap()
+            .unwrap();
+        let mut old = current;
+        old.active.bank = 1;
+        current.sequence = 2;
+        current.active.bank_generation = 2;
+        f.bank.bytes.lock()[..PAGE_SIZE].copy_from_slice(
+            &BankHeader {
+                database_id: f.files.database_id,
+                bank_generation: 2,
+                database: f.identity.database,
+            }
+            .encode()
+            .unwrap(),
+        );
+        current.active.running_crc = crc32c::crc32c(&f.bank.bytes.lock());
+        *f.bank.durable.lock() = f.bank.bytes.lock().clone();
+        {
+            let mut slots = f.selector.bytes.lock();
+            slots[..PAGE_SIZE].copy_from_slice(&current.encode().unwrap());
+            slots[PAGE_SIZE..].copy_from_slice(&old.encode().unwrap());
+            *f.selector.durable.lock() = slots.clone();
+        }
+        for file in [&f.bank, &f.unused, &f.selector] {
+            file.delay_mutations.store(true, Ordering::Release);
+        }
+        let mut compact = loaded(&f)
+            .prepare_checkpoint(checkpoint_target(&f), -200)
+            .unwrap();
         let mut stopped_before_successor = false;
         for _ in 0..20 {
             assert!(matches!(compact.poll().unwrap(), IOResult::IO(_)));
