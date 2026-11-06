@@ -1,4 +1,4 @@
-name: Shared MVCC native runtime admission validation
+name: Shared VDBE native admission regression validation
 on:
   workflow_dispatch:
 permissions:
@@ -10,75 +10,70 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "1"
 jobs:
-  io-leases:
+  vdbe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: cce5e625394d58f6f0378f2724cce78b2d6f1355
+          ref: 807b48ad447c272cfd9df4b07c9d53aea9eb4944
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Record exact runtime and filesystem
+      - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = cce5e625394d58f6f0378f2724cce78b2d6f1355
+          test "$(git rev-parse HEAD)" = 807b48ad447c272cfd9df4b07c9d53aea9eb4944
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Native retained shared open and independent readonly handles
+      - name: Native admission barrier and reset retirement
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared-open-native.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-open-native.log
-      - name: Guarded replay, global snapshot and materialized base
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --skip journal_mode --test-threads=1 --nocapture 2>&1 | tee admission-green.log
+          grep -q '2 passed; 0 failed' admission-green.log
+      - name: Journal mode marker regression must fail before fix
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database::shared_ -- --test-threads=1 --nocapture 2>&1 | tee shared-runtime.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-runtime.log
-      - name: Portable physical-retirement, failure and binding checks
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::guarded_file::tests --
-          --test-threads=1 --nocapture --skip process_ofd_lock_survives_abort_until_backend_retirement
-          --skip guarded_file_peer_process 2>&1 | tee guarded-file.log
-      - name: Actual competing-process OFD retirement boundary
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_journal_mode -- --test-threads=1 --nocapture 2>&1 | tee journal-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' journal-red.log
+          grep -q 'Invalid read_version: 254' journal-red.log
+      - name: Admission bypass negative control
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::guarded_file::tests::process_ofd_lock_survives_abort_until_backend_retirement -- --exact --nocapture 2>&1 | tee ofd-process.log
-          grep -q '1 passed; 0 failed' ofd-process.log
-      - name: Manifest codec, abort and successful-handoff ownership
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest:: --
-          --test-threads=1 --nocapture 2>&1 | tee manifest.log
-      - name: Shared commit durability, errors, CRC and retirement
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('core/vdbe/execute.rs')
+          source = path.read_text()
+          before = 'if mv_store.is_shared() {\n        return mv_store.begin_shared_nonblock('
+          assert source.count(before) == 1
+          path.write_text(source.replace(before, 'if false && mv_store.is_shared() {\n        return mv_store.begin_shared_nonblock('))
+          PYCODE
+          git diff > bypass.patch
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_fresh_read_and_savepoint -- --test-threads=1 --nocapture 2>&1 | tee admission-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' admission-red.log
+          grep -q 'shared fresh admission bypassed publication barrier' admission-red.log
+      - name: Restore route and recheck
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_commit:: -- --test-threads=1 --nocapture 2>&1 | tee shared-commit.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-commit.log
-      - name: Shared prefix adoption after abandoned append
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prefix_adoption -- --test-threads=1 --nocapture 2>&1 | tee prefix-adoption.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' prefix-adoption.log
-      - name: Existing shared authority process invariants
-        run: >-
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority:: --
-          --test-threads=1 --nocapture 2>&1 | tee authority.log
-      - name: Strict focused library lint
-        run: cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench --no-deps -- -D warnings
-      - name: Preserve exact source and test output
+          git checkout -- core/vdbe/execute.rs
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --skip journal_mode --test-threads=1 --nocapture 2>&1 | tee admission-restored.log
+          grep -q '2 passed; 0 failed' admission-restored.log
+      - name: Preserve exact source and controls
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-mvcc-commit-leases
+          name: shared-vdbe-native-controls
           path: |
-            shared-open-native.log
-            shared-runtime.log
             source.txt
             rustc.txt
-            guarded-file.log
-            ofd-process.log
-            manifest.log
-            shared-commit.log
-            prefix-adoption.log
-            authority.log
+            *.log
+            bypass.patch
           retention-days: 14
