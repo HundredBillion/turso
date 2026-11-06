@@ -19932,11 +19932,25 @@ fn op_journal_mode_inner(
 
                 let prev_mode_raw = return_if_io!(state, header_result);
 
-                let prev_mode_version = prev_mode_raw
-                    .to_version()
-                    .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
-
-                let prev_mode = journal_mode::JournalMode::from(prev_mode_version);
+                #[cfg(all(host_shared_wal, unix))]
+                let shared = mv_store.as_ref().is_some_and(|store| store.is_shared());
+                #[cfg(not(all(host_shared_wal, unix)))]
+                let shared = false;
+                let prev_mode = if shared {
+                    #[cfg(all(host_shared_wal, unix))]
+                    if prev_mode_raw.0 != crate::mvcc::database::SHARED_MVCC_VERSION {
+                        return Err(LimboError::Corrupt(
+                            "shared MVCC database lost its format marker".into(),
+                        )
+                        .into());
+                    }
+                    journal_mode::JournalMode::Mvcc
+                } else {
+                    let version = prev_mode_raw.to_version().map_err(|val| {
+                        LimboError::Corrupt(format!("Invalid read_version: {val}"))
+                    })?;
+                    journal_mode::JournalMode::from(version)
+                };
                 state.active_op_state.journal_mode().prev_mode = Some(prev_mode);
 
                 // If no new mode specified, just return current mode
@@ -19965,6 +19979,13 @@ fn op_journal_mode_inner(
                     state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
+                }
+
+                if shared {
+                    return Err(LimboError::InvalidArgument(
+                        "changing shared MVCC journal mode requires an offline transition".into(),
+                    )
+                    .into());
                 }
 
                 if *db != crate::MAIN_DB_ID {
@@ -22030,12 +22051,15 @@ mod shared_begin_tests {
         let f = Fixture::new();
         for sql in ["PRAGMA journal_mode", "PRAGMA journal_mode=mvcc"] {
             let mut statement = f.connection.prepare(sql).unwrap();
+            let mut rows = 0;
             statement
                 .run_with_row_callback(|row| {
                     assert_eq!(row.get::<&str>(0)?, "mvcc");
+                    rows += 1;
                     Ok(())
                 })
                 .unwrap();
+            assert_eq!(rows, 1);
         }
         assert!(matches!(
             f.connection.execute("PRAGMA journal_mode=wal"),
@@ -22047,6 +22071,45 @@ mod shared_begin_tests {
             &[crate::mvcc::database::SHARED_MVCC_VERSION; 2]
         );
     }
+    #[test]
+    fn shared_vdbe_sequence_admission_preserves_outer_snapshot_when_busy() {
+        let f = Fixture::new();
+        f.connection.execute("BEGIN CONCURRENT").unwrap();
+        f.connection.execute("SELECT value FROM preserved").unwrap();
+        let outer = f.connection.get_mv_tx();
+        assert!(outer.is_some());
+        assert!(f.connection.pager.load().holds_read_lock());
+        let statement = f.connection.prepare("SELECT 1").unwrap();
+        let mut state = ProgramState::new(2, 0);
+        let instruction = Insn::SequenceBeginInnerTx {
+            db: crate::MAIN_DB_ID,
+            path_kind_reg: 0,
+            saved_outer_reg: 1,
+        };
+        f.hold_publication();
+        for _ in 0..2 {
+            let error = match op_sequence_begin_inner_tx(
+                statement.get_program(),
+                &mut state,
+                &instruction,
+                statement.get_pager(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("sequence admission bypassed publication barrier"),
+            };
+            assert!(matches!(*error, LimboError::Busy));
+            assert_eq!(f.connection.get_mv_tx(), outer);
+            assert!(f.connection.pager.load().holds_read_lock());
+            assert!(state.sequence_inner_tx_pending.is_none());
+        }
+        f.release_publication();
+        f.connection.execute("SELECT value FROM preserved").unwrap();
+        assert_eq!(f.connection.get_mv_tx(), outer);
+        f.connection.execute("ROLLBACK").unwrap();
+        assert!(f.connection.get_mv_tx().is_none());
+        assert!(!f.connection.pager.load().holds_read_lock());
+    }
+
     #[test]
     fn shared_vdbe_reset_during_admission_retains_physical_read_ownership() {
         let reads = Arc::new(DelayedReads::default());
