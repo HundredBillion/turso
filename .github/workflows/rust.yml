@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 22fabf2b3a35b78e841a9536b08b9a5d71568546
+          ref: 43e04947da6c171a993f219877ea51bf6a7dcc45
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,26 +25,20 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 22fabf2b3a35b78e841a9536b08b9a5d71568546
+          test "$(git rev-parse HEAD)" = 43e04947da6c171a993f219877ea51bf6a7dcc45
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Export a real marked fixture
+      - name: Lost mapped epoch reproduces reused durable owner identity
         run: |
-          mkdir "$RUNNER_TEMP/shared-probe"
-          TURSO_SHARED_PROBE_DIR="$RUNNER_TEMP/shared-probe" cargo test --locked -p turso_core --lib --features conn_raw_api shared_runtime_export_fixture_for_release_probe -- --ignored --test-threads=1 --nocapture 2>&1 | tee fixture.log
-          grep -q '1 passed; 0 failed' fixture.log
-      - name: Production library reuses coordination and reopens after drop
-        run: |
-          cargo run --locked -p turso_core --features test_helper --example shared_open_probe -- "$RUNNER_TEMP/shared-probe/shared.db" 67108864 2>&1 | tee production-green.log
-          grep -q 'production-library shared open probe passed' production-green.log
-      - name: Native strict file and independent mapping checks
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files -- --test-threads=1 --nocapture 2>&1 | tee shared-files.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_preserves_base_and_separates_readonly_handles -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-open.log
-          grep -q '1 passed; 0 failed' native-open.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api authority_incarnation_does_not_reuse_durable_owner_after_mapped_state_loss -- --test-threads=1 --nocapture 2>&1 | tee epoch-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'assertion failed: snapshot.epoch > acknowledged_owner.0' epoch-red.log
+          grep -q '0 passed; 1 failed' epoch-red.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
