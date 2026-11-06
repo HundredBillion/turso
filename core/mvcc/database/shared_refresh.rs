@@ -45,7 +45,7 @@ impl SharedReplayContext {
         let state = self.state.lock().take().ok_or(LimboError::Busy)?;
         let mut refresh = SharedRefresh {
             owner: self.clone(),
-            last_frame_timestamp: state.context.persistent_tx_ts_max,
+            last_frame_timestamp: 0,
             state: Some(state),
             loaded: Some(loaded),
             file,
@@ -162,7 +162,7 @@ impl SharedRefresh {
             );
         }
         self.header_read = false;
-        self.last_frame_timestamp = state.context.persistent_tx_ts_max;
+        self.last_frame_timestamp = 0;
         Ok(())
     }
 
@@ -760,6 +760,64 @@ mod tests {
             db.conn.pager.load().clone(),
             &db.conn,
             crate::MAIN_DB_ID,
+        );
+    }
+
+    #[test]
+    fn shared_refresh_validates_retained_prefix_after_base_materialization() {
+        use super::super::tests::MvccTestDb;
+        use crate::mvcc::persistent_storage::logical_log::LogicalLog;
+        let db = MvccTestDb::new();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io
+            .open_file("checkpoint-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        for timestamp in [10, 20] {
+            io.wait_for_completion(
+                log.log_tx(LogRecord::for_test(timestamp, &[], None))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let record = ManifestRecord::new(
+            3,
+            FileId { dev: 1, ino: 2 },
+            1,
+            log.header().unwrap().salt,
+            PublishedPrefix {
+                committed_timestamp: 20,
+                end_offset: log.offset,
+                running_crc: log.running_crc,
+            },
+        )
+        .unwrap();
+        let mut base = context(&db);
+        base.persistent_tx_ts_max = 20;
+        base.max_commit_ts_seen = 20;
+        base.replay_cutoff_ts = 20;
+        let authority = authority_for_test(Arc::new(AuthorityFile));
+        let replay = SharedReplayContext::new(
+            base,
+            record,
+            Arc::new(Storage::new(file.clone(), io.clone(), None)),
+        );
+        let mut refresh = replay
+            .refresh(loaded(&io, record, &authority), file)
+            .unwrap();
+        let loaded = io
+            .block(|| refresh.poll(db.mvcc_store.as_ref(), &db.conn))
+            .unwrap();
+        loaded.into_guard().unwrap().finish().unwrap();
+        assert_eq!(
+            replay
+                .state
+                .lock()
+                .as_ref()
+                .unwrap()
+                .context
+                .max_commit_ts_seen,
+            20
         );
     }
 
