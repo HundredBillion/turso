@@ -2004,6 +2004,12 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
+        // Private memory targets and VFS backends without shared WAL keep their local WAL.
+        db_opts = db_opts.with_multiprocess_wal(
+            db_opts.enable_multiprocess_wal
+                && !is_memory_like(&opts.path)
+                && io.supports_shared_wal_coordination(),
+        );
         let db = Database::open(
             io.clone(),
             &opts.path,

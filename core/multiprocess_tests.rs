@@ -1115,6 +1115,96 @@ fn multiprocess_shm_schema_child_process() {
         .unwrap();
 }
 
+#[test]
+fn attached_memory_targets_stay_private_with_multiprocess_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.db");
+    let memory_vfs_path = dir.path().join("memory-vfs.db");
+    let db = Database::open_file_with_flags(
+        multiprocess_test_io(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    for target in [
+        ":memory:".to_string(),
+        String::new(),
+        "file::memory:?cache=private".to_string(),
+        format!("file:{}?vfs=memory", memory_vfs_path.display()),
+    ] {
+        for connection in [&conn, &other] {
+            connection
+                .execute(format!("ATTACH '{target}' AS aux"))
+                .unwrap();
+            let id = connection.get_database_id_by_name("aux").unwrap();
+            assert!(!connection
+                .get_source_database(id)
+                .experimental_multiprocess_wal_enabled());
+            connection.execute("CREATE TABLE aux.test(x)").unwrap();
+        }
+        conn.execute("INSERT INTO aux.test VALUES (1)").unwrap();
+        assert_eq!(attached_count(&conn), "1");
+        assert_eq!(attached_count(&other), "0");
+        for connection in [&conn, &other] {
+            connection.execute("DETACH aux").unwrap();
+        }
+    }
+    assert!(!memory_vfs_path.exists());
+}
+
+#[test]
+fn attached_memory_permissions_with_readonly_multiprocess_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.db");
+    let db = Database::open_file_with_flags(
+        multiprocess_test_io(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    db.connect(ConnectOpts::new())
+        .unwrap()
+        .execute("CREATE TABLE main_t(x); INSERT INTO main_t VALUES (7)")
+        .unwrap();
+    let conn = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+    for target in [":memory:", ""] {
+        conn.execute(format!("ATTACH '{target}' AS aux")).unwrap();
+        let id = conn.get_database_id_by_name("aux").unwrap();
+        assert!(!conn
+            .get_source_database(id)
+            .experimental_multiprocess_wal_enabled());
+        assert!(get_rows(&conn, "SELECT name FROM aux.sqlite_schema").is_empty());
+        assert!(matches!(
+            conn.execute("CREATE TABLE aux.test(x)"),
+            Err(LimboError::ReadOnly)
+        ));
+        conn.execute("DETACH aux").unwrap();
+    }
+    conn.execute("CREATE TEMP TABLE local_t(x); INSERT INTO local_t SELECT x FROM main_t")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT x FROM local_t"),
+        vec![vec![Value::Integer(7)]]
+    );
+    assert!(matches!(
+        conn.execute("INSERT INTO main_t VALUES (8)"),
+        Err(LimboError::ReadOnly)
+    ));
+    let missing = dir.path().join("missing.db");
+    assert!(conn
+        .execute(format!("ATTACH '{}' AS disk", missing.display()))
+        .is_err());
+    assert!(!missing.exists());
+}
+
 fn attached_count(conn: &Arc<Connection>) -> String {
     get_rows(conn, "select count(*) from aux.test")[0][0].to_string()
 }
