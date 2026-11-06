@@ -22,6 +22,8 @@ Local combined checks also covered actual Shuttle scheduling, attachment/checkpo
 
 With Node 24.22.2, matched fresh-process debug builds failed the unchanged 16 MiB blob RSS budget before the memory repairs (about 144 MiB growth) and passed after them (113–123 MiB across four runs). The body size and six-times-body limit were unchanged. This is local debug-build evidence, not an optimized production benchmark. The full JavaScript sync file also passed with its existing skips.
 
+A modern replay of seed `4849548719320319367` with `turso_whopper --mode fts-merge --max-steps 60000` passed in both WAL and MVCC modes. The original report lacks its full workload configuration and scheduling coordinates, so this is additional coverage, not proof that the historical mismatch is repaired.
+
 The branch additionally contains the independently reviewed aggregate misuse guard and matching C header version from the PHP compatibility follow-up. Invalid registered aggregate placement now returns an error instead of aborting the host. These changes do not resolve the separate deferred writer-activation or read-only startup hashing review findings.
 
 ## Already present
