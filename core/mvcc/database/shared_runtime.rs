@@ -136,12 +136,19 @@ impl SharedMvccRuntime {
         }))
     }
 
+    pub(super) fn owns_authority(
+        &self,
+        guard: &crate::mvcc::shared_authority::AuthorityGuard,
+    ) -> bool {
+        guard.belongs_to(&Arc::downgrade(&self.files.authority))
+    }
+
     pub(super) fn validate_oracle_identity(
         &self,
         guard: &crate::mvcc::shared_authority::AuthorityGuard,
         identity: RecoveryIdentity,
     ) -> Result<()> {
-        if !guard.belongs_to(&Arc::downgrade(&self.files.authority))
+        if !self.owns_authority(guard)
             || guard.published()? != identity.prefix
             || !guard.incarnation_ready()?
             || !self
@@ -890,11 +897,41 @@ fn shared_oracle_native_keeps_outer_snapshot_and_rejects_unresolved_state() {
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completion() {
+    run_shared_checkpoint_fixture(false, |_| Arc::new(crate::io::PlatformIO::new().unwrap()));
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+pub(in crate::mvcc) struct SharedCompletedCheckpointFixture {
+    pub proof: crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof,
+    pub guard: crate::mvcc::shared_authority::AuthorityGuard,
+    pub ids: crate::mvcc::shared_ids::io_protocol::checkpoint_prepare::SuspendedPreparedIds,
+    pub pause: crate::mvcc::checkpoint_gate::CheckpointPause,
+    pub database: Arc<crate::Database>,
+    pub connection: Arc<Connection>,
+    pub io: Arc<dyn crate::IO>,
+    pub path: PathBuf,
+    pub namespace: PathBuf,
+    pub limit: u64,
+    pub directory: tempfile::TempDir,
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+pub(in crate::mvcc) fn shared_completed_checkpoint_fixture(
+    io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+) -> SharedCompletedCheckpointFixture {
+    run_shared_checkpoint_fixture(true, io_factory).unwrap()
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+fn run_shared_checkpoint_fixture(
+    complete: bool,
+    io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+) -> Option<SharedCompletedCheckpointFixture> {
     use crate::state_machine::{StateTransition, TransitionResult};
     use crate::storage::wal::CheckpointMode;
     let directory = tempfile::tempdir().unwrap();
     let (path, limit) = shared_runtime_fixture(directory.path());
-    let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let io = io_factory(&path);
     let db = crate::Database::open(
         io.clone(),
         path.to_str().unwrap(),
@@ -940,6 +977,40 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
         }
     };
     let prefix = loaded.record().prefix();
+    let initial_record = loaded.record();
+    let preflight_source = RecoveryIdentity {
+        database: DatabaseGeneration {
+            generation: initial_record.log_generation(),
+            checkpoint_timestamp: base_timestamp,
+        },
+        prefix,
+    };
+    let preflight_target = DatabaseGeneration {
+        generation: initial_record.log_generation().checked_add(1).unwrap(),
+        checkpoint_timestamp: prefix.committed_timestamp,
+    };
+    let mut ids_load = runtime
+        .ids
+        .load(loaded.into_guard().unwrap(), preflight_source)
+        .unwrap();
+    let loaded_ids = loop {
+        match ids_load.poll().unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(loaded) => break loaded,
+        }
+    };
+    loaded_ids.preflight_checkpoint(preflight_target).unwrap();
+    let (suspended_ids, guard) = loaded_ids.suspend();
+    let mut manifest_reload =
+        ManifestLoad::new(runtime.files.manifest.clone(), guard, runtime.database_id).unwrap();
+    let loaded = loop {
+        match manifest_reload.poll().unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(loaded) => break loaded,
+        }
+    };
+    assert_eq!(loaded.record(), initial_record);
+
     let mut publication = loaded.begin_checkpoint_intent(base_timestamp).unwrap();
     let intent = loop {
         match publication.poll().unwrap() {
@@ -963,6 +1034,7 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
     checkpoint
         .authorize_shared_materialization(&intent)
         .unwrap();
+    assert!(checkpoint.materialized_checkpoint_proof(&intent).is_err());
     loop {
         match checkpoint.step(&()).unwrap() {
             TransitionResult::Continue => {}
@@ -970,8 +1042,18 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
             TransitionResult::Done(_) => break,
         }
     }
+    let materialized = loop {
+        match checkpoint.materialized_checkpoint_proof(&intent).unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(proof) => break proof,
+        }
+    };
+    assert!(materialized.matches_intent(&intent));
+    assert!(materialized.physical_floor() < 0);
+    assert!(checkpoint.materialized_checkpoint_proof(&intent).is_err());
     let materialized_main = std::fs::read(&path).unwrap();
     assert_ne!(materialized_main, main_before);
+    assert_eq!(&materialized_main[18..20], &[SHARED_MVCC_VERSION; 2]);
     assert!(
         materialized_main
             .windows(b"materialized shared row".len())
@@ -992,6 +1074,62 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
     }
     drop(main_binding);
     drop(wal_binding);
+    if complete {
+        let record = intent.record();
+        let source = RecoveryIdentity {
+            database: DatabaseGeneration {
+                generation: record.log_generation(),
+                checkpoint_timestamp: base_timestamp,
+            },
+            prefix,
+        };
+        let target = DatabaseGeneration {
+            generation: record.checkpoint_intent().unwrap().target_generation,
+            checkpoint_timestamp: prefix.committed_timestamp,
+        };
+        let (token, guard) = intent.suspend();
+        let loaded = suspended_ids.rejoin_source(guard).unwrap();
+        let mut preparation = loaded
+            .prepare_checkpoint(target, materialized.physical_floor())
+            .unwrap();
+        let prepared = loop {
+            match preparation.poll().unwrap() {
+                IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+                IOResult::Done(prepared) => break prepared,
+            }
+        };
+        let mut publication = token.begin_completion(materialized, prepared).unwrap();
+        let completed = loop {
+            match publication.poll().unwrap() {
+                IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+                IOResult::Done(completed) => break completed,
+            }
+        };
+        let (proof, mut guard, ids) = completed.into_parts();
+        assert!(proof.matches_lease(&guard));
+        assert_eq!(proof.source_identity(), Some(source));
+        assert_eq!(proof.target_identity().database, target);
+        assert!(ids.prepared_floor().unwrap() <= proof.materialized_floor());
+        assert_eq!(guard.published().unwrap(), source.prefix);
+        guard.publish_checkpoint(&proof).unwrap();
+        assert_eq!(guard.published().unwrap(), proof.target_identity().prefix);
+        assert_eq!(std::fs::read(&logical_path).unwrap(), log_before);
+        let namespace = runtime.files.namespace.clone();
+        return Some(SharedCompletedCheckpointFixture {
+            proof,
+            guard,
+            ids,
+            pause: _pause,
+            database: db,
+            connection,
+            io,
+            path,
+            namespace,
+            limit,
+            directory,
+        });
+    }
+    drop(suspended_ids);
     intent.into_guard().finish().unwrap();
     drop(_pause);
     let reopened = crate::Database::open(
@@ -1002,8 +1140,37 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
     assert!(
         matches!(reopened, Err(LimboError::InvalidArgument(message)) if message.contains("checkpoint recovery"))
     );
+    None
 }
 
 #[cfg(all(test, target_os = "linux", not(shuttle)))]
 #[path = "shared_id_oracle_tests.rs"]
 mod shared_id_oracle_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_checkpoint_native_completion_requires_id_finalization_before_admission() {
+    let fixture =
+        shared_completed_checkpoint_fixture(|_| Arc::new(crate::io::PlatformIO::new().unwrap()));
+    let source = fixture.proof.source_identity().unwrap();
+    let target = fixture.proof.target_identity();
+    assert_eq!(target.database.generation, source.database.generation + 1);
+    assert_eq!(target.prefix.end_offset, 0);
+    assert_eq!(
+        target.prefix.committed_timestamp,
+        source.prefix.committed_timestamp
+    );
+    drop(fixture.ids);
+    fixture.guard.finish().unwrap();
+    drop(fixture.pause);
+    let reopened = crate::Database::open(
+        fixture.io,
+        fixture.path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+            .with_shared_mvcc_for_test(fixture.limit),
+    );
+    assert!(
+        matches!(reopened, Err(LimboError::InvalidArgument(message)) if message.contains("checkpoint recovery"))
+    );
+}

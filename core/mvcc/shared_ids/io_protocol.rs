@@ -1781,6 +1781,171 @@ mod tests {
     }
 
     #[test]
+    fn id_checkpoint_preflight_reserves_preparation_and_finalization_sequences() {
+        for sequence in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let f = writable_fixture();
+            let mut current = loaded(&f);
+            current.selection.selector.sequence = sequence;
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            let preflight = current.preflight_checkpoint(checkpoint_target(&f));
+            if sequence == u64::MAX - 2 {
+                assert!(preflight.is_ok());
+            } else {
+                assert!(matches!(preflight, Err(LimboError::DatabaseFull)));
+            }
+            let result = current.prepare_checkpoint(checkpoint_target(&f), -200);
+            if sequence == u64::MAX - 2 {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    matches!(result, Err(LimboError::DatabaseFull)),
+                    "sequence {sequence}"
+                );
+            }
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+        }
+    }
+
+    #[test]
+    fn id_checkpoint_loaded_handoff_keeps_preflight_state_without_rebinding() {
+        for reacquire in [false, true] {
+            let f = writable_fixture();
+            let current = loaded(&f);
+            current.preflight_checkpoint(checkpoint_target(&f)).unwrap();
+            let before = [&f.bank, &f.unused, &f.selector].map(|file| file.bytes.lock().clone());
+            let original = current.guard.io_lease();
+            let (suspended, guard) = current.suspend();
+            assert_eq!(suspended.source_identity(), f.identity);
+            assert!(matches!(
+                f.files.selector.bind(&guard),
+                Err(LimboError::Busy)
+            ));
+            let guard = if reacquire {
+                drop(guard);
+                let mut guard = f.authority.try_acquire().unwrap();
+                guard.recover(f.identity.prefix).unwrap();
+                guard
+            } else {
+                guard
+            };
+            let result = suspended.rejoin_source(guard);
+            if reacquire {
+                assert!(result.is_err());
+            } else {
+                let loaded = result.unwrap();
+                assert!(crate::sync::Weak::ptr_eq(
+                    &original,
+                    &loaded.guard.io_lease()
+                ));
+                loaded.preflight_checkpoint(checkpoint_target(&f)).unwrap();
+                loaded.into_guard().finish().unwrap();
+            }
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector].map(|file| file.bytes.lock().clone())
+            );
+        }
+    }
+
+    #[test]
+    fn id_checkpoint_prepare_handoff_retains_bindings_and_exact_source_lease() {
+        let f = writable_fixture();
+        let mut prepare = loaded(&f)
+            .prepare_checkpoint(checkpoint_target(&f), -200)
+            .unwrap();
+        let IOResult::Done(prepared) = prepare.poll().unwrap() else {
+            panic!("synchronous fixture")
+        };
+        assert_eq!(prepared.prepared_floor().unwrap(), -200);
+        let original = prepared.guard().io_lease();
+        let before = f.selector.bytes.lock().clone();
+        let (suspended, guard) = prepared.suspend();
+        assert_eq!(suspended.prepared_floor().unwrap(), -200);
+        assert_eq!(suspended.source_identity(), f.identity);
+        assert_eq!(suspended.target().unwrap(), checkpoint_target(&f));
+        assert!(crate::sync::Weak::ptr_eq(&original, &guard.io_lease()));
+        assert!(matches!(
+            f.files.selector.bind(&guard),
+            Err(LimboError::Busy)
+        ));
+        let prepared = suspended.rejoin_source(guard).unwrap();
+        assert_eq!(prepared.source_identity(), f.identity);
+        assert_eq!(prepared.target(), checkpoint_target(&f));
+        assert!(crate::sync::Weak::ptr_eq(
+            &original,
+            &prepared.guard().io_lease()
+        ));
+        assert_eq!(*f.selector.bytes.lock(), before);
+    }
+
+    #[test]
+    fn id_checkpoint_prepare_handoff_rejects_reacquired_authority() {
+        let f = writable_fixture();
+        let mut prepare = loaded(&f)
+            .prepare_checkpoint(checkpoint_target(&f), -200)
+            .unwrap();
+        let IOResult::Done(prepared) = prepare.poll().unwrap() else {
+            panic!("synchronous fixture")
+        };
+        let before = f.selector.bytes.lock().clone();
+        let (suspended, guard) = prepared.suspend();
+        drop(guard);
+        let mut other = f.authority.try_acquire().unwrap();
+        other.recover(f.identity.prefix).unwrap();
+        assert!(suspended.rejoin_source(other).is_err());
+        assert_eq!(*f.selector.bytes.lock(), before);
+        assert!(f.authority.try_acquire().unwrap().requires_recovery());
+    }
+
+    #[test]
+    fn id_checkpoint_prepare_handoff_rejects_changed_source_prefix() {
+        use crate::mvcc::commit_manifest::{ManifestLoad, ManifestRecord, SLOT_SIZE};
+        let f = writable_fixture();
+        let mut prepare = loaded(&f)
+            .prepare_checkpoint(checkpoint_target(&f), -200)
+            .unwrap();
+        let IOResult::Done(prepared) = prepare.poll().unwrap() else {
+            panic!("synchronous fixture")
+        };
+        let before = f.selector.bytes.lock().clone();
+        let (suspended, guard) = prepared.suspend();
+        let first = ManifestRecord::new(1, f.files.database_id, 1, 123, f.identity.prefix).unwrap();
+        let mut bytes = vec![0; 2 * SLOT_SIZE];
+        let encoded = first.encode();
+        bytes[..encoded.len()].copy_from_slice(&encoded);
+        let file = TestFile::new(808, bytes);
+        file.writable.store(true, Ordering::Release);
+        let mut load = ManifestLoad::new(file, guard, f.files.database_id).unwrap();
+        let IOResult::Done(manifest) = load.poll().unwrap() else {
+            panic!("synchronous manifest")
+        };
+        let next = ManifestRecord::new(
+            2,
+            f.files.database_id,
+            1,
+            123,
+            PublishedPrefix {
+                committed_timestamp: 1,
+                end_offset: PAGE_SIZE as u64,
+                running_crc: 123,
+            },
+        )
+        .unwrap();
+        let mut publication = manifest.publish(next).unwrap();
+        let IOResult::Done(durable) = publication.poll().unwrap() else {
+            panic!("synchronous publication")
+        };
+        let guard = durable.publish().unwrap();
+        assert!(suspended.rejoin_source(guard).is_err());
+        assert_eq!(*f.selector.bytes.lock(), before);
+    }
+
+    #[test]
     fn id_checkpoint_prepare_rejects_invalid_target_floor_live_readers_and_budget() {
         for case in 0..7 {
             let mut f = writable_fixture();

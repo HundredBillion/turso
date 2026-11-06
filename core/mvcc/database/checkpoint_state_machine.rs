@@ -272,7 +272,36 @@ pub struct LockStates {
 #[cfg(all(host_shared_wal, unix))]
 struct SharedMaterializationAuthorization {
     lease: crate::sync::Weak<crate::mvcc::shared_authority::PublicationLease>,
-    timestamp: u64,
+    record: crate::mvcc::commit_manifest::ManifestRecord,
+}
+
+#[cfg(all(host_shared_wal, unix))]
+pub(in crate::mvcc) struct MaterializedCheckpointProof {
+    authorization: SharedMaterializationAuthorization,
+    physical_floor: i64,
+}
+
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+impl MaterializedCheckpointProof {
+    pub(in crate::mvcc) fn physical_floor(&self) -> i64 {
+        self.physical_floor
+    }
+    pub(in crate::mvcc) fn matches_manifest(
+        &self,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+        guard: &crate::mvcc::shared_authority::AuthorityGuard,
+    ) -> bool {
+        self.authorization.record == record
+            && crate::sync::Weak::ptr_eq(&self.authorization.lease, &guard.io_lease())
+    }
+    pub(in crate::mvcc) fn matches_intent(
+        &self,
+        intent: &crate::mvcc::commit_manifest::checkpoint_publication::MirroredCheckpointIntent,
+    ) -> bool {
+        self.authorization.record == intent.record()
+            && crate::sync::Weak::ptr_eq(&self.authorization.lease, &intent.guard().io_lease())
+    }
 }
 
 /// A state machine that performs a complete checkpoint operation on the MVCC store.
@@ -349,6 +378,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     mode: CheckpointMode,
     #[cfg(all(host_shared_wal, unix))]
     shared_materialization: Option<SharedMaterializationAuthorization>,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_materialization_complete: bool,
     /// Internal metadata table info for persisting `persistent_tx_ts_max` atomically with pager commit.
     mvcc_meta_table: Option<(MVTableId, usize)>,
     /// File-backed databases must persist replay boundary durably.
@@ -980,6 +1011,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             mode,
             #[cfg(all(host_shared_wal, unix))]
             shared_materialization: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_materialization_complete: false,
             mvcc_meta_table,
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
@@ -1044,6 +1077,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if !matches!(self.state, CheckpointState::PrepareCheckpoint)
             || self.shared_materialization.is_some()
             || self.mvstore.uses_passive_checkpoint()
+            || !self.durable_mvcc_metadata
+            || self.mvcc_meta_table.is_none()
             || self.sync_mode != SyncMode::Full
             || !matches!(
                 self.mode,
@@ -1085,9 +1120,64 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
         self.shared_materialization = Some(SharedMaterializationAuthorization {
             lease: intent.guard().io_lease(),
-            timestamp: record.prefix().committed_timestamp,
+            record,
         });
         Ok(())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    #[allow(dead_code)]
+    pub(super) fn materialized_checkpoint_proof(
+        &mut self,
+        intent: &crate::mvcc::commit_manifest::checkpoint_publication::MirroredCheckpointIntent,
+    ) -> Result<IOResult<MaterializedCheckpointProof>> {
+        let authorization = self.shared_materialization.as_ref().ok_or_else(|| {
+            LimboError::InvalidArgument("checkpoint has no materialization authorization".into())
+        })?;
+        if !self.shared_materialization_complete
+            || !matches!(self.state, CheckpointState::Finalize)
+            || self.lock_states.blocking_checkpoint_lock_held
+            || self.checkpoint_result.is_some()
+            || authorization.record != intent.record()
+            || !crate::sync::Weak::ptr_eq(&authorization.lease, &intent.guard().io_lease())
+            || intent.guard().published()? != authorization.record.prefix()
+            || self.mvstore.durable_txid_max.load(Ordering::Acquire)
+                != authorization.record.prefix().committed_timestamp
+        {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint has not completed materialization".into(),
+            ));
+        }
+        if !intent.guard().io_retired() {
+            return Ok(IOResult::IO(IOCompletions(
+                intent.guard().retirement_completion(),
+            )));
+        }
+        let runtime =
+            self.mvstore.shared_runtime.get().ok_or_else(|| {
+                LimboError::InvalidArgument("checkpoint lost shared runtime".into())
+            })?;
+        if runtime.physical_wal_file().size()? != 0 {
+            return Err(LimboError::Corrupt(
+                "materialized checkpoint retains physical WAL".into(),
+            ));
+        }
+        let page_size = u64::from(self.pager.get_page_size().ok_or(LimboError::NotADB)?.get());
+        let bytes = runtime.main_file().size()?;
+        if bytes == 0 || bytes % page_size != 0 {
+            return Err(LimboError::Corrupt(
+                "materialized main file has incomplete pages".into(),
+            ));
+        }
+        let physical_floor = i64::try_from(bytes / page_size)
+            .ok()
+            .and_then(i64::checked_neg)
+            .filter(|floor| *floor != i64::MIN)
+            .ok_or(LimboError::DatabaseFull)?;
+        Ok(IOResult::Done(MaterializedCheckpointProof {
+            authorization: self.shared_materialization.take().unwrap(),
+            physical_floor,
+        }))
     }
 
     #[cfg(test)]
@@ -2570,7 +2660,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let authorization = self.shared_materialization.as_ref().ok_or_else(|| {
                 LimboError::InvalidArgument("shared checkpoint requires mirrored intent".into())
             })?;
-            if self.mvstore.last_committed_tx_ts.load(Ordering::Acquire) != authorization.timestamp
+            if self.mvstore.last_committed_tx_ts.load(Ordering::Acquire)
+                != authorization.record.prefix().committed_timestamp
             {
                 return Err(LimboError::Corrupt(
                     "shared checkpoint frontier changed".into(),
@@ -3780,6 +3871,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                 let end = self.mvstore.storage.on_checkpoint_end(Ok(result));
                 self.release_checkpoint_locks_if_needed();
                 end?;
+                #[cfg(all(host_shared_wal, unix))]
+                if self.shared_materialization.is_some() {
+                    self.shared_materialization_complete = true;
+                }
                 res
             }
             Ok(result) => Ok(result),

@@ -101,6 +101,18 @@ pub(crate) use shared_runtime::{
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{shared_runtime_fixture, shared_runtime_fixture_with_limit};
 
+#[cfg(all(
+    test,
+    host_shared_wal,
+    target_os = "linux",
+    target_pointer_width = "64",
+    not(shuttle)
+))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_runtime::{
+    shared_completed_checkpoint_fixture, SharedCompletedCheckpointFixture,
+};
+
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
 mod shared_commit_integration_tests;
 
