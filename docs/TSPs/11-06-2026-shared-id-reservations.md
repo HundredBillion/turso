@@ -582,3 +582,13 @@ checks pass 55 shared-ID tests with this one native test ignored; the broader
 test now starts with incarnation readiness false and confirms that it remains
 false after delayed callbacks retire, with snapshot admission still rejected.
 Native process execution remains a hosted Linux check.
+
+
+The first hosted native reservation run failed at the fixture's authority-open
+unwrap: a peer briefly holds the lifetime byte exclusively during restart
+bookkeeping, so another opener can legitimately return `Busy` before that peer
+downgrades to its shared lifetime lock. The fixture now retries only startup
+`Busy`, with a ten-second deadline; other errors fail immediately. A parent-held
+exclusive lifetime lock forces both child processes to report this startup
+contention before the parent releases the lock. Reservation and commit operations
+are not retried. Native green evidence still requires the hosted rerun.
