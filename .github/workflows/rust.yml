@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: eac0d6bc24ded8476cfcea460de18172c32d7dbe
+          ref: b5cc515163ff811cad060efa8d25cce9e31355e6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,15 +25,25 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = eac0d6bc24ded8476cfcea460de18172c32d7dbe
+          test "$(git rev-parse HEAD)" = b5cc515163ff811cad060efa8d25cce9e31355e6
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Concrete native offline upgrade and exclusion
+      - name: Epoch identity and native reservation process recovery
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_ -- --test-threads=1 --nocapture 2>&1 | tee offline-green.log
-          grep -q '3 passed; 0 failed' offline-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_authority:: -- --test-threads=1 --nocapture 2>&1 | tee authority.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids:: -- --test-threads=1 --nocapture 2>&1 | tee ids.log
+          grep -q 'native_id_reservations_survive_death_compaction_and_reopen ... ok' ids.log
+      - name: Native opening SQL commits and admission after reconciliation
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee opening.log
+          grep -q '1 passed; 0 failed' opening.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commits.log
+          grep -q '2 passed; 0 failed' commits.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee vdbe.log
+          grep -q '6 passed; 0 failed' vdbe.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh_ -- --test-threads=1 --nocapture 2>&1 | tee refresh.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Preserve exact source and expected failure
         if: always()
