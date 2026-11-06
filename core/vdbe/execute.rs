@@ -21855,9 +21855,103 @@ mod tests {
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
 mod shared_begin_tests {
     use super::*;
-    use crate::io::{File, PlatformIO, SharedWalLockKind};
+    use crate::io::{Buffer, File, PlatformIO, SharedWalLockKind};
     use crate::{ConnectOpts, Database, EngineDialect, OpenOptions, IO};
     use std::os::unix::fs::MetadataExt;
+
+    #[derive(Default)]
+    struct DelayedReads {
+        enabled: std::sync::atomic::AtomicBool,
+        release_retained: std::sync::atomic::AtomicBool,
+        pending: crate::sync::Mutex<Vec<(Arc<dyn File>, u64, Completion)>>,
+        retained: crate::sync::Mutex<Vec<Completion>>,
+    }
+    struct DelayedManifestFile {
+        inner: Arc<dyn File>,
+        reads: Arc<DelayedReads>,
+    }
+    impl File for DelayedManifestFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn file_id(&self) -> Result<Option<crate::io::FileId>> {
+            self.inner.file_id()
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            if self.reads.enabled.load(Ordering::SeqCst) {
+                self.reads
+                    .pending
+                    .lock()
+                    .push((self.inner.clone(), pos, c.clone()));
+                Ok(c)
+            } else {
+                self.inner.pread(pos, c)
+            }
+        }
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, kind: crate::io::FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, kind)
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+    struct DelayedIo {
+        inner: PlatformIO,
+        reads: Arc<DelayedReads>,
+    }
+    impl crate::io::Clock for DelayedIo {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+    impl IO for DelayedIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            if std::path::Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == "manifest")
+            {
+                Ok(Arc::new(DelayedManifestFile {
+                    inner,
+                    reads: self.reads.clone(),
+                }))
+            } else {
+                Ok(inner)
+            }
+        }
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn supports_shared_wal_coordination(&self) -> bool {
+            self.inner.supports_shared_wal_coordination()
+        }
+        fn step(&self) -> Result<()> {
+            if self.reads.release_retained.load(Ordering::SeqCst) {
+                self.reads.retained.lock().clear();
+            }
+            let pending = std::mem::take(&mut *self.reads.pending.lock());
+            for (file, offset, completion) in pending {
+                let physical = file.pread(offset, completion)?;
+                self.reads.retained.lock().push(physical);
+            }
+            self.inner.step()
+        }
+    }
 
     struct Fixture {
         connection: Arc<Connection>,
@@ -21867,9 +21961,11 @@ mod shared_begin_tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_io(Arc::new(PlatformIO::new().unwrap()))
+        }
+        fn with_io(io: Arc<dyn IO>) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
-            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
             let database = Database::open(
                 io.clone(),
                 path.to_str().unwrap(),
@@ -21950,5 +22046,43 @@ mod shared_begin_tests {
             &bytes[18..20],
             &[crate::mvcc::database::SHARED_MVCC_VERSION; 2]
         );
+    }
+    #[test]
+    fn shared_vdbe_reset_during_admission_retains_physical_read_ownership() {
+        let reads = Arc::new(DelayedReads::default());
+        let io = Arc::new(DelayedIo {
+            inner: PlatformIO::new().unwrap(),
+            reads: reads.clone(),
+        });
+        let f = Fixture::with_io(io.clone());
+        let mut statement = f.connection.prepare("SELECT value FROM preserved").unwrap();
+        reads.enabled.store(true, Ordering::SeqCst);
+        assert!(matches!(statement.step().unwrap(), StepResult::IO));
+        assert!(!reads.pending.lock().is_empty());
+        assert!(f.connection.get_mv_tx().is_none());
+        assert!(!f.connection.pager.load().holds_read_lock());
+        reads.enabled.store(false, Ordering::SeqCst);
+        statement.reset().unwrap();
+        assert!(reads.pending.lock().is_empty());
+        assert!(!reads.retained.lock().is_empty());
+        assert!(!f
+            .authority_file
+            .shared_wal_try_lock_byte(1, true, SharedWalLockKind::LinuxOfd)
+            .unwrap());
+        reads.release_retained.store(true, Ordering::SeqCst);
+        io.step().unwrap();
+        f.hold_publication();
+        f.release_publication();
+        let mut rows = 0;
+        statement
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get::<&str>(0)?, "durable payload");
+                rows += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(f.connection.get_mv_tx().is_none());
+        assert!(!f.connection.pager.load().holds_read_lock());
     }
 }
