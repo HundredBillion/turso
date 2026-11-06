@@ -21,7 +21,8 @@ and crash controls use SIGKILL.
 * `turso-wal-control`: the full ordinary-WAL control scenarios, if supported by
   the current engine's process admission. Failure is evidence of that control's
   limits, not permission to weaken shared-mode acceptance.
-* `shared-acceptance`: all scenarios below, requiring successful execution of
+* `shared-acceptance`: PDO URI only for the user-approved initial release. All
+  scenarios below require successful execution of
   two disjoint write transactions before either commits. Every opened participant
   must report `PRAGMA turso_mvcc_mode` as exactly `shared`. A missing capability
   produces exit 78 before durability configuration or data-changing SQL.
@@ -38,8 +39,8 @@ non-memory filename before calling `sqlite3_open_v2`; a `file:` URI therefore
 fails before reaching the intended parser. This was reproduced against stock
 SQLite and is visible in [PHP 8.3.6 source](https://github.com/php/php-src/blob/php-8.3.6/ext/sqlite3/sqlite3.c#L105).
 The SQLite3 ordinary controls use plain paths and explicit read-only flags.
-Shared SQLite3 URI opening remains a clear failure until an approved explicit
-binding API exists. No filename rewrite or ordinary-mode fallback is used.
+Shared SQLite3 is outside the user-approved initial release; `shared-acceptance`
+rejects SQLite3 or vendor flags at argument validation. No filename rewrite or ordinary-mode fallback is used.
 
 ## Run
 
@@ -91,8 +92,12 @@ concurrent automatic IDs and sequence persistence; read-only main and attachment
 write rejection; writable private TEMP; and durable-file hashes. Stock SQLite
 may create an empty WAL on a read-only open, so only that control permits a new
 zero-byte WAL; existing bytes must remain unchanged. Turso profiles require the
-recorded main/WAL/log files to remain byte-identical, excluding coordination
-sidecars from the content-preservation comparison.
+recorded main/WAL/log files and identity-directory `manifest`, `logical` and
+`physical-wal` to remain byte-identical. The shared fixture must contain all three
+identity durable files. Writable `authority` and `physical-tshm` coordination files
+are excluded. Refused upgrades compare the entire dedicated legacy-fixture
+subtree, including newly created identity directories; supervisor logs and its
+external ACK ledger live outside that subtree.
 
 Each recovery transaction has two exact independently specified rows. The
 supervisor records and fsyncs its intent before work, and records/fsyncs an ACK
@@ -124,7 +129,8 @@ Real PHP 8.3.6/PDO and SQLite3 stock controls passed in a disposable Ubuntu 24.0
 container. This includes response barriers, conflicts, read-only/TEMP/ATTACH,
 forced deaths, lost acknowledgment, fresh recovery and integrity checks. The
 ignored-options negative control exited 78 as required. Supervisor negative tests
-reject silent workers, stale response IDs, incomplete responses, lost acknowledged
+reject missing identity durable files, identity-file changes, rejected-upgrade
+sidecar creation, silent workers, stale response IDs, incomplete responses, lost acknowledged
 rows, partial unreported transactions and mismatched ACK payloads.
 
 The controls exposed two harness defects before completion: fetching a zero-column
@@ -143,7 +149,8 @@ bit, returned SELECT 42, and returned no shared-mode capability. This is evidenc
 for a possible explicit flag API, not evidence that any current Turso flag enables
 shared MVCC. The supervisor's optional `--shared-open-flag 0x10000000` passes that
 flag for shared tests and uses a plain SQLite3 filename, but still requires the
-same mode attestation. With stock SQLite it must exit 78.
+same mode attestation in `sqlite-shared-negative-control` only. With stock SQLite
+it must exit 78; the approved `shared-acceptance` profile rejects this flag.
 
 `probe_open_flags.c` is an isolated diagnostic interposer. It removes GNU loader
 DEEPBIND only so its symbol hook can observe PHP's actual call; it must not be used
@@ -154,6 +161,12 @@ cc -shared -fPIC -Wall -Wextra -Werror probe_open_flags.c -ldl -o /tmp/probe-ope
 LD_PRELOAD=/tmp/probe-open-flags.so php -r '$db=new SQLite3("/tmp/flags.db",6|0x10000000); echo $db->querySingle("SELECT 42"),"\n";'
 ```
 
-The public flag assignment, durable-limit configuration and release support are
-owned by the engine implementation and user scope decision. This test code changes
+The user chose PDO-only initial support, so no vendor flag API is being enabled.
+Any later public flag assignment and durable-limit configuration needs a separate
+reviewed scope decision. This test code changes
 no production interface and never treats stock SQLite's ignored bit as support.
+
+The identity-directory regression controls were observed RED when those files
+and hidden directory creation were omitted, then GREEN with the complete
+snapshots. These are oracle checks; actual new-mode behavior remains unimplemented
+and cannot be certified by constructing synthetic sidecar files.
