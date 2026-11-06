@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6f1083925f20c5e78e850ee63a52e249d6b5c2b8
+          ref: e0a84927e344b4040ee90a1c9fb7c956a312ff1d
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,48 +25,46 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = 6f1083925
+          test "$(git rev-parse --short=9 HEAD)" = e0a84927e
           rustc -Vv | tee rustc.txt
-      - name: Native cleanup proof checks
+      - name: Manifest codec and publication checks
         run: |
           set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup -- --test-threads=1 --nocapture 2>&1 | tee cleanup-green.log
-          grep -q '4 passed; 0 failed' cleanup-green.log
-      - name: Removing identity and raw-path proofs must fail controls
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest -- --test-threads=1 --nocapture 2>&1 | tee manifest-green.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-green.log
+          grep -q '1 passed; 0 failed' fence-green.log
+      - name: Bypassing intent fences must fail native admission control
         run: |
-          cp core/mvcc/mode_transition/staging_cleanup.rs /tmp/cleanup-verified.rs
+          cp core/mvcc/database/shared_runtime.rs /tmp/runtime-verified.rs
+          cp core/mvcc/database/shared_refresh.rs /tmp/refresh-verified.rs
           python3 - <<'PYCODE'
-          p='core/mvcc/mode_transition/staging_cleanup.rs'
-          s=open(p).read()
-          line='        require_identity(&self.path, identity(file)?)?;'
-          assert s.count(line)==1
-          s=s.replace(line,'')
-          raw='let mut wal = staging.as_os_str().to_owned();'
-          assert s.count(raw)==1
-          s=s.replace(raw,'let wal = format!("{}-wal", staging.display());')
-          s=s.replace('        wal.push("-wal");','')
-          open(p,'w').write(s)
+          for p in ['core/mvcc/database/shared_runtime.rs','core/mvcc/database/shared_refresh.rs']:
+              s=open(p).read()
+              guard='loaded.record().requires_recovery()'
+              assert s.count(guard)==1
+              s=s.replace(guard,'loaded.record().checkpoint_intent().is_some()')
+              open(p,'w').write(s)
           PYCODE
           set +e
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup -- --test-threads=1 --nocapture 2>&1 | tee cleanup-negative.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-negative.log
           status=${PIPESTATUS[0]}
           set -e
-          cp /tmp/cleanup-verified.rs core/mvcc/mode_transition/staging_cleanup.rs
+          cp /tmp/runtime-verified.rs core/mvcc/database/shared_runtime.rs
+          cp /tmp/refresh-verified.rs core/mvcc/database/shared_refresh.rs
           test "$status" -ne 0
-          grep -q '2 passed; 2 failed' cleanup-negative.log
-          grep -q 'unwrap_err()' cleanup-negative.log
-          grep -q 'raw-name staging WAL was orphaned' cleanup-negative.log
+          grep -q '0 passed; 1 failed' fence-negative.log
+          grep -q 'assertion failed' fence-negative.log
       - name: Restored exact source passes
         run: |
           git diff --exit-code
           set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup -- --test-threads=1 --nocapture 2>&1 | tee cleanup-restored.log
-          grep -q '4 passed; 0 failed' cleanup-restored.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-restored.log
+          grep -q '1 passed; 0 failed' fence-restored.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: staging-cleanup-green
+          name: downgrade-intent-proof
           path: |
             source.txt
             rustc.txt
