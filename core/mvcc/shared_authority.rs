@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64 as MappedAtomic;
 
 const MAP_LEN: usize = 4096;
 const MAGIC: u64 = u64::from_le_bytes(*b"TMVCC001");
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 const SLOT_COUNT: usize = 64;
 const SLOT_START: usize = 128;
 const SLOT_WIDTH: usize = 32;
@@ -1020,4 +1020,20 @@ pub(super) fn authority_for_test(file: Arc<dyn File>) -> Arc<SharedMvccAuthority
     authority.initialize(FileId { dev: 1, ino: 2 }, 1_000_000);
     authority.store(EPOCH_OFFSET, 1);
     authority
+}
+
+#[cfg(all(test, not(shuttle)))]
+#[test]
+fn shared_authority_rejects_pre_reservation_protocol_without_reinitialization() {
+    use crate::IO;
+    let io = crate::MemoryIO::new();
+    let file = io
+        .open_file("old-authority", crate::io::OpenFlags::Create, false)
+        .unwrap();
+    let authority = authority_for_test(file);
+    authority.store(VERSION_OFFSET, 1);
+    assert!(authority
+        .validate_header(FileId { dev: 1, ino: 2 }, 1_000_000)
+        .is_err());
+    assert_eq!(authority.load(VERSION_OFFSET), 1);
 }
