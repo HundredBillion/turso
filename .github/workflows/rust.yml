@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3ea66031a81c65564b1c1a3541febacf66571341
+          ref: 4f5d04351d17267acaf24e45627c96040e6b2259
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,23 +25,84 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 3ea66031a81c65564b1c1a3541febacf66571341
+          test "$(git rev-parse HEAD)" = 4f5d04351d17267acaf24e45627c96040e6b2259
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Offline publication now includes ID journals
+      - name: Offline namespace, strict files, and codec checks
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --test-threads=1 --nocapture 2>&1 | tee mode-green.log
-      - name: Missing ID files must expose the old strict-opener gap
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files_ -- --test-threads=1 --nocapture 2>&1 | tee files-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids -- --test-threads=1 --nocapture 2>&1 | tee ids-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_authority -- --test-threads=1 --nocapture 2>&1 | tee authority-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee runtime-green.log
+      - name: Alias validation negative control
         run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('core/mvcc/shared_files.rs')
+          source = path.read_text()
+          start = source.index('        let other_ids = [')
+          end = source.index('        if manifest_native.file.metadata()', start)
+          path.write_text(source[:start] + source[end:])
+          PYCODE
+          git diff > alias-bypass.patch
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files_missing_sidecars -- --test-threads=1 --nocapture 2>&1 | tee files-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files_rejects_id_aliases -- --test-threads=1 --nocapture 2>&1 | tee alias-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q '0 passed; 1 failed' files-red.log
-          grep -q 'assertion failed: SharedMvccFiles::open_existing' files-red.log
+          grep -q '0 passed; 1 failed' alias-red.log
+          grep -q 'assertion failed: SharedMvccFiles::open_existing' alias-red.log
+          git checkout -- core/mvcc/shared_files.rs
+      - name: Metadata access negative control
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('core/mvcc/shared_files.rs')
+          source = path.read_text()
+          start = source.index('        let id_banks = [')
+          end = source.index('        let manifest = open_verified(', start)
+          region = source[start:end]
+          assert region.count('OpenFlags::NoLock,') == 3
+          region = region.replace('OpenFlags::NoLock,', 'OpenFlags::NoLock | OpenFlags::ReadOnly,')
+          path.write_text(source[:start] + region + source[end:])
+          PYCODE
+          git diff > readonly-metadata.patch
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files_id_journals_are_writable -- --test-threads=1 --nocapture 2>&1 | tee metadata-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' metadata-red.log
+          grep -q 'Err.*value' metadata-red.log
+          git checkout -- core/mvcc/shared_files.rs
+      - name: Budget preflight negative control
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('core/mvcc/mode_transition.rs')
+          source = path.read_text()
+          before = 'if self.history_limit < MIN_HISTORY_LIMIT {'
+          assert source.count(before) == 1
+          path.write_text(source.replace(before, 'if self.history_limit == 0 {'))
+          PYCODE
+          git diff > late-budget-check.patch
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_invalid_limit -- --test-threads=1 --nocapture 2>&1 | tee budget-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' budget-red.log
+          grep -q 'assertion failed: !touched.load' budget-red.log
+          git checkout -- core/mvcc/mode_transition.rs
+      - name: Restore and verify exact source
+        run: |
+          git diff --exit-code
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_files_ -- --test-threads=1 --nocapture 2>&1 | tee files-restored.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --test-threads=1 --nocapture 2>&1 | tee mode-restored.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
@@ -51,4 +112,5 @@ jobs:
             source.txt
             rustc.txt
             *.log
+            *.patch
           retention-days: 14
