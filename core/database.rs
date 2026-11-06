@@ -626,6 +626,8 @@ pub struct OpenDbAsyncState {
     #[cfg(all(host_shared_wal, unix))]
     shared_runtime: Option<Arc<mvcc::database::SharedMvccRuntime>>,
     #[cfg(all(host_shared_wal, unix))]
+    offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
+    #[cfg(all(host_shared_wal, unix))]
     shared_request: Option<SharedOpenRequest>,
     #[cfg(all(host_shared_wal, unix))]
     shared_open: Option<mvcc::database::SharedOpenState>,
@@ -661,6 +663,8 @@ impl OpenDbAsyncState {
             resolved_options: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_runtime: None,
+            #[cfg(all(host_shared_wal, unix))]
+            offline_marker_recovery: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_request: None,
             #[cfg(all(host_shared_wal, unix))]
@@ -765,6 +769,8 @@ pub struct Database<
     pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(all(host_shared_wal, unix))]
     shared_mvcc_runtime: Option<Arc<mvcc::database::SharedMvccRuntime>>,
+    #[cfg(all(host_shared_wal, unix))]
+    offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
@@ -981,6 +987,8 @@ impl Database {
             durable_storage: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_mvcc_runtime: None,
+            #[cfg(all(host_shared_wal, unix))]
+            offline_marker_recovery: None,
         };
 
         db.register_global_builtin_extensions()
@@ -1443,6 +1451,31 @@ impl Database {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn open_offline_marker_recovery(
+        proof: Arc<mvcc::PreparedMarkerRecovery>,
+    ) -> Result<Arc<Self>> {
+        proof.revalidate()?;
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new()?);
+        let path = proof.path().to_str().ok_or_else(|| {
+            LimboError::InvalidArgument("offline recovery path must be UTF-8".into())
+        })?;
+        let file = io.open_file(path, OpenFlags::NoLock, false)?;
+        if file.file_id()? != Some(proof.database_id()) {
+            return Err(LimboError::InvalidArgument(
+                "offline recovery identity changed".into(),
+            ));
+        }
+        let options = OpenOptions::new(Arc::new(crate::dialect::EngineDialect))
+            .flags(OpenFlags::NoLock)
+            .storage(Arc::new(storage::database::DatabaseFile::new(file)));
+        let mut state = OpenDbAsyncState::new();
+        state.offline_marker_recovery = Some(proof.clone());
+        let db = io.block(|| Self::do_open_async(&mut state, io.clone(), path, &options))?;
+        proof.revalidate()?;
+        Ok(db)
     }
 
     /// Open a database with the given [`OpenOptions`].
@@ -1987,6 +2020,8 @@ impl Database {
                     #[cfg(all(host_shared_wal, unix))]
                     {
                         db.shared_mvcc_runtime.clone_from(&state.shared_runtime);
+                        db.offline_marker_recovery
+                            .clone_from(&state.offline_marker_recovery);
                     }
                     db.writer_readiness
                         .lock()
@@ -2768,6 +2803,15 @@ impl Database {
 
                     let decode_version = |raw: storage::sqlite3_ondisk::RawVersion| {
                         #[cfg(all(host_shared_wal, unix))]
+                        if self.offline_marker_recovery.is_some() {
+                            return if matches!(raw.0, 254 | 255) {
+                                Ok(Version::Wal)
+                            } else {
+                                Err(raw.0)
+                            };
+                        }
+
+                        #[cfg(all(host_shared_wal, unix))]
                         if self.shared_mvcc_runtime.is_some() {
                             return if raw.0 == mvcc::database::SHARED_MVCC_VERSION {
                                 Ok(Version::Mvcc)
@@ -2888,7 +2932,11 @@ impl Database {
                     // In WAL mode, a logical log is always unexpected.
                     // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
                     // recovery and is reconciled in MvStore::bootstrap().
-                    if !open_mv_store && log_exists {
+                    let reject_log_in_wal = !open_mv_store && log_exists;
+                    #[cfg(all(host_shared_wal, unix))]
+                    let reject_log_in_wal =
+                        reject_log_in_wal && self.offline_marker_recovery.is_none();
+                    if reject_log_in_wal {
                         return Err(LimboError::Corrupt(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                             self.path

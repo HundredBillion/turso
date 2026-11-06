@@ -25,13 +25,84 @@ enum MarkerPoint {
 }
 
 pub(super) fn resume_prepared_marker(
-    _path: &Path,
-    _history_limit: u64,
-    _: OfflinePrerequisite,
+    path: &Path,
+    history_limit: u64,
+    prerequisite: OfflinePrerequisite,
 ) -> Result<()> {
-    Err(LimboError::InvalidArgument(
-        "prepared marker recovery is not wired".into(),
-    ))
+    let proof = super::recovery::PreparedMarkerRecovery::open(path, history_limit, prerequisite)?;
+    let db = crate::Database::open_offline_marker_recovery(proof.clone())?;
+    if db
+        .shared_wal
+        .read()
+        .runtime
+        .frame_cache
+        .lock()
+        .keys()
+        .any(|page| *page != 1)
+    {
+        return Err(LimboError::Corrupt(
+            "prepared marker recovery contains unrelated WAL pages".into(),
+        ));
+    }
+    let connection = db.connect(crate::ConnectOpts::new())?;
+    connection.execute("PRAGMA synchronous=FULL")?;
+    let pager = connection.get_pager();
+    let marker = pager
+        .io
+        .block(|| pager.with_header(|header| (header.read_version.0, header.write_version.0)))?;
+    if !matches!(marker, (255, 255) | (254, 254)) {
+        return Err(LimboError::Corrupt(
+            "invalid recovered offline marker".into(),
+        ));
+    }
+    let mut timestamp = None;
+    connection
+        .prepare("SELECT v FROM __turso_internal_mvcc_meta WHERE k='persistent_tx_ts_max'")?
+        .run_with_row_callback(|row| {
+            let value = row.get::<i64>(0)?;
+            if value < 0
+                || value as u64 >= crate::mvcc::shared_authority::MAX_TIMESTAMP
+                || timestamp.is_some()
+            {
+                return Err(LimboError::Corrupt(
+                    "invalid recovered offline timestamp".into(),
+                ));
+            }
+            timestamp = Some(value as u64);
+            Ok(())
+        })?;
+    if timestamp != Some(proof.timestamp()) {
+        return Err(LimboError::Corrupt(
+            "prepared namespace differs from materialized database".into(),
+        ));
+    }
+    if marker.0 == 255 {
+        connection.execute("BEGIN IMMEDIATE")?;
+        pager.io.block(|| {
+            pager.with_header_mut(|header| {
+                header.read_version =
+                    crate::storage::sqlite3_ondisk::RawVersion(SHARED_MVCC_VERSION);
+                header.write_version =
+                    crate::storage::sqlite3_ondisk::RawVersion(SHARED_MVCC_VERSION);
+            })
+        })?;
+        connection.execute("COMMIT")?;
+    }
+    connection.checkpoint(crate::CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })?;
+    connection.close()?;
+    proof.revalidate()?;
+    std::fs::File::open(proof.path())
+        .map_err(fs_error)?
+        .sync_all()
+        .map_err(fs_error)?;
+    if super::validate_shared_open(proof.path())? != proof.prefix() {
+        return Err(LimboError::Corrupt(
+            "resumed marker changed the prepared manifest".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl OrdinaryOfflineBackend {
