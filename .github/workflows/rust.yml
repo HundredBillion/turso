@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9c5af231ca98586b79c69bda82277f07faabc968
+          ref: 57164a8ae3f3008daa2cf3db1d30a77b30c6aead
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = 9c5af231c
+          test "$(git rev-parse --short=9 HEAD)" = 57164a8ae
           rustc -Vv | tee rustc.txt
       - name: Fresh publication orphan regression must fail
         run: |
