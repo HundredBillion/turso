@@ -385,7 +385,8 @@ mod tests {
         let (authority, guard) = initialized(&backend);
         let file = GuardedFile::new(backend.clone(), &authority);
         let binding = file.bind(&guard).unwrap();
-        let _caller = file.sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)
+        let _caller = file
+            .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)
             .unwrap();
         let waiter = guard.retirement_completion();
         drop(binding);

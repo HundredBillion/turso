@@ -143,10 +143,18 @@ pub struct Storage {
     checkpoint_threshold: AtomicI64,
 }
 
+#[cfg(host_shared_wal)]
+pub(super) struct SharedStorageState {
+    pub offset: u64,
+    pub running_crc: u32,
+    pub header: Option<(u8, u64)>,
+}
+
 impl Storage {
     /// Adopt a validated manifest prefix only while holding publication authority
     /// and after all physical I/O using the previous storage state has retired.
     #[cfg(host_shared_wal)]
+    #[allow(dead_code)]
     pub(crate) fn adopt_shared_prefix(
         &self,
         header: Option<logical_log::LogHeader>,
@@ -160,6 +168,26 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(host_shared_wal)]
+    pub(super) fn shared_commit_snapshot(
+        &self,
+        expected_file: &Arc<dyn File>,
+    ) -> Result<SharedStorageState> {
+        let log = self.logical_log.read();
+        if !Arc::ptr_eq(&log.file, expected_file)
+            || self.log_offset.load(Ordering::Relaxed) != log.offset
+            || log.has_pending_write()
+        {
+            return Err(LimboError::InvalidArgument(
+                "shared commit storage has different file, offset, or pending write".into(),
+            ));
+        }
+        Ok(SharedStorageState {
+            offset: log.offset,
+            running_crc: log.running_crc,
+            header: log.header().map(|header| (header.version(), header.salt)),
+        })
+    }
     pub fn new(
         file: Arc<dyn File>,
         io: Arc<dyn crate::IO>,
