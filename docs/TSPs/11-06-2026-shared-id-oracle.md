@@ -138,3 +138,12 @@ Both native adapter test bodies typecheck on macOS with temporarily widened test
 fixture cfgs; those cfg edits are restored before publication, and no native
 execution is claimed. Their production selector remains Linux-only and ignored
 for explicit hosted execution.
+
+The first native facts run stopped before oracle evaluation: CREATE TABLE tried
+to upgrade an older concurrent snapshot after a peer commit and correctly returned
+BUSY. A focused ordinary-MVCC regression reproduced that exact boundary: the
+separate disjoint insert and unchanged-row delete succeed; DDL upgrade fails.
+The native fixture now separates two schedules. One keeps the old outer snapshot
+across the peer commit and tests row visibility. The other performs the peer
+commit before the outer begins, allowing its pending DDL while testing that the
+committed oracle excludes that table. No BUSY retry or engine behavior changed.

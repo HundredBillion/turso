@@ -285,3 +285,35 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> Drop for SharedIdOracle<
         self.cursor.take();
     }
 }
+
+#[cfg(all(test, not(shuttle)))]
+mod fixture_tests {
+    use super::*;
+
+    #[test]
+    fn stale_concurrent_snapshot_can_write_rows_but_cannot_upgrade_for_ddl() {
+        let io = Arc::new(crate::io::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.execute("PRAGMA journal_mode='mvcc'").unwrap();
+        writer.execute("CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO preserved VALUES(1,'base')").unwrap();
+        let outer = db.connect(crate::ConnectOpts::new()).unwrap();
+        outer.execute("BEGIN CONCURRENT").unwrap();
+        outer.execute("SELECT * FROM preserved").unwrap();
+        writer
+            .execute("INSERT INTO preserved VALUES(99,'peer')")
+            .unwrap();
+        outer
+            .execute("INSERT INTO preserved VALUES(500,'outer')")
+            .expect("stale snapshot disjoint insert");
+        outer
+            .execute("DELETE FROM preserved WHERE id=1")
+            .expect("stale snapshot delete unchanged row");
+        assert!(matches!(
+            outer.execute("CREATE TABLE pending(id INTEGER PRIMARY KEY)"),
+            Err(LimboError::Busy)
+        ));
+        outer.execute("ROLLBACK").unwrap();
+    }
+}
