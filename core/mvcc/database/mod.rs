@@ -5522,8 +5522,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Single SkipMap traversal: pass in a fresh Arc; the SkipMap
                 // returns the canonical Arc (ours on miss, an existing one
                 // on hit), which we hand to savepoint tracking.
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions, chain_in_write_set) = self
+                    .insert_index_version_for_writers(
+                        index_id,
+                        sortable_key,
+                        row_version,
+                        [Some(tx), None],
+                    )?;
                 if !chain_in_write_set {
                     tx.add_to_write_set(
                         RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
@@ -5550,7 +5555,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                    self.insert_version_for_writers(id.clone(), row_version, [Some(tx), None])?;
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 tx.record_created_table_version(id.clone(), version_id);
@@ -5601,8 +5606,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions, chain_in_write_set) = self
+                    .insert_index_version_for_writers(
+                        index_id,
+                        sortable_key,
+                        row_version,
+                        [Some(tx), None],
+                    )?;
                 if !chain_in_write_set {
                     tx.add_to_write_set(
                         RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
@@ -5624,7 +5634,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                    self.insert_version_for_writers(id.clone(), row_version, [Some(tx), None])?;
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -8796,7 +8806,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is inserted in the correct order. Returns a reference to the modified version chain,
     /// and whether the chain was already in the write set of the transaction that created
     /// `row_version`.
+    #[cfg(test)]
     fn insert_version(&self, id: RowID, row_version: RowVersion) -> Result<(RowVersions<A>, bool)> {
+        let writers = self.version_writers(&row_version)?;
+        self.insert_version_for_writers(
+            id,
+            row_version,
+            [
+                writers[0].as_ref().map(|tx| tx.value()),
+                writers[1].as_ref().map(|tx| tx.value()),
+            ],
+        )
+    }
+
+    fn insert_version_for_writers(
+        &self,
+        id: RowID,
+        row_version: RowVersion,
+        writers: [Option<&Transaction<A>>; 2],
+    ) -> Result<(RowVersions<A>, bool)> {
         // Retry if GC unlinked this slot while we waited for the write lock.
         loop {
             let row_versions = self.get_or_create_table_row_versions(id.clone())?;
@@ -8804,7 +8832,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.table_versions_still_mapped(&id, &row_versions) {
                 continue;
             }
-            self.ensure_version_writer_unconflicted(&row_version)?;
+            for writer in writers.into_iter().flatten() {
+                writer.ensure_peer_unconflicted()?;
+            }
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
@@ -8813,19 +8843,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    // Call while holding the chain lock: the peer importer marks conflicting writers
-    // under that same lock before replacing any pending end tags.
-    fn ensure_version_writer_unconflicted(&self, version: &RowVersion) -> Result<()> {
-        for timestamp in [version.begin(), version.end()] {
+    // Resolve transaction references before taking a chain lock. Normal local
+    // writes already retain their transaction and bypass this lookup.
+    fn version_writers(&self, version: &RowVersion) -> Result<[Option<TxEntry<'_, A>>; 2]> {
+        let mut writers = [None, None];
+        for (slot, timestamp) in writers.iter_mut().zip([version.begin(), version.end()]) {
             if let Some(TxTimestampOrID::TxID(tx_id)) = timestamp {
-                let tx = self
-                    .txs
-                    .get(&tx_id)
-                    .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                tx.value().ensure_peer_unconflicted()?;
+                *slot = Some(
+                    self.txs
+                        .get(&tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?,
+                );
             }
         }
-        Ok(())
+        Ok(writers)
     }
 
     /// True if `arc` is still the mapped value for `id`.
@@ -8884,6 +8915,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: Arc<SortableIndexKey>,
         row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>, bool)> {
+        let writers = self.version_writers(&row_version)?;
+        self.insert_index_version_for_writers(
+            index_id,
+            key,
+            row_version,
+            [
+                writers[0].as_ref().map(|tx| tx.value()),
+                writers[1].as_ref().map(|tx| tx.value()),
+            ],
+        )
+    }
+
+    fn insert_index_version_for_writers(
+        &self,
+        index_id: MVTableId,
+        key: Arc<SortableIndexKey>,
+        row_version: RowVersion,
+        writers: [Option<&Transaction<A>>; 2],
+    ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>, bool)> {
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         // Same drain-retry as `insert_version`.
@@ -8897,7 +8947,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
             }
-            self.ensure_version_writer_unconflicted(&row_version)?;
+            for writer in writers.into_iter().flatten() {
+                writer.ensure_peer_unconflicted()?;
+            }
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);

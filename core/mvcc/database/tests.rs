@@ -427,7 +427,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
     let row_version = RowVersion {
         id: 1,
-        begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        begin: PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
         end: PackedTs::pack(None),
         data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,

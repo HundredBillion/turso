@@ -306,7 +306,7 @@ receive the error within their deadline.
 | C | Begin/commit integration and conflict validation | Barriers prove overlap; fresh snapshots see peer commits; old snapshots remain stable; same-row, delete and unique-key conflicts cannot both succeed |
 | D | IDs, sequences and schema coordination | Concurrent allocations differ; rollback/restart preserves committed floors; explicit IDs, overflow and sequence watermarks are covered |
 | E | Checkpoint, epoch reload and reclamation | Long reader delays checkpoint; log cap bounds growth; release permits reclamation; sleeping worker reloads; death at every persistent transition recovers |
-| F | C/PHP opt-in and process acceptance | SQLite3 and PDO processes run full CRUD, deadlines, rollback, read-only/TEMP/ATTACH and external acknowledgement-ledger recovery |
+| F | C/PHP opt-in and process acceptance | PDO URI processes run shared-mode CRUD, deadlines, rollback, read-only/TEMP/ATTACH and external acknowledgement-ledger recovery; ordinary SQLite3 remains regression coverage |
 | G | Regression and equal-durability comparison | Storage issue #14 integrated; default modes remain compatible; original issue #11383 rolling restarts exercised; compare actual PHP workers with SQLite |
 
 Each stage needs executable tests that first fail against its preceding source,
@@ -355,3 +355,12 @@ not establish Linux cross-process support.
 Storage issue #14 currently owns changes to read-only activation and I/O guards.
 Integrate its verified commit before final combined runtime validation. Do not
 copy or independently rewrite those guards while that work is in progress.
+
+## Initial PHP binding scope
+
+The user approved PDO-only shared-mode support for the initial release on
+2026-11-06. PDO can forward the explicit URI to the compatibility API. PHP's
+SQLite3 class expands its filename before calling that API, so its ordinary
+behavior stays unchanged; no filename rewrite or vendor open-flag API is added.
+Shared-mode acceptance requires PDO URI opens and explicit capability attestation.
+The SQLite3 class remains covered for ordinary-mode compatibility.

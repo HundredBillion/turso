@@ -40,6 +40,7 @@ Provide opt-in embedded cross-process MVCC, reachable through PHP's C compatibil
 ### Approved initial protocol policies (2026-11-06)
 
 - Expose the opt-in through a validated URI parameter usable by the C/PHP interface.
+- The initial shared-mode PHP release supports PDO URI opens only (user approved 2026-11-06). Ordinary SQLite3-class behavior remains unchanged. Do not introduce a vendor open flag or filename rewriting for the SQLite3 class in this release. Shared-mode acceptance must attest the capability through PDO; ordinary SQLite3 remains part of default-mode regression coverage.
 - Start with globally quiescent checkpoints. Pause new transaction admission while waiting within a bounded busy deadline for active transactions to finish. Preserve readers rather than silently aborting them.
 - Enforce a configurable retained-log limit. If active snapshots prevent reclamation, additional commits return bounded `BUSY`; history must not grow without bound. Reject a transaction larger than the limit before appending any of it.
 - Read-only participants in this explicit mode may write coordination metadata while database, WAL and logical-log contents remain read-only. Reject the opt-in when coordination metadata cannot be written. Existing ordinary read-only opens retain their current guarantees.
