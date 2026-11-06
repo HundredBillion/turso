@@ -103,3 +103,34 @@ and uploads the complete artifact. A green job means the experiment completed;
 it is not an automatic speedup acceptance gate. The comparison still needs
 review for regressions and workload relevance. It does not answer whether Redis
 can be removed or whether a dense vector index is ready for production.
+
+## Hosted comparison on pinned revisions
+
+[Run 42243464027](https://github.com/HundredBillion/turso/actions/runs/42243464027)
+completed all 38 cases on Linux with the recorded Rust 1.88/profile, three
+alternating repeats, one-second warmups, two-second measurements and 50 samples.
+Candidate source was `68aaebc63b898f4fd07e1f19bf4cea4e8190cc6b`.
+[Metadata](results/json-extraction-hosted/metadata.json),
+[all-case summary](results/json-extraction-hosted/summary.csv) and
+[raw samples](results/json-extraction-hosted/samples.json) are retained.
+
+At 100 KiB, first/last/nested extraction was 12.7–13.5% faster than upstream,
+missing-path extraction 25.7% faster, multiple paths 32.9% faster and subdocument
+extraction 13.4% faster. The corresponding fork comparisons also improved.
+At 10 KiB all six extraction cases improved versus both controls. At 1 KiB,
+changes were mixed and small except missing paths, which improved by 9.35%
+versus upstream. The largest observed regression versus upstream was the
+unchanged small JSONB conversion benchmark, +2.63%.
+
+The fork comparison contains repeatable regressions and is not a clean no-regression
+result. Small JSONB conversion rose 24.84% and medium conversion 16.78%; simple
+and remove-property patch cases rose 5.67% and 5.33%. For small conversion,
+fork repeats were 418.5/443.7/418.1 ns and candidate repeats 522.5/523.4/504.8 ns.
+Medium conversion was 659.6/682.2/659.8 versus 775.6/770.5/757.2 ns. Their per-run
+confidence intervals do not overlap. These results cannot be dismissed as noise.
+The `jsonb()` conversion case does not call the changed search traversal, so the
+cause is not established by the source diff; code generation/layout is a
+hypothesis, not a finding. A diagnostic rebuild using one canonical source path,
+including an identical-source rebuild control, is the next way to distinguish
+build-layout effects from an attributable execution regression. Preserve the
+current favorable and unfavorable evidence while that investigation remains open.

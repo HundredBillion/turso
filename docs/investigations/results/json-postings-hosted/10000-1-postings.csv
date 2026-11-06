@@ -1,0 +1,5 @@
+variant,operation,rows,samples,p50_us,p95_us,p99_us
+postings,scalar:$.custom.f3:number,10000,1000,27.201,50.864,53.274
+postings,member:$.tags:text,10000,1000,91.992,99.047,123.664
+postings,scalar:$.optional:null,10000,1000,126.766,134.904,142.112
+postings,durable_update,10000,1000,799.862,1830.458,16864.791

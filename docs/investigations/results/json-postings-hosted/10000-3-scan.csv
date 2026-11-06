@@ -1,0 +1,5 @@
+variant,operation,rows,samples,p50_us,p95_us,p99_us
+scan,scalar:$.custom.f3:number,10000,1000,2918.565,3077.604,3410.997
+scan,member:$.tags:text,10000,1000,4096.811,4281.561,5479.198
+scan,scalar:$.optional:null,10000,1000,3176.617,3264.518,3438.269
+scan,durable_update,10000,1000,240.091,362.883,552.754

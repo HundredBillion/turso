@@ -1,0 +1,30 @@
+variant=postings seed_ms=3301.743
+variant=postings mode=scalar path=$.custom.f3 plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH postings USING COVERING INDEX postings_lookup (tenant=? AND mode=? AND path=? AND kind=? AND scalar=?)", subtype: Text })], [Numeric(Integer(3)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE HASH TABLE FOR DISTINCT", subtype: Text })]]
+variant=postings mode=member path=$.tags plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH postings USING COVERING INDEX postings_lookup (tenant=? AND mode=? AND path=? AND kind=? AND scalar=?)", subtype: Text })], [Numeric(Integer(3)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE HASH TABLE FOR DISTINCT", subtype: Text })]]
+variant=postings mode=scalar path=$.optional plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH postings USING COVERING INDEX postings_lookup (tenant=? AND mode=? AND path=? AND kind=? AND scalar=?)", subtype: Text })], [Numeric(Integer(3)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE HASH TABLE FOR DISTINCT", subtype: Text })]]
+variant=postings database_bytes=49967104 wal_bytes=2068272
+variant=postings checkpoint_us=12194.625 checkpointed_database_bytes=49967104
+variant=postings reopen_configure_us=1195.065
+	Command being timed: "target/lib-release/examples/json_posting_probe"
+	User time (seconds): 8.70
+	System time (seconds): 0.78
+	Percent of CPU this job got: 94%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:10.01
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 335356
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 200586
+	Voluntary context switches: 3701
+	Involuntary context switches: 57
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 3541248
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

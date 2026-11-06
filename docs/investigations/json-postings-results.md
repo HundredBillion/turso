@@ -94,3 +94,42 @@ the update trigger clears both old and new IDs for `UPDATE OR REPLACE` collision
 The explicit insert-replacement case failed before cleanup and passed afterward,
 as did a collision between two document IDs. This followup adds insertion lookup
 work; prior local timings are not measurements of this final fixture.
+
+## Hosted results on the corrected fixture
+
+[Run 42247350572](https://github.com/HundredBillion/turso/actions/runs/42247350572)
+measured source `f91bc579f` with Rust 1.88, optimized lib-release/unwind, separate
+processes, three alternating repeats and 1,000 measured requests per case.
+Lifecycle checks passed before measurement. The [summary](results/json-postings-hosted/summary.csv)
+and adjacent raw CSV/logs preserve all results, configuration, plans and resources.
+The following values are medians of the three reported p50 values at 10,000 rows:
+
+| Operation | Tenant scan, us | Selected expression indexes, us | General postings, us |
+|---|---:|---:|---:|
+| Numeric custom field | 2918.565 | 109.104 | 27.125 |
+| JSON null field | 3176.617 | 100.843 | 126.766 |
+| Array scalar membership | 4135.895 | 4233.312 (scan) | 91.225 |
+| FULL durable replacement | 240.091 | 296.035 | 833.165 |
+
+General postings improved the measured unpredictable-field and membership reads,
+but null lookup was slower than a selected expression index. Durable replacement
+cost 3.47 times the scan schema and 2.81 times the expression-index schema.
+Posting replacement p99 was 16,519 us versus scan 430 us and expression 583 us;
+the tail cost is material even when reads improve.
+
+Checkpointed database sizes were 10,371,072 bytes (scan), 10,715,136 (expression)
+and 49,967,104 (postings). Median bulk-seed time was 124/284/3302 ms respectively.
+Whole-process maximum RSS was 69,288/69,712/335,032 KiB. RSS includes fixture
+creation and the full materialized scan/posting consistency oracle, not just the
+engine's query working set. It must not be presented as an isolated index memory
+requirement. Linux whole-process filesystem-output counters were
+58,776/158,880/3,541,248 blocks, including seed, replacements and checkpoints;
+these establish substantial additional write activity in this probe, not a
+per-update device-level write-amplification estimate. Explicit truncating
+checkpoint medians were 2,868/2,807/14,550 us.
+
+The probe supports a conditional read/write tradeoff, not a general indexing
+recommendation. Use selected indexes for predictable paths where they suffice;
+consider broader postings only when the measured read gain pays for replacement,
+storage and tail costs. These schema comparisons use one engine revision and do
+not establish a speedup over upstream main or application-level cache removal.

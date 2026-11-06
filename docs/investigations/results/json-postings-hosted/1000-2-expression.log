@@ -1,0 +1,30 @@
+variant=expression seed_ms=26.465
+variant=expression mode=scalar path=$.custom.f3 plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH documents USING INDEX documents_custom_f3 (tenant=? AND CASE json_type (payload, '$.custom.f3') WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE json_type (payload, '$.custom.f3') END=?)", subtype: Text })], [Numeric(Integer(19)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE SORTER FOR ORDER BY", subtype: Text })]]
+variant=expression mode=member path=$.tags plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH d USING INDEX documents_tenant (tenant=?)", subtype: Text })], [Numeric(Integer(2)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SCAN json_each AS j", subtype: Text })]]
+variant=expression mode=scalar path=$.optional plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH documents USING INDEX documents_optional (tenant=? AND CASE json_type (payload, '$.optional') WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE json_type (payload, '$.optional') END=?)", subtype: Text })], [Numeric(Integer(19)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE SORTER FOR ORDER BY", subtype: Text })]]
+variant=expression database_bytes=1089536 wal_bytes=1318432
+variant=expression checkpoint_us=1316.226 checkpointed_database_bytes=1089536
+variant=expression reopen_configure_us=864.801
+	Command being timed: "target/lib-release/examples/json_posting_probe"
+	User time (seconds): 0.57
+	System time (seconds): 0.05
+	Percent of CPU this job got: 76%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.81
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 26352
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1632
+	Voluntary context switches: 2800
+	Involuntary context switches: 4
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 41752
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
