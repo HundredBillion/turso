@@ -980,3 +980,7 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
         matches!(reopened, Err(LimboError::InvalidArgument(message)) if message.contains("checkpoint recovery"))
     );
 }
+
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+#[path = "shared_id_oracle_tests.rs"]
+mod shared_id_oracle_tests;

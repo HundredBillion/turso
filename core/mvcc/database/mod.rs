@@ -78,6 +78,9 @@ mod shared_refresh;
 pub(crate) const SHARED_MVCC_VERSION: u8 = crate::mvcc::mode_transition::SHARED_MVCC_VERSION;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
+mod shared_id_oracle;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
 mod shared_oracle;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]

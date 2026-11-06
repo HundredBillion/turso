@@ -57,9 +57,9 @@ pub(in crate::mvcc) enum IdAction {
         domain: Domain,
     },
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::mvcc) enum IdQuery {
-    RowFacts { domain: Domain },
+    RowFacts { domain: Domain, autoincrement: bool },
     RowExists { domain: Domain, value: i64 },
     LogicalFloor,
 }
@@ -201,7 +201,14 @@ impl IdOperation {
                 Stage::Querying(loaded, query) => {
                     self.check_identity(&loaded)?;
                     let request = match query {
-                        QueryState::Rows { domain, .. } => IdQuery::RowFacts { domain },
+                        QueryState::Rows {
+                            domain,
+                            autoincrement,
+                            ..
+                        } => IdQuery::RowFacts {
+                            domain,
+                            autoincrement,
+                        },
                         QueryState::Exists {
                             domain, candidate, ..
                         } => IdQuery::RowExists {
