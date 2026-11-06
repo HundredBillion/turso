@@ -17,7 +17,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("staging.db");
         let destination = dir.path().join("published.db");
-        let backend = OrdinaryOfflineBackend::create_staged(&staging).unwrap();
+        {
+            let io: crate::sync::Arc<dyn crate::IO> =
+                crate::sync::Arc::new(crate::io::SyscallIO::new().unwrap());
+            let db = crate::Database::open_file(
+                io,
+                staging.to_str().unwrap(),
+                crate::sync::Arc::new(crate::EngineDialect),
+            )
+            .unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc; CREATE TABLE kept(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+        let backend =
+            OrdinaryOfflineBackend::open(&staging, OfflinePrerequisite::AllOlderWorkersStopped)
+                .unwrap();
         OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, LIMIT)
             .publish_new(&destination)
             .unwrap();
