@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 67babeb2dd79766ad50d15b92d1036103ade0302
+          ref: 2e6a3e353ad6056a5c7c266616c25198ace3ebcf
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
