@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1e6fbaa2b1aa9be95ace5da9857e16c44419e0ef
+          ref: 67babeb2dd79766ad50d15b92d1036103ade0302
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,16 +25,15 @@ jobs:
         run: |
           git rev-parse HEAD | tee source.txt
           rustc -Vv | tee rustc.txt
-      - name: Existing allocators must expose cross-instance collisions
+      - name: Native ID opcode integration
         run: |
-          set +e
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'independent stores allocated the same live rowid' ids-red.log
-          grep -q "allocator ignored a peer's live explicit key" ids-red.log
-          grep -q 'test result: FAILED' ids-red.log
+          set -o pipefail
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-green.log
+          grep -q '5 passed; 0 failed' ids-green.log
+      - name: Strict library lint
+        run: |
+          set -o pipefail
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
