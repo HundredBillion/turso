@@ -41,9 +41,8 @@ jobs:
       - name: Lease retention and private shared components
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api guarded_file:: -- --test-threads=1 --nocapture 2>&1 | tee guarded.log
-          grep -q '13 passed; 0 failed' guarded.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api process_ofd_lock_survives_abort_until_backend_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee ofd.log
-          grep -q '1 passed; 0 failed' ofd.log
+          grep -q '15 passed; 0 failed' guarded.log
+          grep -q 'process_ofd_lock_survives_abort_until_backend_retirement ... ok' guarded.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_ -- --test-threads=1 --nocapture 2>&1 | tee shared.log
           grep -Eq '[1-9][0-9]* passed; 0 failed' shared.log
       - name: Native materialization opening and commit regression
