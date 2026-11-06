@@ -97,3 +97,29 @@ returning a fact. It stores no context while ID journals load, reconcile dead ow
 Keeping the context's authority pin for the entire reservation operation would deadlock those
 stages' physical-retirement waits. Any callback retained after a fact still owns its individual
 read pin, so the journal cannot acknowledge through an outstanding read.
+
+## Committed fact adapter
+
+The adapter constructs the checked temporary transaction lazily for each query.
+A long-lived context pin would make the ID loader or append wait on that same
+pin; therefore Fact completion drops its cursor and temporary transaction before
+returning. On cancellation/error the cursor drops first, and physical callback
+pins continue to protect pending reads. Each subsequent query receives a new
+private pager at the same continuously held committed prefix.
+
+Row queries first scan committed sqlite_schema membership using the temporary
+snapshot. An absent domain returns an empty maximum or false membership without
+opening a speculative local root. A matched committed root resolves through the
+snapshot-aware logical mapping; non-table roots and sequence-domain row queries
+are rejected. sqlite_schema itself is an intrinsic table. Logical floor combines
+the committed header page bound and schema root bounds. The adapter rejects the
+AUTOINCREMENT RowFacts variant explicitly, preserving the implicit sequence path.
+
+The native fact regression covers a committed row added after the outer snapshot,
+an outer-only insert, an outer deletion of a committed row, a pending local table,
+empty/negative/MAX row maxima, exact membership, logical floor, sequence-routing
+rejection, and cleanup after every fact. It also checks that an idle lazy adapter
+and each completed query leave no context pin blocking ID I/O retirement. Native
+execution of this new regression remains pending; the earlier factory/context
+Linux union passed in run 42295119883. Portable ID policy tests remain green
+(55 passed, one native-process test ignored on macOS).

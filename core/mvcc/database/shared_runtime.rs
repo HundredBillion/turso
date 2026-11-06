@@ -845,7 +845,6 @@ fn shared_oracle_native_keeps_outer_snapshot_and_rejects_unresolved_state() {
     connection.execute("ROLLBACK").unwrap();
 }
 
-
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
@@ -885,3 +884,7 @@ fn shared_open_native_validates_ids_when_incarnation_is_already_ready() {
     assert_eq!(std::fs::read(&path).unwrap(), contents);
     drop(first);
 }
+
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+#[path = "shared_id_oracle_tests.rs"]
+mod shared_id_oracle_tests;
