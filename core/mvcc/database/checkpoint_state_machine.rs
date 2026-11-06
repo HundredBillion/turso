@@ -269,6 +269,12 @@ pub struct LockStates {
     pager_write_tx: bool,
 }
 
+#[cfg(all(host_shared_wal, unix))]
+struct SharedMaterializationAuthorization {
+    lease: crate::sync::Weak<crate::mvcc::shared_authority::PublicationLease>,
+    timestamp: u64,
+}
+
 /// A state machine that performs a complete checkpoint operation on the MVCC store.
 ///
 /// The checkpoint process:
@@ -279,7 +285,8 @@ pub struct LockStates {
 /// 5. Commits the pager transaction, effectively flushing to the WAL
 /// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
 /// 7. Fsync the DB file
-/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
+/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL.
+///    Coordinated shared materialization retains the logical log for later proven reclamation.
 /// 9. Calls `on_checkpoint_end`, then releases checkpoint locks
 ///
 /// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
@@ -340,6 +347,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Checkpoint mode. `should_restart_log()` (Truncate/Restart) gates the WAL
     /// truncation in `TruncateWal`; Passive leaves the WAL non-empty (restart-on-write).
     mode: CheckpointMode,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_materialization: Option<SharedMaterializationAuthorization>,
     /// Internal metadata table info for persisting `persistent_tx_ts_max` atomically with pager commit.
     mvcc_meta_table: Option<(MVTableId, usize)>,
     /// File-backed databases must persist replay boundary durably.
@@ -969,6 +978,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             update_transaction_state,
             sync_mode,
             mode,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_materialization: None,
             mvcc_meta_table,
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
@@ -1009,11 +1020,74 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     #[allow(dead_code)]
     pub(super) fn authorize_shared_materialization(
         &mut self,
-        _intent: &crate::mvcc::commit_manifest::checkpoint_publication::MirroredCheckpointIntent,
+        intent: &crate::mvcc::commit_manifest::checkpoint_publication::MirroredCheckpointIntent,
     ) -> Result<()> {
-        Err(LimboError::InvalidArgument(
-            "shared checkpoint materialization not implemented".into(),
-        ))
+        use crate::mvcc::shared_ids::{io_protocol::RecoveryIdentity, DatabaseGeneration};
+        let connection_pager = self
+            .connection
+            .get_pager_from_database_index(&self.database_id)?;
+        if !Arc::ptr_eq(&self.pager, &connection_pager)
+            || !self.database.get_mv_store().as_ref().is_some_and(|store| {
+                std::ptr::eq(
+                    Arc::as_ptr(store).cast::<()>(),
+                    Arc::as_ptr(&self.mvstore).cast::<()>(),
+                )
+            })
+        {
+            return Err(LimboError::InvalidArgument(
+                "materialization connection provenance differs".into(),
+            ));
+        }
+        if self.connection.is_readonly(self.database_id) {
+            return Err(LimboError::ReadOnly);
+        }
+        if !matches!(self.state, CheckpointState::PrepareCheckpoint)
+            || self.shared_materialization.is_some()
+            || self.mvstore.uses_passive_checkpoint()
+            || self.sync_mode != SyncMode::Full
+            || !matches!(
+                self.mode,
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None
+                }
+            )
+        {
+            return Err(LimboError::InvalidArgument(
+                "invalid shared materialization mode".into(),
+            ));
+        }
+        let runtime = self.mvstore.shared_runtime.get().ok_or_else(|| {
+            LimboError::InvalidArgument("shared materialization requires shared runtime".into())
+        })?;
+        let record = intent.record();
+        let transition = record.checkpoint_intent().ok_or_else(|| {
+            LimboError::InvalidArgument("shared materialization requires mirrored intent".into())
+        })?;
+        runtime.validate_oracle_identity(
+            intent.guard(),
+            RecoveryIdentity {
+                database: DatabaseGeneration {
+                    generation: record.log_generation(),
+                    checkpoint_timestamp: transition.source_checkpoint_timestamp,
+                },
+                prefix: record.prefix(),
+            },
+        )?;
+        if !intent.guard().live_registrations()?.is_empty() || !self.mvstore.txs.is_empty() {
+            return Err(LimboError::Busy);
+        }
+        if self.mvstore.last_committed_tx_ts.load(Ordering::Acquire)
+            != record.prefix().committed_timestamp
+        {
+            return Err(LimboError::Corrupt(
+                "materialization frontier differs from intent".into(),
+            ));
+        }
+        self.shared_materialization = Some(SharedMaterializationAuthorization {
+            lease: intent.guard().io_lease(),
+            timestamp: record.prefix().committed_timestamp,
+        });
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2486,6 +2560,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
+        #[cfg(all(host_shared_wal, unix))]
+        let _shared_pin = if self.mvstore.is_shared() {
+            let authorization = self.shared_materialization.as_ref().ok_or_else(|| {
+                LimboError::InvalidArgument("shared checkpoint requires mirrored intent".into())
+            })?;
+            if self.mvstore.last_committed_tx_ts.load(Ordering::Acquire) != authorization.timestamp
+            {
+                return Err(LimboError::Corrupt(
+                    "shared checkpoint frontier changed".into(),
+                ));
+            }
+            Some(crate::mvcc::shared_authority::PublicationLease::pin(
+                &authorization.lease,
+            )?)
+        } else {
+            None
+        };
         match &self.state {
             CheckpointState::PrepareCheckpoint => {
                 let passive = self.mvstore.uses_passive_checkpoint();
@@ -3342,6 +3433,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateLogicalLog => {
+                #[cfg(all(host_shared_wal, unix))]
+                if self.shared_materialization.is_some() {
+                    // The mirrored completion record must replace intent before log reclamation.
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;

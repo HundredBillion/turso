@@ -912,6 +912,22 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
     let logical_path = runtime.files.namespace.join("logical");
     let log_before = std::fs::read(&logical_path).unwrap();
     assert!(!log_before.is_empty());
+    let mut unauthorized = CheckpointStateMachine::new(
+        connection.get_pager(),
+        store.clone(),
+        connection.clone(),
+        true,
+        crate::SyncMode::Full,
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(
+        matches!(unauthorized.step(&()), Err(LimboError::InvalidArgument(message)) if message.contains("mirrored intent"))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), main_before);
+    assert_eq!(std::fs::read(&logical_path).unwrap(), log_before);
     let _pause = runtime.gate.try_pause_admission().unwrap();
     let guard = runtime.files.authority.try_acquire().unwrap();
     assert!(guard.live_registrations().unwrap().is_empty());
@@ -954,7 +970,14 @@ fn shared_checkpoint_native_materializes_without_reclaiming_log_before_completio
             TransitionResult::Done(_) => break,
         }
     }
-    assert_ne!(std::fs::read(&path).unwrap(), main_before);
+    let materialized_main = std::fs::read(&path).unwrap();
+    assert_ne!(materialized_main, main_before);
+    assert!(
+        materialized_main
+            .windows(b"materialized shared row".len())
+            .any(|window| window == b"materialized shared row"),
+        "committed payload must reach main storage"
+    );
     assert_eq!(std::fs::read(&logical_path).unwrap(), log_before);
     assert_eq!(store.storage.logical_log_offset(), prefix.end_offset);
     assert_eq!(
