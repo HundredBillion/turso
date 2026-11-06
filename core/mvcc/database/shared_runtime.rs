@@ -1,3 +1,7 @@
+#[path = "shared_id_runtime.rs"]
+mod shared_id_runtime;
+pub(crate) use shared_id_runtime::{SharedIdRequest, SharedIdResult, SharedIdState};
+
 use super::shared_refresh::{SharedBeginOptions, SharedRefresh, SharedReplayContext};
 use super::*;
 use crate::io::FileId;

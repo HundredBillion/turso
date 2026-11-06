@@ -37,6 +37,20 @@ impl SharedReplayContext {
         })
     }
 
+    pub(super) fn identity(
+        &self,
+    ) -> Result<crate::mvcc::shared_ids::io_protocol::RecoveryIdentity> {
+        let state = self.state.lock();
+        let state = state.as_ref().ok_or(LimboError::Busy)?;
+        Ok(crate::mvcc::shared_ids::io_protocol::RecoveryIdentity {
+            database: crate::mvcc::shared_ids::DatabaseGeneration {
+                generation: state.observed.log_generation(),
+                checkpoint_timestamp: state.context.persistent_tx_ts_max,
+            },
+            prefix: state.observed.prefix(),
+        })
+    }
+
     pub(super) fn matches_oracle_identity(
         &self,
         identity: crate::mvcc::shared_ids::io_protocol::RecoveryIdentity,
