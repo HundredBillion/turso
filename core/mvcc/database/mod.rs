@@ -1006,7 +1006,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// A peer commit replaced a version this local writer intended to change.
     peer_conflicted: AtomicBool,
     #[cfg(test)]
-    before_chain_mutation: Mutex<
+    before_mutation_lock: Mutex<
         Option<(
             std::sync::mpsc::SyncSender<()>,
             std::sync::mpsc::Receiver<()>,
@@ -1061,7 +1061,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             peer_conflicted: AtomicBool::new(false),
             #[cfg(test)]
-            before_chain_mutation: Mutex::new(None),
+            before_mutation_lock: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
@@ -1076,8 +1076,8 @@ impl<A: RowVersionAllocator> Transaction<A> {
     }
 
     #[cfg(test)]
-    fn pause_before_chain_mutation(&self) {
-        let hook = self.before_chain_mutation.lock().take();
+    fn pause_before_mutation_lock(&self) {
+        let hook = self.before_mutation_lock.lock().take();
         if let Some((arrived, resume)) = hook {
             arrived.send(()).unwrap();
             resume
@@ -3128,6 +3128,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
 
                 tx.ensure_peer_unconflicted()?;
+                #[cfg(test)]
+                tx.pause_before_mutation_lock();
 
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
@@ -3150,8 +3152,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
+                let mut peer_conflict = false;
 
                 let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                    // Import holds this same clock lock through publication. A
+                    // commit may have waited after its initial conflict check.
+                    peer_conflict = tx.peer_conflicted.load(Ordering::Acquire);
                     turso_assert!(
                         ts > tx.begin_ts,
                         "end_ts must be strictly greater than begin_ts"
@@ -3206,10 +3212,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
-                    if can_commit_tx || read_only {
+                    if !peer_conflict && (can_commit_tx || read_only) {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
                 });
+                if peer_conflict {
+                    return Err(LimboError::WriteWriteConflict);
+                }
                 // We allow reads from happening. Exlusive means there is a single writer.
                 if exclusive_conflict && !read_only {
                     return Err(LimboError::WriteWriteConflict);
@@ -4285,7 +4294,7 @@ fn replay_frame_timestamp(frame: &[ParsedOp]) -> Result<u64> {
     };
     let committed = frame
         .first()
-        .map(&timestamp)
+        .map(timestamp)
         .ok_or_else(|| LimboError::Corrupt("empty recovery frame".into()))?;
     if committed > PackedTs::VALUE_MASK || frame.iter().any(|op| timestamp(op) != committed) {
         return Err(LimboError::Corrupt(
@@ -4836,9 +4845,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             table_id.into()
         };
-        if minimum <= self.next_table_id.load(Ordering::SeqCst) {
-            self.next_table_id.store(minimum - 1, Ordering::SeqCst);
-        }
+        self.next_table_id.fetch_min(minimum - 1, Ordering::SeqCst);
     }
 
     /// Insert a live `table_id -> root_page` binding (bootstrap/recovery, or an
@@ -5501,7 +5508,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         turso_assert_eq!(tx.state, TransactionState::Active);
         tx.ensure_peer_unconflicted()?;
         #[cfg(test)]
-        tx.pause_before_chain_mutation();
+        tx.pause_before_mutation_lock();
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5735,7 +5742,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         turso_assert_eq!(tx.state, TransactionState::Active);
         tx.ensure_peer_unconflicted()?;
         #[cfg(test)]
-        tx.pause_before_chain_mutation();
+        tx.pause_before_mutation_lock();
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -10692,6 +10699,264 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ctx.current_schema = current_schema;
         ctx.index_infos = index_infos;
         replay_result
+    }
+
+    // The shared authority must exclude peer commits/checkpoints throughout this
+    // call. Admission uses the same authority before issuing a snapshot timestamp.
+    #[allow(dead_code)]
+    fn install_peer_frame(
+        &self,
+        connection: &Arc<Connection>,
+        ctx: &mut RecoverCtx,
+        prepared: &mut Option<PreparedRecoveryFrame>,
+    ) -> Result<()> {
+        let frame = prepared.as_ref().ok_or_else(|| {
+            LimboError::InvalidArgument("peer frame was already installed".into())
+        })?;
+        let timestamp = frame.commit_timestamp;
+        if timestamp <= ctx.max_commit_ts_seen || timestamp > PackedTs::VALUE_MASK {
+            return Err(LimboError::Corrupt(
+                "non-monotonic live replay frame".into(),
+            ));
+        }
+        // Each request keeps log order. Targets are subsequently deduplicated and
+        // locked by Arc address, independently of the different index comparators.
+        let mut requests: Vec<(Row, bool, bool)> = Vec::new();
+        requests.try_reserve(frame.decoded_frame.len())?;
+        let mut roots = Vec::new();
+        roots.try_reserve(frame.decoded_frame.len().saturating_mul(2))?;
+        let mut header = None;
+        let mut dropped_roots = ctx.dropped_root_pages.clone();
+        for op in &frame.decoded_frame {
+            let (row, delete, resident) = match op {
+                StreamingResult::UpsertTableRow {
+                    row,
+                    btree_resident,
+                    ..
+                } => {
+                    if row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let (root, has_btree) =
+                            self.validate_recovery_schema_root(row.payload())?;
+                        if has_btree && root < 0 {
+                            roots.push(MVTableId::from(root));
+                        }
+                        if has_btree && root > 0 {
+                            dropped_roots.remove(&root);
+                        }
+                    }
+                    (row.clone(), false, *btree_resident)
+                }
+                StreamingResult::UpsertIndexRow {
+                    row,
+                    btree_resident,
+                    ..
+                } => (row.clone(), false, *btree_resident),
+                StreamingResult::DeleteIndexRow { row, .. } => (row.clone(), true, true),
+                StreamingResult::DeleteTableRow { rowid, .. } => {
+                    let prior_in_frame = requests
+                        .iter()
+                        .rev()
+                        .find_map(|(row, delete, _)| (!delete && row.id == *rowid).then_some(row));
+                    let data: &[u8] = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        prior_in_frame
+                            .map(|row| row.payload())
+                            .or_else(|| {
+                                ctx.schema_rows
+                                    .get(&rowid.row_id.to_int_or_panic())
+                                    .map(|record| record.as_blob().as_slice())
+                            })
+                            .unwrap_or(&[])
+                    } else {
+                        &[]
+                    };
+                    if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID && !data.is_empty() {
+                        let (root, has_btree) = self.validate_recovery_schema_root(data)?;
+                        if has_btree && root > 0 {
+                            dropped_roots.insert(root);
+                        }
+                    }
+                    (
+                        Row::new_table_row_in(rowid.clone(), data, self.alloc.clone())?,
+                        true,
+                        true,
+                    )
+                }
+                StreamingResult::UpdateHeader {
+                    header: incoming, ..
+                } => {
+                    header = Some(*incoming);
+                    continue;
+                }
+                StreamingResult::Eof => {
+                    return Err(LimboError::Corrupt("EOF inside live frame".into()))
+                }
+            };
+            roots.push(row.id.table_id);
+            requests.push((row, delete, resident));
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.iter().any(|id| i64::from(*id) == i64::MIN) {
+            return Err(LimboError::Corrupt(
+                "logical table id cannot be lowered".into(),
+            ));
+        }
+        // Global logical-ID reservation must make these sets disjoint. Do not
+        // adopt a mapping which a concurrent local rollback is entitled to remove.
+        for tx in self.txs.iter() {
+            if tx
+                .value()
+                .created_table_ids
+                .lock()
+                .iter()
+                .any(|id| roots.binary_search(id).is_ok())
+            {
+                return Err(LimboError::Corrupt(
+                    "peer frame overlaps a local unpublished table id".into(),
+                ));
+            }
+        }
+        for id in &roots {
+            self.table_id_to_rootpage
+                .try_get_or_insert(*id, RootEntry::live(None))?;
+        }
+        let mut targets = Vec::new();
+        targets.try_reserve(requests.len())?;
+        let mut request_chains = Vec::new();
+        request_chains.try_reserve(requests.len())?;
+        let mut allocators = Vec::new();
+        allocators.try_reserve(requests.len())?;
+        for (row, delete, _) in &mut requests {
+            let chain = match &row.id.row_id {
+                RowKey::Int(rowid) => {
+                    if !*delete {
+                        allocators.push((self.get_rowid_allocator(&row.id.table_id), *rowid));
+                    }
+                    self.get_or_create_table_row_versions(row.id.clone())?
+                }
+                RowKey::Record(key) => {
+                    let index = self.get_or_create_index_rows(row.id.table_id)?;
+                    let entry = self.get_or_create_index_key_entry(index.value(), key.clone())?;
+                    row.id.row_id = RowKey::Record(entry.key().clone());
+                    entry.value().clone()
+                }
+            };
+            request_chains.push(Arc::as_ptr(&chain) as usize);
+            targets.push((row.id.clone(), chain));
+        }
+        targets.sort_unstable_by_key(|(_, chain)| Arc::as_ptr(chain) as usize);
+        targets.dedup_by(|(_, a), (_, b)| Arc::ptr_eq(a, b));
+        let mut dirty_entries = Vec::new();
+        dirty_entries.try_reserve(targets.len())?;
+        for (id, _) in &targets {
+            dirty_entries.push(
+                self.checkpoint_dirty_keys_for(id)
+                    .try_get_or_insert(id.clone(), AtomicU64::new(0))?,
+            );
+        }
+        self.clock.publish_observed(timestamp, || -> Result<()> {
+            for tx in self.txs.iter() {
+                match tx.value().state.load() {
+                    TransactionState::Active if tx.value().begin_ts >= timestamp => {
+                        return Err(LimboError::Corrupt("live snapshot is newer than an unimported peer frame".into()));
+                    }
+                    TransactionState::Preparing(_) | TransactionState::Committed(_) => return Err(LimboError::Busy),
+                    _ => {}
+                }
+            }
+            let mut guards = Vec::new();
+            guards.try_reserve(targets.len())?;
+            for (id, chain) in &targets {
+                let guard = chain.write();
+                let mapped = match &id.row_id {
+                    RowKey::Int(_) => self.table_versions_still_mapped(id, chain),
+                    RowKey::Record(key) => self.index_rows.get(&id.table_id).is_some_and(|index| self.index_versions_still_mapped(index.value(), key, chain)),
+                };
+                if !mapped { return Err(LimboError::Busy); }
+                guards.push(guard);
+            }
+            if dirty_entries.iter().any(|entry| entry.is_removed()) { return Err(LimboError::Busy); }
+            let mut staged = Vec::new();
+            staged.try_reserve(guards.len())?;
+            let mut conflicts = Vec::new();
+            for (index, versions) in guards.iter().enumerate() {
+                let address = Arc::as_ptr(&targets[index].1) as usize;
+                let additions = request_chains.iter().filter(|candidate| **candidate == address).count();
+                let mut copy = <RowVersionChain<A> as TursoVecInExt<RowVersion, A>>::new_in(self.alloc.clone());
+                copy.try_reserve_exact(versions.len().checked_add(additions).ok_or(LimboError::OutOfMemory)?)?;
+                conflicts.try_reserve(versions.len().saturating_mul(2))?;
+                for version in versions.iter() {
+                    copy.push(version.clone());
+                    // SkipMap entries pin lifetime, not a mutex. Retain references
+                    // now so marking conflicts during publication is infallible.
+                    for tag in [version.begin(), version.end()] {
+                        if let Some(TxTimestampOrID::TxID(id)) = tag {
+                            if let Some(tx) = self.txs.get(&id) {
+                                if tx.value().state.load() == TransactionState::Active { conflicts.push(tx); }
+                            }
+                        }
+                    }
+                }
+                staged.push(copy);
+            }
+            for ((row, delete, resident), address) in requests.iter().zip(&request_chains) {
+                let target = targets.binary_search_by_key(address, |(_, chain)| Arc::as_ptr(chain) as usize).expect("resolved replay chain");
+                let versions = &mut staged[target];
+                if *delete {
+                    if let Some(existing) = versions.iter_mut().rev().find(|version| {
+                        let begin = matches!(version.begin(), Some(TxTimestampOrID::Timestamp(begin)) if begin <= timestamp)
+                            || (version.begin().is_none() && matches!(version.end(), Some(TxTimestampOrID::TxID(_))));
+                        begin && matches!(version.end(), None | Some(TxTimestampOrID::TxID(_)))
+                    }) {
+                        existing.set_end(Some(TxTimestampOrID::Timestamp(timestamp)));
+                        continue;
+                    }
+                    if versions.iter().any(|version| version.begin().is_none() && version.end() == Some(TxTimestampOrID::Timestamp(timestamp))) { continue; }
+                }
+                let version = RowVersion::new(self.get_version_id(),
+                    (!delete).then_some(TxTimestampOrID::Timestamp(timestamp)),
+                    delete.then_some(TxTimestampOrID::Timestamp(timestamp)), row.data.clone(), *resident);
+                if !delete {
+                    if let Some(existing) = versions.iter_mut().find(|version| version.begin() == Some(TxTimestampOrID::Timestamp(timestamp))) {
+                        *existing = version;
+                        continue;
+                    }
+                }
+                let begin = self.resolve_begin_timestamp(&version.begin());
+                let position = versions.iter().rposition(|v| self.resolve_begin_timestamp(&v.begin()) <= begin).map_or(0, |index| index + 1);
+                versions.insert(position, version);
+            }
+            let added: usize = staged.iter().zip(&guards).map(|(after, before)| after.len() - before.len()).sum();
+            // Everything below is allocation-free. Old snapshots cannot see the
+            // new timestamp, and admission remains locked until metadata agrees.
+            let prepared = prepared.take().expect("validated peer frame remains pending");
+            for tx in conflicts { tx.value().peer_conflicted.store(true, Ordering::Release); }
+            for (guard, replacement) in guards.iter_mut().zip(staged) { **guard = replacement; }
+            for entry in &dirty_entries { entry.value().fetch_max(timestamp, Ordering::AcqRel); }
+            self.live_version_count_approx.fetch_add(added, Ordering::Relaxed);
+            self.bump_table_rows_epoch();
+            self.bump_index_rows_epoch();
+            // Never acquire schema/header locks while holding version-chain locks.
+            drop(guards);
+            for (allocator, rowid) in &allocators { allocator.insert_row_id_maybe_update(*rowid); }
+            for id in &roots { self.bump_next_table_id_below(*id, None); }
+            if let Some(header) = header { self.global_header.write().replace(header); }
+            let schema_changed = prepared.schema_after.is_some();
+            if let Some(schema) = prepared.schema_after {
+                *connection.schema.write() = schema.clone();
+                *connection.db.schema.lock() = schema.clone();
+                ctx.current_schema = schema;
+                self.last_committed_schema_change_ts.fetch_max(timestamp, Ordering::AcqRel);
+                self.bump_schema_generation();
+            }
+            if let Some(rows) = prepared.schema_rows_after { ctx.schema_rows = rows; }
+            if let Some(types) = prepared.type_sqls_after { ctx.type_sqls = types; }
+            ctx.index_infos = if schema_changed { HashMap::default() } else { prepared.index_infos };
+            ctx.dropped_root_pages = dropped_roots;
+            ctx.max_commit_ts_seen = timestamp;
+            self.last_committed_tx_ts.fetch_max(timestamp, Ordering::AcqRel);
+            Ok(())
+        })
     }
 
     /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the

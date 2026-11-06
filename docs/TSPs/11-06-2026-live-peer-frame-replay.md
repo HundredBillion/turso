@@ -80,3 +80,28 @@ regressions pass. The broader MVCC database suite passes 539 tests with 6 ignore
 The private conflict flag is not yet set by a production importer. SQL result and
 admission checks, atomic frame installation and all Task 3 integration remain
 unfinished; these tests do not establish end-to-end shared-mode behavior.
+
+The private live installer now resolves canonical chains, locks them in Arc-address
+order under the local admission clock, stages replacement contents and conflict
+references, and publishes only after all fallible preparation succeeds. It keeps
+the prepared frame in an Option on failure and consumes it only at publication.
+Missing empty map entries, zero dirty-key placeholders, conservative cursor-epoch
+bumps and unused local version/timestamp numbers may remain after preparation
+fails; visible versions, schema/header, conflict flags and imported watermark do
+not change. The shared authority must still exclude concurrent commit/checkpoint
+work; that caller integration is not yet implemented.
+
+Native stable validation passes 545 MVCC database tests with 6 ignored. Coverage
+includes old/new snapshots, preserved local chain identity, table/index pending
+end replacement and rollback, schema/header publication, CREATE/DROP identity,
+logical-ID exhaustion, and dirty-map allocation failures followed by retry of the
+same prepared frame. The allocator-enabled pinned-nightly job must additionally
+exercise the chain-copy allocation sites before accepting that failure coverage.
+A separate commit race test observed a commit entering Preparing after peer
+invalidation; the commit now rechecks under the admission clock. The new test also
+asserts failed-state cleanup preserves the imported peer version.
+
+Logical-table allocator lowering uses atomic fetch_min so concurrent local
+reservations cannot be overwritten. Imported i64::MIN table IDs are rejected
+before publication. Global table/row/sequence reservation integration remains a
+separate required task; this local monotonicity repair does not provide it.
