@@ -1,35 +1,24 @@
-name: Static JSON traversal experiment
+name: Full preserved JSON suite comparison
 on:
   workflow_dispatch:
 permissions:
   contents: read
-env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
+  actions: read
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: static-json-traversal
-          cache-on-failure: true
-      - name: Verify JSON semantics
+      - name: Fetch verified static traversal and baseline executables
         env:
-          QUICKCHECK_TESTS: "500"
-        run: >-
-          cargo test --locked -p turso_core --lib json:: -- --test-threads=1
-      - name: Compare current main and both extraction variants
-        run: python3 scripts/diagnose_json_canonical.py
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 42257719725 --repo HundredBillion/turso --name static-json-traversal-results --dir static-inputs
+      - name: Alternate full JSON suite on one host
+        run: python3 scripts/compare_json_full_preserved.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: static-json-traversal-results
-          path: canonical-results/
+          name: full-preserved-json-results
+          path: full-json-results/
           retention-days: 14
