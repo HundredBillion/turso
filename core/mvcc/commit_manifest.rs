@@ -22,12 +22,18 @@ pub(super) struct ManifestRecord {
     log_salt: u64,
     prefix: PublishedPrefix,
     checkpoint: Option<CheckpointIntent>,
+    downgrade: Option<DowngradeIntent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CheckpointIntent {
     pub source_checkpoint_timestamp: u64,
     pub target_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DowngradeIntent {
+    pub basename_wal_id: FileId,
 }
 
 impl ManifestRecord {
@@ -50,6 +56,20 @@ impl ManifestRecord {
 
     pub(super) fn checkpoint_intent(&self) -> Option<CheckpointIntent> {
         self.checkpoint
+    }
+
+    pub(super) fn downgrade_intent(&self) -> Option<DowngradeIntent> {
+        self.downgrade
+    }
+
+    pub(super) fn requires_recovery(&self) -> bool {
+        self.checkpoint.is_some() || self.downgrade.is_some()
+    }
+
+    pub(super) fn begin_downgrade(self, _basename_wal_id: FileId) -> Result<Self> {
+        Err(LimboError::InvalidArgument(
+            "downgrade codec is not implemented".into(),
+        ))
     }
 
     pub(super) fn begin_checkpoint(mut self, source_checkpoint_timestamp: u64) -> Result<Self> {
@@ -101,6 +121,7 @@ impl ManifestRecord {
             log_salt,
             prefix,
             checkpoint: None,
+            downgrade: None,
         })
     }
 
@@ -552,6 +573,139 @@ mod tests {
     use super::*;
 
     const DATABASE_ID: FileId = FileId { dev: 1, ino: 2 };
+
+    const WAL_ID: FileId = FileId { dev: 1, ino: 3 };
+
+    #[test]
+    fn commit_manifest_downgrade_roundtrip_is_distinct_terminal_state() {
+        let normal = record(5, 3, 0, 20, 0);
+        let intent = normal.begin_downgrade(WAL_ID).unwrap();
+        assert_eq!(intent.sequence(), 6);
+        assert_eq!(intent.log_generation(), 3);
+        assert_eq!(intent.prefix(), normal.prefix());
+        assert_eq!(
+            intent.downgrade_intent(),
+            Some(DowngradeIntent {
+                basename_wal_id: WAL_ID
+            })
+        );
+        assert!(intent.checkpoint_intent().is_none());
+        assert!(intent.requires_recovery());
+        assert!(!normal.requires_recovery());
+        assert_eq!(
+            u32::from_le_bytes(intent.encode()[8..12].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            ManifestRecord::decode(&intent.encode()).unwrap(),
+            Some(intent)
+        );
+        assert_eq!(
+            select_latest([Some(normal), Some(intent)], DATABASE_ID)
+                .unwrap()
+                .1,
+            intent
+        );
+        assert!(intent.begin_checkpoint(20).is_err());
+        assert!(intent.begin_downgrade(WAL_ID).is_err());
+        for next in [
+            record(7, 3, 0, 20, 0),
+            record(7, 3, 9, 21, 128),
+            record(7, 4, 0, 20, 0),
+        ] {
+            assert!(select_latest([Some(intent), Some(next)], DATABASE_ID).is_err());
+        }
+    }
+
+    #[test]
+    fn commit_manifest_downgrade_requires_empty_normal_state_and_exact_identity() {
+        for source in [
+            record(5, 3, 7, 20, 128),
+            record(5, 3, 7, 20, 0),
+            record(5, 3, 0, 20, 0).begin_checkpoint(20).unwrap(),
+        ] {
+            assert!(source.begin_downgrade(WAL_ID).is_err());
+        }
+        let source = record(5, 3, 0, 20, 0);
+        assert!(source.begin_downgrade(DATABASE_ID).is_err());
+        assert!(source.begin_downgrade(FileId { dev: 2, ino: 3 }).is_err());
+        assert!(record(u64::MAX, 3, 0, 20, 0)
+            .begin_downgrade(WAL_ID)
+            .is_err());
+        let intent = source.begin_downgrade(WAL_ID).unwrap();
+        for previous in [
+            record(4, 3, 0, 20, 0),
+            record(5, 2, 0, 20, 0),
+            record(5, 3, 0, 19, 0),
+            record(5, 3, 7, 20, 128),
+        ] {
+            assert!(select_latest([Some(previous), Some(intent)], DATABASE_ID).is_err());
+        }
+        let other_wal = source.begin_downgrade(FileId { dev: 1, ino: 4 }).unwrap();
+        assert!(select_latest([Some(intent), Some(other_wal)], DATABASE_ID).is_err());
+    }
+
+    #[test]
+    fn commit_manifest_downgrade_mirrors_fence_after_loss_of_either_copy() {
+        let intent = record(5, 3, 0, 20, 0).begin_downgrade(WAL_ID).unwrap();
+        let bytes = intent.encode();
+        for cut in 0..RECORD_SIZE {
+            let torn = ManifestRecord::decode(&bytes[..cut]).unwrap();
+            for records in [[Some(intent), torn], [torn, Some(intent)]] {
+                let selected = select_latest(records, DATABASE_ID).unwrap().1;
+                assert_eq!(selected, intent);
+                assert!(selected.requires_recovery());
+            }
+        }
+        for byte in 0..RECORD_SIZE {
+            for bit in 0..8 {
+                let mut torn = bytes;
+                torn[byte] ^= 1 << bit;
+                let torn = ManifestRecord::decode(&torn).unwrap();
+                assert_eq!(
+                    select_latest([torn, Some(intent)], DATABASE_ID).unwrap().1,
+                    intent
+                );
+            }
+        }
+        let mut unknown = bytes;
+        unknown[8..12].copy_from_slice(&4u32.to_le_bytes());
+        fix_checksum(&mut unknown);
+        assert!(ManifestRecord::decode(&unknown).is_err());
+        for offset in [48, 64, 76, 96] {
+            let mut invalid = bytes;
+            invalid[offset] = 1;
+            fix_checksum(&mut invalid);
+            assert!(ManifestRecord::decode(&invalid).is_err(), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn commit_manifest_generated_downgrade_intents_roundtrip() {
+        fn property(sequence: u64, generation: u64, timestamp: u64, wal_inode: u64) -> bool {
+            let source = record(
+                sequence.clamp(1, u64::MAX - 1),
+                generation.max(1),
+                0,
+                timestamp & ((1 << 62) - 1),
+                0,
+            );
+            let intent = source
+                .begin_downgrade(FileId {
+                    dev: DATABASE_ID.dev,
+                    ino: wal_inode.max(3),
+                })
+                .unwrap();
+            ManifestRecord::decode(&intent.encode()).unwrap() == Some(intent)
+                && select_latest([Some(source), Some(intent)], DATABASE_ID)
+                    .unwrap()
+                    .1
+                    == intent
+        }
+        quickcheck::QuickCheck::new()
+            .tests(200)
+            .quickcheck(property as fn(u64, u64, u64, u64) -> bool);
+    }
 
     #[test]
     fn commit_manifest_checkpoint_intent_roundtrip_retains_old_base_and_exact_target() {
