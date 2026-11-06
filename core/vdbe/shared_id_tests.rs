@@ -94,3 +94,47 @@ fn shared_id_opcode_native_reserves_logical_tables_before_schema_commit() {
     first.execute("ROLLBACK").unwrap();
     second.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_rejects_process_local_sequence_watermark() {
+    let (_directory, first, _) = pair();
+    first.execute("CREATE SEQUENCE shared_sequence").unwrap();
+    let error = first
+        .execute("SELECT sequence_watermark_experimental('shared_sequence')")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires a global live-claim reader"),
+        "{error}"
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_sequence_preserves_saved_outer_owner() {
+    let (_directory, first, second) = pair();
+    first.execute("CREATE SEQUENCE owner_sequence").unwrap();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(100,'outer')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().unwrap();
+    let snapshot = store.read_snapshot_ts(outer);
+    let allocated = integers(&first, "SELECT nextval('owner_sequence')")[0];
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert!(store.is_tx_rollbackable(outer));
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE value='outer'"),
+        [100]
+    );
+    assert!(integers(&second, "SELECT id FROM preserved WHERE value='outer'").is_empty());
+    let later = integers(&second, "SELECT nextval('owner_sequence')")[0];
+    assert!(later > allocated);
+    first.execute("ROLLBACK").unwrap();
+    assert!(integers(&second, "SELECT id FROM preserved WHERE value='outer'").is_empty());
+    assert!(integers(&second, "SELECT nextval('owner_sequence')")[0] > later);
+}

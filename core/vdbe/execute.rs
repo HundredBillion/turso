@@ -11214,6 +11214,17 @@ pub fn op_function(
                     }
                 };
                 let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
+                #[cfg(all(host_shared_wal, unix))]
+                if program
+                    .connection
+                    .mv_store_for_db(namespace.database_id)
+                    .is_some_and(|store| store.is_shared())
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "shared sequence watermark requires a global live-claim reader".into(),
+                    )
+                    .into());
+                }
                 let watermark = program
                     .connection
                     .mv_store_for_db(namespace.database_id)
@@ -12829,6 +12840,8 @@ pub enum OpInsertSubState {
     /// Must complete before Insert so that cursor.rowid()/record() are never
     /// interleaved with a partially-completed cursor.insert().
     NoopCheck,
+    /// Persist a shared row claim before the cursor can mutate the table.
+    ClaimSharedRow,
     /// Insert the row into the table.
     Insert,
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
@@ -13142,6 +13155,51 @@ pub fn op_insert(
                         }
                     }
                 }
+                state.active_op_state.insert().sub_state = OpInsertSubState::ClaimSharedRow;
+                continue;
+            }
+            OpInsertSubState::ClaimSharedRow => {
+                #[cfg(all(host_shared_wal, unix))]
+                if !state.active_op_state.insert().is_noop_update {
+                    let has_rowid = state.get_cursor(*cursor_id).as_btree_mut().has_rowid();
+                    if has_rowid {
+                        if let Some((db_id, table_id, tx_id)) =
+                            shared_id_cursor(program, state, *cursor_id)?
+                        {
+                            let value = state.registers[*key_reg].get_value().as_int().ok_or_else(
+                                || {
+                                    LimboError::InternalError(
+                                        "shared row claim requires an integer key".into(),
+                                    )
+                                },
+                            )?;
+                            let store = program.connection.mv_store_for_db(db_id).unwrap();
+                            let bound_pager = program.get_pager_from_database_index(&db_id)?;
+                            let result = return_if_io!(
+                                state,
+                                store.shared_id_nonblock(
+                                    &program.connection,
+                                    bound_pager,
+                                    tx_id,
+                                    db_id,
+                                    crate::mvcc::database::SharedIdRequest::ClaimExplicitRow {
+                                        table_id,
+                                        value
+                                    },
+                                    &mut state.shared_id,
+                                )
+                            );
+                            if !matches!(result, crate::mvcc::database::SharedIdResult::Claimed) {
+                                return Err(LimboError::InternalError(
+                                    "shared explicit claim returned an allocation".into(),
+                                )
+                                .into());
+                            }
+                            state.reset_shared_id();
+                        }
+                    }
+                }
+                // A later yielding insert resumes after the durable claim.
                 state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                 continue;
             }
@@ -13873,6 +13931,36 @@ pub enum OpNewRowidState {
     GoNext,
 }
 
+/// Resolve the bound MVCC cursor rather than deriving a domain from a SQL
+/// name or a physical root page that may belong to another generation.
+#[cfg(all(host_shared_wal, unix))]
+fn shared_id_cursor(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+) -> Result<Option<(usize, i64, u64)>> {
+    let Some(db_id) = state.cursor_databases.get(cursor_id).copied().flatten() else {
+        return Ok(None);
+    };
+    let Some(store) = program.connection.mv_store_for_db(db_id) else {
+        return Ok(None);
+    };
+    if !store.is_shared() {
+        return Ok(None);
+    }
+    let cursor = state.get_cursor(cursor_id).as_btree_mut() as &mut dyn Any;
+    let Some(cursor) = cursor.downcast_ref::<MvCursor>() else {
+        return Ok(None);
+    };
+    if !Arc::ptr_eq(&store, &cursor.db) {
+        return Err(LimboError::InternalError(
+            "shared ID cursor belongs to another store".into(),
+        ));
+    }
+    let (table_id, tx_id) = cursor.shared_id_identity();
+    Ok(Some((db_id, table_id, tx_id)))
+}
+
 pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
@@ -13914,6 +14002,40 @@ fn new_rowid_inner(
         },
         insn
     );
+
+    #[cfg(all(host_shared_wal, unix))]
+    if let Some((db_id, table_id, tx_id)) = shared_id_cursor(program, state, *cursor)? {
+        if *prev_largest_reg != 0 {
+            return Err(LimboError::InternalError(
+                "shared rowid generation cannot publish a previous-maximum register".into(),
+            )
+            .into());
+        }
+        let store = program.connection.mv_store_for_db(db_id).unwrap();
+        let bound_pager = program.get_pager_from_database_index(&db_id)?;
+        let result = return_if_io!(
+            state,
+            store.shared_id_nonblock(
+                &program.connection,
+                bound_pager,
+                tx_id,
+                db_id,
+                crate::mvcc::database::SharedIdRequest::ReserveRow { table_id },
+                &mut state.shared_id,
+            )
+        );
+        let crate::mvcc::database::SharedIdResult::Value(value) = result else {
+            return Err(LimboError::InternalError(
+                "shared row reservation returned no value".into(),
+            )
+            .into());
+        };
+        state.reset_shared_id();
+        state.registers[*rowid_reg].set_int(value);
+        state.active_op_state.clear();
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
@@ -14668,6 +14790,35 @@ pub fn op_create_btree(
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let Some(mv_store) = mv_store.as_ref() {
+        #[cfg(all(host_shared_wal, unix))]
+        if mv_store.is_shared() {
+            let tx_id = program.connection.get_mv_tx_id_for_db(*db).ok_or_else(|| {
+                LimboError::InternalError("shared table allocation has no transaction".into())
+            })?;
+            let bound_pager = program.get_pager_from_database_index(db)?;
+            let result = return_if_io!(
+                state,
+                mv_store.shared_id_nonblock(
+                    &program.connection,
+                    bound_pager,
+                    tx_id,
+                    *db,
+                    crate::mvcc::database::SharedIdRequest::ReserveLogicalTable,
+                    &mut state.shared_id,
+                )
+            );
+            let crate::mvcc::database::SharedIdResult::Value(value) = result else {
+                return Err(LimboError::InternalError(
+                    "shared table reservation returned no value".into(),
+                )
+                .into());
+            };
+            state.reset_shared_id();
+            mv_store.record_created_table_id(tx_id, value);
+            state.registers[*root].set_int(value);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
         let root_page = mv_store.get_next_table_id();
         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
             mv_store.record_created_table_id(tx_id, root_page);
@@ -15414,6 +15565,62 @@ pub fn op_set_sequence_currval(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[cfg(all(host_shared_wal, unix))]
+fn claim_shared_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    db_id: usize,
+    tx_id: u64,
+    sequence_name: &str,
+    value: i64,
+    autonomous: bool,
+) -> crate::types::IOResultOr<()> {
+    let Some(store) = program.connection.mv_store_for_db(db_id) else {
+        return Ok(IOResult::Done(()));
+    };
+    if !store.is_shared() {
+        return Ok(IOResult::Done(()));
+    }
+    let backing = crate::translate::sequence::sequence_backing_table_name(sequence_name);
+    let root = program
+        .connection
+        .with_schema(db_id, |schema| {
+            schema
+                .get_btree_table(NamespaceId::ROOT, &backing)
+                .map(|table| table.root_page)
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError("shared sequence backing table is missing".into())
+        })?;
+    let table_id = store
+        .try_get_table_id_from_root_page_at(root, store.read_snapshot_ts(tx_id))
+        .ok_or(LimboError::SchemaUpdated)?;
+    let pager = program.get_pager_from_database_index(&db_id)?;
+    let result = match store.shared_id_nonblock(
+        &program.connection,
+        pager,
+        tx_id,
+        db_id,
+        crate::mvcc::database::SharedIdRequest::ClaimSequence {
+            table_id: table_id.into(),
+            value,
+            autonomous,
+        },
+        &mut state.shared_id,
+    )? {
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        IOResult::Done(result) => result,
+    };
+    if !matches!(result, crate::mvcc::database::SharedIdResult::Claimed) {
+        return Err(LimboError::InternalError(
+            "shared sequence claim returned an allocation".into(),
+        )
+        .into());
+    }
+    state.reset_shared_id();
+    Ok(IOResult::Done(()))
+}
+
 /// Publish sequence allocation metadata used by `sequence_watermark_experimental()`.
 ///
 /// The translator emits this only after the sequence backing-table RMW has
@@ -15455,13 +15662,26 @@ pub fn op_sequence_track_allocation(
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
         let mangled_seq_name = mangle_name(*namespace, seq_name);
-        mv_store.set_sequence_watermark(&mangled_seq_name, current_watermark);
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
+                #[cfg(all(host_shared_wal, unix))]
+                return_if_io!(
+                    state,
+                    claim_shared_sequence(
+                        program,
+                        state,
+                        *db,
+                        tx_id,
+                        &mangled_seq_name,
+                        value,
+                        false
+                    )
+                );
                 mv_store.register_sequence_allocation(tx_id, &mangled_seq_name, value)?;
             }
         }
+        mv_store.set_sequence_watermark(&mangled_seq_name, current_watermark);
     }
 
     state.pc += 1;
@@ -15527,6 +15747,19 @@ pub fn op_sequence_register_allocation(
 
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         if mv_store.is_tx_rollbackable(outer_tx_id) {
+            #[cfg(all(host_shared_wal, unix))]
+            return_if_io!(
+                state,
+                claim_shared_sequence(
+                    program,
+                    state,
+                    *db,
+                    outer_tx_id,
+                    &mangle_name(*namespace, seq_name),
+                    value,
+                    true
+                )
+            );
             mv_store.register_sequence_allocation(
                 outer_tx_id,
                 &mangle_name(*namespace, seq_name),
