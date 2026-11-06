@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: da63698ed121c8d2f6965f6bb7519d9813cdb54e
+          ref: 459e59b23b4599b8a7b42b1b842a9c05660f5684
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -29,7 +29,16 @@ jobs:
         run: |
           set -o pipefail
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-green.log
-          grep -q '5 passed; 0 failed' ids-green.log
+          grep -q '6 passed; 0 failed' ids-green.log
+      - name: Preserve separate stale prepare regression
+        run: |
+          set +e
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee stale-prepare-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'idle peer did not import committed sequence DDL before prepare' stale-prepare-red.log
+          grep -q '0 passed; 1 failed' stale-prepare-red.log
       - name: Strict library lint
         run: |
           set -o pipefail
