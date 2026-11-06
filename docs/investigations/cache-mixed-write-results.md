@@ -1,6 +1,6 @@
 # Mixed-write application protocol experiment
 
-This is a test-only implementation of the [approved bounded protocol](cache-mixed-write-protocol.md). It does not change the engine or expose a production service API. Performance acceptance against upstream and current fork main remains pending.
+This is a test-only implementation of the [approved bounded protocol](cache-mixed-write-protocol.md). It does not change the engine or expose a production service API. Corrected hosted screening and the longer comparison against upstream and current fork main are complete. Database-only requests have lower medians in this mutable workload, but tail latency varies too much to support a general cache-removal recommendation or an experimental-runtime speedup.
 
 `benches/examples/cache_mixed_write_probe.rs` reuses the immutable probe's SQL reads, response encoding, loopback framing and Redis transport. Every write changes document version, typed/JSON facets and inventory, and inserts an order in one ordinary WAL/FULL transaction. An independent in-memory model checks exact content, orders, inventory and integrity. All application reads and writes use one shared read/write gate; successful commits advance cache generation before releasing the writer guard. A lost or invalid commit response closes application admission.
 
@@ -43,10 +43,69 @@ The optional Redis worker/checker path retains entries across actual process dea
 
 ## Interpretation
 
-No mutable-workload latency result is accepted yet. Hosted alternating upstream/current-main/candidate trials, recorded model overhead, resource accounting and sustained mixed-write comparisons remain pending. The [sustained immutable result](cache-application-sustained-results.md) already shows lower database-only medians but better Redis tails; it does not justify universal cache removal.
+The corrected screening and longer comparison completed successfully. The longer trials retain lower database-only medians, but invalidate a claim of consistently better database-only tail latency. The [sustained immutable result](cache-application-sustained-results.md) already shows lower database-only medians but better Redis tails; it does not justify universal cache removal.
 
 ## Hosted comparison runner
 
 `python3 scripts/compare_cache_mixed.py --output /tmp/mixed-comparison` builds the identical immutable/mixed examples and simulated-I/O fixture in one canonical worktree path for upstream `2709799`, current fork `4ccf547`, and experimental static-traversal runtime `ad54b7a`. This candidate differs from the earlier immutable application's `c480869` runtime and is not production-accepted. Each runtime uses the same Cargo.lock, Rust 1.88.0 and optimized profile, passes focused example tests, and has its executable/hash preserved. All builds finish before measurement. The dispatch-only `cache-mixed-comparison.yml` workflow uploads raw artifacts.
 
 The separate `run_cache_mixed_probe.py` accepts prebuilt `--binary label=PATH` arguments. Defaults are a bounded screening matrix: 1,000 rows, 4,000 requests at 2,000/s, eight workers, 1%/5% writes, embedded/shared, database-only/Redis, warm/hot, three rotated repeats. This is 72 approximately two-second trials, not sustained acceptance. Each trial initializes a fresh database and resets only its task-owned capped Redis container. Recovery checks run before timing; Redis readiness has a deadline. The runner verifies sequence/write counts, timing arithmetic, trace percentiles, offered-rate horizon, checkpoint cadence/backlog evidence and binary hashes. It records whole-process `/usr/bin/time`, shared-service `/proc`, Redis INFO, and DB/WAL sizes. Initializer cost is outside the timed process; request-process resource counters include warmup/oracle/final validation. Select a sustained subset only after these results establish capacity.
+
+
+## Corrected hosted screening
+
+[Run 42268556981](https://github.com/HundredBillion/turso/actions/runs/42268556981) completed all 72 trials and 288,000 requests on an AMD EPYC 7763 runner. The same fixture revision `8a14bdb01` was built for the three pinned runtimes. Every runtime passed the external four-phase crash/restart controls with retained Redis entries and fresh namespaces before measurement. All trials completed the offered approximately 2,000 requests/second; this establishes capacity for the selected followup rate, not maximum throughput.
+
+At 5% writes, medians of three trial percentiles were:
+
+| Runtime | Deployment | Database-only p50 / p99 (us) | Redis p50 / p99 (us) |
+| --- | --- | --- | --- |
+| Upstream | Embedded | 129 / 806 | 369 / 1370 |
+| Fork main | Embedded | 127 / 801 | 363 / 1179 |
+| Candidate | Embedded | 130 / 814 | 362 / 1200 |
+| Upstream | Loopback service | 209 / 897 | 448 / 1438 |
+| Fork main | Loopback service | 207 / 922 | 442 / 1348 |
+| Candidate | Loopback service | 211 / 930 | 441 / 1358 |
+
+These mutable requests do not reproduce the immutable warm-cache result: each successful write advances the shared cache generation, so cache invalidation and misses matter. This screening favors database-only requests for this specific workload, while it does not establish an advantage for the experimental JSON runtime over current main. Repeat ranges, read/write percentiles, model-publication cost and checkpoint overlap are retained in [screening evidence](results/cache-mixed-screening). Do not pool the three trial percentiles as if they were one latency distribution.
+
+The earlier run `42263467711` failed during shared-service verification: the benchmark client tried to open the database directly while the service owned its handles. The corrected fixture verifies through that service against the client's independent transaction history. A deliberately bypassed verification failed its regression test before the corrected implementation passed. Partial timings from the failed run are not accepted comparison evidence.
+
+The [sustained followup](https://github.com/HundredBillion/turso/actions/runs/42271229744) reuses the successful screening executables after checking their hashes and fixture identity. It measures 36 trials of 60,000 requests each, eight workers at 2,000 requests/second, 5% writes, and PASSIVE checkpoint requests every 200 completed requests. It completed successfully; results follow.
+
+
+## Sustained result and decision
+
+The longer run passed all 36 trials and 2.16 million requests, including fresh-process recovery controls for all three preserved executables. Each trial offered 60,000 requests over thirty seconds, with 3,000 FULL-durability writes. Observed throughput was 1,999.925–1,999.990 requests/second across the complete matrix. This is a fixed-rate comparison, not a saturation-capacity result.
+
+The following values are medians of three independent trial percentiles, in microseconds:
+
+| Runtime | Deployment | Database-only p50 / p95 | Redis p50 / p95 |
+| --- | --- | --- | --- |
+| Upstream | Embedded | 92 / 496 | 185 / 581 |
+| Fork main | Embedded | 90 / 481 | 194 / 600 |
+| Candidate | Embedded | 91 / 499 | 186 / 602 |
+| Upstream | Loopback service | 124 / 556 | 221 / 622 |
+| Fork main | Loopback service | 125 / 527 | 222 / 640 |
+| Candidate | Loopback service | 125 / 547 | 225 / 641 |
+
+Tail latency is much less stable. Each cell below shows the three trial p99 values as **minimum / median / maximum, in milliseconds**:
+
+| Runtime | Deployment | Database-only p99 | Redis p99 |
+| --- | --- | --- | --- |
+| Upstream | Embedded | 29.260 / 73.124 / 134.211 | 0.797 / 1.205 / 89.509 |
+| Fork main | Embedded | 0.591 / 1.079 / 98.026 | 0.692 / 1.652 / 308.139 |
+| Candidate | Embedded | 0.803 / 13.337 / 43.464 | 0.846 / 1.360 / 98.233 |
+| Upstream | Loopback service | 0.641 / 93.425 / 115.735 | 0.681 / 0.705 / 2.358 |
+| Fork main | Loopback service | 0.720 / 1.098 / 3.429 | 0.995 / 72.375 / 94.970 |
+| Candidate | Loopback service | 0.691 / 13.986 / 84.965 | 0.842 / 0.985 / 1.980 |
+
+The traces show occasional slow writes blocking readers through the application gate, followed by delayed request starts. For example, one upstream service write took about 372 ms with negligible initial gate wait; neighboring readers then waited about 370 ms at the gate. A candidate embedded Redis write similarly took about 351 ms. These observations establish application queueing after a slow write, but do not identify its internal database, filesystem or host cause. The harness does not time individual synchronization calls, so attributing these spikes specifically to fsync or dismissing them as host noise would be unsupported.
+
+Each trial completed 300 checkpoint attempts; 299 completed before its final timed request. The last checkpoint drains after traffic, as expected from its completion threshold. Redis read-hit fractions were about 47%, because successful writes invalidate the generation. Timed model-publication work consumed less than 0.003% of the trial horizon in every case; its write p99 was below one microsecond. This narrow model-update cost does not exclude untimed oracle CPU from influencing later requests. Full-process resource counters include setup and verification; shared-service counters and Redis counters are recorded separately.
+
+The [retained results](results/cache-mixed-sustained) include every trial summary, repeat analysis, resource counters, binary/build identities, external recovery ledgers and selected slow-write records. Full traces and executable artifacts are available through the linked runs and retained in the investigation workspace. The screening CPU model was recorded; the reuse-only sustained job recorded its OS/platform but did not separately capture its CPU model. Its copied build metadata describes the screening build host, not new hardware evidence for the sustained run. All variants within the sustained comparison ran on the same hosted job.
+
+**Decision:** database-only is a reasonable simplification candidate for this measured, single-process, warm/hot, small-data request mix because it lowers median latency and removes a cache-coordination dependency. This is not a universal recommendation to remove Redis: the immutable comparison favored warm Redis tails, and this mutable comparison has unstable tails in both modes. No numeric application tail-latency requirement was supplied or invented. The experimental JSON runtime does not establish a consistent application advantage over current fork main and already failed the upstream full-JSON-suite criterion, so it remains unmerged.
+
+These results cover 1,000 documents, eight workers, one offered rate and thirty-second trials on ordinary WAL with FULL writes. They do not establish capacity for large datasets, hours-long operation, multiple independently writing application processes, or cross-process MVCC. The protocol requires every writer to obey one application gate and uses broad generation invalidation; other cache-coherence protocols may have different results. Wider workloads and a product-specific latency target remain necessary before a deployment decision.

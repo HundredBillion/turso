@@ -1,0 +1,8 @@
+{
+  "binary": "/home/runner/work/turso/turso/mixed-controls/binaries/upstream",
+  "sha256": "cfb8140b54d3f55f8ff964998c9e446d8a2b6816f1180cb3a80f08b482835883",
+  "failure_model": "SIGKILL of application process; not power loss",
+  "redis_address": "127.0.0.1:32768",
+  "cache_restart_verified": true,
+  "timing_comparison": false
+}

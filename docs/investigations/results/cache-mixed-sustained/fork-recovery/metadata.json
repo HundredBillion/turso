@@ -1,0 +1,8 @@
+{
+  "binary": "/home/runner/work/turso/turso/mixed-controls/binaries/fork",
+  "sha256": "0bfb6ade2524f131c57bde622ab3e88dc201115b26ed19493779c57b1b2b7dee",
+  "failure_model": "SIGKILL of application process; not power loss",
+  "redis_address": "127.0.0.1:32768",
+  "cache_restart_verified": true,
+  "timing_comparison": false
+}

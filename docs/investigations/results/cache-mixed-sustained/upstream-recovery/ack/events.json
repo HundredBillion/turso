@@ -1,0 +1,19 @@
+[
+  {
+    "event": "ready",
+    "namespace": "b07a7487eacc03dc44d376c5056a14c8"
+  },
+  {
+    "event": "before_commit"
+  },
+  {
+    "event": "committed"
+  },
+  {
+    "event": "published"
+  },
+  {
+    "event": "ack",
+    "generation": 2
+  }
+]

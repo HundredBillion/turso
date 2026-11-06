@@ -1,0 +1,50 @@
+[
+  {
+    "phase": "before_commit",
+    "expected_generation": 1,
+    "acknowledged": false,
+    "recovery": {
+      "ok": true,
+      "generation": 1,
+      "cache_restart": true,
+      "namespace": "ce7420dceb8c5b36295e940e981f9947"
+    },
+    "outcome": "absent"
+  },
+  {
+    "phase": "committed",
+    "expected_generation": 2,
+    "acknowledged": false,
+    "recovery": {
+      "ok": true,
+      "generation": 2,
+      "cache_restart": true,
+      "namespace": "9614ee544eb5f9dabcd82428e671fbea"
+    },
+    "outcome": "completed-commit-without-ack"
+  },
+  {
+    "phase": "published",
+    "expected_generation": 2,
+    "acknowledged": false,
+    "recovery": {
+      "ok": true,
+      "generation": 2,
+      "cache_restart": true,
+      "namespace": "8b66ca09261a89e7b8b01262dfac279a"
+    },
+    "outcome": "completed-commit-without-ack"
+  },
+  {
+    "phase": "ack",
+    "expected_generation": 2,
+    "acknowledged": true,
+    "recovery": {
+      "ok": true,
+      "generation": 2,
+      "cache_restart": true,
+      "namespace": "e4b76ae967c6bdc779ed7e0f4d01280f"
+    },
+    "outcome": "acknowledged-commit"
+  }
+]

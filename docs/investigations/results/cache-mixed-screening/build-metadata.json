@@ -1,0 +1,33 @@
+{
+  "fixture_revision": "8a14bdb01d8d19475c1a10dca3161f857e74453b",
+  "fixture_sha256": {
+    "benches/examples/cache_application_probe.rs": "8169e3eccc7fb0dec2b7ca4646decc49496dfcffd6bf365330871d4c4f4d090f",
+    "benches/examples/cache_mixed_write_probe.rs": "843191a7b36a2fa8d25bb264dddb629583175d59d15fbba8ad6c18b5bae8e93b",
+    "tests/integration/unreliable_io.rs": "0fd69c253ff02eed5c9abdae9f9c5b92278635f98ffbbdd35fba57c7e044c13c"
+  },
+  "runtime_revisions": {
+    "upstream": "2709799dad2ebb0f1749cfa62fa28514f568da28",
+    "fork": "4ccf547a400777307a834b554f467c8868830f5c",
+    "candidate": "ad54b7aaa6bf7b3933d4971ba039f14bab21e3d6"
+  },
+  "lock_sha256": "547f431d2d85bac9b78f5d5999aa650a175e1edb64fb46015172d184e0e92643",
+  "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+  "profile": "lib-release,opt-level3,debug0,codegen-units16,ltofalse,panicunwind,incremental0",
+  "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: x86_64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "binaries": {
+    "upstream": {
+      "path": "/home/runner/work/turso/turso/mixed-comparison/binaries/upstream",
+      "sha256": "cfb8140b54d3f55f8ff964998c9e446d8a2b6816f1180cb3a80f08b482835883"
+    },
+    "fork": {
+      "path": "/home/runner/work/turso/turso/mixed-comparison/binaries/fork",
+      "sha256": "0bfb6ade2524f131c57bde622ab3e88dc201115b26ed19493779c57b1b2b7dee"
+    },
+    "candidate": {
+      "path": "/home/runner/work/turso/turso/mixed-comparison/binaries/candidate",
+      "sha256": "81b6786cd821cf3c5848671c5bf75564c903b87281fe6174d492df9ced4efc0c"
+    }
+  },
+  "started_utc": "2026-11-06T18:13:00Z",
+  "builds_finished_utc": "2026-11-06T18:23:59Z"
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "event": "ready",
+    "namespace": "ea74b5ec62ec1edbbc9064f5879d4176"
+  },
+  {
+    "event": "before_commit"
+  },
+  {
+    "event": "committed"
+  }
+]

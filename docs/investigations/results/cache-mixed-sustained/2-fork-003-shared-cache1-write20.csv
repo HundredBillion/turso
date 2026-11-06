@@ -1,0 +1,2 @@
+path,cache,warm,hot,workers,rate,requests,write_every,writes,elapsed_s,drained_s,throughput,p50_us,p95_us,p99_us,late_p99_us,gate_p99_us,hits,misses,checkpoints,request_end_ns
+127.0.0.1:42805,true,true,true,8,2000,60000,20,3000,30.000228,30.000348,1999.985,221.604,640.220,94969.836,90978.709,107.180,26889,30111,300,29999636401

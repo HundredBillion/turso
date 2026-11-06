@@ -1,0 +1,8 @@
+{
+  "binary": "/home/runner/work/turso/turso/mixed-controls/binaries/candidate",
+  "sha256": "81b6786cd821cf3c5848671c5bf75564c903b87281fe6174d492df9ced4efc0c",
+  "failure_model": "SIGKILL of application process; not power loss",
+  "redis_address": "127.0.0.1:32768",
+  "cache_restart_verified": true,
+  "timing_comparison": false
+}

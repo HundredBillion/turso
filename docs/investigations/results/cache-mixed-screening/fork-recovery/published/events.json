@@ -1,0 +1,15 @@
+[
+  {
+    "event": "ready",
+    "namespace": "3f3fcd1522234d77c15057b55bb0d9e5"
+  },
+  {
+    "event": "before_commit"
+  },
+  {
+    "event": "committed"
+  },
+  {
+    "event": "published"
+  }
+]

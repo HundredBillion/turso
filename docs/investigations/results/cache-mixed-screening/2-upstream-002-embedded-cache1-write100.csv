@@ -1,0 +1,2 @@
+path,cache,warm,hot,workers,rate,requests,write_every,writes,elapsed_s,drained_s,throughput,p50_us,p95_us,p99_us,late_p99_us,gate_p99_us,hits,misses,checkpoints,request_end_ns
+embedded,true,true,true,8,2000,4000,100,40,1.999953,2.001279,2000.047,191.566,749.629,1175.639,89.243,154.027,3240,720,20,1999707110

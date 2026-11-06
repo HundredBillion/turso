@@ -1,0 +1,362 @@
+[
+  {
+    "trial": "0-candidate-000-embedded-cache0-write20",
+    "sequence": 12400,
+    "service_ns": 176818365,
+    "gate_wait_ns": 70,
+    "model_update_ns": 401,
+    "arrival_latency_ns": 176876823,
+    "late_start_ns": 58458,
+    "finished_ns": 6376876823
+  },
+  {
+    "trial": "0-candidate-001-embedded-cache1-write20",
+    "sequence": 44200,
+    "service_ns": 30371593,
+    "gate_wait_ns": 30,
+    "model_update_ns": 211,
+    "arrival_latency_ns": 30428797,
+    "late_start_ns": 57204,
+    "finished_ns": 22130428797
+  },
+  {
+    "trial": "0-candidate-002-shared-cache0-write20",
+    "sequence": 39960,
+    "service_ns": 28110778,
+    "gate_wait_ns": 12694325,
+    "model_update_ns": 261,
+    "arrival_latency_ns": 38532858,
+    "late_start_ns": 10422080,
+    "finished_ns": 20018532858
+  },
+  {
+    "trial": "0-candidate-003-shared-cache1-write20",
+    "sequence": 33600,
+    "service_ns": 150358063,
+    "gate_wait_ns": 250,
+    "model_update_ns": 571,
+    "arrival_latency_ns": 150417372,
+    "late_start_ns": 59309,
+    "finished_ns": 16950417372
+  },
+  {
+    "trial": "0-fork-000-embedded-cache0-write20",
+    "sequence": 36400,
+    "service_ns": 362992014,
+    "gate_wait_ns": 30,
+    "model_update_ns": 640,
+    "arrival_latency_ns": 363051981,
+    "late_start_ns": 59967,
+    "finished_ns": 18563051981
+  },
+  {
+    "trial": "0-fork-001-embedded-cache1-write20",
+    "sequence": 22600,
+    "service_ns": 91706216,
+    "gate_wait_ns": 40,
+    "model_update_ns": 321,
+    "arrival_latency_ns": 91765810,
+    "late_start_ns": 59594,
+    "finished_ns": 11391765810
+  },
+  {
+    "trial": "0-fork-002-shared-cache0-write20",
+    "sequence": 10600,
+    "service_ns": 57210211,
+    "gate_wait_ns": 30,
+    "model_update_ns": 250,
+    "arrival_latency_ns": 57276175,
+    "late_start_ns": 65964,
+    "finished_ns": 5357276175
+  },
+  {
+    "trial": "0-fork-003-shared-cache1-write20",
+    "sequence": 52060,
+    "service_ns": 25548200,
+    "gate_wait_ns": 70,
+    "model_update_ns": 251,
+    "arrival_latency_ns": 25600113,
+    "late_start_ns": 51913,
+    "finished_ns": 26055600113
+  },
+  {
+    "trial": "0-upstream-000-embedded-cache0-write20",
+    "sequence": 30400,
+    "service_ns": 408980063,
+    "gate_wait_ns": 61,
+    "model_update_ns": 931,
+    "arrival_latency_ns": 409038982,
+    "late_start_ns": 58919,
+    "finished_ns": 15609038982
+  },
+  {
+    "trial": "0-upstream-001-embedded-cache1-write20",
+    "sequence": 37940,
+    "service_ns": 14686858,
+    "gate_wait_ns": 41,
+    "model_update_ns": 190,
+    "arrival_latency_ns": 14743997,
+    "late_start_ns": 57139,
+    "finished_ns": 18984743997
+  },
+  {
+    "trial": "0-upstream-002-shared-cache0-write20",
+    "sequence": 51160,
+    "service_ns": 11890032,
+    "gate_wait_ns": 90,
+    "model_update_ns": 180,
+    "arrival_latency_ns": 11947203,
+    "late_start_ns": 57171,
+    "finished_ns": 25591947203
+  },
+  {
+    "trial": "0-upstream-003-shared-cache1-write20",
+    "sequence": 27400,
+    "service_ns": 182534711,
+    "gate_wait_ns": 80,
+    "model_update_ns": 531,
+    "arrival_latency_ns": 182576353,
+    "late_start_ns": 41642,
+    "finished_ns": 13882576353
+  },
+  {
+    "trial": "1-candidate-000-shared-cache1-write20",
+    "sequence": 37600,
+    "service_ns": 29242795,
+    "gate_wait_ns": 60,
+    "model_update_ns": 221,
+    "arrival_latency_ns": 29301163,
+    "late_start_ns": 58368,
+    "finished_ns": 18829301163
+  },
+  {
+    "trial": "1-candidate-001-shared-cache0-write20",
+    "sequence": 29580,
+    "service_ns": 11891597,
+    "gate_wait_ns": 50,
+    "model_update_ns": 190,
+    "arrival_latency_ns": 11949068,
+    "late_start_ns": 57471,
+    "finished_ns": 14801949068
+  },
+  {
+    "trial": "1-candidate-002-embedded-cache1-write20",
+    "sequence": 5000,
+    "service_ns": 39399800,
+    "gate_wait_ns": 50,
+    "model_update_ns": 121,
+    "arrival_latency_ns": 39459013,
+    "late_start_ns": 59213,
+    "finished_ns": 2539459013
+  },
+  {
+    "trial": "1-candidate-003-embedded-cache0-write20",
+    "sequence": 43600,
+    "service_ns": 315717832,
+    "gate_wait_ns": 40,
+    "model_update_ns": 591,
+    "arrival_latency_ns": 315776502,
+    "late_start_ns": 58670,
+    "finished_ns": 22115776502
+  },
+  {
+    "trial": "1-fork-000-shared-cache1-write20",
+    "sequence": 49600,
+    "service_ns": 308210027,
+    "gate_wait_ns": 60,
+    "model_update_ns": 531,
+    "arrival_latency_ns": 308269049,
+    "late_start_ns": 59022,
+    "finished_ns": 25108269049
+  },
+  {
+    "trial": "1-fork-001-shared-cache0-write20",
+    "sequence": 46000,
+    "service_ns": 230782988,
+    "gate_wait_ns": 120,
+    "model_update_ns": 1022,
+    "arrival_latency_ns": 230842351,
+    "late_start_ns": 59363,
+    "finished_ns": 23230842351
+  },
+  {
+    "trial": "1-fork-002-embedded-cache1-write20",
+    "sequence": 35640,
+    "service_ns": 3736808,
+    "gate_wait_ns": 1241086,
+    "model_update_ns": 201,
+    "arrival_latency_ns": 3841761,
+    "late_start_ns": 104953,
+    "finished_ns": 17823841761
+  },
+  {
+    "trial": "1-fork-003-embedded-cache0-write20",
+    "sequence": 40240,
+    "service_ns": 28357226,
+    "gate_wait_ns": 51,
+    "model_update_ns": 151,
+    "arrival_latency_ns": 28373710,
+    "late_start_ns": 16484,
+    "finished_ns": 20148373710
+  },
+  {
+    "trial": "1-upstream-000-shared-cache1-write20",
+    "sequence": 58200,
+    "service_ns": 11297696,
+    "gate_wait_ns": 30,
+    "model_update_ns": 190,
+    "arrival_latency_ns": 11357007,
+    "late_start_ns": 59311,
+    "finished_ns": 29111357007
+  },
+  {
+    "trial": "1-upstream-001-shared-cache0-write20",
+    "sequence": 54600,
+    "service_ns": 372276542,
+    "gate_wait_ns": 70,
+    "model_update_ns": 1112,
+    "arrival_latency_ns": 372338468,
+    "late_start_ns": 61926,
+    "finished_ns": 27672338468
+  },
+  {
+    "trial": "1-upstream-002-embedded-cache1-write20",
+    "sequence": 43800,
+    "service_ns": 333309321,
+    "gate_wait_ns": 30,
+    "model_update_ns": 701,
+    "arrival_latency_ns": 333368577,
+    "late_start_ns": 59256,
+    "finished_ns": 22233368577
+  },
+  {
+    "trial": "1-upstream-003-embedded-cache0-write20",
+    "sequence": 41400,
+    "service_ns": 347273797,
+    "gate_wait_ns": 91,
+    "model_update_ns": 791,
+    "arrival_latency_ns": 347338397,
+    "late_start_ns": 64600,
+    "finished_ns": 21047338397
+  },
+  {
+    "trial": "2-candidate-000-embedded-cache0-write20",
+    "sequence": 11800,
+    "service_ns": 12966956,
+    "gate_wait_ns": 40,
+    "model_update_ns": 180,
+    "arrival_latency_ns": 13026433,
+    "late_start_ns": 59477,
+    "finished_ns": 5913026433
+  },
+  {
+    "trial": "2-candidate-001-embedded-cache1-write20",
+    "sequence": 3400,
+    "service_ns": 351401131,
+    "gate_wait_ns": 50,
+    "model_update_ns": 211,
+    "arrival_latency_ns": 351458293,
+    "late_start_ns": 57162,
+    "finished_ns": 2051458293
+  },
+  {
+    "trial": "2-candidate-002-shared-cache0-write20",
+    "sequence": 52200,
+    "service_ns": 217121205,
+    "gate_wait_ns": 70,
+    "model_update_ns": 681,
+    "arrival_latency_ns": 217178477,
+    "late_start_ns": 57272,
+    "finished_ns": 26317178477
+  },
+  {
+    "trial": "2-candidate-003-shared-cache1-write20",
+    "sequence": 27600,
+    "service_ns": 127702909,
+    "gate_wait_ns": 60,
+    "model_update_ns": 260,
+    "arrival_latency_ns": 127761009,
+    "late_start_ns": 58100,
+    "finished_ns": 13927761009
+  },
+  {
+    "trial": "2-fork-000-embedded-cache0-write20",
+    "sequence": 1660,
+    "service_ns": 28499963,
+    "gate_wait_ns": 40,
+    "model_update_ns": 321,
+    "arrival_latency_ns": 28558671,
+    "late_start_ns": 58708,
+    "finished_ns": 858558671
+  },
+  {
+    "trial": "2-fork-001-embedded-cache1-write20",
+    "sequence": 31200,
+    "service_ns": 450136896,
+    "gate_wait_ns": 60,
+    "model_update_ns": 641,
+    "arrival_latency_ns": 450195368,
+    "late_start_ns": 58472,
+    "finished_ns": 16050195368
+  },
+  {
+    "trial": "2-fork-002-shared-cache0-write20",
+    "sequence": 8800,
+    "service_ns": 104889173,
+    "gate_wait_ns": 60,
+    "model_update_ns": 601,
+    "arrival_latency_ns": 104946979,
+    "late_start_ns": 57806,
+    "finished_ns": 4504946979
+  },
+  {
+    "trial": "2-fork-003-shared-cache1-write20",
+    "sequence": 4800,
+    "service_ns": 321373527,
+    "gate_wait_ns": 100,
+    "model_update_ns": 952,
+    "arrival_latency_ns": 321431215,
+    "late_start_ns": 57688,
+    "finished_ns": 2721431215
+  },
+  {
+    "trial": "2-upstream-000-embedded-cache0-write20",
+    "sequence": 2000,
+    "service_ns": 294782366,
+    "gate_wait_ns": 60,
+    "model_update_ns": 431,
+    "arrival_latency_ns": 294839807,
+    "late_start_ns": 57441,
+    "finished_ns": 1294839807
+  },
+  {
+    "trial": "2-upstream-001-embedded-cache1-write20",
+    "sequence": 10960,
+    "service_ns": 81236248,
+    "gate_wait_ns": 70,
+    "model_update_ns": 301,
+    "arrival_latency_ns": 81294476,
+    "late_start_ns": 58228,
+    "finished_ns": 5561294476
+  },
+  {
+    "trial": "2-upstream-002-shared-cache0-write20",
+    "sequence": 33000,
+    "service_ns": 297420401,
+    "gate_wait_ns": 100,
+    "model_update_ns": 1472,
+    "arrival_latency_ns": 297485504,
+    "late_start_ns": 65103,
+    "finished_ns": 16797485504
+  },
+  {
+    "trial": "2-upstream-003-shared-cache1-write20",
+    "sequence": 51400,
+    "service_ns": 5098182,
+    "gate_wait_ns": 120,
+    "model_update_ns": 211,
+    "arrival_latency_ns": 5155690,
+    "late_start_ns": 57508,
+    "finished_ns": 25705155690
+  }
+]
