@@ -21985,8 +21985,20 @@ mod shared_begin_tests {
             Self::with_io(Arc::new(PlatformIO::new().unwrap()))
         }
         fn with_io(io: Arc<dyn IO>) -> Self {
+            Self::with_io_and_limit(io, None)
+        }
+        fn with_io_and_limit(io: Arc<dyn IO>, limit: Option<u64>) -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+            let (path, limit) = match limit {
+                Some(limit) => (
+                    crate::mvcc::database::shared_runtime_fixture_with_limit(
+                        directory.path(),
+                        limit,
+                    ),
+                    limit,
+                ),
+                None => crate::mvcc::database::shared_runtime_fixture(directory.path()),
+            };
             let database = Database::open(
                 io.clone(),
                 path.to_str().unwrap(),
@@ -22108,6 +22120,66 @@ mod shared_begin_tests {
         f.connection.execute("ROLLBACK").unwrap();
         assert!(f.connection.get_mv_tx().is_none());
         assert!(!f.connection.pager.load().holds_read_lock());
+    }
+
+    #[test]
+    fn shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop() {
+        for reset in [true, false] {
+            let f =
+                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "a".repeat(90_000)
+                ))
+                .unwrap();
+            f.connection.execute("BEGIN CONCURRENT").unwrap();
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "b".repeat(90_000)
+                ))
+                .unwrap();
+            let tx = f.connection.get_mv_tx();
+            assert!(tx.is_some());
+            let mut commit = f.connection.prepare("COMMIT").unwrap();
+            assert!(matches!(
+                commit.run_with_row_callback(|_| Ok(())),
+                Err(LimboError::Busy)
+            ));
+            if reset {
+                commit.reset().unwrap();
+            }
+            drop(commit);
+            assert_eq!(
+                f.connection.get_mv_tx(),
+                tx,
+                "cap Busy discarded explicit transaction"
+            );
+            assert!(!f.connection.get_auto_commit());
+            let check_value = |expected: &str| {
+                let mut rows = 0;
+                f.connection
+                    .prepare("SELECT length(value), substr(value,1,1) FROM preserved")
+                    .unwrap()
+                    .run_with_row_callback(|row| {
+                        assert_eq!(row.get::<i64>(0)?, 90_000);
+                        assert_eq!(row.get::<&str>(1)?, expected);
+                        rows += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(rows, 1);
+            };
+            check_value("b");
+            assert!(matches!(
+                f.connection.execute("COMMIT"),
+                Err(LimboError::Busy)
+            ));
+            assert_eq!(f.connection.get_mv_tx(), tx);
+            f.connection.execute("ROLLBACK").unwrap();
+            check_value("a");
+        }
     }
 
     #[test]
