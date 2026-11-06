@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9a8183223231ae1851a36c2ef7dba5b652099757
+          ref: d67a9f87d
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,21 +25,19 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9a8183223231ae1851a36c2ef7dba5b652099757
+          test "$(git rev-parse --short=9 HEAD)" = d67a9f87d
           rustc -Vv | tee rustc.txt
-      - name: Prepared marker token must fail before implementation
+      - name: Prepared marker token native proof checks
         run: |
-          set +e
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_token_retains -- --test-threads=1 --nocapture 2>&1 | tee token-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' token-red.log
-          grep -q 'prepared recovery validation is not implemented' token-red.log
+          set -o pipefail
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_token -- --test-threads=1 --nocapture 2>&1 | tee token-green.log
+          grep -q '5 passed; 0 failed' token-green.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api mapped_shared_wal_coordination_snapshot_waits -- --test-threads=1 --nocapture 2>&1 | tee snapshot.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marker-token-red
+          name: marker-token-green
           path: |
             source.txt
             rustc.txt
