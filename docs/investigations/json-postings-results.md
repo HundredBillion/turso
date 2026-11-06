@@ -80,3 +80,9 @@ At 1,000 rows the checkpointed file sizes were 1,048,576 bytes for scan,
 A separate local expression-index run produced scalar p50 8.46 us and null
 p50 4.92 us, illustrating that selected indexes can match or beat general postings
 for known paths. These separate-run timings remain exploratory.
+
+The membership scan explicitly requires an array at the requested path;
+`json_each` alone also emits a row for scalar values. A non-array null membership
+regression failed without this guard and passed after restoration. Earlier local
+raw runs predate this additional guard, although their queried `tags` fields were
+all arrays. Hosted results must use the guarded revision.

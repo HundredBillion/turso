@@ -11,7 +11,7 @@ const SCHEMA: &str = "CREATE TABLE documents(id INTEGER PRIMARY KEY, tenant INTE
 const POSTINGS: &str = include_str!("../fixtures/json_postings.sql");
 const INDEX_QUERY: &str = "SELECT DISTINCT document_id FROM postings WHERE tenant=?1 AND mode=?2 AND path=?3 AND kind=?4 AND scalar IS ?5 ORDER BY document_id";
 const SCALAR_SCAN: &str = "SELECT id FROM documents WHERE tenant=?1 AND CASE json_type(payload,?3) WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE json_type(payload,?3) END = ?4 AND json_extract(payload,?3) IS ?5 ORDER BY id";
-const MEMBER_SCAN: &str = "SELECT d.id FROM documents d WHERE tenant=?1 AND EXISTS(SELECT 1 FROM json_each(d.payload,?3) j WHERE CASE j.type WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE j.type END = ?4 AND j.atom IS ?5) ORDER BY d.id";
+const MEMBER_SCAN: &str = "SELECT d.id FROM documents d WHERE tenant=?1 AND json_type(d.payload,?3)='array' AND EXISTS(SELECT 1 FROM json_each(d.payload,?3) j WHERE CASE j.type WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE j.type END = ?4 AND j.atom IS ?5) ORDER BY d.id";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count: usize = std::env::var("POSTING_ROWS")
@@ -487,10 +487,11 @@ mod tests {
         let (db, conn) = open(&dir.path().join("test.db")).expect("open database");
         conn.execute(SCHEMA).expect("create documents");
         conn.execute(POSTINGS).expect("create postings");
-        conn.execute("INSERT INTO documents VALUES(1,1,jsonb('{\"n\":null,\"tags\":[1,1,1.0,true,\"1\"]}')),(2,1,jsonb('{}')),(3,2,jsonb('{\"n\":null,\"tags\":[1]}'))").expect("insert documents");
+        conn.execute("INSERT INTO documents VALUES(1,1,jsonb('{\"n\":null,\"tags\":[1,1,1.0,true,\"1\"]}')),(2,1,jsonb('{}')),(3,2,jsonb('{\"n\":null,\"tags\":[1]}')), (4,1,jsonb('{\"tags\":1}')), (5,1,jsonb('{\"tags\":{\"k\":1}}'))").expect("insert documents");
         for (mode, path, kind, value, scan, expected) in [
             ("scalar", "$.n", "null", Value::Null, SCALAR_SCAN, 1),
             ("scalar", "$.missing", "null", Value::Null, SCALAR_SCAN, 0),
+            ("member", "$.n", "null", Value::Null, MEMBER_SCAN, 0),
             (
                 "member",
                 "$.tags",
