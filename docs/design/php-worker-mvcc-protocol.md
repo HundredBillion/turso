@@ -96,11 +96,25 @@ An opted-in database requires explicit safe downgrade before older binaries can
 reopen it. The user approved this compatibility policy on 2026-11-06. No header
 value has yet been allocated or changed in the implementation.
 
+A marker rejects future old opens; it cannot revoke an already-open old read-only
+handle that holds no database lock. The user approved requiring an explicit
+offline upgrade with every older worker stopped, including those unlocked
+readers. Ordinary shared-mode URI opening must reject an existing old-format
+database rather than silently upgrading it. The transition command/procedure
+must state this stopped-worker prerequisite; an exclusive database lock alone
+cannot verify it.
+
+For a newly created database, the final pathname must not expose an ordinary or
+empty header before the new marker is durable. Publish a fully initialized,
+marked inode atomically without overwriting a racing creator, and synchronize
+its identity-specific sidecars and parent directory. The concrete publication
+implementation and old-reader race tests remain required.
+
 Upgrade and downgrade must follow these transitions:
 
 | Transition | Required ownership and durable action | Crash recovery |
 | --- | --- | --- |
-| Start upgrade | Exclusive ordinary database lock, no legacy or protocol participants | Before any durable marker, ordinary old-format recovery remains valid |
+| Start upgrade | Explicit offline action after all older workers are stopped; exclusive ordinary database lock and no protocol participants | Before any durable marker, ordinary old-format recovery remains valid |
 | Prepare upgrade | Finish ordinary MVCC recovery/checkpoint; synchronize database and sidecars | Reopen through ordinary recovery if the marker is still old |
 | Publish new marker | Write matching read/write versions through the pager and synchronize the complete checkpoint | Old readers reject a durable new marker; new readers reconcile incomplete physical WAL work |
 | Enable protocol admission | Create/validate coordination epoch only after marker durability | No shared-mode commit can precede durable old-reader exclusion |
@@ -110,7 +124,9 @@ Upgrade and downgrade must follow these transitions:
 | Finish downgrade | Remove only unused logical coordination metadata after all protocol handles leave | Idle old-generation workers must fail mode validation before any new operation |
 
 The upgrade/downgrade commands and error mapping need explicit tests with an old
-executable, including an old read-only handle already open at upgrade start.
+executable, including an old read-only handle already open before a shared-mode URI request.
+That ordinary request must reject implicit upgrade. The explicit offline
+transition is exercised only after the operator has stopped the older workers.
 Changing a marker directly with a byte write is not an implementation of this
 transition protocol.
 
