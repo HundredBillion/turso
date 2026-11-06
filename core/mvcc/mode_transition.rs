@@ -177,7 +177,7 @@ impl StagedDatabase {
         observe(PublicationPoint::Published)?;
         require_path_identity(&self.path, id)?;
         fs::remove_file(&self.path).map_err(fs_error)?;
-        sync_directory(self.path.parent().unwrap_or(Path::new(".")))?;
+        sync_directory(self.path.parent().unwrap_or_else(|| Path::new(".")))?;
         observe(PublicationPoint::StagingRemoved)?;
         Ok(())
     }
@@ -375,7 +375,7 @@ pub(super) fn namespace_for(path: &Path, id: FileId) -> Result<PathBuf> {
 fn canonical_parent(path: &Path) -> Result<PathBuf> {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
+        .unwrap_or_else(|| Path::new("."))
         .canonicalize()
         .map_err(fs_error)
 }

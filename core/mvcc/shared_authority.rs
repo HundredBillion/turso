@@ -65,6 +65,26 @@ impl SharedMvccAuthority {
         database_id: FileId,
         history_limit: u64,
     ) -> Result<Arc<Self>> {
+        Self::open_with_creation(io, path, database_id, history_limit, true)
+    }
+
+    /// Reopen published coordination without recreating an unlinked live mapping.
+    pub(super) fn open_existing(
+        io: &Arc<dyn IO>,
+        path: &str,
+        database_id: FileId,
+        history_limit: u64,
+    ) -> Result<Arc<Self>> {
+        Self::open_with_creation(io, path, database_id, history_limit, false)
+    }
+
+    fn open_with_creation(
+        io: &Arc<dyn IO>,
+        path: &str,
+        database_id: FileId,
+        history_limit: u64,
+        allow_creation: bool,
+    ) -> Result<Arc<Self>> {
         if !cfg!(all(target_os = "linux", target_pointer_width = "64"))
             || !io.supports_shared_wal_coordination()
         {
@@ -77,14 +97,18 @@ impl SharedMvccAuthority {
                 "shared MVCC history limit must be positive".into(),
             ));
         }
-        let file = io.open_shared_wal_file(path)?;
+        let file = if allow_creation {
+            io.open_shared_wal_file(path)?
+        } else {
+            io.open_file(path, crate::OpenFlags::NoLock, false)?
+        };
         let exclusive = file.shared_wal_try_lock_byte(LIFETIME_LOCK, true, LOCK_KIND)?;
         if !exclusive && !file.shared_wal_try_lock_byte(LIFETIME_LOCK, false, LOCK_KIND)? {
             return Err(LimboError::Busy);
         }
         let result = (|| {
             match file.size()? {
-                0 if exclusive => file.shared_wal_set_len(MAP_LEN as u64)?,
+                0 if exclusive && allow_creation => file.shared_wal_set_len(MAP_LEN as u64)?,
                 size if size == MAP_LEN as u64 => {}
                 _ => {
                     return Err(LimboError::Corrupt(
@@ -105,7 +129,7 @@ impl SharedMvccAuthority {
                 poisoned: AtomicBool::new(false),
                 local_slots: Mutex::new([false; SLOT_COUNT]),
             });
-            if authority.load(MAGIC_OFFSET) == 0 && exclusive {
+            if authority.load(MAGIC_OFFSET) == 0 && exclusive && allow_creation {
                 authority.initialize(database_id, history_limit);
             }
             authority.validate_header(database_id, history_limit)?;
@@ -457,6 +481,115 @@ mod tests {
     const DATABASE_ID: FileId = FileId { dev: 1, ino: 2 };
 
     #[test]
+    fn authority_existing_only_does_not_recreate_unlinked_live_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination");
+        let authority = open(&path);
+        initialize(&authority);
+        let old_id = authority.file.file_id().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let reopened = if std::env::var_os("TURSO_AUTHORITY_LEGACY_CREATE_CONTROL").is_some() {
+            SharedMvccAuthority::open(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+        } else {
+            SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+        };
+        assert!(
+            reopened.is_err(),
+            "recreated coordination while the old mapping remained live"
+        );
+        assert!(!path.exists());
+        assert_eq!(authority.file.file_id().unwrap(), old_id);
+        let guard = authority.try_acquire().unwrap();
+        assert_eq!(guard.published().unwrap(), PublishedPrefix::default());
+        guard.finish().unwrap();
+    }
+
+    #[test]
+    fn authority_existing_only_rejects_missing_short_or_uninitialized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination");
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        assert!(
+            SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+                .is_err()
+        );
+        assert!(!path.exists());
+        for size in [0, 1, MAP_LEN - 1, MAP_LEN, MAP_LEN + 1] {
+            let bytes = vec![0; size];
+            std::fs::write(&path, &bytes).unwrap();
+            let before_id = io.file_id(path.to_str().unwrap()).unwrap();
+            assert!(SharedMvccAuthority::open_existing(
+                &io,
+                path.to_str().unwrap(),
+                DATABASE_ID,
+                1024
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(io.file_id(path.to_str().unwrap()).unwrap(), before_id);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn authority_existing_only_rejects_incompatible_header_without_mutation() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination");
+        let authority = open(&path);
+        initialize(&authority);
+        drop(authority);
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let original = std::fs::read(&path).unwrap();
+        for (id, limit) in [(FileId { dev: 1, ino: 3 }, 1024), (DATABASE_ID, 2048)] {
+            assert!(
+                SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), id, limit).is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&999u64.to_le_bytes(), VERSION_OFFSET as u64)
+            .unwrap();
+        let incompatible = std::fs::read(&path).unwrap();
+        assert!(
+            SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), incompatible);
+    }
+
+    #[test]
+    fn authority_existing_only_preserves_live_state_and_requires_recovery_after_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination");
+        let authority = open(&path);
+        initialize(&authority);
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let existing =
+            SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+                .unwrap();
+        assert_eq!(
+            existing.file.file_id().unwrap(),
+            authority.file.file_id().unwrap()
+        );
+        let epoch = existing.load(EPOCH_OFFSET);
+        let guard = authority.try_acquire().unwrap();
+        assert!(matches!(existing.try_acquire(), Err(LimboError::Busy)));
+        guard.finish().unwrap();
+        let guard = existing.try_acquire().unwrap();
+        assert!(!guard.requires_recovery());
+        guard.finish().unwrap();
+        drop(existing);
+        drop(authority);
+        let reopened =
+            SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+                .unwrap();
+        assert!(reopened.load(EPOCH_OFFSET) > epoch);
+        assert!(reopened.try_acquire().unwrap().requires_recovery());
+    }
+
+    #[test]
     fn authority_recovers_after_independent_owner_is_killed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination");
@@ -465,7 +598,11 @@ mod tests {
         let mut child = spawn(&path, "guard");
         assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
         child.kill();
-        let mut guard = authority.try_acquire().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let reopened =
+            SharedMvccAuthority::open_existing(&io, path.to_str().unwrap(), DATABASE_ID, 1024)
+                .unwrap();
+        let mut guard = reopened.try_acquire().unwrap();
         assert!(guard.requires_recovery());
         assert!(guard.published().is_err());
         let recovered = PublishedPrefix {
