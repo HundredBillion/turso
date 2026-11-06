@@ -719,3 +719,19 @@ same-authority reacquisition rejection, and changed-prefix rejection after an
 actual manifest publication on the original guard. Existing interruption and
 physical-retirement tests remain green. This is an ownership seam, not completed
 checkpoint or generation-transition acceptance.
+
+Before publishing checkpoint intent, the coordinator calls
+`LoadedIds::preflight_checkpoint(target)` while admissions are paused. This checks
+the finalized source witness, exact target boundary, absence of live registrations,
+replacement-bank budget, bank-generation increment, and room for **two** selector
+sequence increments (preparation and finalization). At source sequence MAX-1 the
+old implementation could prepare successfully but could never publish its final
+witness. A focused boundary regression reproduced that failure; preparation now
+reuses the early preflight and rejects before mutation.
+
+`LoadedIds::suspend` retains the same validated state/bindings while the manifest
+intent and materializer temporarily own the guard. Its opaque `SuspendedIds`
+rejoins only the original live lease and source prefix. Prepared handoff reuses
+that payload rather than maintaining a second ownership representation. The
+actual physical floor is supplied after materialization; this early capacity
+check makes no claim about that later value.

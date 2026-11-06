@@ -1,14 +1,7 @@
 use super::*;
 
 impl LoadedIds {
-    /// The coordinator validates the materialized domain mapping and pauses admission.
-    /// The floor comes from its committed oracle at this operation's held identity.
-    /// Preparation does not prove materialization or authorize old-bank reclamation.
-    pub(in crate::mvcc) fn prepare_checkpoint(
-        mut self,
-        target: DatabaseGeneration,
-        committed_floor: i64,
-    ) -> Result<IdCheckpointPrepare> {
+    pub(in crate::mvcc) fn preflight_checkpoint(&self, target: DatabaseGeneration) -> Result<()> {
         use crate::io::File;
         let identity = self.identity;
         if self.guard.published()? != identity.prefix
@@ -30,6 +23,41 @@ impl LoadedIds {
         if !self.guard.live_registrations()?.is_empty() {
             return Err(LimboError::Busy);
         }
+        self.selection
+            .selector
+            .sequence
+            .checked_add(2)
+            .ok_or(LimboError::DatabaseFull)?;
+        let old = self.selection.selected;
+        old.bank_generation
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        let peak = old
+            .end
+            .checked_add((4 * PAGE_SIZE) as u64)
+            .and_then(|total| total.checked_add(identity.prefix.end_offset))
+            .ok_or(LimboError::TooBig)?;
+        if self.files.history_budget < MIN_ID_BUDGET_BYTES {
+            return Err(LimboError::TooBig);
+        }
+        if peak > self.files.history_budget {
+            return Err(LimboError::Busy);
+        }
+        if self.files.banks[usize::from(old.bank)].size()? < old.end {
+            return Err(corrupt("selected ID bank became truncated"));
+        }
+        Ok(())
+    }
+
+    /// The coordinator validates the materialized domain mapping and pauses admission.
+    /// The floor comes from its committed oracle at this operation's held identity.
+    /// Preparation does not prove materialization or authorize old-bank reclamation.
+    pub(in crate::mvcc) fn prepare_checkpoint(
+        mut self,
+        target: DatabaseGeneration,
+        committed_floor: i64,
+    ) -> Result<IdCheckpointPrepare> {
+        self.preflight_checkpoint(target)?;
         if committed_floor >= 0 || committed_floor == i64::MIN {
             return Err(invalid("invalid committed logical ID floor"));
         }
@@ -62,21 +90,6 @@ impl LoadedIds {
         bytes.try_reserve_exact(2 * PAGE_SIZE)?;
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&record);
-        let peak = old
-            .end
-            .checked_add(bytes.len() as u64)
-            .and_then(|total| total.checked_add(identity.prefix.end_offset))
-            .and_then(|total| total.checked_add((2 * PAGE_SIZE) as u64))
-            .ok_or(LimboError::TooBig)?;
-        if self.files.history_budget < MIN_ID_BUDGET_BYTES {
-            return Err(LimboError::TooBig);
-        }
-        if peak > self.files.history_budget {
-            return Err(LimboError::Busy);
-        }
-        if self.files.banks[old_bank].size()? < old.end {
-            return Err(corrupt("selected ID bank became truncated"));
-        }
         let selected = BankRef {
             bank: next_bank as u8,
             bank_generation,
@@ -224,8 +237,8 @@ impl PreparedIds {
     }
 }
 
-/// Retains the prepared image while the coordinator temporarily owns its exact guard.
-pub(in crate::mvcc) struct SuspendedPreparedIds {
+/// Retains bindings while a coordinator temporarily owns the exact authority guard.
+pub(in crate::mvcc) struct SuspendedIds {
     files: Arc<SharedIds>,
     bindings: [FileBinding; 3],
     identity: RecoveryIdentity,
@@ -235,8 +248,12 @@ pub(in crate::mvcc) struct SuspendedPreparedIds {
     lease: crate::sync::Weak<PublicationLease>,
 }
 
-impl PreparedIds {
-    pub(in crate::mvcc) fn suspend(self) -> (SuspendedPreparedIds, AuthorityGuard) {
+pub(in crate::mvcc) struct SuspendedPreparedIds {
+    loaded: SuspendedIds,
+}
+
+impl LoadedIds {
+    pub(in crate::mvcc) fn suspend(self) -> (SuspendedIds, AuthorityGuard) {
         let LoadedIds {
             files,
             guard,
@@ -245,10 +262,10 @@ impl PreparedIds {
             selection,
             state,
             banks,
-        } = self.loaded;
+        } = self;
         let lease = guard.io_lease();
         (
-            SuspendedPreparedIds {
+            SuspendedIds {
                 files,
                 bindings,
                 identity,
@@ -262,13 +279,48 @@ impl PreparedIds {
     }
 }
 
-impl SuspendedPreparedIds {
+impl SuspendedIds {
     pub(in crate::mvcc) fn source_identity(&self) -> RecoveryIdentity {
         self.identity
     }
 
+    pub(in crate::mvcc) fn rejoin_source(self, guard: AuthorityGuard) -> Result<LoadedIds> {
+        let lease = guard.io_lease();
+        if !crate::sync::Weak::ptr_eq(&self.lease, &lease)
+            || guard.published()? != self.identity.prefix
+        {
+            return Err(invalid(
+                "suspended IDs require the original source authority lease",
+            ));
+        }
+        PublicationLease::pin(&lease)?;
+        Ok(LoadedIds {
+            files: self.files,
+            guard,
+            bindings: self.bindings,
+            identity: self.identity,
+            selection: self.selection,
+            state: self.state,
+            banks: self.banks,
+        })
+    }
+}
+
+impl PreparedIds {
+    pub(in crate::mvcc) fn suspend(self) -> (SuspendedPreparedIds, AuthorityGuard) {
+        let (loaded, guard) = self.loaded.suspend();
+        (SuspendedPreparedIds { loaded }, guard)
+    }
+}
+
+impl SuspendedPreparedIds {
+    pub(in crate::mvcc) fn source_identity(&self) -> RecoveryIdentity {
+        self.loaded.identity
+    }
+
     pub(in crate::mvcc) fn target(&self) -> Result<DatabaseGeneration> {
-        self.selection
+        self.loaded
+            .selection
             .selector
             .prepared
             .map(|reference| reference.database)
@@ -276,29 +328,12 @@ impl SuspendedPreparedIds {
     }
 
     pub(in crate::mvcc) fn prepared_floor(&self) -> Result<i64> {
-        prepared_floor(self.selection, &self.banks)
+        prepared_floor(self.loaded.selection, &self.loaded.banks)
     }
 
     pub(in crate::mvcc) fn rejoin_source(self, guard: AuthorityGuard) -> Result<PreparedIds> {
-        let lease = guard.io_lease();
-        if !crate::sync::Weak::ptr_eq(&self.lease, &lease)
-            || guard.published()? != self.identity.prefix
-        {
-            return Err(invalid(
-                "prepared IDs require the original source authority lease",
-            ));
-        }
-        PublicationLease::pin(&lease)?;
         Ok(PreparedIds {
-            loaded: LoadedIds {
-                files: self.files,
-                guard,
-                bindings: self.bindings,
-                identity: self.identity,
-                selection: self.selection,
-                state: self.state,
-                banks: self.banks,
-            },
+            loaded: self.loaded.rejoin_source(guard)?,
         })
     }
 }
