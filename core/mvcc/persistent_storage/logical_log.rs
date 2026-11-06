@@ -458,6 +458,10 @@ pub struct LogHeader {
 }
 
 impl LogHeader {
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
         Self::new_with_version(io, LOG_VERSION_V2)
     }
@@ -675,6 +679,10 @@ impl LogicalLog {
         self.finish_pending_header_write();
         self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
+    }
+
+    pub(crate) fn has_pending_write(&self) -> bool {
+        self.pending_header_write.is_some() || self.pending_running_crc.is_some()
     }
 
     pub(crate) fn header(&self) -> Option<&LogHeader> {
