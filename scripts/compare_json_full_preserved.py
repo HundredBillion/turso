@@ -2,10 +2,12 @@ import csv, hashlib, json, os, subprocess
 from pathlib import Path
 out=Path('full-json-results').resolve();out.mkdir()
 inputs={v:Path('static-inputs')/'binaries'/v/'json_benchmark' for v in ['fork','static','upstream']}
+original=json.loads(Path('static-inputs/metadata.json').read_text())
 metadata={'source_run':42257719725,'binaries':{},'cpu':subprocess.check_output(['lscpu'],text=True)}
 for label,path in inputs.items():
     path.chmod(0o755)
     metadata['binaries'][label]=hashlib.sha256(path.read_bytes()).hexdigest()
+    assert metadata['binaries'][label]==original['binaries'][label]['json_benchmark']
 (out/'metadata.json').write_text(json.dumps(metadata,indent=2))
 env=dict(os.environ,DISABLE_RUSQLITE_BENCHMARK='1',CRITERION_HOME=str(out/'alternating'))
 labels=list(inputs)
