@@ -1194,6 +1194,103 @@ mod tests {
         };
         (id.ordinal, value)
     }
+    fn explicit_claim_action(
+        owner: journal::Owner,
+        domain: journal::Domain,
+        value: i64,
+    ) -> super::super::policy::IdAction {
+        use super::super::policy::{IdAction, SequenceDurability};
+        if domain.sequence {
+            IdAction::ClaimSequence {
+                owner,
+                domain,
+                value,
+                durability: SequenceDurability::OuterTransaction,
+            }
+        } else {
+            IdAction::ClaimExplicitRow {
+                owner,
+                domain,
+                value,
+            }
+        }
+    }
+
+    #[test]
+    fn id_policy_identical_claim_reuses_earliest_reservation_across_savepoints() {
+        use super::super::policy::{IdAction, IdResult};
+        for sequence in [false, true] {
+            let f = writable_fixture();
+            let registration = registration(&f);
+            let owner = owner(&registration);
+            let domain = journal::Domain {
+                generation: 1,
+                table: -2,
+                sequence,
+            };
+            let first = policy(&f, explicit_claim_action(owner, domain, 7), None);
+            let IdResult::Marked(mark) = policy(&f, IdAction::Savepoint { owner }, None) else {
+                panic!("savepoint")
+            };
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            assert_eq!(
+                policy(&f, explicit_claim_action(owner, domain, 7), None),
+                first
+            );
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+            assert_eq!(
+                reserved(policy(&f, explicit_claim_action(owner, domain, 8), None)),
+                (2, 8)
+            );
+            policy(&f, IdAction::ReleaseAfter { mark }, None);
+            assert_eq!(
+                policy(&f, explicit_claim_action(owner, domain, 7), None),
+                first
+            );
+            assert_eq!(
+                reserved(policy(&f, explicit_claim_action(owner, domain, 8), None)),
+                (3, 8)
+            );
+        }
+    }
+
+    #[test]
+    fn id_policy_identical_claim_at_cap_does_not_append_dead_owner_cleanup() {
+        for sequence in [false, true] {
+            let mut f = writable_fixture();
+            let a = registration(&f);
+            let b = registration(&f);
+            let domain = journal::Domain {
+                generation: 1,
+                table: -2,
+                sequence,
+            };
+            let first = policy(&f, explicit_claim_action(owner(&a), domain, 7), None);
+            policy(&f, explicit_claim_action(owner(&b), domain, 9), None);
+            drop(b);
+            let current = loaded(&f);
+            let bytes = current.retained_bytes().unwrap();
+            current.into_guard().finish().unwrap();
+            Arc::get_mut(&mut f.files).unwrap().history_budget = bytes;
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            assert_eq!(
+                policy(&f, explicit_claim_action(owner(&a), domain, 7), None),
+                first
+            );
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+        }
+    }
+
     #[test]
     fn id_policy_savepoints_do_not_reuse_logical_ids_or_ordinals() {
         use super::super::policy::{IdAction, IdResult};

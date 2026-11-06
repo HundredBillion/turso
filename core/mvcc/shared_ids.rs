@@ -1123,6 +1123,21 @@ pub(super) mod journal {
         pub(super) fn max_owner_epoch(&self) -> Option<u64> {
             self.owners.keys().map(|owner| owner.epoch).max()
         }
+        pub(super) fn matching_claim(&self, owner: Owner, claim: Claim) -> Result<Option<u64>> {
+            owner.validate()?;
+            let Some(owned) = self.owners.get(&owner) else {
+                return Ok(None);
+            };
+            if owned.retired {
+                return Err(corrupt("ID owner is retired"));
+            }
+            Ok(owned
+                .claims
+                .iter()
+                .filter_map(|(ordinal, existing)| (*existing == claim).then_some(*ordinal))
+                .min())
+        }
+
         pub(super) fn next_ordinal(&self, owner: Owner) -> Result<u64> {
             match self.owners.get(&owner) {
                 Some(claims) if claims.retired => Err(corrupt("ID owner is retired")),
@@ -1199,6 +1214,46 @@ pub(super) mod journal {
             table: -2,
             sequence: false,
         };
+        #[test]
+        fn matching_claim_uses_earliest_live_ordinal_and_rejects_retired_owner() {
+            let exact = Claim {
+                key: ClaimKey::Domain(DOMAIN),
+                value: 7,
+            };
+            let mut state = load(&[claim(A, 1, DOMAIN, 7), claim(A, 2, DOMAIN, 7)]).unwrap();
+            assert_eq!(state.matching_claim(A, exact).unwrap(), Some(1));
+            state
+                .apply(
+                    Change::ReleaseAfter {
+                        owner: A,
+                        next_ordinal: 2,
+                    },
+                    1,
+                )
+                .unwrap();
+            assert_eq!(state.matching_claim(A, exact).unwrap(), Some(1));
+            state
+                .apply(
+                    Change::ReleaseAfter {
+                        owner: A,
+                        next_ordinal: 1,
+                    },
+                    1,
+                )
+                .unwrap();
+            assert_eq!(state.matching_claim(A, exact).unwrap(), None);
+            state.apply(claim(A, 3, DOMAIN, 7), 1).unwrap();
+            assert_eq!(state.matching_claim(A, exact).unwrap(), Some(3));
+            state.owners.get_mut(&A).unwrap().last_ordinal = u64::MAX;
+            assert!(matches!(
+                state.next_ordinal(A),
+                Err(LimboError::DatabaseFull)
+            ));
+            assert_eq!(state.matching_claim(A, exact).unwrap(), Some(3));
+            state.apply(Change::ReleaseOwner { owner: A }, 1).unwrap();
+            assert!(state.matching_claim(A, exact).is_err());
+        }
+
         #[test]
         fn owner_epoch_summary_includes_retired_keys_until_compaction() {
             let owner = Owner {
