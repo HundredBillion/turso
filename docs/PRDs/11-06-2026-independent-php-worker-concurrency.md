@@ -1,6 +1,6 @@
 # Independent PHP worker concurrency
 
-Status: implementation requirements for fork issue #7. The prerequisite repairs and full cross-process protocol are separate milestones. This document does not claim that either milestone has passed verification.
+Status: prerequisite repairs are integrated and have passed focused Linux/Windows and local PHP/C/JavaScript verification (see the upstream reuse record). The full cross-process MVCC protocol is not implemented. Fork issue #7 stays open and its implementation PR stays draft until that separate acceptance milestone is complete.
 
 ## Problem Statement
 
