@@ -35,9 +35,9 @@ jobs:
           sha256sum "$(python3 -c 'import json; from pathlib import Path; print(next(v["executable"] for l in Path("dense-results/build.jsonl").read_text().splitlines() if (v:=json.loads(l)).get("executable") and v["target"]["name"]=="integration_tests"))')" > dense-results/binary.sha256
       - name: Validate transaction and recovery behavior
         run: '"$TEST_BINARY" dense_ivf --nocapture --test-threads=1 > dense-results/lifecycle.log 2>&1'
-      - name: Measure recall and latency at 100k rows
+      - name: Measure recall and latency at 1m rows
         env:
-          DENSE_IVF_ROWS: "100000"
+          DENSE_IVF_ROWS: "1000000"
           DENSE_IVF_QUERIES: "100"
         run: /usr/bin/time -v "$TEST_BINARY" dense_ivf_recall_probe --ignored --nocapture --test-threads=1 > dense-results/measurement.log 2> dense-results/resources.log
       - uses: actions/upload-artifact@v4
