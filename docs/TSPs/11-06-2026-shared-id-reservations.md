@@ -693,3 +693,29 @@ in that run. The workflow later failed because a separate VDBE selector requeste
 ignored tests and selected zero; that failure does not invalidate the executed ID
 test evidence and does not make the complete workflow successful. This hosted
 run predates the six cross-generation preparation tests.
+
+### Prepared checkpoint ownership transfer
+
+`PreparedIds::suspend` returns the continuously held authority guard separately
+from an opaque `SuspendedPreparedIds`. The suspended value retains all three
+file bindings, both bank images, selector/replay state, source identity, and the
+exact lease identity. This lets an owned manifest publication state machine use
+the guard without releasing and reacquiring authority.
+
+`rejoin_source` accepts only that same live lease with the unchanged source
+prefix. A new guard from the same authority inode is insufficient. Rejection
+consumes the guard and leaves recovery required; it never mutates either bank.
+There is no target-prefix rejoin API. Finalization still needs the coordinator's
+opaque completed-checkpoint proof after its typed authority prefix reset.
+
+Both prepared and suspended values expose a fallible prepared-floor getter by
+validating and replaying the referenced prepared bank. The coordinator can check
+this durable image against its actual materialized physical-root bound rather
+than trusting a cached caller-supplied floor.
+
+The valid handoff test failed against a stub rejoin and passes with exact-lease
+validation. Nine checkpoint preparation tests pass, including retained bindings,
+same-authority reacquisition rejection, and changed-prefix rejection after an
+actual manifest publication on the original guard. Existing interruption and
+physical-retirement tests remain green. This is an ownership seam, not completed
+checkpoint or generation-transition acceptance.
