@@ -1,4 +1,5 @@
 mod io_protocol;
+mod policy;
 
 use crate::io::FileId;
 use crate::{LimboError, Result};
@@ -956,6 +957,33 @@ mod journal {
             Ok(())
         }
 
+        pub(super) fn next_ordinal(&self, owner: Owner) -> Result<u64> {
+            match self.owners.get(&owner) {
+                Some(claims) if claims.retired => Err(corrupt("ID owner is retired")),
+                Some(claims) => claims
+                    .last_ordinal
+                    .checked_add(1)
+                    .ok_or(LimboError::DatabaseFull),
+                None => Ok(1),
+            }
+        }
+        pub(super) fn owner_retired(&self, owner: Owner) -> bool {
+            self.owners.get(&owner).is_some_and(|claims| claims.retired)
+        }
+        pub(super) fn active_owners(&self) -> impl Iterator<Item = Owner> + '_ {
+            self.owners
+                .iter()
+                .filter_map(|(owner, claims)| (!claims.retired).then_some(*owner))
+        }
+        pub(super) fn row_owner(&self, domain: Domain, value: i64) -> Option<Owner> {
+            self.rows.get(&(domain, value)).map(|entry| entry.0)
+        }
+        pub(super) fn maximum_claimed_row(&self, domain: Domain) -> Option<i64> {
+            self.rows
+                .keys()
+                .filter_map(|(key, value)| (*key == domain).then_some(*value))
+                .max()
+        }
         pub(super) fn claims(&self, owner: Owner) -> impl Iterator<Item = (u64, Claim)> + '_ {
             self.owners.get(&owner).into_iter().flat_map(|owner| {
                 owner

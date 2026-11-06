@@ -128,11 +128,11 @@ pub(super) struct IdLoad {
 
 pub(super) struct LoadedIds {
     files: Arc<SharedIds>,
-    guard: AuthorityGuard,
+    pub(super) guard: AuthorityGuard,
     bindings: [FileBinding; 3],
-    identity: RecoveryIdentity,
-    selection: SelectedIds,
-    state: journal::State,
+    pub(super) identity: RecoveryIdentity,
+    pub(super) selection: SelectedIds,
+    pub(super) state: journal::State,
     banks: [Vec<u8>; 2],
 }
 
@@ -1014,6 +1014,588 @@ mod tests {
         }
         assert_eq!(current.state.last_record, 3);
         current.guard.finish().unwrap();
+    }
+
+    struct Oracle {
+        identity: RecoveryIdentity,
+        maximum: Option<i64>,
+    }
+    impl super::super::policy::CommittedIdOracle for Oracle {
+        fn identity(&self) -> RecoveryIdentity {
+            self.identity
+        }
+        fn poll(
+            &mut self,
+            _: &AuthorityGuard,
+            query: &super::super::policy::IdQuery,
+        ) -> Result<IOResult<super::super::policy::IdFact>> {
+            use super::super::policy::{IdFact, IdQuery};
+            Ok(IOResult::Done(match query {
+                IdQuery::RowFacts { .. } => IdFact::RowFacts {
+                    maximum: self.maximum,
+                    autoincrement_floor: 0,
+                },
+                IdQuery::RowExists { value, .. } => IdFact::RowExists(self.maximum == Some(*value)),
+                IdQuery::LogicalFloor => IdFact::LogicalFloor(-1),
+            }))
+        }
+    }
+    fn registration(f: &Fixture) -> crate::mvcc::shared_authority::SnapshotRegistration {
+        let mut guard = f.authority.try_acquire().unwrap();
+        let registration = guard.register_snapshot().unwrap();
+        guard.finish().unwrap();
+        registration
+    }
+    fn policy(
+        f: &Fixture,
+        action: super::super::policy::IdAction,
+        maximum: Option<i64>,
+    ) -> super::super::policy::IdResult {
+        let mut operation = f
+            .files
+            .start(
+                f.authority.try_acquire().unwrap(),
+                f.identity,
+                Box::new(Oracle {
+                    identity: f.identity,
+                    maximum,
+                }),
+                Arc::new(crate::MemoryIO::new()),
+                action,
+            )
+            .unwrap();
+        let IOResult::Done(outcome) = operation.poll().unwrap() else {
+            panic!("synchronous oracle");
+        };
+        outcome.guard.finish().unwrap();
+        outcome.result
+    }
+    #[test]
+    fn id_policy_reserves_distinct_rows_before_either_owner_commits() {
+        use super::super::policy::{IdAction, IdResult};
+        let f = fixture();
+        f.bank.writable.store(true, Ordering::Release);
+        f.selector.writable.store(true, Ordering::Release);
+        let a = registration(&f);
+        let b = registration(&f);
+        let domain = journal::Domain {
+            generation: 1,
+            table: -2,
+            sequence: false,
+        };
+        for (registration, expected) in [(&a, 1), (&b, 2)] {
+            let owner = journal::Owner {
+                epoch: registration.epoch,
+                begin: registration.begin_timestamp,
+            };
+            let result = policy(
+                &f,
+                IdAction::ReserveRow {
+                    owner,
+                    domain,
+                    autoincrement: false,
+                },
+                None,
+            );
+            let IdResult::Reserved { id, value } = result else {
+                panic!("reservation");
+            };
+            assert_eq!(id.owner, owner);
+            assert_eq!(id.ordinal, 1);
+            assert_eq!(value, expected);
+        }
+    }
+
+    fn owner(registration: &crate::mvcc::shared_authority::SnapshotRegistration) -> journal::Owner {
+        journal::Owner {
+            epoch: registration.epoch,
+            begin: registration.begin_timestamp,
+        }
+    }
+    fn writable_fixture() -> Fixture {
+        let f = fixture();
+        f.bank.writable.store(true, Ordering::Release);
+        f.selector.writable.store(true, Ordering::Release);
+        f
+    }
+    fn reserved(result: super::super::policy::IdResult) -> (u64, i64) {
+        let super::super::policy::IdResult::Reserved { id, value } = result else {
+            panic!("reservation");
+        };
+        (id.ordinal, value)
+    }
+    #[test]
+    fn id_policy_savepoints_do_not_reuse_logical_ids_or_ordinals() {
+        use super::super::policy::{IdAction, IdResult};
+        let f = writable_fixture();
+        let a = registration(&f);
+        let a_owner = owner(&a);
+        let IdResult::Marked(empty) = policy(&f, IdAction::Savepoint { owner: a_owner }, None)
+        else {
+            panic!("mark");
+        };
+        assert_eq!(empty.next_ordinal, 1);
+        assert_eq!(
+            policy(&f, IdAction::ReleaseAfter { mark: empty }, None),
+            IdResult::Released
+        );
+        assert_eq!(f.bank.mutations.load(Ordering::Acquire), 0);
+        assert_eq!(
+            reserved(policy(
+                &f,
+                IdAction::ReserveLogicalTable { owner: a_owner },
+                None
+            )),
+            (1, -101)
+        );
+        let IdResult::Marked(mark) = policy(&f, IdAction::Savepoint { owner: a_owner }, None)
+        else {
+            panic!("mark");
+        };
+        assert_eq!(
+            reserved(policy(
+                &f,
+                IdAction::ReserveLogicalTable { owner: a_owner },
+                None
+            )),
+            (2, -102)
+        );
+        policy(&f, IdAction::ReleaseAfter { mark }, None);
+        assert_eq!(
+            reserved(policy(
+                &f,
+                IdAction::ReserveLogicalTable { owner: a_owner },
+                None
+            )),
+            (3, -103)
+        );
+        drop(a);
+        let b = registration(&f);
+        assert_eq!(
+            reserved(policy(
+                &f,
+                IdAction::ReserveLogicalTable { owner: owner(&b) },
+                None
+            )),
+            (1, -104)
+        );
+    }
+
+    #[test]
+    fn id_policy_reclaims_dead_row_claims_and_reconciles_committed_maximum() {
+        use super::super::policy::IdAction;
+        for committed in [None, Some(100)] {
+            let f = writable_fixture();
+            let a = registration(&f);
+            let domain = journal::Domain {
+                generation: 1,
+                table: -2,
+                sequence: false,
+            };
+            assert_eq!(
+                reserved(policy(
+                    &f,
+                    IdAction::ReserveRow {
+                        owner: owner(&a),
+                        domain,
+                        autoincrement: false
+                    },
+                    None
+                )),
+                (1, 1)
+            );
+            drop(a);
+            let b = registration(&f);
+            assert_eq!(
+                reserved(policy(
+                    &f,
+                    IdAction::ReserveRow {
+                        owner: owner(&b),
+                        domain,
+                        autoincrement: false
+                    },
+                    committed
+                )),
+                (1, committed.unwrap_or(0) + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn id_policy_sequence_claims_preserve_supplied_cycle_descending_and_boundary_values() {
+        use super::super::policy::{IdAction, IdResult, SequenceDurability};
+        for durability in [
+            SequenceDurability::OuterTransaction,
+            SequenceDurability::AutonomousInner,
+        ] {
+            let f = writable_fixture();
+            let a = registration(&f);
+            let domain = journal::Domain {
+                generation: 1,
+                table: -3,
+                sequence: true,
+            };
+            for value in [9, 1, 2, 1, 0, -1, -2, i64::MIN, i64::MAX] {
+                let (_, recorded) = reserved(policy(
+                    &f,
+                    IdAction::ClaimSequence {
+                        owner: owner(&a),
+                        domain,
+                        value,
+                        durability,
+                    },
+                    None,
+                ));
+                assert_eq!(recorded, value);
+            }
+            assert_eq!(
+                policy(&f, IdAction::LowestLiveSequenceClaim { domain }, None),
+                IdResult::LowestClaim(Some(i64::MIN))
+            );
+            let mutations = f.bank.mutations.load(Ordering::Acquire);
+            drop(a);
+            assert_eq!(
+                policy(&f, IdAction::LowestLiveSequenceClaim { domain }, None),
+                IdResult::LowestClaim(None)
+            );
+            assert_eq!(
+                f.bank.mutations.load(Ordering::Acquire),
+                mutations,
+                "read-only watermark never journals cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn id_policy_preserves_negative_row_start_and_autoincrement_exhaustion() {
+        use super::super::policy::IdAction;
+        let f = writable_fixture();
+        let a = registration(&f);
+        let domain = journal::Domain {
+            generation: 1,
+            table: -2,
+            sequence: false,
+        };
+        assert_eq!(
+            reserved(policy(
+                &f,
+                IdAction::ReserveRow {
+                    owner: owner(&a),
+                    domain,
+                    autoincrement: false
+                },
+                Some(-3)
+            )),
+            (1, -2)
+        );
+        let before = f.bank.mutations.load(Ordering::Acquire);
+        let mut operation = f
+            .files
+            .start(
+                f.authority.try_acquire().unwrap(),
+                f.identity,
+                Box::new(Oracle {
+                    identity: f.identity,
+                    maximum: Some(i64::MAX),
+                }),
+                Arc::new(crate::MemoryIO::new()),
+                IdAction::ReserveRow {
+                    owner: owner(&a),
+                    domain,
+                    autoincrement: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(operation.poll(), Err(LimboError::DatabaseFull)));
+        assert_eq!(f.bank.mutations.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn id_policy_rejects_stale_oracle_and_unregistered_owner_before_mutation() {
+        use super::super::policy::IdAction;
+        for stale in [false, true] {
+            let f = writable_fixture();
+            let a = registration(&f);
+            let action = IdAction::ReserveLogicalTable { owner: owner(&a) };
+            let mut identity = f.identity;
+            if stale {
+                identity.database.generation += 1;
+            } else {
+                drop(a);
+            }
+            let result = f.files.start(
+                f.authority.try_acquire().unwrap(),
+                f.identity,
+                Box::new(Oracle {
+                    identity,
+                    maximum: None,
+                }),
+                Arc::new(crate::MemoryIO::new()),
+                action,
+            );
+            if stale {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().poll().is_err());
+            }
+            assert_eq!(f.bank.mutations.load(Ordering::Acquire), 0);
+        }
+    }
+
+    struct FloorsOracle(RecoveryIdentity);
+    impl super::super::policy::CommittedIdOracle for FloorsOracle {
+        fn identity(&self) -> RecoveryIdentity {
+            self.0
+        }
+        fn poll(
+            &mut self,
+            _: &AuthorityGuard,
+            query: &super::super::policy::IdQuery,
+        ) -> Result<IOResult<super::super::policy::IdFact>> {
+            use super::super::policy::{IdFact, IdQuery};
+            Ok(IOResult::Done(match query {
+                IdQuery::RowFacts { .. } => IdFact::RowFacts {
+                    maximum: Some(10),
+                    autoincrement_floor: 100,
+                },
+                IdQuery::LogicalFloor => IdFact::LogicalFloor(-1000),
+                IdQuery::RowExists { .. } => panic!("no random fallback below exhaustion"),
+            }))
+        }
+    }
+    #[test]
+    fn id_policy_committed_autoincrement_and_logical_floors_override_smaller_live_state() {
+        use super::super::policy::IdAction;
+        let f = writable_fixture();
+        let a = registration(&f);
+        let domain = journal::Domain {
+            generation: 1,
+            table: -2,
+            sequence: false,
+        };
+        for (action, expected) in [
+            (
+                IdAction::ReserveRow {
+                    owner: owner(&a),
+                    domain,
+                    autoincrement: true,
+                },
+                (1, 101),
+            ),
+            (
+                IdAction::ReserveLogicalTable { owner: owner(&a) },
+                (2, -1001),
+            ),
+        ] {
+            let mut operation = f
+                .files
+                .start(
+                    f.authority.try_acquire().unwrap(),
+                    f.identity,
+                    Box::new(FloorsOracle(f.identity)),
+                    Arc::new(crate::MemoryIO::new()),
+                    action,
+                )
+                .unwrap();
+            let IOResult::Done(result) = operation.poll().unwrap() else {
+                panic!("synchronous floor oracle");
+            };
+            assert_eq!(reserved(result.result), expected);
+            result.guard.finish().unwrap();
+        }
+    }
+
+    struct FixedRandomIo {
+        inner: crate::MemoryIO,
+        calls: AtomicUsize,
+    }
+    impl crate::io::Clock for FixedRandomIo {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+    impl crate::IO for FixedRandomIo {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: crate::OpenFlags,
+            direct: bool,
+        ) -> Result<Arc<dyn File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn step(&self) -> Result<()> {
+            self.inner.step()
+        }
+        fn generate_random_number(&self) -> i64 {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+    }
+    #[test]
+    fn id_policy_random_fallback_checks_live_claims_and_stops_after_100_attempts() {
+        use super::super::policy::IdAction;
+        for collision in [false, true] {
+            let f = writable_fixture();
+            let a = registration(&f);
+            let b = registration(&f);
+            let domain = journal::Domain {
+                generation: 1,
+                table: -2,
+                sequence: false,
+            };
+            if collision {
+                policy(
+                    &f,
+                    IdAction::ClaimExplicitRow {
+                        owner: owner(&a),
+                        domain,
+                        value: 1,
+                    },
+                    None,
+                );
+            }
+            let io = Arc::new(FixedRandomIo {
+                inner: crate::MemoryIO::new(),
+                calls: AtomicUsize::new(0),
+            });
+            let mut operation = f
+                .files
+                .start(
+                    f.authority.try_acquire().unwrap(),
+                    f.identity,
+                    Box::new(Oracle {
+                        identity: f.identity,
+                        maximum: Some(i64::MAX),
+                    }),
+                    io.clone(),
+                    IdAction::ReserveRow {
+                        owner: owner(&b),
+                        domain,
+                        autoincrement: false,
+                    },
+                )
+                .unwrap();
+            let result = operation.poll();
+            if collision {
+                assert!(matches!(result, Err(LimboError::DatabaseFull)));
+                assert_eq!(io.calls.load(Ordering::Acquire), 100);
+            } else {
+                let IOResult::Done(result) = result.unwrap() else {
+                    panic!("synchronous fallback");
+                };
+                assert_eq!(reserved(result.result), (1, 1));
+                assert_eq!(io.calls.load(Ordering::Acquire), 1);
+                result.guard.finish().unwrap();
+            }
+        }
+    }
+
+    struct DelayedOracle {
+        identity: RecoveryIdentity,
+        file: Arc<TestFile>,
+        completion: Option<Completion>,
+    }
+    impl super::super::policy::CommittedIdOracle for DelayedOracle {
+        fn identity(&self) -> RecoveryIdentity {
+            self.identity
+        }
+        fn poll(
+            &mut self,
+            guard: &AuthorityGuard,
+            _: &super::super::policy::IdQuery,
+        ) -> Result<IOResult<super::super::policy::IdFact>> {
+            if self.completion.is_none() {
+                let pin = PublicationLease::pin(&guard.io_lease())?;
+                let completion =
+                    Completion::new_read(Arc::new(Buffer::new_temporary(1)), move |_| {
+                        let _pin = &pin;
+                        None
+                    });
+                self.completion = Some(self.file.pread(0, completion)?);
+            }
+            let completion = self.completion.as_ref().unwrap();
+            if !completion.finished() {
+                return Ok(IOResult::IO(IOCompletions(completion.clone())));
+            }
+            if let Some(error) = completion.get_error() {
+                return Err(error.into());
+            }
+            // Drop the caller's completed reference; the backend can still retain its callback.
+            self.completion.take();
+            Ok(IOResult::Done(super::super::policy::IdFact::RowFacts {
+                maximum: None,
+                autoincrement_floor: 0,
+            }))
+        }
+    }
+    #[test]
+    fn id_policy_oracle_reads_hold_authority_until_backend_retirement() {
+        use super::super::policy::IdAction;
+        for cancel in [false, true] {
+            let f = writable_fixture();
+            let a = registration(&f);
+            let oracle_file = TestFile::new(90, vec![1]);
+            oracle_file.delayed.store(true, Ordering::Release);
+            let domain = journal::Domain {
+                generation: 1,
+                table: -2,
+                sequence: false,
+            };
+            let mut operation = f
+                .files
+                .start(
+                    f.authority.try_acquire().unwrap(),
+                    f.identity,
+                    Box::new(DelayedOracle {
+                        identity: f.identity,
+                        file: oracle_file.clone(),
+                        completion: None,
+                    }),
+                    Arc::new(crate::MemoryIO::new()),
+                    IdAction::ReserveRow {
+                        owner: owner(&a),
+                        domain,
+                        autoincrement: false,
+                    },
+                )
+                .unwrap();
+            let IOResult::IO(waiter) = operation.poll().unwrap() else {
+                panic!("oracle read pending");
+            };
+            if cancel {
+                waiter.0.abort();
+                assert!(operation.poll().is_err());
+                drop(operation);
+                drop(waiter);
+                assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                oracle_file.complete_pending(true);
+                assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                oracle_file.retire();
+                let mut guard = f.authority.try_acquire().unwrap();
+                guard.recover(PublishedPrefix::default()).unwrap();
+                guard.finish().unwrap();
+            } else {
+                oracle_file.complete_pending(true);
+                drop(waiter);
+                let IOResult::IO(retirement) = operation.poll().unwrap() else {
+                    panic!("oracle backend still owns callback");
+                };
+                assert!(!retirement.0.finished());
+                assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+                oracle_file.retire();
+                let IOResult::Done(result) = operation.poll().unwrap() else {
+                    panic!("oracle retired");
+                };
+                assert_eq!(reserved(result.result), (1, 1));
+                result.guard.finish().unwrap();
+            }
+        }
     }
 
     struct RetirementIo {

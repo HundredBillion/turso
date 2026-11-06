@@ -98,31 +98,26 @@ struct RecoveryIdentity {
 enum IdAction {
     ReserveRow { owner: IdOwner, domain: IdDomain, autoincrement: bool },
     ClaimExplicitRow { owner: IdOwner, domain: IdDomain, value: i64 },
-    ReserveSequence { owner: IdOwner, domain: IdDomain, durability: SequenceDurability },
+    ClaimSequence { owner: IdOwner, domain: IdDomain, value: i64, durability: SequenceDurability },
     ReserveLogicalTable { owner: IdOwner },
     Savepoint { owner: IdOwner },
     ReleaseAfter { mark: SavepointMark },
     ReleaseOwner { owner: IdOwner },
-    SequenceWatermark { domain: IdDomain },
+    LowestLiveSequenceClaim { domain: IdDomain },
 }
 enum IdQuery {
     RowFacts { domain: IdDomain },
     RowExists { domain: IdDomain, value: i64 },
-    SequenceFacts { domain: IdDomain },
     LogicalFloor,
-}
-struct SequenceFacts {
-    value: i64, is_called: bool, increment: i64, minimum: i64, maximum: i64, cycle: bool,
 }
 enum IdFact {
     RowFacts { maximum: Option<i64>, autoincrement_floor: i64 },
     RowExists(bool),
-    SequenceFacts(SequenceFacts),
     LogicalFloor(i64),
 }
 trait CommittedIdOracle: Send {
     fn identity(&self) -> RecoveryIdentity;
-    fn poll(&mut self, query: &IdQuery) -> Result<IOResult<IdFact>>;
+    fn poll(&mut self, guard: &AuthorityGuard, query: &IdQuery) -> Result<IOResult<IdFact>>;
 }
 impl SharedIds {
     fn open_existing(
@@ -131,7 +126,7 @@ impl SharedIds {
     ) -> Result<Arc<Self>>;
     fn start(
         self: &Arc<Self>, guard: AuthorityGuard, identity: RecoveryIdentity,
-        oracle: Box<dyn CommittedIdOracle>, action: IdAction,
+        oracle: Box<dyn CommittedIdOracle>, io: Arc<dyn IO>, action: IdAction,
     ) -> Result<IdOperation>;
 }
 impl IdOperation {
@@ -142,11 +137,28 @@ enum IdResult {
     Reserved { id: ReservationId, value: i64 },
     Marked(SavepointMark),
     Released,
-    Watermark(Option<i64>),
+    LowestClaim(Option<i64>),
 }
 ```
 
-`SequenceFacts` carries the existing descriptor's current value, `is_called`, increment, minimum, maximum and cycle behavior. `SequenceDurability` comes from the existing execution path: an exclusive outer transaction (including ordinary `BEGIN`) skips the autonomous inner transaction and rolls sequence changes back; `BEGIN CONCURRENT` uses an independently committed inner transaction. The journal must preserve this distinction rather than turning all sequence values into permanent reservations. It is not an ascending-only replacement for the current sequence contract. The operation owns the guard, oracle and bound files across yields. Success returns the guard to the enclosing transaction state machine; it does not call `finish` on its behalf. Failure/drop retains ownership through any submitted backend mutations using `GuardedFile`, and forces subsequent reconciliation rather than claiming an unpublished reservation succeeded.
+`ClaimSequence` records a value already allocated and descriptor-validated by the existing
+engine sequence transaction, before its commit can publish. It does not derive a cursor from
+unordered outstanding claims: a committed value plus old outstanding values cannot distinguish
+successive CYCLE wraps. The existing transaction and row-conflict logic retains responsibility
+for ascending/descending increments, min/max limits and CYCLE behavior. `SequenceDurability`
+comes from that execution path: an exclusive outer transaction (including ordinary `BEGIN`)
+skips the autonomous transaction and rolls sequence changes back; `BEGIN CONCURRENT` uses an
+independently committed inner transaction. The journal preserves that distinction by tracking
+outstanding claims without treating them as a second authoritative cursor.
+
+The operation owns the guard, oracle and bound files across yields. Oracle reads receive the
+held guard and retain its lease through backend completion retirement. Success returns the
+guard to the enclosing transaction state machine; it does not call `finish` on its behalf.
+Failure/drop retains ownership through submitted backend mutations using `GuardedFile`, and
+forces subsequent reconciliation rather than claiming an unpublished reservation succeeded.
+Ordinary row-ID overflow uses the existing IO random source and the same 100-attempt positive
+lower-half candidate range as `op_new_rowid`, checking each candidate against both committed
+rows and live claims under the same authority. AUTOINCREMENT exhaustion never uses that fallback.
 
 Before evaluating an action, require exact equality between oracle identity, supplied recovered identity and the held authority's published prefix. An oracle behind the current manifest may neither release a dead owner's claims nor issue a replacement ID. The caller imports committed frames before constructing this view; the component rejects a stale view rather than silently querying an old transaction snapshot.
 
@@ -251,6 +263,11 @@ The ordinary append preflight conservatively counts existing physical tail bytes
 abandoned unacknowledged bytes, before truncation. It can therefore return BUSY before it
 can reclaim that tail. Recovery or quiescent compaction must provide bounded reclamation;
 ordinary append must not relax the live-history budget to make progress.
+
+Full transaction rollback can retire its snapshot registration without a mandatory journal
+append; later reconciliation treats its claims as dead. Savepoint rollback must preflight
+release capacity before local rollback reports success. If pressure prevents recording a
+release, the engine must not report that the reservation claims were released.
 
 Read-only participants can inspect reservation watermarks and liveness under authority but do not mutate reservation banks or repair tails. Mutating reconciliation is deferred to a writer/recovery owner; unavailable writable recovery returns an explicit error. Existing authority coordination bookkeeping remains governed by the approved read-only metadata policy.
 
@@ -406,3 +423,40 @@ physical size. Root independently reviewed preflight and durability ordering.
 This is deterministic component evidence, not process-crash or real-filesystem
 acceptance. The reservation policy, committed-oracle adapter, liveness reconciliation,
 quiescent compaction and coordinated sidecar/runtime initialization remain open.
+
+
+### Sequence claim minimum integration boundary
+
+`LowestLiveSequenceClaim` reports only the numeric minimum of live claimed values.
+It is not a complete safe-scan boundary or an ordering over CYCLE/descending
+allocations. The existing `MvStore::sequence_watermark` combines this kind of
+active-allocation minimum with the current sequence boundary. Its
+`first_unsafe_sequence_watermark` helper specifically targets ascending non-CYCLE
+CDC scans. Runtime integration must preserve that descriptor/current-boundary logic.
+The `SequenceDurability` argument identifies the caller's existing transaction path;
+the journal does not itself commit or roll back sequence cursor mutations.
+
+
+## Reservation policy milestone evidence
+
+Forty focused shared-ID tests pass, including nine policy tests using the actual
+snapshot registration API with deterministic file and committed-oracle fixtures.
+The first two-owner reservation test failed against the policy stub. Two owners
+now obtain distinct automatic row IDs before either commits. Tests cover dead-owner
+reconciliation, committed maxima and AUTOINCREMENT/logical floors, negative row
+starts, exhausted AUTOINCREMENT, the existing random fallback's 100-attempt bound,
+savepoint-before-first-claim no-op, and permanent floor/ordinal preservation.
+
+Supplied sequence values cover CYCLE-shaped repetitions, negative increments and
+signed limits in both caller routing modes. These tests show that the journal
+records supplied values; they do not prove engine sequence descriptor validation or
+transaction-mode integration. Read-only lowest-claim queries exclude dead owners
+without appending cleanup. Delayed oracle read tests cover cancellation and success
+while backend callbacks retain the authority lease. Stale oracle identities and
+unregistered owners fail before mutation. Focused library clippy passes with the
+existing baseline allowances; changed Rust files pass formatting.
+
+Root reviewed row/logical decisions and required the distinction between a numeric
+claim minimum and the engine's complete sequence scan boundary. Native multi-process
+acceptance, the real database oracle/VM hooks, coordinated sidecar initialization and
+quiescent compaction remain required before enabling the feature.
