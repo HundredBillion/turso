@@ -4,6 +4,8 @@
 //! attached databases.
 
 mod readonly;
+#[cfg(all(host_shared_wal, unix))]
+mod shared_oracle;
 use readonly::ReadonlyStorage;
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
