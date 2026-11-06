@@ -8,22 +8,22 @@ use crate::types::IOCompletions;
 use crate::{IOResult, IO};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ReservationId {
+pub(in crate::mvcc) struct ReservationId {
     pub owner: Owner,
     pub ordinal: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SavepointMark {
+pub(in crate::mvcc) struct SavepointMark {
     pub owner: Owner,
     pub next_ordinal: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SequenceDurability {
+pub(in crate::mvcc) enum SequenceDurability {
     OuterTransaction,
     AutonomousInner,
 }
 #[derive(Clone, Copy, Debug)]
-pub(super) enum IdAction {
+pub(in crate::mvcc) enum IdAction {
     ReserveRow {
         owner: Owner,
         domain: Domain,
@@ -58,13 +58,13 @@ pub(super) enum IdAction {
     },
 }
 #[derive(Clone, Copy, Debug)]
-pub(super) enum IdQuery {
+pub(in crate::mvcc) enum IdQuery {
     RowFacts { domain: Domain },
     RowExists { domain: Domain, value: i64 },
     LogicalFloor,
 }
 #[derive(Clone, Copy, Debug)]
-pub(super) enum IdFact {
+pub(in crate::mvcc) enum IdFact {
     RowFacts {
         maximum: Option<i64>,
         autoincrement_floor: i64,
@@ -72,24 +72,26 @@ pub(super) enum IdFact {
     RowExists(bool),
     LogicalFloor(i64),
 }
-pub(super) trait CommittedIdOracle: Send {
+pub(in crate::mvcc) trait CommittedIdOracle: Send {
     fn identity(&self) -> RecoveryIdentity;
     /// Reads must retain the supplied authority lease through backend completion retirement.
     fn poll(&mut self, guard: &AuthorityGuard, query: &IdQuery) -> Result<IOResult<IdFact>>;
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum IdResult {
+pub(in crate::mvcc) enum IdResult {
     Reserved { id: ReservationId, value: i64 },
     Marked(SavepointMark),
     Released,
     LowestClaim(Option<i64>),
 }
-pub(super) struct IdOutcome {
+pub(in crate::mvcc) struct IdOutcome {
     pub guard: AuthorityGuard,
     pub result: IdResult,
+    /// Physical ID metadata bytes sampled while this returned guard remains held.
+    pub retained_bytes: u64,
 }
 impl SharedIds {
-    pub(super) fn start(
+    pub(in crate::mvcc) fn start(
         self: &Arc<Self>,
         guard: AuthorityGuard,
         identity: RecoveryIdentity,
@@ -113,7 +115,7 @@ impl SharedIds {
     }
 }
 
-pub(super) struct IdOperation {
+pub(in crate::mvcc) struct IdOperation {
     stage: Stage,
     oracle: Box<dyn CommittedIdOracle>,
     io: Arc<dyn IO>,
@@ -151,7 +153,7 @@ enum Decision {
     Append(Change, IdResult),
 }
 impl IdOperation {
-    pub(super) fn poll(&mut self) -> Result<IOResult<IdOutcome>> {
+    pub(in crate::mvcc) fn poll(&mut self) -> Result<IOResult<IdOutcome>> {
         loop {
             match std::mem::replace(&mut self.stage, Stage::Finished) {
                 Stage::Loading(mut load) => match load.poll()? {
@@ -236,9 +238,11 @@ impl IdOperation {
                         self.stage = Stage::Retiring(loaded, result);
                         return Ok(IOResult::IO(IOCompletions(completion)));
                     }
+                    let retained_bytes = loaded.retained_bytes()?;
                     return Ok(IOResult::Done(IdOutcome {
                         guard: loaded.guard,
                         result,
+                        retained_bytes,
                     }));
                 }
                 Stage::Finished => return Err(invalid("ID operation already terminated")),
