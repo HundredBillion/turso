@@ -1,0 +1,45 @@
+{
+  "revisions": {
+    "fork": "78a77aac11310d4d928bff623195d34b33242dd5",
+    "candidate": "68aaebc63b898f4fd07e1f19bf4cea4e8190cc6b",
+    "fork_rebuild": "78a77aac11310d4d928bff623195d34b33242dd5",
+    "upstream": "2709799dad2ebb0f1749cfa62fa28514f568da28"
+  },
+  "fixtures": {
+    "benches/Cargo.toml": "99dbe76400d69fa716255c49d2a40f027fea46097295a036c709f60c27f4c45b",
+    "benches/json_benchmark.rs": "a935b5ac689f56a1bb601fab4500a9d1d771430dd97348ad8eadfa7f36b2efb0",
+    "benches/json_extract_allocations.rs": "eefb9a6da41ffa11aef9c43023c07a1a9efccf12a53dab3dd88a59562acb798b"
+  },
+  "toolchain": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: x86_64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "environment": {
+    "CARGO_HOME": "/home/runner/.cargo",
+    "CARGO_TERM_COLOR": "always",
+    "CARGO_INCREMENTAL": "0",
+    "RUSTUP_TOOLCHAIN": "1.88.0",
+    "CARGO_TARGET_DIR": "/tmp/turso-json-canonical-target",
+    "CARGO_PROFILE_LIB_RELEASE_OPT_LEVEL": "3",
+    "CARGO_PROFILE_LIB_RELEASE_DEBUG": "0",
+    "CARGO_PROFILE_LIB_RELEASE_CODEGEN_UNITS": "16",
+    "CARGO_PROFILE_LIB_RELEASE_LTO": "false",
+    "CARGO_PROFILE_LIB_RELEASE_PANIC": "unwind",
+    "RUSTC": "/home/runner/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc"
+  },
+  "binaries": {
+    "fork": {
+      "json_extract_allocations": "8b3e1f75d1b4fa310ba91288d647bb51673fcd5fea30ec3740e08c88466dd679",
+      "json_benchmark": "d7eddc7fa13e5f74d93bc8b42194c1ba4ff68a80451de71791e129cb308f2e6f"
+    },
+    "candidate": {
+      "json_extract_allocations": "589e24f734f97fc0bb67e537722250d20735563371852fd25974e19ce9e15fcf",
+      "json_benchmark": "3fb76fc4b2b85f5a34f9bc01112835e52ecace1ee448473e8f32f4aaba4932be"
+    },
+    "fork_rebuild": {
+      "json_extract_allocations": "8b3e1f75d1b4fa310ba91288d647bb51673fcd5fea30ec3740e08c88466dd679",
+      "json_benchmark": "d7eddc7fa13e5f74d93bc8b42194c1ba4ff68a80451de71791e129cb308f2e6f"
+    },
+    "upstream": {
+      "json_extract_allocations": "286122d36de19ac015661396a12f7e7f96972021ee246a3cf8bccbcd7cf56596",
+      "json_benchmark": "b877a76b1f7aefcdbfa2bf9d49dc1a2e1e1d17a509c9a691d3afc19019aaef92"
+    }
+  }
+}

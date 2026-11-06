@@ -1,0 +1,2 @@
+path,cache,warm,hot,workers,rate,requests,elapsed_s,throughput,p50_us,p95_us,p99_us,late_p99_us,hits,misses
+embedded,true,true,true,8,2000,60000,30.001138,1999.924,133.885,143.695,156.652,64.362,60000,0
