@@ -41,7 +41,7 @@ jobs:
           grep -q '1 passed; 0 failed' opening.log
           timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commits.log
           grep -q '2 passed; 0 failed' commits.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee vdbe.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee vdbe.log
           grep -q '6 passed; 0 failed' vdbe.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh_ -- --test-threads=1 --nocapture 2>&1 | tee refresh.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
