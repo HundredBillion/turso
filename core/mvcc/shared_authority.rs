@@ -1,7 +1,7 @@
 use crate::io::{File, FileId, SharedWalLockKind, SharedWalMappedRegion};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, Mutex, Weak};
-use crate::{LimboError, Result, IO};
+use crate::{Completion, LimboError, Result, IO};
 use std::sync::atomic::AtomicU64 as MappedAtomic;
 
 const MAP_LEN: usize = 4096;
@@ -53,6 +53,8 @@ pub(super) struct AuthorityGuard {
 struct LeaseState {
     active: bool,
     owned: bool,
+    pins: usize,
+    retirement: Option<Completion>,
 }
 
 pub(super) struct PublicationLease {
@@ -61,19 +63,20 @@ pub(super) struct PublicationLease {
 }
 
 pub(super) struct IoPin {
-    _lease: Arc<PublicationLease>,
+    lease: Option<Arc<PublicationLease>>,
 }
 
 impl PublicationLease {
     pub(super) fn pin(lease: &Weak<Self>) -> Result<IoPin> {
         let lease = lease.upgrade().ok_or(LimboError::Busy)?;
         {
-            let state = lease.state.lock();
+            let mut state = lease.state.lock();
             if !state.active || !state.owned {
                 return Err(LimboError::Busy);
             }
+            state.pins = state.pins.checked_add(1).ok_or(LimboError::TooBig)?;
         }
-        Ok(IoPin { _lease: lease })
+        Ok(IoPin { lease: Some(lease) })
     }
 
     fn release(&self, state: &mut LeaseState) -> Result<()> {
@@ -91,6 +94,27 @@ impl PublicationLease {
             .publication_owned
             .store(false, Ordering::Release);
         Ok(())
+    }
+}
+
+impl Drop for IoPin {
+    fn drop(&mut self) {
+        let lease = self.lease.take().expect("I/O pin owns its lease");
+        let retirement = {
+            let mut state = lease.state.lock();
+            state.pins -= 1;
+            if state.pins == 0 {
+                state.retirement.take()
+            } else {
+                None
+            }
+        };
+        // Lease destruction also locks state and may release OS ownership.
+        // Notify only after releasing both the state mutex and this pin's Arc.
+        drop(lease);
+        if let Some(retirement) = retirement {
+            retirement.complete(0);
+        }
     }
 }
 
@@ -250,6 +274,8 @@ impl SharedMvccAuthority {
                 state: Mutex::new(LeaseState {
                     active: true,
                     owned: true,
+                    pins: 0,
+                    retirement: None,
                 }),
             }),
         })
@@ -314,7 +340,20 @@ impl AuthorityGuard {
     /// Observe backend retirement without consuming the guard; concurrent submissions may race it.
     pub(super) fn io_retired(&self) -> bool {
         let state = self.lease.state.lock();
-        state.active && state.owned && Arc::strong_count(&self.lease) == 1
+        state.active && state.owned && state.pins == 0
+    }
+
+    /// Wait for admitted backend pins, including completion objects whose callback ran.
+    /// A cancelled waiter is replaced so a later caller still drives I/O progress.
+    pub(super) fn retirement_completion(&self) -> Completion {
+        let mut state = self.lease.state.lock();
+        if state.pins == 0 {
+            return Completion::new_yield();
+        }
+        if state.retirement.as_ref().is_none_or(Completion::finished) {
+            state.retirement = Some(Completion::new_wait());
+        }
+        state.retirement.as_ref().unwrap().clone()
     }
 
     pub(super) fn belongs_to(&self, authority: &Weak<SharedMvccAuthority>) -> bool {
@@ -484,7 +523,7 @@ impl AuthorityGuard {
         let mut state = self.lease.state.lock();
         // Closing admission also rejects weak upgrades that race the final pin check.
         state.active = false;
-        if Arc::strong_count(&self.lease) != 1 {
+        if state.pins != 0 {
             return Err(LimboError::Busy);
         }
         self.authority.store(RECOVERY_OFFSET, 0);

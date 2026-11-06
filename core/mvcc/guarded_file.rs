@@ -312,6 +312,92 @@ mod tests {
         }
     }
 
+    struct RetirementIo {
+        inner: crate::io::MemoryIO,
+        backend: Arc<DelayedFile>,
+        steps: crate::sync::atomic::AtomicUsize,
+    }
+    impl crate::io::Clock for RetirementIo {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+    impl crate::IO for RetirementIo {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: crate::OpenFlags,
+            direct: bool,
+        ) -> Result<Arc<dyn File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn step(&self) -> Result<()> {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            self.backend.retire();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retirement_wait_steps_backend_and_replaces_aborted_waiter() {
+        use crate::IO;
+        let backend = Arc::new(DelayedFile::default());
+        let (authority, guard) = initialized(&backend);
+        let file = GuardedFile::new(backend.clone(), &authority);
+        let binding = file.bind(&guard).unwrap();
+        let caller = file
+            .pwrite(
+                0,
+                Arc::new(Buffer::new(vec![1; 4])),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        backend.complete_without_retiring(4);
+        assert!(caller.finished());
+        let abandoned = guard.retirement_completion();
+        assert!(!abandoned.finished());
+        abandoned.abort();
+        let waiter = guard.retirement_completion();
+        assert!(!waiter.finished());
+        drop(binding);
+        let io = RetirementIo {
+            inner: crate::io::MemoryIO::new(),
+            backend: backend.clone(),
+            steps: Default::default(),
+        };
+        io.wait_for_completion(waiter.clone()).unwrap();
+        assert_eq!(io.steps.load(Ordering::SeqCst), 1);
+        assert!(waiter.finished());
+        assert!(guard.io_retired());
+        guard.finish().unwrap();
+        assert!(!authority.try_acquire().unwrap().requires_recovery());
+    }
+
+    #[test]
+    fn retirement_notification_follows_last_pin_unlock_after_guard_drop() {
+        let backend = Arc::new(DelayedFile::default());
+        let (authority, guard) = initialized(&backend);
+        let file = GuardedFile::new(backend.clone(), &authority);
+        let binding = file.bind(&guard).unwrap();
+        let _caller = file.sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)
+            .unwrap();
+        let waiter = guard.retirement_completion();
+        drop(binding);
+        drop(guard);
+        backend.complete_without_retiring(0);
+        assert!(!waiter.finished());
+        assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
+        backend.retire();
+        assert!(waiter.finished());
+        assert!(authority.try_acquire().unwrap().requires_recovery());
+    }
+
     #[test]
     fn backend_retention_outlives_caller_abort_and_guard_drop() {
         for operation in 0..4 {
