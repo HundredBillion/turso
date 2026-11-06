@@ -1470,10 +1470,11 @@ impl Database {
     pub fn test_shared_open_pair(path: &str, history_limit: u64) -> Result<()> {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
         let mut readonly =
-            OpenOptions::new(Arc::new(crate::EngineDialect)).flags(OpenFlags::ReadOnly);
+            OpenOptions::new(Arc::new(crate::dialect::EngineDialect)).flags(OpenFlags::ReadOnly);
         readonly.shared_mvcc_history_limit = Some(history_limit);
         let first = Self::open(io.clone(), path, readonly)?;
-        let mut writable = OpenOptions::new(Arc::new(crate::EngineDialect)).flags(OpenFlags::None);
+        let mut writable =
+            OpenOptions::new(Arc::new(crate::dialect::EngineDialect)).flags(OpenFlags::None);
         writable.shared_mvcc_history_limit = Some(history_limit);
         let second = Self::open(io, path, writable)?;
         let first_coordination = first
