@@ -160,6 +160,41 @@ After owner death, validate the frame chain from the last trusted boundary and
 truncate only an incomplete tail under exclusive append ownership. Never treat
 a corrupt frame inside the acknowledged prefix as an ordinary tail.
 
+### Durable publication record
+
+The mapped authority's timestamp, offset and CRC fields are written separately.
+They are safe to consume under a completed publication guard, but they are not a
+trusted recovery boundary after owner death. `recover(prefix)` in the private
+authority component deliberately accepts a prefix supplied by a future verified
+recovery caller; its process tests use synthetic prefixes and prove no log
+durability property.
+
+Commit integration will add a separate two-slot manifest. Each fixed-size record
+has a format version, record sequence, database identity, log generation/salt,
+committed timestamp, end offset, running log CRC and record checksum. Write only
+the inactive slot after the logical-log write and synchronization complete.
+Check the exact write count and synchronize the manifest before shared
+publication and acknowledgement. Never overwrite the latest valid record while
+preparing its successor. A complete but unacknowledged newer record may be
+adopted after validating its referenced log prefix; an incomplete successor must
+leave the preceding acknowledged boundary intact.
+
+The active mode marker requires a valid manifest. Empty or missing manifests
+must not silently initialize an existing opted-in database. Initial upgrade
+creates and synchronizes its first record before making the new mode durable.
+Recovery first reconciles physical WAL/checkpoint metadata: a durable checkpoint
+may already contain every transaction in an older manifest. Otherwise, it
+validates the manifest's committed log prefix strictly and treats only later
+bytes as a tentative suffix. This ordering is required before the current
+synthetic recovery API can be used by real transaction code.
+
+Failure tests must interrupt the inactive-slot write at every byte, delay/fail
+both synchronization operations, kill the publisher before and after each
+completion, and reopen through a fresh process. The external acknowledgement
+ledger remains the acceptance oracle. The manifest follows the filesystem's
+successful-write-and-fsync durability contract; checksums do not repair arbitrary
+later media corruption.
+
 The process-local group-commit queue cannot independently own the shared append
 position. Initial protocol commits use the single global publisher; later group
 commit optimization needs its own proof of ordering and error propagation.
@@ -258,6 +293,21 @@ failures can be reproduced. Thread-only results and reopened handles in the same
 process cannot substitute for this evidence.
 
 ## Current execution limits
+
+Private components implemented so far:
+
+- The committed-prefix log reader passed 73 native logical-log tests with
+  `conn_raw_api`, including generated plain/encrypted boundaries and delayed
+  short reads. Independent review found two edge cases (buffered truncation and
+  missing committed headers); both were reproduced as failing tests and fixed.
+- The private shared authority at `5b5814ccd` passed six Linux tests (five
+  substantive cases plus its subprocess entry point), and eight strict-prefix
+  tests passed in the same [validation run](https://github.com/HundredBillion/turso/actions/runs/42237976884).
+  Its preceding [red run](https://github.com/HundredBillion/turso/actions/runs/42237152419)
+  compiled and failed the three initial behavioral tests at the deliberately
+  unimplemented constructor. It covers ownership, process death, snapshot slots,
+  limits and incompatible participants. It does not connect authority to database
+  transactions or establish durable commit recovery.
 
 The development host is macOS. The approved initial target is Linux, so native
 macOS success cannot establish support. A local Docker Linux aarch64 runner is
