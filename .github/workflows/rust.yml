@@ -1,59 +1,138 @@
-name: PHP simulator validation
+name: WriteStress exact-seed diagnostic
 on:
   workflow_dispatch:
 permissions:
   contents: read
+defaults:
+  run:
+    shell: bash
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: "1"
 jobs:
-  simulator:
+  replay:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    strategy:
-      matrix:
-        profile:
-          - name: WriteStress
-            iterations: 4
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_stress --io-backend=memory"
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker
-        uses: "./.github/shared/setup-mold"
+        uses: ./.github/shared/setup-mold
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust"
+          prefix-key: v1-rust
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build simulator
-        run: cargo build -p limbo_sim --bin limbo_sim --locked
-      - name: Simulator ${{ matrix.profile.name }}
-        env:
-          SIM_ARGS: ${{ matrix.profile.args }}
+      - name: Install diagnostic tools
         run: |
-          set -euo pipefail
-          seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
-            i="$1"
-            log="sim-run-$i.log"
-            seed="$(od -An -N8 -tu8 /dev/urandom | tr -d "[:space:]")"
-            echo "iteration $i starting: seed: $seed"
-            read -r -a args <<< "$SIM_ARGS"
-            if ./target/debug/limbo_sim "${args[@]}" --seed "$seed" >"$log" 2>&1; then
-              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
-            else
-              echo "iteration $i FAILED:"
-              cat "$log"
-              exit 255
-            fi
-          ' _
-      - name: Upload simulator logs
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+      - name: Build exact simulator source before timing
+        run: |
+          mkdir -p replay-artifacts
+          git rev-parse HEAD > replay-artifacts/revision.txt
+          git diff --stat fe2cf37d663bdb1241e6716f0b0af0c24850de33 HEAD > replay-artifacts/source-diff.txt
+          rustc -Vv > replay-artifacts/toolchain.txt
+          lscpu > replay-artifacts/cpu.txt
+          cargo build -p limbo_sim --bin limbo_sim --locked 2>&1 | tee replay-artifacts/build.log
+          sha256sum target/debug/limbo_sim > replay-artifacts/binary.sha256
+      - name: Replay one seed with bounded runtime and stack samples
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess, time
+          out = pathlib.Path('replay-artifacts')
+          command = ['./target/debug/limbo_sim', '--maximum-tests', '1000', '--min-tick', '10', '--max-tick', '50', '--profile', 'write_stress', '--io-backend=memory', '--seed', '2320317890799282086']
+          (out/'command.json').write_text(json.dumps(command))
+          def capture(name, args, seconds=45):
+              with (out/name).open('w') as f:
+                  try:
+                      completed = subprocess.run(args, stdout=f, stderr=subprocess.STDOUT, timeout=seconds)
+                      return completed.returncode
+                  except subprocess.TimeoutExpired:
+                      f.write('\nDIAGNOSTIC COMMAND TIMED OUT\n')
+                      return 124
+          def stack(pid, label, core=False):
+              args = ['gdb', '-q', '-nx', '-batch', '-ex', 'set pagination off', '-ex', 'set debuginfod enabled off', '-ex', 'info threads', '-ex', 'thread apply all bt 60']
+              if core:
+                  args += ['-ex', 'set use-coredump-filter on', '-ex', 'generate-core-file replay-artifacts/timeout.core']
+              args += ['-ex', 'detach', '-p', str(pid)]
+              return capture(label, args, 120 if core else 45)
+          logpath = out/'simulator-2320317890799282086.log'
+          started = time.monotonic()
+          next_stack = 180
+          offset = 0
+          integrity_checks = 0
+          timed_out = False
+          with logpath.open('wb') as log, (out/'progress.jsonl').open('w') as progress:
+              process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+              while process.poll() is None:
+                  elapsed = time.monotonic() - started
+                  with logpath.open('rb') as current:
+                      current.seek(offset)
+                      chunk = current.read()
+                      offset = current.tell()
+                  integrity_checks += chunk.count(b'ASSERT PRAGMA integrity_check should return ok')
+                  last = chunk.decode('utf-8',errors='replace').splitlines()[-1:] if chunk else []
+                  stats = subprocess.run(['ps','-p',str(process.pid),'-o','pid,etime,time,%cpu,%mem,rss,vsz,stat,wchan:32,args'],capture_output=True,text=True).stdout
+                  sample = {'elapsed_seconds':round(elapsed,3),'pid':process.pid,'log_bytes':offset,'integrity_assertions':integrity_checks,'last_new_line':last,'ps':stats}
+                  print(json.dumps(sample),flush=True)
+                  progress.write(json.dumps(sample)+'\n');progress.flush()
+                  if elapsed >= 1500:
+                      timed_out = True
+                      stack(process.pid,'timeout-stack.txt',core=True)
+                      process.terminate()
+                      try:
+                          process.wait(timeout=15)
+                      except subprocess.TimeoutExpired:
+                          process.kill();process.wait()
+                      break
+                  if elapsed >= next_stack:
+                      stack(process.pid,f'stack-{int(elapsed):04}.txt')
+                      next_stack += 180
+                  try:
+                      process.wait(timeout=30)
+                  except subprocess.TimeoutExpired:
+                      pass
+              code = process.wait()
+          if timed_out:
+              shutil.copy2('target/debug/limbo_sim',out/'limbo_sim')
+          for name in ['.bugbase','simulator-output']:
+              if pathlib.Path(name).exists():
+                  shutil.copytree(name,out/name,dirs_exist_ok=True)
+          if pathlib.Path('simulator.log').exists():
+              shutil.copy2('simulator.log',out/'simulator-internal.log')
+          with logpath.open(errors='replace') as source, (out/'logged-interactions.txt').open('w') as target:
+              for line in source:
+                  if 'execute_interaction_turso{' in line:
+                      target.write(line)
+          status = {'exit_code':code,'runtime_limit_seconds':1500,'timed_out':timed_out,'elapsed_seconds':time.monotonic()-started,'source_commit':'fe2cf37d663bdb1241e6716f0b0af0c24850de33','note':'The memory backend may not serialize plan/DB before interruption; timeout.core preserves process memory, and logged-interactions.txt retains observed operations.'}
+          (out/'outcome.json').write_text(json.dumps(status,indent=2))
+          print(json.dumps(status),flush=True)
+          PY
+      - name: Report artifact sizes
+        if: ${{ always() }}
+        run: du -ah replay-artifacts | sort -h | tail -25
+      - name: Retain diagnostic logs, generated state and timeout memory
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: simulator-${{ matrix.profile.name }}-${{ github.run_attempt }}
-          path: sim-run-*.log
-          if-no-files-found: ignore
+          name: writestress-seed-2320317890799282086-${{ github.run_attempt }}
+          path: replay-artifacts/
+          include-hidden-files: true
+          compression-level: 6
           retention-days: 7
-
+          if-no-files-found: error
+      - name: Mark unsuccessful replay
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY'
+          import json,pathlib,sys
+          path=pathlib.Path('replay-artifacts/outcome.json')
+          if not path.exists():sys.exit('Replay did not finish recording outcome')
+          result=json.loads(path.read_text())
+          sys.exit(1 if result['timed_out'] or result['exit_code'] != 0 else 0)
+          PY
