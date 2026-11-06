@@ -1,3 +1,5 @@
+mod ordinary;
+
 use super::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
 use super::shared_authority::PublishedPrefix;
 use super::shared_ids::{DatabaseGeneration, InitialIds, MIN_HISTORY_LIMIT};
