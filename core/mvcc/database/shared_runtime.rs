@@ -432,28 +432,33 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                         let record = loaded.record();
                         let guard = loaded.into_guard()?;
                         open.refresh = None;
-                        if !guard.incarnation_ready()? {
-                            state.ids_load = Some(runtime.ids.load(
-                                guard,
-                                RecoveryIdentity {
-                                    database: DatabaseGeneration {
-                                        generation: record.log_generation(),
-                                        checkpoint_timestamp: state.persistent_timestamp,
-                                    },
-                                    prefix: record.prefix(),
+                        state.ids_load = Some(runtime.ids.load(
+                            guard,
+                            RecoveryIdentity {
+                                database: DatabaseGeneration {
+                                    generation: record.log_generation(),
+                                    checkpoint_timestamp: state.persistent_timestamp,
                                 },
-                            )?);
-                            state.stage = SharedBootstrapStage::Incarnation;
-                            continue;
-                        }
-                        guard.finish()?;
+                                prefix: record.prefix(),
+                            },
+                        )?);
                         state.stage = SharedBootstrapStage::Incarnation;
                     }
                     SharedBootstrapStage::Incarnation => {
                         if let Some(load) = state.ids_load.as_mut() {
                             let loaded = return_if_io!(load.poll());
                             state.ids_load = None;
-                            state.ids_mirror = Some(loaded.mirror_current_witness()?);
+                            if loaded.has_pending_checkpoint() {
+                                return Err(LimboError::InvalidArgument(
+                                    "shared checkpoint recovery is required".into(),
+                                )
+                                .into());
+                            }
+                            if loaded.guard().incarnation_ready()? {
+                                loaded.into_guard().finish()?;
+                            } else {
+                                state.ids_mirror = Some(loaded.mirror_current_witness()?);
+                            }
                         }
                         if let Some(mirror) = state.ids_mirror.as_mut() {
                             let proof = return_if_io!(mirror.poll());
