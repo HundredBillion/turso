@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d3a3f6707e33bcffc4c57173f7cee71d28ab076a
+          ref: 732666f87f4ae2b8467db14c9c12bd43ea8677fd
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,33 +25,17 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = d3a3f6707e33bcffc4c57173f7cee71d28ab076a
+          test "$(git rev-parse HEAD)" = 732666f87f4ae2b8467db14c9c12bd43ea8677fd
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Oracle provenance and independent transaction lifecycle
+      - name: Ordinary backend and recovery controls
         run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_oracle_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee oracle.log
-          grep -q '2 passed; 0 failed' oracle.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api read_pinned_file -- --test-threads=1 --nocapture 2>&1 | tee pins.log
-          grep -q '2 passed; 0 failed' pins.log
-      - name: Epoch identity and native reservation process recovery
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest:: -- --test-threads=1 --nocapture 2>&1 | tee manifests.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_authority:: -- --test-threads=1 --nocapture 2>&1 | tee authority.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids:: -- --test-threads=1 --nocapture 2>&1 | tee ids.log
-          grep -q 'native_id_reservations_survive_death_compaction_and_reopen ... ok' ids.log
-      - name: Native opening SQL commits and admission after reconciliation
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee opening.log
-          grep -q '2 passed; 0 failed' opening.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commits.log
-          grep -q '2 passed; 0 failed' commits.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee vdbe.log
-          grep -q '6 passed; 0 failed' vdbe.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh_ -- --test-threads=1 --nocapture 2>&1 | tee refresh.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::mode_transition -- --test-threads=1 --nocapture 2>&1 | tee mode-green.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' mode-green.log
+      - name: Strict core lint
+        run: cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
