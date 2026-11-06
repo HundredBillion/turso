@@ -1,0 +1,84 @@
+{
+  "revisions": {
+    "upstream": "2709799dad2ebb0f1749cfa62fa28514f568da28",
+    "fork": "78a77aac11310d4d928bff623195d34b33242dd5",
+    "candidate": "68aaebc63b898f4fd07e1f19bf4cea4e8190cc6b"
+  },
+  "host": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+  "cpu_count": 4,
+  "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: x86_64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "profile": "lib-release; benchmark panic=unwind; codegen-units=16; lto=false",
+  "parameters": {
+    "upstream": "2709799dad2ebb0f1749cfa62fa28514f568da28",
+    "fork": "78a77aac11310d4d928bff623195d34b33242dd5",
+    "candidate": "HEAD",
+    "toolchain": "1.88.0",
+    "jobs": 2,
+    "repeats": 3,
+    "warmup": 1.0,
+    "measurement": 2.0,
+    "samples": 50,
+    "summarize_only": false
+  },
+  "started_utc": "2026-11-06T15:32:26Z",
+  "benchmark_binaries": {
+    "upstream": {
+      "json_extract_allocations": "e1c5a2f3422a9d46bf8f7a671379f174ee6a0690fbd31940eacb2e1eb3a5358d",
+      "json_benchmark": "10cf2f1da769239d091be2a5eff9baacf6103b2fdeb2b25525f9901ba84afd24"
+    },
+    "fork": {
+      "json_extract_allocations": "64a3abf4432876938e6d837c0c67edd0722a65b60fb6a373970c788f11646079",
+      "json_benchmark": "5aac65e95b8aa80e5950bc1f53c48b0e91f8655123c31367c742e9a77439e265"
+    },
+    "candidate": {
+      "json_extract_allocations": "8734c00454b9b42e6582694b4251cb35d06f17fd61442eec3f562609e3827de8",
+      "json_benchmark": "48f70a419374aef8da51df6e1871fdb9436f904f78ebe0c670da9ab48c5a7245"
+    }
+  },
+  "fixture_sha256": {
+    "benches/Cargo.toml": "99dbe76400d69fa716255c49d2a40f027fea46097295a036c709f60c27f4c45b",
+    "benches/json_benchmark.rs": "a935b5ac689f56a1bb601fab4500a9d1d771430dd97348ad8eadfa7f36b2efb0",
+    "benches/json_extract_allocations.rs": "eefb9a6da41ffa11aef9c43023c07a1a9efccf12a53dab3dd88a59562acb798b"
+  },
+  "benchmarks": [
+    "JSON Extract/1024/first",
+    "JSON Extract/1024/last",
+    "JSON Extract/1024/missing",
+    "JSON Extract/1024/multiple",
+    "JSON Extract/1024/nested",
+    "JSON Extract/1024/subdocument",
+    "JSON Extract/10240/first",
+    "JSON Extract/10240/last",
+    "JSON Extract/10240/missing",
+    "JSON Extract/10240/multiple",
+    "JSON Extract/10240/nested",
+    "JSON Extract/10240/subdocument",
+    "JSON Extract/102400/first",
+    "JSON Extract/102400/last",
+    "JSON Extract/102400/missing",
+    "JSON Extract/102400/multiple",
+    "JSON Extract/102400/nested",
+    "JSON Extract/102400/subdocument",
+    "JSON Patch - Add New Property/Limbo",
+    "JSON Patch - Array Update/Limbo",
+    "JSON Patch - Complex User Object Update/Limbo",
+    "JSON Patch - Deeply Nested Social Feed Update/Limbo",
+    "JSON Patch - Large Config Update/Limbo",
+    "JSON Patch - Nested Property Update/Limbo",
+    "JSON Patch - Remove Property/Limbo",
+    "JSON Patch - Simple Property Update/Limbo",
+    "JSONB Size - Array heavy/Limbo",
+    "JSONB Size - Deeply nested/Limbo",
+    "JSONB Size - Large/Limbo",
+    "JSONB Size - Medium/Limbo",
+    "JSONB Size - Real world json #1/Limbo",
+    "JSONB Size - Real world json 2/Limbo",
+    "JSONB Size - Real world json 3/Limbo",
+    "JSONB Size - Real world json 4/Limbo",
+    "JSONB Size - Real world json 5/Limbo",
+    "JSONB Size - Real world json 6/Limbo",
+    "JSONB Size - Small/Limbo",
+    "Sequential JSONB Calls/Limbo - Sequential"
+  ],
+  "finished_utc": "2026-11-06T16:02:59Z"
+}

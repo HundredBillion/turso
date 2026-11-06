@@ -1,0 +1,5 @@
+variant,operation,rows,samples,p50_us,p95_us,p99_us
+expression,scalar:$.custom.f3:number,1000,1000,13.348,13.523,19.193
+expression,member:$.tags:text,1000,1000,393.568,404.731,422.604
+expression,scalar:$.optional:null,1000,1000,13.380,13.603,18.726
+expression,durable_update,1000,1000,264.744,373.409,744.963

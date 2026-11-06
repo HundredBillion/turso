@@ -1,0 +1,21 @@
+variant=scan seed_ms=4.588
+variant=scan mode=scalar path=$.custom.f3 plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH documents USING INDEX documents_tenant (tenant=?)", subtype: Text })]]
+variant=scan mode=member path=$.tags plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH d USING INDEX documents_tenant (tenant=?)", subtype: Text })], [Numeric(Integer(2)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SCAN json_each AS j", subtype: Text })]]
+variant=scan mode=scalar path=$.optional plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH documents USING INDEX documents_tenant (tenant=?)", subtype: Text })]]
+variant=scan database_bytes=4096 wal_bytes=1483232
+variant=scan checkpoint_us=488.041 checkpointed_database_bytes=1048576
+variant=scan reopen_configure_us=1177.750
+variant=expression seed_ms=10.839
+variant=expression mode=scalar path=$.custom.f3 plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH documents USING INDEX documents_custom_f3 (tenant=? AND CASE json_type (payload, '$.custom.f3') WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE json_type (payload, '$.custom.f3') END=?)", subtype: Text })], [Numeric(Integer(19)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE SORTER FOR ORDER BY", subtype: Text })]]
+variant=expression mode=member path=$.tags plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH d USING INDEX documents_tenant (tenant=?)", subtype: Text })], [Numeric(Integer(2)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SCAN json_each AS j", subtype: Text })]]
+variant=expression mode=scalar path=$.optional plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH documents USING INDEX documents_optional (tenant=? AND CASE json_type (payload, '$.optional') WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE json_type (payload, '$.optional') END=?)", subtype: Text })], [Numeric(Integer(19)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE SORTER FOR ORDER BY", subtype: Text })]]
+variant=expression database_bytes=4096 wal_bytes=2381392
+variant=expression checkpoint_us=747.417 checkpointed_database_bytes=1089536
+variant=expression reopen_configure_us=1001.916
+variant=postings seed_ms=102.359
+variant=postings mode=scalar path=$.custom.f3 plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH postings USING COVERING INDEX postings_lookup (tenant=? AND mode=? AND path=? AND kind=? AND scalar=?)", subtype: Text })], [Numeric(Integer(3)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE HASH TABLE FOR DISTINCT", subtype: Text })]]
+variant=postings mode=member path=$.tags plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH postings USING COVERING INDEX postings_lookup (tenant=? AND mode=? AND path=? AND kind=? AND scalar=?)", subtype: Text })], [Numeric(Integer(3)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE HASH TABLE FOR DISTINCT", subtype: Text })]]
+variant=postings mode=scalar path=$.optional plan=[[Numeric(Integer(1)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "SEARCH postings USING COVERING INDEX postings_lookup (tenant=? AND mode=? AND path=? AND kind=? AND scalar=?)", subtype: Text })], [Numeric(Integer(3)), Numeric(Integer(0)), Numeric(Integer(0)), Text(Text { value: "USE HASH TABLE FOR DISTINCT", subtype: Text })]]
+variant=postings database_bytes=4874240 wal_bytes=3370192
+variant=postings checkpoint_us=1918.042 checkpointed_database_bytes=4882432
+variant=postings reopen_configure_us=1087.791

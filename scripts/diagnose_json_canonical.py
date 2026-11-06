@@ -16,9 +16,9 @@ spec.loader.exec_module(comparison)
 canonical = Path('/tmp/turso-json-canonical-source')
 target = Path('/tmp/turso-json-canonical-target')
 assert not canonical.exists() and not target.exists()
-revisions = {'fork': '78a77aac11310d4d928bff623195d34b33242dd5',
-             'candidate': '68aaebc63b898f4fd07e1f19bf4cea4e8190cc6b',
-             'fork_rebuild': '78a77aac11310d4d928bff623195d34b33242dd5',
+revisions = {'fork': '4ccf547a400777307a834b554f467c8868830f5c',
+             'candidate': 'c4808695adcbe8fbd6f240d34910f7fd3a3febb6',
+             'static': 'ad54b7aaa',
              'upstream': '2709799dad2ebb0f1749cfa62fa28514f568da28'}
 env = dict(os.environ, RUSTUP_TOOLCHAIN='1.88.0', CARGO_INCREMENTAL='0', CARGO_TARGET_DIR=str(target),
            CARGO_PROFILE_LIB_RELEASE_OPT_LEVEL='3', CARGO_PROFILE_LIB_RELEASE_DEBUG='0',
@@ -26,7 +26,7 @@ env = dict(os.environ, RUSTUP_TOOLCHAIN='1.88.0', CARGO_INCREMENTAL='0', CARGO_T
            CARGO_PROFILE_LIB_RELEASE_PANIC='unwind')
 env['RUSTC'] = comparison.command(['rustup', 'which', '--toolchain', '1.88.0', 'rustc'])
 fixtures = ['benches/Cargo.toml', 'benches/json_benchmark.rs', 'benches/json_extract_allocations.rs']
-metadata = {'revisions': revisions, 'fixtures': {p: comparison.digest(repo/p) for p in fixtures},
+metadata = {'cpu': subprocess.check_output(['lscpu'], text=True), 'revisions': revisions, 'fixtures': {p: comparison.digest(repo/p) for p in fixtures},
             'toolchain': comparison.command([env['RUSTC'], '-Vv']), 'environment': {k:v for k,v in env.items() if k.startswith('CARGO_') or k in ('RUSTUP_TOOLCHAIN','RUSTC')}, 'binaries': {}}
 (out/'metadata.json').write_text(json.dumps(metadata, indent=2))
 subprocess.run(['git','worktree','add','--detach',str(canonical),revisions['fork']],check=True)
@@ -41,7 +41,7 @@ try:
     filt = 'JSONB Size - (Small|Medium)/Limbo|JSON Patch - (Simple Property Update|Remove Property)/Limbo|JSON Extract/(1024|102400)/(first|multiple)'
     runtime = dict(env, DISABLE_RUSQLITE_BENCHMARK='1', CRITERION_HOME=str(out/'alternating'))
     labels = list(revisions)
-    for repeat in range(1,4):
+    for repeat in range(1,5):
         order = labels[repeat-1:]+labels[:repeat-1]
         for label in order:
             name=f'{label}-{repeat}'
@@ -58,6 +58,6 @@ for estimate in (out/'alternating').rglob('estimates.json'):
     e=json.loads(estimate.read_text())['median']
     benchmark=json.loads((estimate.parent/'benchmark.json').read_text())['full_id']
     rows.append({'benchmark':benchmark,'variant':variant,'repeat':int(repeat),'median_ns':e['point_estimate'],'lower_ns':e['confidence_interval']['lower_bound'],'upper_ns':e['confidence_interval']['upper_bound']})
-assert len(rows)==8*4*3,len(rows)
+assert len(rows)==8*4*4,len(rows)
 with (out/'summary.csv').open('w') as f:
     writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(sorted(rows,key=lambda r:(r['benchmark'],r['variant'],r['repeat'])))

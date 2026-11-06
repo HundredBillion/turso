@@ -1,0 +1,13 @@
+variant,operation,rows,samples,p50_us,p95_us,p99_us
+scan,scalar:$.custom.f3:number,1000,100,128.625,133.750,139.292
+scan,member:$.tags:text,1000,100,125.667,129.125,131.291
+scan,scalar:$.optional:null,1000,100,133.167,139.750,148.292
+scan,durable_update,1000,100,42.625,63.000,127.667
+expression,scalar:$.custom.f3:number,1000,100,5.375,5.542,6.084
+expression,member:$.tags:text,1000,100,124.292,132.500,140.625
+expression,scalar:$.optional:null,1000,100,4.792,4.917,5.000
+expression,durable_update,1000,100,60.625,84.292,156.917
+postings,scalar:$.custom.f3:number,1000,100,2.875,3.125,5.541
+postings,member:$.tags:text,1000,100,5.500,5.666,5.875
+postings,scalar:$.optional:null,1000,100,6.292,6.500,6.666
+postings,durable_update,1000,100,185.042,267.041,1567.625

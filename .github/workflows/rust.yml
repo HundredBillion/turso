@@ -1,26 +1,34 @@
-name: Matched-host JSON artifact diagnosis
+name: Static JSON traversal experiment
 on:
   workflow_dispatch:
 permissions:
   contents: read
-  actions: read
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch preserved executable controls
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: static-json-traversal
+          cache-on-failure: true
+      - name: Verify JSON semantics
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run download 42243464027 --repo HundredBillion/turso --name json-performance-comparison --dir comparison-inputs/original
-          gh run download 42250171490 --repo HundredBillion/turso --name canonical-json-results --dir comparison-inputs/canonical
-      - name: Alternate original and canonical binaries on one host
-        run: python3 scripts/compare_json_artifacts.py
+          QUICKCHECK_TESTS: "500"
+        run: cargo test --locked -p turso_core --lib json:: -- --test-threads=1
+      - name: Compare current main and both extraction variants
+        run: python3 scripts/diagnose_json_canonical.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: matched-json-artifact-results
-          path: artifact-comparison-results/
+          name: static-json-traversal-results
+          path: canonical-results/
           retention-days: 14

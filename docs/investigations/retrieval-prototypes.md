@@ -1,7 +1,7 @@
 # Approved retrieval experiments
 
-The user approved both experiments on 2026-11-06. They are not implemented
-features or approved production interfaces. Compare against the fork's current main using identical
+The user approved both experiments on 2026-11-06. They are experiments, not approved production features or interfaces.
+See `json-postings-results.md` for the implemented SQL-backed probe. Compare against the fork's current main using identical
 workloads and configurations. Preserve exact results as the correctness baseline;
 an approximate method reports its recall/latency curve without an assumed
 acceptable recall loss. No extension ABI or file-format commitment follows from
@@ -31,7 +31,7 @@ Define the first probe's semantics narrowly:
 | String / number / boolean | Distinct kinds; numeric INTEGER/REAL equality follows engine comparison without lossy conversion |
 | Arrays | Scalar membership only; repeated equal members do not duplicate document results |
 | Objects | Scalar leaves at explicit canonical paths; no recursive containment claim |
-| Duplicate object keys | Excluded from generated data; production behavior must be specified separately |
+| Duplicate object keys | Rejected by prototype triggers; production behavior must be specified separately |
 | Tenant | Required leading index predicate and checked against the returned document |
 
 One transaction replaces the document and all its postings. Measure the cost of
