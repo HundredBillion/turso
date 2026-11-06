@@ -86,3 +86,9 @@ jobs:
           ln -s "$PWD/target/debug/libturso_sqlite3.so" "$probe_dir/lib/libsqlite3.so.0"
           sha256sum target/debug/libturso_sqlite3.so
           LD_LIBRARY_PATH="$probe_dir/lib:$PWD/target/debug" php .github/scripts/php-storage-probe.php turso "$probe_dir/candidate.db"
+      - name: Core with actual Shuttle instrumentation
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: --cfg tokio_unstable --cfg shuttle
+        run: >-
+          cargo test --locked -p turso_core --lib shuttle_ -- --test-threads=1
