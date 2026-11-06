@@ -46,7 +46,7 @@ The exact oracle's EQP must conversely contain no index method.
 | Internal attachment and transactional postings | Verified by focused tests | core/index_method/experimental_dense_ivf.rs |
 | Exactness, mutation and tenant tests | Passed in WAL and MVCC | tests/integration/index_method/dense_ivf.rs |
 | Concurrent writers and injected failures | Focused scenarios passed | Existing QueuedIo and UnreliableIo harnesses |
-| Synthetic 100k recall and latency sweep | Pending | No representative corpus supplied |
+| Synthetic 100k recall and latency sweep | Local debug correctness passed; isolated optimized run pending | evidence/dense-ivf-100k-local-debug.txt |
 | Independent branch review | Pending | Parent agent review |
 
 Initial tests correctly failed: the planner took a scan before equality and
@@ -110,9 +110,41 @@ centroids and held-out queries remain identical. Updates set `e=e` to measure
 complete replacement without changing later sweep workloads. The recorded WAL
 bytes are an observed update volume, not a device write-amplification estimate.
 
+## Local 100k functional result
+
+The committed probe at `5f3a98f0b` completed the 100,000-row / 100-query sweep
+on 2026-11-06. All-cluster results matched exact rows and distances, and every
+actual candidate count matched the independent assignment count. Full output:
+[evidence/dense-ivf-100k-local-debug.txt](evidence/dense-ivf-100k-local-debug.txt).
+This was an **unoptimized debug build on the shared Mac**, not a speedup claim.
+
+| nprobe | Recall@10: 80,000-row tenant | Recall@10: 100-row tenant |
+| --- | ---: | ---: |
+| 1 | 0.725 | 0.100 |
+| 2 | 0.955 | 0.200 |
+| 4 | 0.995 | 0.295 |
+| 8 | 1.000 | 0.535 |
+| 16 | 1.000 | 0.840 |
+| 32 | 1.000 | 1.000 |
+
+Filtering before ranking prevents cross-tenant results, but it does not make
+small-nprobe recall acceptable for highly selective tenants. The sparse tenant
+needed every cluster to recover all exact neighbors in this generated workload.
+No recall threshold is approved by these numbers.
+
+Observed base allocation was 15,204,352 bytes including the tenant B-tree;
+the dense index added 16,261,120 allocated bytes. Whole-process peak RSS was
+103,038,976 bytes, including the in-memory generated corpus and benchmark.
+The entire run took 61.3 seconds. Each index build took 5.59–6.94 seconds;
+1,000 replacements took 46.3–56.0 ms and generated 733,392 WAL bytes.
+Reopen plus first query ranged from 10.2 to 102.5 ms across probe counts.
+Raw p50/p95/p99 and both exact baselines are retained in the evidence file.
+These host-dependent figures only establish that resource usage was practical
+for this scale; wait for isolated optimized results before comparing speed.
+
 ## Limits
 
-The 100k measurement is pending; the 2k run is a functional smoke check. No
+The isolated optimized 100k measurement is pending. No
 representative embeddings were supplied and no recall loss has been accepted.
 The crash test covers torn checkpoint writeback under FULL synchronous mode;
 it is not an exhaustive commit-phase, syscall-failure, or simulator seed sweep.
