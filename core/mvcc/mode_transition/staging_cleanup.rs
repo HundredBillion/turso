@@ -75,11 +75,10 @@ impl StagingCleanup {
                 .ok_or_else(|| invalid("destination filename is missing"))?,
         );
         let main = open_retained(&staging)?;
+        let mut wal = staging.as_os_str().to_owned();
+        wal.push("-wal");
         let sidecars = [
-            Sidecar::capture(
-                PathBuf::from(format!("{}-wal", staging.display())),
-                Kind::Wal,
-            )?,
+            Sidecar::capture(PathBuf::from(wal), Kind::Wal)?,
             Sidecar::capture(staging.with_extension("db-log"), Kind::Logical)?,
         ];
         let main_id = identity(&main)?;
@@ -220,6 +219,32 @@ mod tests {
             );
         }
     }
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires filesystem support for non-UTF8 filenames"
+    )]
+    fn staging_cleanup_preserves_raw_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"staging\xff.db".to_vec()));
+        let destination = dir.path().join("published.db");
+        let mut wal_name = staging.as_os_str().to_owned();
+        wal_name.push("-wal");
+        let wal = PathBuf::from(wal_name);
+        std::fs::write(&staging, b"retained inode").unwrap();
+        std::fs::write(&wal, []).unwrap();
+        std::fs::write(staging.with_extension("db-log"), []).unwrap();
+        let cleanup = super::StagingCleanup::capture(&staging, &destination).unwrap();
+        std::fs::hard_link(&staging, &destination).unwrap();
+        std::fs::remove_file(&staging).unwrap();
+        cleanup.finish().unwrap();
+        assert!(!wal.exists(), "raw-name staging WAL was orphaned");
+        assert_eq!(std::fs::read(destination).unwrap(), b"retained inode");
+    }
+
     struct MutateAfterClose {
         backend: Option<OrdinaryOfflineBackend>,
         staging: PathBuf,
