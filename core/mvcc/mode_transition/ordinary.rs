@@ -134,6 +134,11 @@ impl OrdinaryOfflineBackend {
             path.with_extension("db-log"),
             PathBuf::from(format!("{}-tshm", path_string(&path)?)),
         ] {
+            if sidecar == path {
+                return Err(LimboError::InvalidArgument(
+                    "staging database must not alias its sidecars".into(),
+                ));
+            }
             match std::fs::symlink_metadata(sidecar) {
                 Ok(_) => {
                     return Err(LimboError::InvalidArgument(
