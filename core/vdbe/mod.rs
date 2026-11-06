@@ -3605,16 +3605,24 @@ impl Program {
         state.commit_state.cleanup_mvcc_checkpoint_state();
         #[cfg(all(host_shared_wal, unix))]
         if matches!(err, None | Some(LimboError::Busy))
-            && matches!(
-                self.insns.get(state.pc as usize).map(|(insn, _)| insn),
+            && match self.insns.get(state.pc as usize).map(|(insn, _)| insn) {
                 Some(Insn::AutoCommit {
                     auto_commit: true,
                     rollback: false,
                     ..
-                })
-            )
+                }) => true,
+                Some(Insn::Savepoint {
+                    op: insn::SavepointOp::Release,
+                    name,
+                }) => self.connection.with_named_savepoints(|frames| {
+                    frames.iter().rposition(|frame| frame.name == *name) == Some(0)
+                        && frames[0].starts_transaction
+                }),
+                _ => false,
+            }
         {
-            // Only a literal COMMIT may leave its explicit transaction active.
+            // COMMIT and outermost RELEASE may retain their explicit transaction.
+            // RELEASE has not removed its root or nested savepoint frames.
             // The state machine proves the cap rejected it before any I/O and
             // has already restored Active before permitting this drop.
             if let CommitState::CommittingMvcc { state_machine } = &mut state.commit_state {
