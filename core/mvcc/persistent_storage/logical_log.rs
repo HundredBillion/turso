@@ -458,6 +458,19 @@ pub struct LogHeader {
 }
 
 impl LogHeader {
+    /// Rejects partial headers, logical frames, and trailing bytes before offline recovery.
+    pub(crate) fn validate_header_only_file(bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if bytes.len() != LOG_HDR_SIZE {
+            return Err(LimboError::Corrupt(
+                "offline recovery requires an empty logical log".into(),
+            ));
+        }
+        Self::decode(bytes).map(|_| ())
+    }
+
     pub(crate) fn version(&self) -> u8 {
         self.version
     }
@@ -3988,6 +4001,22 @@ pub(crate) enum IndexOpKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_log_requires_empty_or_exact_valid_header() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::MemoryIO::new());
+        assert!(LogHeader::validate_header_only_file(&[]).is_ok());
+        for version in [LOG_VERSION_V2, LOG_VERSION] {
+            let bytes = LogHeader::new_with_version(&io, version).encode();
+            LogHeader::validate_header_only_file(&bytes).unwrap();
+            assert!(LogHeader::validate_header_only_file(&bytes[..bytes.len() - 1]).is_err());
+            let mut trailing = bytes.to_vec();
+            trailing.push(0);
+            assert!(LogHeader::validate_header_only_file(&trailing).is_err());
+            let mut damaged = bytes;
+            damaged[8] ^= 1;
+            assert!(LogHeader::validate_header_only_file(&damaged).is_err());
+        }
+    }
     use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
