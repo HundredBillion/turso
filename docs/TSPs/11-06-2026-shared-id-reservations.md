@@ -767,3 +767,24 @@ target; a source-selected or normal selector returns none. `identity` and
 `selected_logical_floor` expose the corresponding load identity and replayed
 floor without raw-bank access. The target-selection regression fails against an
 always-none stub and also checks both negative cases.
+
+### Repeated claims within one transaction
+
+An identical explicit-row or sequence claim by the same live owner returns its
+earliest still-live reservation ID. It does not append or consume another owner
+ordinal. The policy checks the requester registration and recovered identity first,
+then answers this case before unrelated dead-owner cleanup, so an existing claim
+can be used even at the retained-byte cap. New reservations still perform cleanup
+and enforce their ordinary budget/conflict checks.
+
+Savepoint release removes claims at or after its mark. A released value receives
+a new monotone ordinal when claimed again; a claim predating the mark keeps its
+original ID. Retired owners remain invalid. Cross-owner row conflicts and existing
+cross-owner sequence/CYCLE semantics are unchanged. The codec still accepts old
+journals containing duplicate same-owner claims and chooses the earliest live one.
+
+The duplicate-ordinal and at-cap regressions both failed before this change (a
+new ordinal and BUSY, respectively). All 71 portable ID tests pass, including
+savepoint regeneration, earliest legacy duplicate selection, retired owners,
+ordinal exhaustion, and the no-append cap case with an unrelated dead owner.
+One native process test remains ignored in that macOS run.
