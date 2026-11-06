@@ -2,14 +2,50 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from run import Worker, verify_recovery
+from run import Suite, Worker, snapshot_tree, verify_recovery
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_readonly_snapshot_covers_identity_durable_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = Suite.__new__(Suite)
+            suite.output = Path(directory)
+            suite.database = suite.output / "marked.db"
+            suite.database.write_bytes(b"marker")
+            suite.mode = "shared"
+            identity = suite.database.stat()
+            sidecars = suite.output / f".turso-mvcc-{identity.st_dev:016x}-{identity.st_ino:016x}"
+            sidecars.mkdir()
+            for name in ["manifest", "logical", "physical-wal", "authority", "physical-tshm"]:
+                (sidecars / name).write_bytes(b"initial")
+            before = suite.durable_bytes()
+            for name in ["manifest", "logical", "physical-wal"]:
+                (sidecars / name).write_bytes(b"changed")
+                self.assertNotEqual(suite.durable_bytes(), before)
+                (sidecars / name).write_bytes(b"initial")
+            for name in ["authority", "physical-tshm"]:
+                (sidecars / name).write_bytes(b"participant changed")
+            self.assertEqual(suite.durable_bytes(), before)
+            (sidecars / "logical").unlink()
+            with self.assertRaisesRegex(AssertionError, "durable files are missing"):
+                suite.durable_bytes()
+
+    def test_rejected_upgrade_snapshot_detects_identity_directory_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            (fixture / "old.db").write_bytes(b"old database")
+            before = snapshot_tree(fixture)
+            identity = fixture / ".turso-mvcc-new-identity"
+            identity.mkdir()
+            self.assertNotEqual(snapshot_tree(fixture), before)
+            (identity / "manifest").write_bytes(b"unexpected upgrade")
+            self.assertNotEqual(snapshot_tree(fixture), before)
+
     def worker(self, script):
         worker = Worker.__new__(Worker)
         worker.name = "protocol-negative-control"

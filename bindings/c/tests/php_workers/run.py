@@ -345,10 +345,18 @@ class Suite:
             assert after == before, "read-only operations changed durable files"
 
     def durable_bytes(self):
+        paths = []
+        for root in [self.database, self.output / "attached.db"]:
+            paths.extend([root, Path(str(root) + "-wal"), Path(str(root) + "-log")])
+            if root.exists():
+                identity = root.stat()
+                directory = root.parent / f".turso-mvcc-{identity.st_dev:016x}-{identity.st_ino:016x}"
+                durable = [directory / name for name in ["manifest", "logical", "physical-wal"]]
+                if self.mode == "shared" and root == self.database:
+                    assert all(path.is_file() for path in durable), "shared durable files are missing"
+                paths.extend(durable)
         return {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-                for root in [self.database, self.output / "attached.db"]
-                for path in [root, Path(str(root) + "-wal"), Path(str(root) + "-log")]
-                if path.exists()}
+                for path in paths if path.exists()}
 
     def single_worker_control(self):
         worker = Worker(self, "single-worker")
@@ -362,15 +370,14 @@ class Suite:
         worker.close()
 
     def refuse_implicit_upgrade(self):
-        path = self.output / "existing-ordinary.db"
+        fixture = self.output / "legacy-fixture"
+        fixture.mkdir()
+        path = fixture / "existing-ordinary.db"
         ordinary = Worker(self, "ordinary-existing", path=path, mode="wal")
         ordinary.sql("CREATE TABLE preserved(x)")
         ordinary.sql("INSERT INTO preserved VALUES(42)")
         ordinary.close()
-        def snapshot():
-            return {str(file): hashlib.sha256(file.read_bytes()).hexdigest()
-                    for file in path.parent.glob(path.name + "*")}
-        before = snapshot()
+        before = snapshot_tree(fixture)
         try:
             Worker(self, "implicit-upgrade-rejected", path=path, mode="shared")
         except (UnsupportedMode, StartupRejected) as error:
@@ -378,7 +385,7 @@ class Suite:
             self.record("implicit_upgrade_rejected", reason=str(error))
         else:
             raise AssertionError("existing ordinary database was silently upgraded")
-        assert snapshot() == before, "refused upgrade changed persistent files"
+        assert snapshot_tree(fixture) == before, "refused upgrade changed persistent fixture subtree"
 
     def crash_recovery(self, hold_reader=True):
         reader = Worker(self, "crash-long-reader") if hold_reader else None
@@ -465,6 +472,12 @@ def verify_recovery(ledger, outcomes, actual):
     return acknowledged
 
 
+def snapshot_tree(directory):
+    return {str(path.relative_to(directory)): "directory" if path.is_dir()
+            else hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(directory.rglob("*"))}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=["sqlite-wal-control", "sqlite-shared-negative-control", "turso-single-worker-control", "turso-wal-control", "shared-acceptance"], required=True)
@@ -485,6 +498,8 @@ def main():
         parser.error("busy timeout/deadline outside bounded test range")
     if args.shared_open_flag < 0 or args.shared_open_flag > 0x7fffffff or args.shared_open_flag & 0x7:
         parser.error("vendor flag must fit positive C int and not change access flags")
+    if args.profile == "shared-acceptance" and (args.api != "pdo" or args.shared_open_flag):
+        parser.error("initial shared-mode acceptance is PDO URI only; SQLite3 flags are diagnostic, unsupported API")
     suite = Suite(args)
     try:
         suite.run()
