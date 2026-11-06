@@ -271,12 +271,12 @@ impl NativeFile {
     }
 }
 
-fn filesystem_supported(magic: i64) -> bool {
+pub(super) fn filesystem_supported(magic: i64) -> bool {
     magic == EXT_FAMILY_MAGIC
 }
 
 #[cfg(target_os = "linux")]
-fn filesystem_magic(file: &std::fs::File) -> Result<i64> {
+pub(super) fn filesystem_magic(file: &std::fs::File) -> Result<i64> {
     use std::os::fd::AsRawFd;
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -286,7 +286,7 @@ fn filesystem_magic(file: &std::fs::File) -> Result<i64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn filesystem_magic(_: &std::fs::File) -> Result<i64> {
+pub(super) fn filesystem_magic(_: &std::fs::File) -> Result<i64> {
     Err(LimboError::InvalidArgument(
         "shared MVCC files require 64-bit Linux".into(),
     ))
