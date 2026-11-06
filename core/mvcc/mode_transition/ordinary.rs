@@ -144,16 +144,21 @@ impl OrdinaryOfflineBackend {
                 Err(error) => return Err(fs_error(error)),
             }
         }
-        let native = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(fs_error)?;
+        let create_file = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(fs_error)
+        };
+        let native = create_file(&path)?;
         lock_exclusive(&native)?;
         let id = identity(&native)?;
+        let _wal = create_file(&PathBuf::from(format!("{}-wal", path_string(&path)?)))?;
+        let _log = create_file(&path.with_extension("db-log"))?;
         let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new()?);
         let main = io.open_file(path_string(&path)?, OpenFlags::NoLock, false)?;
         if main.file_id()? != Some(id) {
