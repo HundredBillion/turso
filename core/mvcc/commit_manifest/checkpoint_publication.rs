@@ -308,3 +308,7 @@ impl CheckpointCompletionPublication {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "checkpoint_completion_tests.rs"]
+mod native_tests;

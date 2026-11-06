@@ -108,7 +108,8 @@ pub(crate) use shared_runtime::{shared_runtime_fixture, shared_runtime_fixture_w
 ))]
 #[allow(unused_imports)]
 pub(in crate::mvcc) use shared_runtime::{
-    shared_completed_checkpoint_fixture, SharedCompletedCheckpointFixture,
+    shared_completed_checkpoint_fixture, shared_prepared_checkpoint_fixture,
+    SharedCompletedCheckpointFixture, SharedPreparedCheckpointFixture,
 };
 
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]

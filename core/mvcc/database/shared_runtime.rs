@@ -920,17 +920,75 @@ pub(in crate::mvcc) struct SharedCompletedCheckpointFixture {
 }
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+pub(in crate::mvcc) struct SharedPreparedCheckpointFixture {
+    pub token: crate::mvcc::commit_manifest::checkpoint_publication::CheckpointIntentToken,
+    pub materialized: super::checkpoint_state_machine::MaterializedCheckpointProof,
+    pub prepared: crate::mvcc::shared_ids::io_protocol::checkpoint_prepare::PreparedIds,
+    pub pause: crate::mvcc::checkpoint_gate::CheckpointPause,
+    pub database: Arc<crate::Database>,
+    pub connection: Arc<Connection>,
+    pub io: Arc<dyn crate::IO>,
+    pub path: PathBuf,
+    pub namespace: PathBuf,
+    pub limit: u64,
+    pub directory: tempfile::TempDir,
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+pub(in crate::mvcc) fn shared_prepared_checkpoint_fixture(
+    io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+) -> SharedPreparedCheckpointFixture {
+    run_shared_checkpoint_fixture(true, io_factory).unwrap()
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 pub(in crate::mvcc) fn shared_completed_checkpoint_fixture(
     io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
 ) -> SharedCompletedCheckpointFixture {
-    run_shared_checkpoint_fixture(true, io_factory).unwrap()
+    let fixture = shared_prepared_checkpoint_fixture(io_factory);
+    let source = fixture.prepared.source_identity();
+    let target = fixture.prepared.target();
+    let log_path = fixture.namespace.join("logical");
+    let log_before = std::fs::read(&log_path).unwrap();
+    let mut publication = fixture
+        .token
+        .begin_completion(fixture.materialized, fixture.prepared)
+        .unwrap();
+    let completed = loop {
+        match publication.poll().unwrap() {
+            IOResult::IO(waiter) => fixture.io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(completed) => break completed,
+        }
+    };
+    let (proof, mut guard, ids) = completed.into_parts();
+    assert!(proof.matches_lease(&guard));
+    assert_eq!(proof.source_identity(), Some(source));
+    assert_eq!(proof.target_identity().database, target);
+    assert!(ids.prepared_floor().unwrap() <= proof.materialized_floor());
+    assert_eq!(guard.published().unwrap(), source.prefix);
+    guard.publish_checkpoint(&proof).unwrap();
+    assert_eq!(guard.published().unwrap(), proof.target_identity().prefix);
+    assert_eq!(std::fs::read(&log_path).unwrap(), log_before);
+    SharedCompletedCheckpointFixture {
+        proof,
+        guard,
+        ids,
+        pause: fixture.pause,
+        database: fixture.database,
+        connection: fixture.connection,
+        io: fixture.io,
+        path: fixture.path,
+        namespace: fixture.namespace,
+        limit: fixture.limit,
+        directory: fixture.directory,
+    }
 }
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 fn run_shared_checkpoint_fixture(
     complete: bool,
     io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
-) -> Option<SharedCompletedCheckpointFixture> {
+) -> Option<SharedPreparedCheckpointFixture> {
     use crate::state_machine::{StateTransition, TransitionResult};
     use crate::storage::wal::CheckpointMode;
     let directory = tempfile::tempdir().unwrap();
@@ -1080,13 +1138,6 @@ fn run_shared_checkpoint_fixture(
     drop(wal_binding);
     if complete {
         let record = intent.record();
-        let source = RecoveryIdentity {
-            database: DatabaseGeneration {
-                generation: record.log_generation(),
-                checkpoint_timestamp: base_timestamp,
-            },
-            prefix,
-        };
         let target = DatabaseGeneration {
             generation: record.checkpoint_intent().unwrap().target_generation,
             checkpoint_timestamp: prefix.committed_timestamp,
@@ -1102,27 +1153,11 @@ fn run_shared_checkpoint_fixture(
                 IOResult::Done(prepared) => break prepared,
             }
         };
-        let mut publication = token.begin_completion(materialized, prepared).unwrap();
-        let completed = loop {
-            match publication.poll().unwrap() {
-                IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
-                IOResult::Done(completed) => break completed,
-            }
-        };
-        let (proof, mut guard, ids) = completed.into_parts();
-        assert!(proof.matches_lease(&guard));
-        assert_eq!(proof.source_identity(), Some(source));
-        assert_eq!(proof.target_identity().database, target);
-        assert!(ids.prepared_floor().unwrap() <= proof.materialized_floor());
-        assert_eq!(guard.published().unwrap(), source.prefix);
-        guard.publish_checkpoint(&proof).unwrap();
-        assert_eq!(guard.published().unwrap(), proof.target_identity().prefix);
-        assert_eq!(std::fs::read(&logical_path).unwrap(), log_before);
         let namespace = runtime.files.namespace.clone();
-        return Some(SharedCompletedCheckpointFixture {
-            proof,
-            guard,
-            ids,
+        return Some(SharedPreparedCheckpointFixture {
+            token,
+            materialized,
+            prepared,
             pause: _pause,
             database: db,
             connection,
