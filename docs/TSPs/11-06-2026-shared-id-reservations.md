@@ -503,3 +503,31 @@ files to a still-live lease. It excludes logical bytes. Operation admission will
 add separate floor-only compaction headroom; a namespace that fits 16KiB alone
 need not have enough budget to reserve or compact. Task 4a may consume these helpers
 without claiming Task 4b or compaction is complete.
+
+
+## Same-generation compaction milestone evidence
+
+`LoadedIds::compact_floor_only(identity, committed_floor)` continuously retains its
+authority, requires no live registrations and no pending generation transition,
+and preserves the minimum of the permanent and prefix-matched committed floor.
+It freshly mirror-syncs the current witness before reusing the inactive bank,
+synchronizes a floor-only successor, mirror-syncs its selection, then truncates and
+synchronizes the old bank. It neither changes the database generation nor remaps
+domains. The coordinator owns admission pausing/deadlines while waiting for
+quiescence; the operation keeps publication authority through all submitted I/O.
+
+All 50 focused tests pass. Seven compaction tests cover actual reclamation at a
+fixed 32KiB limit, repeated bounded file sizes with retained inode identities,
+readers/stale identities/invalid floors/sequence exhaustion rejected before writes,
+all fourteen mutation failure boundaries, and cancellation/backend retirement at
+every mutation. Durable image selection always retains a complete old or new floor.
+The initial reclamation test failed against the stub. A separate causal control
+omitted the initial second-selector synchronization: interrupted bank reuse plus
+one damaged selector then failed with a selected-header mismatch. Restoring both
+current-witness synchronizations made that test and the complete suite pass.
+Focused library clippy and changed-file formatting pass with baseline allowances.
+
+These deterministic component tests do not prove native multi-process operation,
+real committed-oracle integration, or cross-generation checkpoint remapping. The
+prepared-successor/finalization protocol and complete domain remap remain required
+parts of Task 3; this helper cannot substitute for them.
