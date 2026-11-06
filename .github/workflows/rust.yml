@@ -1,4 +1,4 @@
-name: Shared commit publication and cap reset regression
+name: Shared commit cap reset preservation validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 844f31e848689c3088334421a0ff9676d95d2586
+          ref: b8e78c330c71401b5a58266119ac1c05e2db9907
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,29 +25,28 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 844f31e848689c3088334421a0ff9676d95d2586
+          test "$(git rev-parse HEAD)" = b8e78c330c71401b5a58266119ac1c05e2db9907
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Explicit COMMIT cap reset regression must fail before hook
+      - name: Shared cap preservation and admission
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_explicit_commit_cap_busy -- --test-threads=1 --nocapture 2>&1 | tee cap-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' cap-red.log
-          grep -q 'cap Busy discarded explicit transaction' cap-red.log
-      - name: Native shared commit publication
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee cap-green.log
+          grep -q '5 passed; 0 failed' cap-green.log
+      - name: Native snapshot publication and recovery
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commit-native.log
-          grep -q '2 passed; 0 failed' commit-native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_preserves_snapshots -- --ignored --test-threads=1 --nocapture 2>&1 | tee snapshot.log
+          grep -q '1 passed; 0 failed' snapshot.log
+      - name: Ordinary abandoned commit cleanup
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api abandoned -- --test-threads=1 2>&1 | tee abandoned.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - name: Preserve exact source and controls
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-commit-cap-red
+          name: shared-commit-cap-green
           path: |
             source.txt
             rustc.txt
