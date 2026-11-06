@@ -1,5 +1,9 @@
-use super::shared_authority::PublishedPrefix;
+use super::shared_authority::{AuthorityGuard, PublishedPrefix};
 use crate::io::FileId;
+use crate::io::{Buffer, Completion, File, FileSyncType};
+use crate::sync::{Arc, Mutex};
+use crate::types::IOCompletions;
+use crate::IOResult;
 use crate::{LimboError, Result};
 
 const RECORD_SIZE: usize = 128;
@@ -156,6 +160,227 @@ fn select_latest(
         ));
     }
     Ok((slot, newest))
+}
+
+const SLOT_SIZE: usize = 4096;
+
+struct ManifestLoad {
+    file: Arc<dyn File>,
+    ownership: Arc<Mutex<Option<AuthorityGuard>>>,
+    database_id: FileId,
+    size: usize,
+    slot: usize,
+    filled: usize,
+    bytes: [u8; RECORD_SIZE],
+    records: [Option<ManifestRecord>; 2],
+    pending: Option<(Completion, Arc<Buffer>, Arc<std::sync::atomic::AtomicI32>)>,
+    terminated: bool,
+}
+
+impl ManifestLoad {
+    fn new(file: Arc<dyn File>, guard: AuthorityGuard, database_id: FileId) -> Result<Self> {
+        Self::start(file, Some(guard), database_id)
+    }
+
+    fn start(
+        file: Arc<dyn File>,
+        guard: Option<AuthorityGuard>,
+        database_id: FileId,
+    ) -> Result<Self> {
+        let size = file.size()?;
+        if size > (SLOT_SIZE * 2) as u64 {
+            return Err(LimboError::Corrupt("oversized MVCC manifest".into()));
+        }
+        Ok(Self {
+            file,
+            ownership: Arc::new(Mutex::new(guard)),
+            database_id,
+            size: size as usize,
+            slot: 0,
+            filled: 0,
+            bytes: [0; RECORD_SIZE],
+            records: [None; 2],
+            pending: None,
+            terminated: false,
+        })
+    }
+
+    fn poll(&mut self) -> Result<IOResult<LoadedManifest>> {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        if self.terminated {
+            return Err(LimboError::InvalidArgument(
+                "manifest load already terminated".into(),
+            ));
+        }
+        self.terminated = true;
+        loop {
+            if let Some((completion, buffer, count)) = self.pending.take() {
+                if !completion.finished() {
+                    self.pending = Some((completion.clone(), buffer, count));
+                    self.terminated = false;
+                    return Ok(IOResult::IO(IOCompletions(completion)));
+                }
+                if let Some(error) = completion.get_error() {
+                    return Err(error.into());
+                }
+                let n = count.load(Ordering::Acquire);
+                if n <= 0 || n as usize > buffer.len() {
+                    return Err(LimboError::Corrupt(
+                        "unexpected MVCC manifest read length".into(),
+                    ));
+                }
+                let n = n as usize;
+                self.bytes[self.filled..self.filled + n].copy_from_slice(&buffer.as_slice()[..n]);
+                self.filled += n;
+            }
+            if self.slot == 2 {
+                let (slot, record) = select_latest(self.records, self.database_id)?;
+                return Ok(IOResult::Done(LoadedManifest {
+                    file: self.file.clone(),
+                    guard: self.ownership.lock().take(),
+                    slot,
+                    record,
+                }));
+            }
+            let expected = self
+                .size
+                .saturating_sub(self.slot * SLOT_SIZE)
+                .min(RECORD_SIZE);
+            if self.filled == expected {
+                self.records[self.slot] = ManifestRecord::decode(&self.bytes[..expected])?;
+                self.slot += 1;
+                self.filled = 0;
+                continue;
+            }
+            let buffer = Arc::new(Buffer::new_temporary(expected - self.filled));
+            let count = Arc::new(AtomicI32::new(-1));
+            let read = count.clone();
+            let ownership = self.ownership.clone();
+            let completion = Completion::new_read(buffer.clone(), move |result| {
+                let _keep_alive = &ownership;
+                if let Ok((_, n)) = result {
+                    read.store(n, Ordering::Release);
+                }
+                None
+            });
+            let completion = self
+                .file
+                .pread((self.slot * SLOT_SIZE + self.filled) as u64, completion)?;
+            self.pending = Some((completion, buffer, count));
+        }
+    }
+}
+
+struct LoadedManifest {
+    file: Arc<dyn File>,
+    guard: Option<AuthorityGuard>,
+    slot: usize,
+    record: ManifestRecord,
+}
+
+struct DurableManifest {
+    guard: Option<AuthorityGuard>,
+    slot: usize,
+    record: ManifestRecord,
+}
+
+struct ManifestPublication {
+    file: Arc<dyn File>,
+    ownership: Arc<Mutex<Option<AuthorityGuard>>>,
+    slot: usize,
+    record: ManifestRecord,
+    stage: PublicationStage,
+}
+
+enum PublicationStage {
+    Start,
+    Writing(Completion, Arc<std::sync::atomic::AtomicI32>),
+    Syncing(Completion),
+    Finished,
+}
+
+impl LoadedManifest {
+    fn publish(self, next: ManifestRecord) -> Result<ManifestPublication> {
+        if self.slot > 1 || self.record.sequence.checked_add(1) != Some(next.sequence) {
+            return Err(LimboError::InvalidArgument(
+                "invalid next manifest sequence".into(),
+            ));
+        }
+        select_latest([Some(self.record), Some(next)], self.record.database_id)?;
+        Ok(ManifestPublication {
+            file: self.file,
+            ownership: Arc::new(Mutex::new(self.guard)),
+            slot: 1 - self.slot,
+            record: next,
+            stage: PublicationStage::Start,
+        })
+    }
+}
+
+impl ManifestPublication {
+    fn poll(&mut self) -> Result<IOResult<DurableManifest>> {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        loop {
+            match std::mem::replace(&mut self.stage, PublicationStage::Finished) {
+                PublicationStage::Start => {
+                    let buffer = Arc::new(Buffer::new_temporary(SLOT_SIZE));
+                    buffer.as_mut_slice().fill(0);
+                    buffer.as_mut_slice()[..RECORD_SIZE].copy_from_slice(&self.record.encode());
+                    let written = Arc::new(AtomicI32::new(-1));
+                    let count = written.clone();
+                    let ownership = self.ownership.clone();
+                    let completion = Completion::new_write(move |result| {
+                        // Keep authority until the backend retires the operation, even after abort.
+                        let _keep_alive = &ownership;
+                        if let Ok(n) = result {
+                            count.store(n, Ordering::Release);
+                        }
+                    });
+                    let completion =
+                        self.file
+                            .pwrite((self.slot * SLOT_SIZE) as u64, buffer, completion)?;
+                    self.stage = PublicationStage::Writing(completion, written);
+                }
+                PublicationStage::Writing(completion, written) => {
+                    if !completion.finished() {
+                        self.stage = PublicationStage::Writing(completion.clone(), written);
+                        return Ok(IOResult::IO(IOCompletions(completion)));
+                    }
+                    if let Some(error) = completion.get_error() {
+                        return Err(error.into());
+                    }
+                    if written.load(Ordering::Acquire) != SLOT_SIZE as i32 {
+                        return Err(LimboError::Corrupt("short MVCC manifest write".into()));
+                    }
+                    let ownership = self.ownership.clone();
+                    let sync = Completion::new_sync(move |_| {
+                        let _keep_alive = &ownership;
+                    });
+                    let sync = self.file.sync(sync, FileSyncType::FullFsync)?;
+                    self.stage = PublicationStage::Syncing(sync);
+                }
+                PublicationStage::Syncing(completion) => {
+                    if !completion.finished() {
+                        self.stage = PublicationStage::Syncing(completion.clone());
+                        return Ok(IOResult::IO(IOCompletions(completion)));
+                    }
+                    if let Some(error) = completion.get_error() {
+                        return Err(error.into());
+                    }
+                    return Ok(IOResult::Done(DurableManifest {
+                        guard: self.ownership.lock().take(),
+                        slot: self.slot,
+                        record: self.record,
+                    }));
+                }
+                PublicationStage::Finished => {
+                    return Err(LimboError::InvalidArgument(
+                        "manifest publication already terminated".into(),
+                    ))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +570,288 @@ mod tests {
             select_latest([Some(previous), Some(identical_boundary)], DATABASE_ID).unwrap(),
             (1, identical_boundary)
         );
+    }
+
+    struct DelayedManifestFile {
+        bytes: Mutex<Vec<u8>>,
+        pending: Mutex<Option<(Option<(u64, Arc<Buffer>)>, Completion)>>,
+        syncs: std::sync::atomic::AtomicUsize,
+        pending_read: Mutex<Option<(u64, Completion)>>,
+    }
+
+    impl DelayedManifestFile {
+        fn initialized(record: ManifestRecord) -> Arc<Self> {
+            let mut bytes = vec![0; SLOT_SIZE];
+            bytes[..RECORD_SIZE].copy_from_slice(&record.encode());
+            Arc::new(Self {
+                bytes: Mutex::new(bytes),
+                pending: Mutex::new(None),
+                syncs: std::sync::atomic::AtomicUsize::new(0),
+                pending_read: Mutex::new(None),
+            })
+        }
+
+        fn retire(&self, count: usize, fail: bool) {
+            let (write, completion) = self.pending.lock().take().unwrap();
+            if let Some((offset, buffer)) = write {
+                let mut bytes = self.bytes.lock();
+                let offset = offset as usize;
+                let len = bytes.len().max(offset + count);
+                bytes.resize(len, 0);
+                bytes[offset..offset + count].copy_from_slice(&buffer.as_slice()[..count]);
+            }
+            if fail {
+                completion.error(crate::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected manifest IO",
+                ));
+            } else {
+                completion.complete(count as i32);
+            }
+        }
+
+        fn retire_read(&self, limit: usize) {
+            let (offset, completion) = self.pending_read.lock().take().unwrap();
+            let bytes = self.bytes.lock();
+            let offset = offset as usize;
+            let buffer = completion.as_read().buf();
+            let n = limit
+                .min(buffer.len())
+                .min(bytes.len().saturating_sub(offset));
+            buffer.as_mut_slice()[..n].copy_from_slice(&bytes[offset..offset + n]);
+            completion.complete(n as i32);
+        }
+
+        fn selected(&self) -> ManifestRecord {
+            let bytes = self.bytes.lock();
+            let decode = |offset: usize| {
+                let start = offset.min(bytes.len());
+                let end = (offset + RECORD_SIZE).min(bytes.len());
+                ManifestRecord::decode(&bytes[start..end]).unwrap()
+            };
+            select_latest([decode(0), decode(SLOT_SIZE)], DATABASE_ID)
+                .unwrap()
+                .1
+        }
+    }
+
+    impl File for DelayedManifestFile {
+        fn lock_file(&self, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn unlock_file(&self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Result<u64> {
+            Ok(self.bytes.lock().len() as u64)
+        }
+        fn truncate(&self, _: u64, _: Completion) -> Result<Completion> {
+            unreachable!()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            assert!(self.pending_read.lock().replace((pos, c.clone())).is_none());
+            Ok(c)
+        }
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            assert_eq!(pos, SLOT_SIZE as u64);
+            assert_eq!(buffer.len(), SLOT_SIZE);
+            assert!(self
+                .pending
+                .lock()
+                .replace((Some((pos, buffer)), c.clone()))
+                .is_none());
+            Ok(c)
+        }
+        fn sync(&self, c: Completion, _: FileSyncType) -> Result<Completion> {
+            self.syncs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(self.pending.lock().replace((None, c.clone())).is_none());
+            Ok(c)
+        }
+    }
+
+    fn publishing(
+        file: Arc<dyn File>,
+        previous: ManifestRecord,
+        next: ManifestRecord,
+    ) -> ManifestPublication {
+        LoadedManifest {
+            file,
+            guard: None,
+            slot: 0,
+            record: previous,
+        }
+        .publish(next)
+        .unwrap()
+    }
+
+    #[test]
+    fn commit_manifest_publication_waits_for_exact_write_then_sync() {
+        let previous = record(1, 1, 123, 10, 100);
+        let next = record(2, 1, 123, 11, 200);
+        let file = DelayedManifestFile::initialized(previous);
+        let mut publication = publishing(file.clone(), previous, next);
+        assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+        assert_eq!(file.selected(), previous);
+        assert_eq!(file.syncs.load(std::sync::atomic::Ordering::Relaxed), 0);
+        file.retire(SLOT_SIZE, false);
+        assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+        assert_eq!(file.syncs.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+        file.retire(0, false);
+        let IOResult::Done(durable) = publication.poll().unwrap() else {
+            panic!("sync completed")
+        };
+        assert_eq!(durable.record, next);
+        assert_eq!(durable.slot, 1);
+        assert_eq!(file.selected(), next);
+        assert!(publication.poll().is_err());
+    }
+
+    #[test]
+    fn commit_manifest_short_write_or_failed_sync_never_acknowledges() {
+        let previous = record(1, 1, 123, 10, 100);
+        let next = record(2, 1, 123, 11, 200);
+        for count in 0..SLOT_SIZE {
+            let file = DelayedManifestFile::initialized(previous);
+            let mut publication = publishing(file.clone(), previous, next);
+            assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+            file.retire(count, false);
+            assert!(publication.poll().is_err(), "count {count}");
+            assert!(publication.poll().is_err(), "count {count}");
+            assert_eq!(file.syncs.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(file.selected() == previous || file.selected() == next);
+            assert_eq!(&file.bytes.lock()[..RECORD_SIZE], &previous.encode());
+        }
+        let file = DelayedManifestFile::initialized(previous);
+        let mut publication = publishing(file.clone(), previous, next);
+        assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+        file.retire(SLOT_SIZE, false);
+        assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+        file.retire(0, true);
+        assert!(publication.poll().is_err());
+        assert!(publication.poll().is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    #[test]
+    fn commit_manifest_aborted_state_retains_authority_until_backend_retirement() {
+        use super::super::shared_authority::SharedMvccAuthority;
+        for at_sync in [false, true] {
+            for abort in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("authority");
+                let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+                let authority =
+                    SharedMvccAuthority::open(&io, path.to_str().unwrap(), DATABASE_ID, 8192)
+                        .unwrap();
+                let contender =
+                    SharedMvccAuthority::open(&io, path.to_str().unwrap(), DATABASE_ID, 8192)
+                        .unwrap();
+                let mut guard = authority.try_acquire().unwrap();
+                guard.recover(PublishedPrefix::default()).unwrap();
+                let previous = record(1, 1, 123, 10, 100);
+                let next = record(2, 1, 123, 11, 200);
+                let file = DelayedManifestFile::initialized(previous);
+                let mut publication = LoadedManifest {
+                    file: file.clone(),
+                    guard: Some(guard),
+                    slot: 0,
+                    record: previous,
+                }
+                .publish(next)
+                .unwrap();
+                assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+                if at_sync {
+                    file.retire(SLOT_SIZE, false);
+                    assert!(matches!(publication.poll().unwrap(), IOResult::IO(_)));
+                }
+                if abort {
+                    file.pending.lock().as_ref().unwrap().1.abort();
+                    assert!(publication.poll().is_err());
+                }
+                drop(publication);
+                assert!(matches!(authority.try_acquire(), Err(LimboError::Busy)));
+                assert!(matches!(contender.try_acquire(), Err(LimboError::Busy)));
+                file.retire(if at_sync { 0 } else { SLOT_SIZE }, false);
+                let recovered = contender.try_acquire().unwrap();
+                assert!(recovered.requires_recovery());
+            }
+        }
+    }
+
+    #[test]
+    fn commit_manifest_load_reads_separated_slots_and_rejects_missing_manifest() {
+        use crate::io::{MemoryIO, OpenFlags};
+        use crate::IO;
+        let previous = record(1, 1, 123, 10, 100);
+        let next = record(2, 1, 123, 11, 200);
+        let io = MemoryIO::new();
+        let file = io.open_file("manifest", OpenFlags::Create, false).unwrap();
+        let mut missing = ManifestLoad::start(file.clone(), None, DATABASE_ID).unwrap();
+        assert!(missing.poll().is_err());
+        for (slot, record) in [(0, previous), (1, next)] {
+            let buffer = Arc::new(Buffer::new_temporary(SLOT_SIZE));
+            buffer.as_mut_slice().fill(0);
+            buffer.as_mut_slice()[..RECORD_SIZE].copy_from_slice(&record.encode());
+            drop(
+                file.pwrite(
+                    (slot * SLOT_SIZE) as u64,
+                    buffer,
+                    Completion::new_write(|_| {}),
+                )
+                .unwrap(),
+            );
+            let mut load = ManifestLoad::start(file.clone(), None, DATABASE_ID).unwrap();
+            let IOResult::Done(loaded) = load.poll().unwrap() else {
+                panic!("synchronous read")
+            };
+            assert_eq!(loaded.record, record);
+            assert_eq!(loaded.slot, slot);
+            assert!(load.poll().is_err());
+        }
+    }
+
+    #[test]
+    fn commit_manifest_load_handles_delayed_short_reads_and_torn_inactive_slot() {
+        let previous = record(1, 1, 123, 10, 100);
+        let next = record(2, 1, 123, 11, 200);
+        for next_bytes in [0, 7, 127, 128] {
+            let file = DelayedManifestFile::initialized(previous);
+            if next_bytes > 0 {
+                let mut bytes = file.bytes.lock();
+                bytes.resize(SLOT_SIZE + next_bytes, 0);
+                bytes[SLOT_SIZE..].copy_from_slice(&next.encode()[..next_bytes]);
+            }
+            let mut load = ManifestLoad::start(file.clone(), None, DATABASE_ID).unwrap();
+            let mut waits = 0;
+            loop {
+                match load.poll().unwrap() {
+                    IOResult::IO(_) => {
+                        waits += 1;
+                        file.retire_read(7);
+                    }
+                    IOResult::Done(loaded) => {
+                        assert!(waits >= RECORD_SIZE.div_ceil(7));
+                        assert_eq!(
+                            loaded.record,
+                            if next_bytes == RECORD_SIZE {
+                                next
+                            } else {
+                                previous
+                            }
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        let file = DelayedManifestFile::initialized(previous);
+        let mut load = ManifestLoad::start(file.clone(), None, DATABASE_ID).unwrap();
+        assert!(matches!(load.poll().unwrap(), IOResult::IO(_)));
+        file.retire_read(0);
+        assert!(load.poll().is_err());
+        assert!(load.poll().is_err());
     }
 
     fn record(

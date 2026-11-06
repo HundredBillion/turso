@@ -169,7 +169,9 @@ authority component deliberately accepts a prefix supplied by a future verified
 recovery caller; its process tests use synthetic prefixes and prove no log
 durability property.
 
-Commit integration will add a separate two-slot manifest. Each fixed-size record
+The private manifest component uses separate 4096-byte aligned slots at offsets
+0 and 4096. Each slot contains a 128-byte checksummed record and zero padding;
+publication writes the entire inactive block. Each record
 has a format version, record sequence, database identity, log generation/salt,
 committed timestamp, end offset, running log CRC and record checksum. Write only
 the inactive slot after the logical-log write and synchronization complete.
@@ -194,6 +196,25 @@ completion, and reopen through a fresh process. The external acknowledgement
 ledger remains the acceptance oracle. The manifest follows the filesystem's
 successful-write-and-fsync durability contract; checksums do not repair arbitrary
 later media corruption.
+The torn-write model preserves previously synchronized, separately addressed
+blocks; placing both records in one sector would not satisfy it.
+
+The yielding loader owns publication authority through slot selection. It reads
+short completions to the expected record length and rejects unexpected EOF.
+The publisher checks the full block byte count, then waits for manifest sync.
+Both read and write/sync completion callbacks retain authority ownership until
+the backend retires the operation. A cancelled completion's `finished` flag is
+not evidence that the kernel has stopped using its buffers. In the io_uring
+backend, `get_key` retains the completion with `Arc::into_raw`; only processing
+the actual operation CQE consumes that reference. The cancellation CQE does not.
+Callbacks never extract the authority guard on abort or error. Only observing a
+successful manifest sync transfers it to the durable result.
+
+Local manifest tests cover delayed reads in seven-byte chunks, every short
+block-write count, failed sync, missing active-mode manifests and repeated polls
+after terminal results. Native Linux authority-retention validation and actual
+process-death/acknowledgement-ledger tests remain pending at this stage. The
+component is private and has no engine commit caller yet.
 
 The process-local group-commit queue cannot independently own the shared append
 position. Initial protocol commits use the single global publisher; later group
