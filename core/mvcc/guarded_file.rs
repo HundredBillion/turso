@@ -1,12 +1,13 @@
 //! Shared file mutations retain publication ownership through backend completion retirement.
 
-use super::shared_authority::{AuthorityGuard, PublicationLease};
+use super::shared_authority::{AuthorityGuard, PublicationLease, SharedMvccAuthority};
 use crate::io::{CompletionGroup, File, FileId, FileSyncType};
 use crate::sync::{Arc, Mutex, Weak};
 use crate::{Buffer, Completion, CompletionError, LimboError, Result};
 
 pub(super) struct GuardedFile {
     inner: Arc<dyn File>,
+    authority: Weak<SharedMvccAuthority>,
     lease: Mutex<LeaseSlot>,
 }
 
@@ -21,9 +22,11 @@ pub(super) struct FileBinding {
 }
 
 impl GuardedFile {
-    pub(super) fn new(inner: Arc<dyn File>) -> Arc<Self> {
+    /// Callers validate file provenance first; this wrapper enforces subsequent guard identity.
+    pub(super) fn new(inner: Arc<dyn File>, authority: &Arc<SharedMvccAuthority>) -> Arc<Self> {
         Arc::new(Self {
             inner,
+            authority: Arc::downgrade(authority),
             lease: Mutex::new(LeaseSlot {
                 lease: Weak::new(),
                 bound: false,
@@ -35,6 +38,11 @@ impl GuardedFile {
         let mut current = self.lease.lock();
         if current.lease.upgrade().is_some() {
             return Err(LimboError::Busy);
+        }
+        if !guard.belongs_to(&self.authority) {
+            return Err(LimboError::InvalidArgument(
+                "shared file belongs to a different authority".into(),
+            ));
         }
         let lease = guard.io_lease();
         PublicationLease::pin(&lease)?;
@@ -312,7 +320,7 @@ mod tests {
             let authority = authority_for_test(backend.clone());
             let mut guard = authority.try_acquire().unwrap();
             guard.recover(PublishedPrefix::default()).unwrap();
-            let file = GuardedFile::new(backend.clone());
+            let file = GuardedFile::new(backend.clone(), &authority);
             let binding = file.bind(&guard).unwrap();
             let buffer = Arc::new(Buffer::new(vec![1; 16]));
             let completion = match operation {
@@ -370,7 +378,7 @@ mod tests {
     fn finish_rejects_backend_pins_even_after_successful_callback() {
         let backend = Arc::new(DelayedFile::default());
         let (authority, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let file = GuardedFile::new(backend.clone(), &authority);
         let _binding = file.bind(&guard).unwrap();
         let completion = file
             .pwrite(
@@ -403,7 +411,7 @@ mod tests {
     fn binding_scope_rejects_mutation_and_cannot_disable_new_binding() {
         let backend = Arc::new(DelayedFile::default());
         let (authority, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let file = GuardedFile::new(backend.clone(), &authority);
         assert!(matches!(
             file.truncate(0, Completion::new_trunc(|_| {})),
             Err(LimboError::Busy)
@@ -440,8 +448,8 @@ mod tests {
     #[test]
     fn dropped_binding_cannot_replace_retained_backend_lease() {
         let backend = Arc::new(DelayedFile::default());
-        let (_, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let (authority, guard) = initialized(&backend);
+        let file = GuardedFile::new(backend.clone(), &authority);
         let binding = file.bind(&guard).unwrap();
         let completion = file
             .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
@@ -455,16 +463,23 @@ mod tests {
         backend.complete_without_retiring(0);
         assert!(matches!(file.bind(&other_guard), Err(LimboError::Busy)));
         backend.retire();
-        let _binding = file.bind(&other_guard).unwrap();
+        assert!(matches!(
+            file.bind(&other_guard),
+            Err(LimboError::InvalidArgument(_))
+        ));
         other_guard.finish().unwrap();
+        let mut guard = authority.try_acquire().unwrap();
+        guard.recover(PublishedPrefix::default()).unwrap();
+        let _binding = file.bind(&guard).unwrap();
+        guard.finish().unwrap();
     }
 
     #[test]
     fn short_negative_and_failed_vector_children_reach_caller() {
         for result in [-1, 0, 3, 5] {
             let backend = Arc::new(DelayedFile::default());
-            let (_, guard) = initialized(&backend);
-            let file = GuardedFile::new(backend.clone());
+            let (authority, guard) = initialized(&backend);
+            let file = GuardedFile::new(backend.clone(), &authority);
             let _binding = file.bind(&guard).unwrap();
             let buffer = Arc::new(Buffer::new(vec![2; 4]));
             let completion = file
@@ -483,8 +498,8 @@ mod tests {
             assert!(!backend.locked.load(Ordering::Acquire));
         }
         let backend = Arc::new(DelayedFile::default());
-        let (_, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let (authority, guard) = initialized(&backend);
+        let file = GuardedFile::new(backend.clone(), &authority);
         let _binding = file.bind(&guard).unwrap();
         let completion = file
             .pwrite(
@@ -505,7 +520,7 @@ mod tests {
     fn vector_submission_failure_and_overflow_keep_submitted_children_safe() {
         let backend = Arc::new(DelayedFile::default());
         let (authority, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let file = GuardedFile::new(backend.clone(), &authority);
         let _binding = file.bind(&guard).unwrap();
         let buffer = Arc::new(Buffer::new(vec![2; 4]));
         assert!(matches!(
@@ -535,7 +550,7 @@ mod tests {
     fn pin_precedes_backend_submission_and_survives_concurrent_guard_drop() {
         let backend = Arc::new(DelayedFile::default());
         let (authority, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let file = GuardedFile::new(backend.clone(), &authority);
         let binding = file.bind(&guard).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
@@ -570,8 +585,8 @@ mod tests {
     #[test]
     fn empty_vector_needs_binding_but_leaves_no_retained_pin() {
         let backend = Arc::new(DelayedFile::default());
-        let (_, guard) = initialized(&backend);
-        let file = GuardedFile::new(backend.clone());
+        let (authority, guard) = initialized(&backend);
+        let file = GuardedFile::new(backend.clone(), &authority);
         assert!(matches!(
             file.pwritev(0, vec![], Completion::new_write(|_| {})),
             Err(LimboError::Busy)
@@ -591,7 +606,7 @@ mod tests {
         for pending in [false, true] {
             let backend = Arc::new(DelayedFile::default());
             let (authority, guard) = initialized(&backend);
-            let file = GuardedFile::new(backend.clone());
+            let file = GuardedFile::new(backend.clone(), &authority);
             let _binding = file.bind(&guard).unwrap();
             backend.fail_unlock.store(true, Ordering::SeqCst);
             if pending {
@@ -611,6 +626,23 @@ mod tests {
                 Err(LimboError::InvalidArgument(_))
             ));
         }
+    }
+
+    #[test]
+    fn file_binding_rejects_a_different_runtime_authority() {
+        let backend = Arc::new(DelayedFile::default());
+        let (authority, guard) = initialized(&backend);
+        let file = GuardedFile::new(backend.clone(), &authority);
+        let other = Arc::new(DelayedFile::default());
+        let (_, other_guard) = initialized(&other);
+        assert!(matches!(
+            file.bind(&other_guard),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        assert_eq!(backend.submissions.load(Ordering::SeqCst), 0);
+        let _binding = file.bind(&guard).unwrap();
+        guard.finish().unwrap();
+        other_guard.finish().unwrap();
     }
     #[cfg(target_os = "linux")]
     fn real_authority(
@@ -684,7 +716,7 @@ mod tests {
         let mut guard = authority.try_acquire().unwrap();
         guard.recover(PublishedPrefix::default()).unwrap();
         let backend = Arc::new(DelayedFile::default());
-        let file = GuardedFile::new(backend.clone());
+        let file = GuardedFile::new(backend.clone(), &authority);
         let binding = file.bind(&guard).unwrap();
         let caller = file
             .pwrite(

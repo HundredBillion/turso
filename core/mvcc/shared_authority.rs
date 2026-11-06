@@ -313,6 +313,10 @@ impl AuthorityGuard {
         state.active && state.owned && Arc::strong_count(&self.lease) == 1
     }
 
+    pub(super) fn belongs_to(&self, authority: &Weak<SharedMvccAuthority>) -> bool {
+        Weak::ptr_eq(authority, &Arc::downgrade(&self.authority))
+    }
+
     pub(super) fn io_lease(&self) -> Weak<PublicationLease> {
         Arc::downgrade(&self.lease)
     }
