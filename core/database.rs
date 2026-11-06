@@ -1466,6 +1466,46 @@ impl Database {
         }
     }
 
+    #[cfg(all(feature = "test_helper", host_shared_wal, unix))]
+    pub fn test_shared_open_pair(path: &str, history_limit: u64) -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let mut readonly =
+            OpenOptions::new(Arc::new(crate::EngineDialect)).flags(OpenFlags::ReadOnly);
+        readonly.shared_mvcc_history_limit = Some(history_limit);
+        let first = Self::open(io.clone(), path, readonly)?;
+        let mut writable = OpenOptions::new(Arc::new(crate::EngineDialect)).flags(OpenFlags::None);
+        writable.shared_mvcc_history_limit = Some(history_limit);
+        let second = Self::open(io, path, writable)?;
+        let first_coordination = first
+            .shared_mvcc_runtime
+            .as_ref()
+            .unwrap()
+            .physical_coordination();
+        let second_coordination = second
+            .shared_mvcc_runtime
+            .as_ref()
+            .unwrap()
+            .physical_coordination();
+        if Arc::ptr_eq(&first, &second)
+            || !Arc::ptr_eq(&first_coordination, &second_coordination)
+            || !first.is_readonly()
+            || second.is_readonly()
+        {
+            return Err(LimboError::InternalError(
+                "independent shared opens have inconsistent ownership".into(),
+            ));
+        }
+        let first_connection = first.connect(ConnectOpts::new())?;
+        let second_connection = second.connect(ConnectOpts::new())?;
+        for connection in [&first_connection, &second_connection] {
+            connection.execute("BEGIN")?;
+            connection.execute("SELECT count(*) FROM sqlite_schema")?;
+        }
+        first_connection.execute("COMMIT")?;
+        second_connection.execute("COMMIT")?;
+        Ok(())
+    }
+
     /// IOResult-driven twin of [`Database::open`]: the caller drives the IO
     /// loop and passes `state` between calls. Default storage resolution is
     /// retained in the state across IO yields.
