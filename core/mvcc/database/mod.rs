@@ -85,6 +85,10 @@ pub(crate) use shared_runtime::{
     SharedBeginState, SharedBootstrapState, SharedMvccRuntime, SharedOpenState,
 };
 
+#[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
+#[allow(unused_imports)]
+pub(crate) use shared_runtime::shared_runtime_fixture;
+
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
