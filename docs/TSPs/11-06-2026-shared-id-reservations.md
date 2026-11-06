@@ -237,6 +237,12 @@ Pending or unacknowledged autonomous inner sequence commits must be recovered
 before quiescence is accepted; lack of live registrations alone does not prove
 that their durable outcomes have been reconciled. Check the complete mapping, fallible allocation budget and encoded size before touching the inactive bank. Truncate only the inactive bank, write/sync its snapshot, then publish/sync both copies of the selecting or prepared-successor witness. Retire the old active content only after the matching database generation is durable and both selector slots no longer reference that bank. If this work is same-generation garbage compaction, the generation proof remains unchanged.
 
+The minimum initialized metadata footprint is four 4096-byte pages: two selector slots,
+one active bank header and its permanent logical-floor record; an unused bank may be empty.
+Compaction also needs room for a replacement bank before the old bank can be reclaimed.
+Repeated rolled-back reservations consume this same bounded budget even while long-lived
+readers prevent compaction. Pressure returns bounded BUSY without evicting readers or claims.
+
 The configured history budget accounts for both reservation bank sizes, selector bytes and the
 current recovered logical prefix end offset; calculate the total under authority,
 using the supplied `RecoveryIdentity` rather than a stale process-local estimate. Before exceeding it, return bounded contention and request a quiescent checkpoint; do not silently grow an unlimited reservation tail. If the irreducible compact state itself exceeds the configured budget, return an explicit resource error. This is a tunable byte budget, not a permanent number-of-tables limit. Peak compaction allowance includes both old and new snapshots; preflight must not start a transition that cannot retain the last complete bank.
@@ -349,3 +355,26 @@ Replay state is private and discarded on error; its mutation helper is not an
 atomic live-state update API. No actual journal I/O, mirrored-sync acknowledgement,
 liveness reclamation or runtime allocation is enabled by these tests. Those remain
 Tasks 2–4, including real committed-oracle and checkpoint integration.
+
+
+## Owned journal loader milestone evidence
+
+Twenty-five focused shared-ID tests pass: seventeen codec/replay checks and eight
+owned-loader checks. The loader validates the held authority prefix, selects the
+witness before reading its bounded bank prefixes, validates both referenced banks,
+and retains the authority and file bindings for the next operation. Constructor
+callers must supply existing-only files from the validated database identity
+namespace; authority binding alone does not establish path provenance.
+
+Loader tests cover short reads, dropped operations, explicitly aborted returned
+completions, wrong-authority guards, stale prefixes, corrupt selected data, EOF and
+backend errors. A backend that releases completion callbacks only from `IO::step`
+reproduced a progress failure with a finished yield. Using the authority's pending
+retirement completion makes that regression pass, and prevents success or authority
+release before the backend releases its submitted reads. Focused library clippy
+passes with the existing baseline lint allowances.
+
+The live-owner timestamp boundary test also rejects the authority's reserved
+maximum timestamp, while leaving recovered checkpoint timestamp decoding unchanged.
+No reservation append, durable acknowledgement, compaction, dead-owner reclamation
+or real allocator/VM integration is enabled by this loader milestone.

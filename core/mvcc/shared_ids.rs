@@ -1,3 +1,5 @@
+mod io_protocol;
+
 use crate::io::FileId;
 use crate::{LimboError, Result};
 
@@ -231,6 +233,33 @@ fn select(
     database_id: FileId,
     database: DatabaseGeneration,
 ) -> Result<SelectedIds> {
+    let (selector, slots_agree) = select_witness(slots, database_id)?;
+    // Selection precedes data validation. A corrupt selected prefix never permits fallback.
+    validate_bank(
+        banks[usize::from(selector.active.bank)],
+        database_id,
+        selector.active,
+    )?;
+    if let Some(next) = selector.prepared {
+        validate_bank(banks[usize::from(next.bank)], database_id, next)?;
+    }
+    let selected = if selector.active.database == database {
+        selector.active
+    } else if let Some(next) = selector.prepared.filter(|next| next.database == database) {
+        next
+    } else {
+        return Err(corrupt(
+            "ID selector does not cover the recovered database generation",
+        ));
+    };
+    Ok(SelectedIds {
+        selector,
+        selected,
+        slots_agree,
+    })
+}
+
+fn select_witness(slots: [&[u8]; 2], database_id: FileId) -> Result<(IdSelector, bool)> {
     let records = [IdSelector::decode(slots[0])?, IdSelector::decode(slots[1])?];
     for record in records.iter().flatten() {
         if record.database_id != database_id {
@@ -254,29 +283,7 @@ fn select(
         [Some(record), None] | [None, Some(record)] => record,
         [None, None] => return Err(corrupt("no valid ID selector witness")),
     };
-    // Selection precedes data validation. A corrupt selected prefix never permits fallback.
-    validate_bank(
-        banks[usize::from(selector.active.bank)],
-        database_id,
-        selector.active,
-    )?;
-    if let Some(next) = selector.prepared {
-        validate_bank(banks[usize::from(next.bank)], database_id, next)?;
-    }
-    let selected = if selector.active.database == database {
-        selector.active
-    } else if let Some(next) = selector.prepared.filter(|next| next.database == database) {
-        next
-    } else {
-        return Err(corrupt(
-            "ID selector does not cover the recovered database generation",
-        ));
-    };
-    Ok(SelectedIds {
-        selector,
-        selected,
-        slots_agree: records[0].is_some() && records[0] == records[1],
-    })
+    Ok((selector, records[0].is_some() && records[0] == records[1]))
 }
 
 fn replay_selected(selection: SelectedIds, banks: [&[u8]; 2]) -> Result<journal::State> {
@@ -697,7 +704,7 @@ mod journal {
         pub change: Change,
     }
     impl Record {
-        fn encode(self) -> Result<[u8; PAGE_SIZE]> {
+        pub(super) fn encode(self) -> Result<[u8; PAGE_SIZE]> {
             if self.sequence == 0 {
                 return Err(corrupt("invalid ID journal sequence"));
             }
