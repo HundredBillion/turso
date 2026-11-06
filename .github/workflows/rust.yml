@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 71e5509e9b08a76e54ec4325651b754a04c6d52c
+          ref: ffb9a05a5110d2ce0a8a5f1eb90a72125aae026d
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,25 +25,19 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 71e5509e9b08a76e54ec4325651b754a04c6d52c
+          test "$(git rev-parse HEAD)" = ffb9a05a5110d2ce0a8a5f1eb90a72125aae026d
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Epoch identity and native reservation process recovery
+      - name: Concrete offline upgrade and interrupted marker recovery
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_authority:: -- --test-threads=1 --nocapture 2>&1 | tee authority.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids:: -- --test-threads=1 --nocapture 2>&1 | tee ids.log
-          grep -q 'native_id_reservations_survive_death_compaction_and_reopen ... ok' ids.log
-      - name: Native opening SQL commits and admission after reconciliation
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee opening.log
-          grep -q '1 passed; 0 failed' opening.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee commits.log
-          grep -q '2 passed; 0 failed' commits.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee vdbe.log
-          grep -q '6 passed; 0 failed' vdbe.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh_ -- --test-threads=1 --nocapture 2>&1 | tee refresh.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition::ordinary::tests:: -- --test-threads=1 --nocapture 2>&1 | tee offline-green.log
+          grep -q '4 passed; 0 failed; 1 ignored' offline-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_token_ -- --test-threads=1 --nocapture 2>&1 | tee recovery-token.log
+          grep -q '5 passed; 0 failed' recovery-token.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_preserves_base_and_separates_readonly_handles -- --ignored --test-threads=1 --nocapture 2>&1 | tee normal-open.log
+          grep -q '1 passed; 0 failed' normal-open.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Preserve exact source and expected failure
         if: always()
