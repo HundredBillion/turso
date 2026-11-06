@@ -82,13 +82,28 @@ impl NativeIds {
         };
         let main = open("identity");
         let id = main.file_id().unwrap().unwrap();
-        let authority = SharedMvccAuthority::open_existing(
-            &io,
-            dir.join("authority").to_str().unwrap(),
-            id,
-            HISTORY_LIMIT,
-        )
-        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut reported_busy = false;
+        let authority = loop {
+            match SharedMvccAuthority::open_existing(
+                &io,
+                dir.join("authority").to_str().unwrap(),
+                id,
+                HISTORY_LIMIT,
+            ) {
+                Ok(authority) => break authority,
+                Err(LimboError::Busy) if Instant::now() < deadline => {
+                    if !reported_busy {
+                        if let Ok(role) = std::env::var(ROLE) {
+                            std::fs::write(dir.join(format!("{role}.open-busy")), []).unwrap();
+                        }
+                        reported_busy = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("native ID authority open failed: {error}"),
+            }
+        };
         let files = SharedIds::open_existing(
             [
                 GuardedFile::new(open("ids-a"), &authority),
@@ -315,8 +330,26 @@ fn native_id_reservations_survive_death_compaction_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let dir = directory.path();
     NativeIds::initialize(dir);
+    let io = crate::io::PlatformIO::new().unwrap();
+    let startup = io
+        .open_file(
+            dir.join("authority").to_str().unwrap(),
+            OpenFlags::NoLock,
+            false,
+        )
+        .unwrap();
+    // Another opener can hold this lifetime byte exclusively during restart bookkeeping.
+    startup
+        .shared_wal_lock_byte(0, true, crate::io::SharedWalLockKind::LinuxOfd)
+        .unwrap();
     let mut a = spawn(dir, "a");
     let mut b = spawn(dir, "b");
+    wait_exists(&dir.join("a.open-busy"));
+    wait_exists(&dir.join("b.open-busy"));
+    startup
+        .shared_wal_unlock_byte(0, crate::io::SharedWalLockKind::LinuxOfd)
+        .unwrap();
+    drop(startup);
     let a_result = read_result(dir, "a");
     let b_result = read_result(dir, "b");
     let mut rows = [a_result.0, b_result.0];
