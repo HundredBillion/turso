@@ -86,3 +86,11 @@ The membership scan explicitly requires an array at the requested path;
 regression failed without this guard and passed after restoration. Earlier local
 raw runs predate this additional guard, although their queried `tags` fields were
 all arrays. Hosted results must use the guarded revision.
+
+Conflict replacement is included explicitly: `INSERT OR REPLACE` can implicitly
+delete an old row without firing its delete trigger when recursive triggers are
+disabled. The insert trigger therefore clears `NEW.id` postings before rebuilding;
+the update trigger clears both old and new IDs for `UPDATE OR REPLACE` collisions.
+The explicit insert-replacement case failed before cleanup and passed afterward,
+as did a collision between two document IDs. This followup adds insertion lookup
+work; prior local timings are not measurements of this final fixture.

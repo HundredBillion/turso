@@ -440,6 +440,11 @@ mod tests {
             conn.execute(POSTINGS).expect("create postings");
             conn.execute("INSERT INTO documents VALUES(1,1,jsonb('{\"n\":1,\"r\":1.0,\"big\":9007199254740993,\"nothing\":null,\"text\":\"1\",\"flag\":true,\"tags\":[1,1,null,false,\"1\"]}'))").expect("insert mixed document");
             assert_consistent(&db, &conn).expect("initial consistency");
+            conn.execute("INSERT OR REPLACE INTO documents VALUES(1,1,jsonb('{\"n\":4}'))")
+                .expect("replace document");
+            assert_consistent(&db, &conn).expect("replacement consistency");
+            conn.execute("INSERT INTO documents VALUES(9,2,jsonb('{\"n\":9}')); UPDATE OR REPLACE documents SET id=1 WHERE id=9").expect("replace conflicting identity");
+            assert_consistent(&db, &conn).expect("update replacement consistency");
             conn.execute("BEGIN; UPDATE documents SET tenant=2,payload=jsonb('{\"n\":2}'); SAVEPOINT edit; DELETE FROM documents; ROLLBACK TO edit; RELEASE edit").expect("savepoint sequence");
             assert_consistent(&db, &conn).expect("savepoint consistency");
             conn.execute("ROLLBACK").expect("rollback transaction");

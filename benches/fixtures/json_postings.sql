@@ -23,6 +23,7 @@ CREATE TRIGGER documents_check_update BEFORE UPDATE ON documents BEGIN
 END;
 
 CREATE TRIGGER documents_postings_insert AFTER INSERT ON documents BEGIN
+    DELETE FROM postings WHERE document_id = NEW.id;
     INSERT INTO postings
         SELECT NEW.id, NEW.tenant, 'scalar', fullkey,
                CASE type WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number'
@@ -39,7 +40,7 @@ CREATE TRIGGER documents_postings_insert AFTER INSERT ON documents BEGIN
 END;
 
 CREATE TRIGGER documents_postings_update AFTER UPDATE ON documents BEGIN
-    DELETE FROM postings WHERE document_id = OLD.id;
+    DELETE FROM postings WHERE document_id = OLD.id OR document_id = NEW.id;
     INSERT INTO postings
         SELECT NEW.id, NEW.tenant, 'scalar', fullkey,
                CASE type WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number'
