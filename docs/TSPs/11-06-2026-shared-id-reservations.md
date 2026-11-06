@@ -760,3 +760,10 @@ bodies typecheck with temporary local cfg widening; those edits are restored.
 Hosted execution and the deliberate early-reclaim negative control remain pending.
 This milestone does not implement the recovered completed-generation entry or
 prove end-to-end runtime checkpoint acceptance.
+
+Recovery reads only validated loaded-state metadata. `pending_checkpoint_source`
+returns a source generation only when the selected reference is the prepared
+target; a source-selected or normal selector returns none. `identity` and
+`selected_logical_floor` expose the corresponding load identity and replayed
+floor without raw-bank access. The target-selection regression fails against an
+always-none stub and also checks both negative cases.
