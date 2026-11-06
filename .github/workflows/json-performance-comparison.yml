@@ -1,0 +1,44 @@
+name: JSON performance comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Candidate commit or branch
+        required: false
+  pull_request:
+    paths:
+      - core/json/**
+      - benches/json_benchmark.rs
+      - benches/json_extract_allocations.rs
+      - scripts/compare_json_benchmarks.py
+      - .github/workflows/json-performance-comparison.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: json-comparison-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || inputs.candidate_ref || github.sha }}
+      - uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: "1.88.0"
+      - name: Build controls and candidate, then measure alternating runs
+        run: python3 scripts/compare_json_benchmarks.py --output json-comparison-results
+      - name: Preserve raw samples, compiler logs, binary hashes and executables
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-performance-comparison
+          path: json-comparison-results/
+          retention-days: 14
