@@ -1,4 +1,4 @@
-name: Shared MVCC I/O lease validation
+name: Shared MVCC commit and I/O lease validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c9615d6828944c031c87a311a7fa1888e8e97be7
+          ref: c908cfb99398d9700968f27a6d941744ce8422c8
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact runtime and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = c9615d6828944c031c87a311a7fa1888e8e97be7
+          test "$(git rev-parse HEAD)" = c908cfb99398d9700968f27a6d941744ce8422c8
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -43,6 +43,14 @@ jobs:
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest:: --
           --test-threads=1 --nocapture 2>&1 | tee manifest.log
+      - name: Shared commit durability, errors, CRC and retirement
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_commit:: -- --test-threads=1 --nocapture 2>&1 | tee shared-commit.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-commit.log
+      - name: Shared prefix adoption after abandoned append
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prefix_adoption -- --test-threads=1 --nocapture 2>&1 | tee prefix-adoption.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' prefix-adoption.log
       - name: Existing shared authority process invariants
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority:: --
@@ -53,12 +61,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-mvcc-io-leases
+          name: shared-mvcc-commit-leases
           path: |
             source.txt
             rustc.txt
             guarded-file.log
             ofd-process.log
             manifest.log
+            shared-commit.log
+            prefix-adoption.log
             authority.log
           retention-days: 14
