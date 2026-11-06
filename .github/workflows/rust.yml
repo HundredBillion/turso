@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e0a84927e344b4040ee90a1c9fb7c956a312ff1d
+          ref: 8c3500e86df75d12f1702d9d758069bb47fcea29
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = e0a84927e
+          test "$(git rev-parse --short=9 HEAD)" = 8c3500e86
           rustc -Vv | tee rustc.txt
       - name: Manifest codec and publication checks
         run: |
