@@ -21973,7 +21973,7 @@ mod shared_begin_tests {
             )
             .unwrap();
             let connection = database.connect(ConnectOpts::new()).unwrap();
-            assert!(connection.mv_store().unwrap().is_shared());
+            assert!(connection.mv_store().as_ref().unwrap().is_shared());
             let metadata = std::fs::metadata(&path).unwrap();
             let authority = directory.path().join(format!(
                 ".turso-mvcc-{:016x}-{:016x}/authority",
