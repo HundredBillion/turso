@@ -32,3 +32,6 @@ jobs:
       - name: Committed-prefix replay
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api committed_prefix -- --test-threads=1
+      - name: Durable manifest and cancellation ownership
+        run: >-
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest::tests -- --test-threads=1 --nocapture
