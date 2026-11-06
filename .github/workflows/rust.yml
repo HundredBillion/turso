@@ -39,24 +39,32 @@ jobs:
         with:
           cache-on-failure: true
       - name: Source identity
-        run: git log -2 --format=fuller
+        run: >-
+          git log -2 --format=fuller
       - name: Observed storage authority
-        run: cargo test --locked -p turso_core --lib --features "${{ matrix.core_features }}" database::readonly::tests -- --test-threads=1
+        run: >-
+          cargo test --locked -p turso_core --lib --features "${{ matrix.core_features }}" database::readonly::tests -- --test-threads=1
       - name: Read-only filesystem contract
-        run: cargo test --locked -p turso_core --lib --features "${{ matrix.core_features }}" io::filesystem_open_tests:: -- --test-threads=1
+        run: >-
+          cargo test --locked -p turso_core --lib --features "${{ matrix.core_features }}" io::filesystem_open_tests:: -- --test-threads=1
       - name: Header lifecycle and activation failures
-        run: cargo test --locked -p core_tester --features "${{ matrix.test_features }}" --test integration_tests storage::header_version -- --test-threads=1
+        run: >-
+          cargo test --locked -p core_tester --features "${{ matrix.test_features }}" --test integration_tests storage::header_version -- --test-threads=1
       - name: PostgreSQL legacy read-only opening
-        run: cargo test --locked -p turso_pg_tests --features "${{ matrix.test_features }}" --test integration_tests test_postgres_refuses_a_database_file_whose_tables_are_in_no_schema -- --nocapture
+        run: >-
+          cargo test --locked -p turso_pg_tests --features "${{ matrix.test_features }}" --test integration_tests test_postgres_refuses_a_database_file_whose_tables_are_in_no_schema -- --nocapture
       - name: Sync and SDK regressions
-        run: cargo test --locked -p turso_sync_engine --features "${{ matrix.sync_features }}" --lib
+        run: >-
+          cargo test --locked -p turso_sync_engine --features "${{ matrix.sync_features }}" --lib
       - name: Build fresh C library
-        run: cargo build --locked -p turso_sqlite3 --lib
+        run: >-
+          cargo build --locked -p turso_sqlite3 --lib
       - name: C compatibility on Linux
         if: runner.os == 'Linux'
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
-        run: cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=1
+        run: >-
+          cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=1
       - name: C compatibility on Windows
         if: runner.os == 'Windows'
         shell: pwsh
