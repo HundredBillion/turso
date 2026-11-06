@@ -839,3 +839,44 @@ fn shared_oracle_native_keeps_outer_snapshot_and_rejects_unresolved_state() {
     guard.finish().unwrap();
     connection.execute("ROLLBACK").unwrap();
 }
+
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_open_native_validates_ids_when_incarnation_is_already_ready() {
+    use crate::{Database, OpenOptions};
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, limit) = super::shared_runtime_fixture(dir.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(crate::dialect::EngineDialect))
+        .flags(crate::OpenFlags::ReadOnly)
+        .with_shared_mvcc_for_test(limit);
+    let first = Database::open(io.clone(), path.to_str().unwrap(), options.clone()).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let namespace = crate::mvcc::mode_transition::namespace_for(
+        &path,
+        FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        },
+    )
+    .unwrap();
+    let selector = namespace.join("ids-selector");
+    let before = std::fs::read(&selector).unwrap();
+    let contents = std::fs::read(&path).unwrap();
+    let mut damaged = before.clone();
+    damaged[0] ^= 1;
+    damaged[4096] ^= 1;
+    std::fs::write(&selector, &damaged).unwrap();
+    let reopened = Database::open(io, path.to_str().unwrap(), options);
+    std::fs::write(&selector, &before).unwrap();
+    assert!(
+        reopened.is_err(),
+        "live authority readiness bypassed durable ID validation"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), contents);
+    drop(first);
+}
