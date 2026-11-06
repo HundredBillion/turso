@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ffb9a05a5110d2ce0a8a5f1eb90a72125aae026d
+          ref: fca0428f6a5253ac8ac8355e59ef0de8509e9b5a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,20 +25,20 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ffb9a05a5110d2ce0a8a5f1eb90a72125aae026d
+          test "$(git rev-parse HEAD)" = fca0428f6a5253ac8ac8355e59ef0de8509e9b5a
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Concrete offline upgrade and interrupted marker recovery
+      - name: Fresh offline initialization has no implementation yet
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition::ordinary::tests:: -- --test-threads=1 --nocapture 2>&1 | tee offline-green.log
-          grep -q '4 passed; 0 failed; 1 ignored' offline-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api marker_recovery_token_ -- --test-threads=1 --nocapture 2>&1 | tee recovery-token.log
-          grep -q '5 passed; 0 failed' recovery-token.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_preserves_base_and_separates_readonly_handles -- --ignored --test-threads=1 --nocapture 2>&1 | tee normal-open.log
-          grep -q '1 passed; 0 failed' normal-open.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_initializes_and_publishes_fresh_database_without_replacement -- --test-threads=1 --nocapture 2>&1 | tee fresh-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'fresh offline initialization is not implemented' fresh-red.log
+          grep -q '0 passed; 1 failed' fresh-red.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
