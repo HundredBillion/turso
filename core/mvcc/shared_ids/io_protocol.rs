@@ -7,12 +7,12 @@ use crate::{Buffer, Completion, IOResult};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RecoveryIdentity {
+pub(in crate::mvcc) struct RecoveryIdentity {
     pub database: DatabaseGeneration,
     pub prefix: PublishedPrefix,
 }
 
-pub(super) struct SharedIds {
+pub(in crate::mvcc) struct SharedIds {
     banks: [Arc<GuardedFile>; 2],
     selector: Arc<GuardedFile>,
     database_id: FileId,
@@ -23,7 +23,7 @@ impl SharedIds {
     /// The caller supplies files opened existing-only in the validated database identity
     /// namespace, all bound to that same authority, and the retained main file ID.
     /// Guard bindings verify authority association; they do not establish path provenance.
-    pub(super) fn open_existing(
+    pub(in crate::mvcc) fn open_existing(
         banks: [Arc<GuardedFile>; 2],
         selector: Arc<GuardedFile>,
         database_id: FileId,
@@ -64,7 +64,7 @@ impl SharedIds {
         }
     }
 
-    pub(super) fn load(
+    pub(in crate::mvcc) fn load(
         self: &Arc<Self>,
         guard: AuthorityGuard,
         identity: RecoveryIdentity,
@@ -112,7 +112,7 @@ struct PendingRead {
     count: Arc<AtomicI32>,
 }
 
-pub(super) struct IdLoad {
+pub(in crate::mvcc) struct IdLoad {
     files: Arc<SharedIds>,
     identity: RecoveryIdentity,
     ownership: Arc<Mutex<Option<AuthorityGuard>>>,
@@ -126,7 +126,7 @@ pub(super) struct IdLoad {
     finished: bool,
 }
 
-pub(super) struct LoadedIds {
+pub(in crate::mvcc) struct LoadedIds {
     files: Arc<SharedIds>,
     pub(super) guard: AuthorityGuard,
     bindings: [FileBinding; 3],
@@ -137,6 +137,22 @@ pub(super) struct LoadedIds {
 }
 
 impl LoadedIds {
+    pub(in crate::mvcc) fn retained_bytes(&self) -> Result<u64> {
+        use crate::io::File;
+        self.guard.published()?;
+        self.files
+            .banks
+            .iter()
+            .chain(std::iter::once(&self.files.selector))
+            .try_fold(0u64, |total, file| {
+                total.checked_add(file.size()?).ok_or(LimboError::TooBig)
+            })
+    }
+
+    pub(in crate::mvcc) fn into_guard(self) -> AuthorityGuard {
+        self.guard
+    }
+
     /// Persists a change already checked against live registrations and the committed oracle.
     /// This layer validates replay and durability; it does not choose or authorize an ID.
     pub(super) fn append(mut self, change: journal::Change) -> Result<IdAppend> {
@@ -287,7 +303,7 @@ impl IdAppend {
 }
 
 impl IdLoad {
-    pub(super) fn poll(&mut self) -> Result<IOResult<LoadedIds>> {
+    pub(in crate::mvcc) fn poll(&mut self) -> Result<IOResult<LoadedIds>> {
         use crate::io::File;
         if self.finished {
             return Err(invalid("ID journal load already terminated"));
@@ -1067,6 +1083,10 @@ mod tests {
         let IOResult::Done(outcome) = operation.poll().unwrap() else {
             panic!("synchronous oracle");
         };
+        assert_eq!(
+            outcome.retained_bytes,
+            f.selector.size().unwrap() + f.bank.size().unwrap() + f.unused.size().unwrap()
+        );
         outcome.guard.finish().unwrap();
         outcome.result
     }
@@ -1596,6 +1616,16 @@ mod tests {
                 result.guard.finish().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn retained_id_bytes_include_both_physical_tails_under_owned_guard() {
+        let f = fixture();
+        f.bank.bytes.lock().extend_from_slice(&[0; PAGE_SIZE]);
+        f.unused.bytes.lock().resize(2 * PAGE_SIZE, 0);
+        let loaded = loaded(&f);
+        assert_eq!(loaded.retained_bytes().unwrap(), (7 * PAGE_SIZE) as u64);
+        loaded.into_guard().finish().unwrap();
     }
 
     struct RetirementIo {
