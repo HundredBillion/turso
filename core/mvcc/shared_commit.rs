@@ -24,6 +24,7 @@ pub(super) struct SharedCommit {
     cleanup_pin: Option<IoPin>,
     pending_owned: bool,
     durable: bool,
+    preflight_rejected: bool,
 }
 
 enum Stage {
@@ -110,12 +111,17 @@ impl SharedCommit {
             cleanup_pin: Some(cleanup_pin),
             pending_owned: false,
             durable: false,
+            preflight_rejected: false,
         })
     }
 
     /// Sticky as soon as manifest FULL sync is observed, including later errors.
     pub(super) fn is_durable(&self) -> bool {
         self.durable
+    }
+
+    pub(super) fn preflight_rejected(&self) -> bool {
+        self.preflight_rejected
     }
 
     pub(super) fn poll(&mut self) -> Result<IOResult<AuthorityGuard>> {
@@ -134,6 +140,7 @@ impl SharedCommit {
                     let prefix = selected.prefix();
                     let timestamp = record.tx_timestamp;
                     let framed = Cell::new(None);
+                    let preflight_rejected = Cell::new(false);
                     let callback = |bytes: SharedBufferData, info: LogTxFrameInfo| -> Result<()> {
                         let len = u64::try_from(bytes.len()).map_err(|_| LimboError::TooBig)?;
                         let salt = if prefix.end_offset == 0 {
@@ -155,7 +162,10 @@ impl SharedCommit {
                         {
                             return Err(invalid("shared frame does not extend selected prefix"));
                         }
-                        loaded.guard()?.check_append_size(len)?;
+                        if let Err(error) = loaded.guard()?.check_append_size(len) {
+                            preflight_rejected.set(true);
+                            return Err(error);
+                        }
                         let next = ManifestRecord::new(
                             selected.sequence() + 1,
                             selected.database_id(),
@@ -174,7 +184,9 @@ impl SharedCommit {
                         Ok(())
                     };
                     self.pending_owned = true;
-                    let (completion, bytes) = self.storage.log_tx(record, Some(&callback))?;
+                    let result = self.storage.log_tx(record, Some(&callback));
+                    self.preflight_rejected = preflight_rejected.get();
+                    let (completion, bytes) = result?;
                     let (next, len) = framed
                         .get()
                         .ok_or_else(|| invalid("shared serializer omitted frame validation"))?;

@@ -87,7 +87,10 @@ pub(crate) use shared_runtime::{
 
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
 #[allow(unused_imports)]
-pub(crate) use shared_runtime::shared_runtime_fixture;
+pub(crate) use shared_runtime::{shared_runtime_fixture, shared_runtime_fixture_with_limit};
+
+#[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
+mod shared_commit_integration_tests;
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -1502,6 +1505,12 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     /// (e.g. CREATE INDEX on a multi-million row table) don't monopolize
     /// the executor.
     BuildLogRecord(BuildLogRecordCtx),
+    #[cfg(all(host_shared_wal, unix))]
+    SharedLogicalLog {
+        end_ts: u64,
+    },
+    #[cfg(all(host_shared_wal, unix))]
+    SharedFinalize,
     BeginCommitLogicalLog {
         end_ts: u64,
         log_record: LogRecord,
@@ -1714,6 +1723,12 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     /// Bytes from the in-flight logical-log write. Applied to the writer offset
     /// only after `on_log_write_complete` succeeds.
     pending_log_append_bytes: Option<u64>,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_commit: Option<Box<shared_runtime::SharedTransactionCommit>>,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_preflight_preservable: bool,
+    #[cfg(all(host_shared_wal, unix))]
+    preserve_shared_transaction: bool,
     group_batch: Option<GroupBatch>,
     /// This state machine issued at least one `log_tx` (leader or exclusive).
     wrote_logical_log: bool,
@@ -1830,6 +1845,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pager,
             header,
             pending_log_append_bytes: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_commit: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_preflight_preservable: false,
+            #[cfg(all(host_shared_wal, unix))]
+            preserve_shared_transaction: false,
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
@@ -1849,6 +1870,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             .as_ref()
             .filter(|entry| !entry.is_removed())
             .map(|entry| entry.value())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    fn reset_shared_preflight(&mut self, store: &Arc<MvStore<Clock, A>>, preservable: bool) {
+        self.shared_preflight_preservable = preservable;
+        if let Some(tx) = self.committing_tx(store) {
+            tx.state.store(TransactionState::Active);
+        }
+        self.shared_commit = None;
+        self.state = CommitState::Initial;
     }
 
     fn release_group_claim(&mut self) {
@@ -1905,7 +1936,51 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
+    pub(crate) fn can_preserve_shared_preflight(&self) -> bool {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            return self.shared_preflight_preservable
+                && self.shared_commit.is_none()
+                && self.tx_entry.as_ref().is_some_and(|entry| {
+                    !entry.is_removed()
+                        && entry.value().state.load() == TransactionState::Active
+                        && !entry.value().log_appended.load(Ordering::Acquire)
+                });
+        }
+        #[cfg(not(all(host_shared_wal, unix)))]
+        {
+            false
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn preserve_shared_preflight_on_drop(&mut self) -> bool {
+        if !self.can_preserve_shared_preflight() {
+            return false;
+        }
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.preserve_shared_transaction = true;
+        }
+        true
+    }
+
     fn cleanup_unfinished_commit(&mut self) {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.preserve_shared_transaction && self.can_preserve_shared_preflight() {
+            return;
+        }
+
+        #[cfg(all(host_shared_wal, unix))]
+        if self
+            .shared_commit
+            .as_ref()
+            .is_some_and(|shared| shared.is_durable())
+        {
+            if let Some(tx) = self.committing_tx(&self.mvcc_store) {
+                tx.log_appended.store(true, Ordering::Release);
+            }
+        }
         if !self.is_finalized {
             self.release_group_claim();
             self.cleanup_mvcc_checkpoint_state();
@@ -3147,6 +3222,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
+                #[cfg(all(host_shared_wal, unix))]
+                {
+                    self.shared_preflight_preservable = false;
+                }
+                #[cfg(all(host_shared_wal, unix))]
+                let shared_timestamp = if let Some(runtime) = mvcc_store.shared_runtime.get() {
+                    if self.shared_commit.is_none() {
+                        self.shared_commit = Some(Box::new(
+                            shared_runtime::SharedTransactionCommit::new(runtime.clone())?,
+                        ));
+                    }
+                    match self
+                        .shared_commit
+                        .as_mut()
+                        .unwrap()
+                        .poll_prepare(mvcc_store, &self.connection)
+                        .map_err(|error| *error)?
+                    {
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                        IOResult::Done(timestamp) => Some(timestamp),
+                    }
+                } else {
+                    None
+                };
+                #[cfg(not(all(host_shared_wal, unix)))]
+                let shared_timestamp: Option<u64> = None;
                 let tx = self
                     .committing_tx(mvcc_store)
                     .ok_or(LimboError::TxTerminated)?;
@@ -3186,7 +3287,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 let mut exclusive_conflict = false;
                 let mut peer_conflict = false;
 
-                let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                let mut publish_preparing = |ts| {
                     // Import holds this same clock lock through publication. A
                     // commit may have waited after its initial conflict check.
                     peer_conflict = tx.peer_conflicted.load(Ordering::Acquire);
@@ -3231,7 +3332,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     };
 
                     let header_dirty = tx.header_dirty.load(Ordering::Acquire);
-                    turso_assert!(!header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id), "header_dirty=true implies that tx is exclusive");
+                    turso_assert!(
+                        !header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id),
+                        "header_dirty=true implies that tx is exclusive"
+                    );
                     if our_cookie != global_cookie && !header_dirty {
                         tracing::debug!("cookie mismatch in CommitState::Initial tx({our_cookie}) != global(!{global_cookie})");
                         schema_conflict = true;
@@ -3247,7 +3351,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     if !peer_conflict && (can_commit_tx || read_only) {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
-                });
+                };
+                let end_ts = if let Some(timestamp) = shared_timestamp {
+                    mvcc_store
+                        .clock
+                        .publish_observed(timestamp, || -> Result<()> {
+                            publish_preparing(timestamp);
+                            Ok(())
+                        })?;
+                    timestamp
+                } else {
+                    mvcc_store.get_commit_timestamp(publish_preparing)
+                };
                 if peer_conflict {
                     return Err(LimboError::WriteWriteConflict);
                 }
@@ -3479,6 +3594,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
             CommitState::MarkDirtyKeys { .. } => self.step_mark_dirty_keys(mvcc_store),
             CommitState::BeginCommitLogicalLog { end_ts, .. } => {
+                #[cfg(all(host_shared_wal, unix))]
+                if let Some(shared) = self.shared_commit.as_mut() {
+                    let timestamp = *end_ts;
+                    let CommitState::BeginCommitLogicalLog { log_record, .. } = std::mem::replace(
+                        &mut self.state,
+                        CommitState::SharedLogicalLog { end_ts: timestamp },
+                    ) else {
+                        unreachable!()
+                    };
+                    if let Err(error) = shared.begin_write(log_record) {
+                        self.reset_shared_preflight(mvcc_store, false);
+                        return Err(error);
+                    }
+                    return Ok(TransitionResult::Continue);
+                }
+
                 let is_exclusive = mvcc_store.is_exclusive_tx(&self.tx_id);
                 if !is_exclusive && self.commit_coordinator.group_commit_enabled() {
                     let end_ts = *end_ts;
@@ -3517,6 +3648,47 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 };
                 self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
                 Ok(TransitionResult::Continue)
+            }
+            #[cfg(all(host_shared_wal, unix))]
+            CommitState::SharedLogicalLog { end_ts } => {
+                let end_ts = *end_ts;
+                let shared = self.shared_commit.as_mut().unwrap();
+                let result = shared.poll_write();
+                if result.is_err() && shared.preflight_rejected() {
+                    let error = *result.unwrap_err();
+                    self.reset_shared_preflight(mvcc_store, matches!(error, LimboError::Busy));
+                    return Err(error);
+                }
+                if shared.is_durable() {
+                    if let Some(tx) = self.committing_tx(mvcc_store) {
+                        tx.log_appended.store(true, Ordering::Release);
+                    }
+                    self.wrote_logical_log = true;
+                }
+                match result.map_err(|error| *error)? {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {
+                        self.state = CommitState::EndCommitLogicalLog { end_ts };
+                        Ok(TransitionResult::Continue)
+                    }
+                }
+            }
+            #[cfg(all(host_shared_wal, unix))]
+            CommitState::SharedFinalize => {
+                match self
+                    .shared_commit
+                    .as_mut()
+                    .unwrap()
+                    .poll_finish(mvcc_store, &self.connection)
+                    .map_err(|error| *error)?
+                {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {
+                        self.shared_commit = None;
+                        self.finalize(mvcc_store)?;
+                        Ok(TransitionResult::Done(()))
+                    }
+                }
             }
             CommitState::AwaitGroupCommit { end_ts, ticket } => {
                 self.step_await_group_commit(mvcc_store, *end_ts, *ticket)
@@ -3770,6 +3942,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
+                #[cfg(all(host_shared_wal, unix))]
+                if self.shared_commit.is_some() {
+                    self.state = CommitState::SharedFinalize;
+                    return Ok(TransitionResult::Continue);
+                }
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
@@ -3839,6 +4016,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
     }
 
     fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+        #[cfg(all(host_shared_wal, unix))]
+        if let Some(shared) = self.shared_commit.take() {
+            shared.finish_without_append()?;
+        }
         self.is_finalized = true;
         Ok(())
     }
@@ -6854,6 +7035,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         checkpoint_read_guard: CheckpointReadLockState,
         portable_logical_changes: bool,
     ) -> Result<TxID> {
+        if self.is_shared() {
+            self.release_unadopted_checkpoint_read_guard(checkpoint_read_guard);
+            return Err(LimboError::InvalidArgument(
+                "shared transactions require coordinated admission".into(),
+            ));
+        }
         self.begin_tx_at_snapshot(
             pager,
             expected_schema_generation,
@@ -11927,6 +12114,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Initial => write!(f, "Initial"),
+            #[cfg(all(host_shared_wal, unix))]
+            Self::SharedLogicalLog { end_ts } => f
+                .debug_struct("SharedLogicalLog")
+                .field("end_ts", end_ts)
+                .finish(),
+            #[cfg(all(host_shared_wal, unix))]
+            Self::SharedFinalize => write!(f, "SharedFinalize"),
             Self::Commit { end_ts } => f.debug_struct("Commit").field("end_ts", end_ts).finish(),
             Self::WaitForDependencies { end_ts } => f
                 .debug_struct("WaitForDependencies")
