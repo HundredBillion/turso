@@ -788,3 +788,24 @@ new ordinal and BUSY, respectively). All 71 portable ID tests pass, including
 savepoint regeneration, earliest legacy duplicate selection, retired owners,
 ordinal exhaustion, and the no-append cap case with an unrelated dead owner.
 One native process test remains ignored in that macOS run.
+
+### Recovered finalization entry (native acceptance pending)
+
+The private `LoadedIds::finalize_recovered_checkpoint` entry consumes a freshly
+recovered completed proof with no live source-prefix claim. If the selector still
+references a prepared target, it requires the exact validated source generation
+and checks both old and prepared floors. If the highest selector already selects
+only the target, the old source identity is unavailable: the proof must say so,
+and the operation re-mirrors that same selector sequence before reclaiming the
+inactive bank. It never reconstructs source identity from an older witness and
+never requires another sequence increment merely to finish recovery.
+
+Both routes require the exact target load identity, lease, empty target prefix,
+materialized floor, and no live registrations. The live prepared entry separately
+requires its exact source identity. They share the same six-step durable
+publication/reclamation state machine and typed final outcome.
+
+The runtime owner reviewed this factor without a blocker. It compiled during the
+71-test portable ID run and passed library lint, but the recovered-proof positive
+and crash-reopen tests still require the physical evidence constructor. This entry
+is committed to unblock that integration; it is not native recovery acceptance.

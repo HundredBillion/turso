@@ -8,89 +8,144 @@ impl SuspendedPreparedIds {
         proof: CompletedCheckpointProof,
     ) -> Result<IdCheckpointFinalize> {
         let suspended = self.loaded;
-        let target = proof.target_identity();
-        let old = suspended.selection.selector.active;
-        let prepared = suspended
-            .selection
-            .selector
-            .prepared
-            .ok_or_else(|| invalid("ID finalization requires a prepared generation"))?;
-        let target_prefix = PublishedPrefix {
-            committed_timestamp: target.database.checkpoint_timestamp,
-            end_offset: 0,
-            running_crc: 0,
-        };
-        if !crate::sync::Weak::ptr_eq(&suspended.lease, &guard.io_lease())
-            || !proof.matches_lease(&guard)
-            || proof.source_database() != Some(suspended.identity.database)
-            || proof.source_database() != Some(old.database)
-            || proof
-                .source_identity()
-                .is_some_and(|source| source != suspended.identity)
-            || prepared.database != target.database
-            || target.database.generation <= old.database.generation
-            || target.prefix != target_prefix
-            || guard.published()? != target.prefix
-        {
-            return Err(invalid(
-                "ID finalization requires the completed target and original authority lease",
-            ));
+        if !crate::sync::Weak::ptr_eq(&suspended.lease, &guard.io_lease()) {
+            return Err(invalid("prepared IDs lost their original authority lease"));
         }
-        PublicationLease::pin(&guard.io_lease())?;
-        if !guard.live_registrations()?.is_empty() {
-            return Err(LimboError::Busy);
-        }
-        let state = replay_selected(
-            SelectedIds {
-                selected: prepared,
-                ..suspended.selection
-            },
-            [&suspended.banks[0], &suspended.banks[1]],
-        )?;
-        if proof.materialized_floor() >= 0
-            || proof.materialized_floor() == i64::MIN
-            || state.logical_floor > proof.materialized_floor()
-            || state.logical_floor > suspended.state.logical_floor
-        {
-            return Err(invalid(
-                "prepared ID floor does not cover the completed checkpoint",
-            ));
-        }
-        let selector = IdSelector {
-            sequence: suspended
-                .selection
-                .selector
-                .sequence
-                .checked_add(1)
-                .ok_or(LimboError::DatabaseFull)?,
-            database_id: suspended.files.database_id,
-            active: prepared,
-            prepared: None,
-        };
-        let bytes = encoded_buffer(&selector.encode()?);
+        let source = suspended.identity;
         let loaded = LoadedIds {
             files: suspended.files,
             guard,
             bindings: suspended.bindings,
-            identity: target,
-            selection: SelectedIds {
-                selector,
-                selected: prepared,
-                slots_agree: true,
-            },
-            state,
+            identity: suspended.identity,
+            selection: suspended.selection,
+            state: suspended.state,
             banks: suspended.banks,
         };
-        Ok(IdCheckpointFinalize {
-            loaded: Some(loaded),
-            proof: Some(proof),
-            selector: bytes,
-            old_bank: usize::from(old.bank),
-            step: 0,
-            pending: None,
-            finished: false,
-        })
+        begin_finalization(loaded, proof, Some(source))
     }
+}
+
+impl LoadedIds {
+    pub(in crate::mvcc) fn finalize_recovered_checkpoint(
+        self,
+        proof: CompletedCheckpointProof,
+    ) -> Result<IdCheckpointFinalize> {
+        begin_finalization(self, proof, None)
+    }
+}
+
+fn begin_finalization(
+    mut loaded: LoadedIds,
+    proof: CompletedCheckpointProof,
+    live_source: Option<RecoveryIdentity>,
+) -> Result<IdCheckpointFinalize> {
+    let target = proof.target_identity();
+    let old = loaded.selection.selector.active;
+    let prepared = loaded.selection.selector.prepared;
+    let selected = prepared.unwrap_or(old);
+    let loaded_matches = match (live_source, prepared) {
+        (Some(source), Some(_)) => {
+            source == loaded.identity
+                && source.database == old.database
+                && loaded.selection.selected == old
+        }
+        (None, _) => loaded.identity == target && loaded.selection.selected == selected,
+        (Some(_), None) => false,
+    };
+    let expected_source = prepared.map(|_| old.database);
+    let target_prefix = PublishedPrefix {
+        committed_timestamp: target.database.checkpoint_timestamp,
+        end_offset: 0,
+        running_crc: 0,
+    };
+    if !loaded_matches
+        || proof.source_identity() != live_source
+        || !proof.matches_lease(&loaded.guard)
+        || proof.source_database() != expected_source
+        || selected.database != target.database
+        || prepared.is_some_and(|_| {
+            target.database.generation <= old.database.generation
+                || target.database.checkpoint_timestamp < old.database.checkpoint_timestamp
+        })
+        || target.prefix != target_prefix
+        || loaded.guard.published()? != target.prefix
+    {
+        return Err(invalid(
+            "ID finalization requires the completed target and original authority lease",
+        ));
+    }
+    PublicationLease::pin(&loaded.guard.io_lease())?;
+    if !loaded.guard.live_registrations()?.is_empty() {
+        return Err(LimboError::Busy);
+    }
+    let old_floor = if prepared.is_some() {
+        Some(
+            replay_selected(
+                SelectedIds {
+                    selected: old,
+                    ..loaded.selection
+                },
+                [&loaded.banks[0], &loaded.banks[1]],
+            )?
+            .logical_floor,
+        )
+    } else {
+        None
+    };
+    let state = replay_selected(
+        SelectedIds {
+            selected,
+            ..loaded.selection
+        },
+        [&loaded.banks[0], &loaded.banks[1]],
+    )?;
+    if proof.materialized_floor() >= 0
+        || proof.materialized_floor() == i64::MIN
+        || state.logical_floor > proof.materialized_floor()
+        || old_floor.is_some_and(|floor| state.logical_floor > floor)
+    {
+        return Err(invalid(
+            "prepared ID floor does not cover the completed checkpoint",
+        ));
+    }
+    let sequence = if prepared.is_some() {
+        loaded
+            .selection
+            .selector
+            .sequence
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?
+    } else {
+        loaded.selection.selector.sequence
+    };
+    let old_bank = if prepared.is_some() {
+        usize::from(old.bank)
+    } else {
+        1 - usize::from(selected.bank)
+    };
+    let selector = IdSelector {
+        sequence,
+        database_id: loaded.files.database_id,
+        active: selected,
+        prepared: None,
+    };
+    let bytes = encoded_buffer(&selector.encode()?);
+    loaded.identity = target;
+    loaded.selection = SelectedIds {
+        selector,
+        selected,
+        slots_agree: true,
+    };
+    loaded.state = state;
+    Ok(IdCheckpointFinalize {
+        loaded: Some(loaded),
+        proof: Some(proof),
+        selector: bytes,
+        old_bank,
+        step: 0,
+        pending: None,
+        finished: false,
+    })
 }
 
 pub(in crate::mvcc) struct IdCheckpointFinalize {
