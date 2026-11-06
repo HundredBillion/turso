@@ -144,6 +144,22 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Adopt a validated manifest prefix only while holding publication authority
+    /// and after all physical I/O using the previous storage state has retired.
+    #[cfg(host_shared_wal)]
+    pub(crate) fn adopt_shared_prefix(
+        &self,
+        header: Option<logical_log::LogHeader>,
+        offset: u64,
+        running_crc: u32,
+        committed_timestamp: u64,
+    ) -> Result<()> {
+        let mut log = self.logical_log.write();
+        log.adopt_shared_prefix(header, offset, running_crc, committed_timestamp)?;
+        self.shadow_offset_store(offset);
+        Ok(())
+    }
+
     pub fn new(
         file: Arc<dyn File>,
         io: Arc<dyn crate::IO>,
