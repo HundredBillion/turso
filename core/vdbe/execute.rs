@@ -4307,6 +4307,7 @@ pub fn op_transaction(
     match result {
         Ok(result) => Ok(result),
         Err(err) => {
+            state.reset_shared_begin();
             state.active_op_state.clear();
             Err(err)
         }
@@ -4397,6 +4398,41 @@ fn begin_fresh_mvcc_tx(
             Err(err)
         }
     }
+}
+
+/// Shared admission imports the durable prefix before taking any new pager snapshot.
+#[allow(clippy::too_many_arguments)]
+fn begin_fresh_mvcc_tx_nonblock(
+    mv_store: &MvStore,
+    pager: &Arc<Pager>,
+    mode: &TransactionMode,
+    connection: &Arc<Connection>,
+    expected_schema_generation: Option<u64>,
+    database_id: usize,
+    state: &mut ProgramState,
+) -> IOResultOr<u64> {
+    #[cfg(all(host_shared_wal, unix))]
+    if mv_store.is_shared() {
+        return mv_store.begin_shared_nonblock(
+            connection,
+            pager.clone(),
+            matches!(mode, TransactionMode::Write),
+            expected_schema_generation,
+            database_id,
+            &mut state.shared_begin,
+        );
+    }
+    #[cfg(not(all(host_shared_wal, unix)))]
+    let _ = (database_id, state);
+    begin_fresh_mvcc_tx(
+        mv_store,
+        pager,
+        mode,
+        connection,
+        expected_schema_generation,
+    )
+    .map(IOResult::Done)
+    .map_err(Into::into)
 }
 
 fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> IOResultOr<u32> {
@@ -4744,21 +4780,24 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
-                            match begin_fresh_mvcc_tx(
+                            match begin_fresh_mvcc_tx_nonblock(
                                 mv_store,
                                 &pager,
                                 &effective_mode,
                                 &conn,
                                 None,
+                                *db,
+                                state,
                             ) {
-                                Ok(tx_id) => {
+                                Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+                                Ok(IOResult::Done(tx_id)) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
                                     if conn.get_auto_commit() && !conn.is_nested_stmt() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }
                                 }
-                                Err(err) => return Err(err.into()),
+                                Err(err) => return Err(err),
                             }
                         } else if write {
                             // Upgrade: attached DB has a Read/Concurrent tx but the
@@ -4808,17 +4847,19 @@ pub fn op_transaction_inner(
                             // there and forces a reprepare against the published roots — without
                             // the old non-atomic post-begin recheck (which also tripped on
                             // publishes strictly after our snapshot).
-                            let expected_schema_generation =
-                                match conn.mvcc_begin_schema_generation() {
-                                    Ok(generation) => generation,
-                                    Err(err) => {
-                                        if started_read_tx {
-                                            conn.set_tx_state(current_state);
-                                            state.auto_txn_cleanup = TxnCleanup::None;
-                                        }
-                                        return Err(err.into());
+                            let expected_schema_generation = match state
+                                .captured_shared_schema_generation()
+                                .map_or_else(|| conn.mvcc_begin_schema_generation(), Ok)
+                            {
+                                Ok(generation) => generation,
+                                Err(err) => {
+                                    if started_read_tx {
+                                        conn.set_tx_state(current_state);
+                                        state.auto_txn_cleanup = TxnCleanup::None;
                                     }
-                                };
+                                    return Err(err.into());
+                                }
+                            };
                             #[cfg(any(test, injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
@@ -4842,14 +4883,17 @@ pub fn op_transaction_inner(
                             } else {
                                 *tx_mode
                             };
-                            match begin_fresh_mvcc_tx(
+                            match begin_fresh_mvcc_tx_nonblock(
                                 mv_store,
                                 &pager,
                                 &fresh_mode,
                                 &conn,
                                 expected_schema_generation,
+                                *db,
+                                state,
                             ) {
-                                Ok(tx_id) => {
+                                Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+                                Ok(IOResult::Done(tx_id)) => {
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, fresh_mode)));
@@ -4869,7 +4913,7 @@ pub fn op_transaction_inner(
                                         conn.set_tx_state(current_state);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
-                                    return Err(err.into());
+                                    return Err(err);
                                 }
                             }
                         } else if updated {
@@ -5507,6 +5551,32 @@ pub fn op_savepoint(
                         )
                     {
                         return Ok(state.suspend_on_io(io));
+                    }
+                }
+            }
+            #[cfg(all(host_shared_wal, unix))]
+            if let Some(mv_store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+                if conn.get_mv_tx_id().is_none() {
+                    let fresh_mode = if conn.begin_concurrent_is_pending() {
+                        TransactionMode::Concurrent
+                    } else {
+                        TransactionMode::Read
+                    };
+                    let tx_id = return_if_io!(
+                        state,
+                        begin_fresh_mvcc_tx_nonblock(
+                            mv_store,
+                            pager,
+                            &fresh_mode,
+                            &conn,
+                            None,
+                            crate::MAIN_DB_ID,
+                            state
+                        )
+                    );
+                    conn.set_mv_tx(Some((tx_id, fresh_mode)));
+                    if conn.get_tx_state().no_btree_tx_open() {
+                        conn.set_tx_state(TransactionState::Read);
                     }
                 }
             }
@@ -15583,12 +15653,31 @@ pub fn op_sequence_begin_inner_tx(
         }
     }
 
-    let inner_tx_id = mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
-        pager.clone(),
-        None,
-        CheckpointReadLockState::NotHeld,
-        conn.portable_logical_changes_enabled(),
-    )?;
+    #[cfg(all(host_shared_wal, unix))]
+    let shared_inner = mv_store.is_shared();
+    #[cfg(not(all(host_shared_wal, unix)))]
+    let shared_inner = false;
+    let inner_tx_id = if shared_inner {
+        return_if_io!(
+            state,
+            begin_fresh_mvcc_tx_nonblock(
+                &mv_store,
+                pager,
+                &TransactionMode::Concurrent,
+                &conn,
+                None,
+                *db,
+                state
+            )
+        )
+    } else {
+        mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
+            pager.clone(),
+            None,
+            CheckpointReadLockState::NotHeld,
+            conn.portable_logical_changes_enabled(),
+        )?
+    };
     conn.set_mv_tx_for_db(
         *db,
         Some((
