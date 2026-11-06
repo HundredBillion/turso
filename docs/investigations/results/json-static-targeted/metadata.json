@@ -1,0 +1,48 @@
+{
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  4\nOn-line CPU(s) list:                     0-3\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC 9V74 80-Core Processor\nCPU family:                              25\nModel:                                   17\nThread(s) per core:                      2\nCore(s) per socket:                      2\nSocket(s):                               1\nStepping:                                1\nBogoMIPS:                                5192.26\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves user_shstk avx512_bf16 clzero xsaveerptr rdpru arat npt nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm\nVirtualization:                          AMD-V\nHypervisor vendor:                       Microsoft\nVirtualization type:                     full\nL1d cache:                               64 KiB (2 instances)\nL1i cache:                               64 KiB (2 instances)\nL2 cache:                                2 MiB (2 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-3\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Vulnerable: Safe RET, no microcode\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Retpolines; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Vulnerable: No microcode\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "revisions": {
+    "fork": "4ccf547a400777307a834b554f467c8868830f5c",
+    "candidate": "c4808695adcbe8fbd6f240d34910f7fd3a3febb6",
+    "static": "ad54b7aaa",
+    "upstream": "2709799dad2ebb0f1749cfa62fa28514f568da28"
+  },
+  "fixtures": {
+    "benches/Cargo.toml": "99dbe76400d69fa716255c49d2a40f027fea46097295a036c709f60c27f4c45b",
+    "benches/json_benchmark.rs": "a935b5ac689f56a1bb601fab4500a9d1d771430dd97348ad8eadfa7f36b2efb0",
+    "benches/json_extract_allocations.rs": "eefb9a6da41ffa11aef9c43023c07a1a9efccf12a53dab3dd88a59562acb798b"
+  },
+  "toolchain": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: x86_64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5",
+  "environment": {
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_HOME": "/home/runner/.cargo",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_TERM_COLOR": "always",
+    "CARGO_INCREMENTAL": "0",
+    "RUSTUP_TOOLCHAIN": "1.88.0",
+    "CARGO_TARGET_DIR": "/tmp/turso-json-canonical-target",
+    "CARGO_PROFILE_LIB_RELEASE_OPT_LEVEL": "3",
+    "CARGO_PROFILE_LIB_RELEASE_DEBUG": "0",
+    "CARGO_PROFILE_LIB_RELEASE_CODEGEN_UNITS": "16",
+    "CARGO_PROFILE_LIB_RELEASE_LTO": "false",
+    "CARGO_PROFILE_LIB_RELEASE_PANIC": "unwind",
+    "RUSTC": "/home/runner/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc"
+  },
+  "binaries": {
+    "fork": {
+      "json_extract_allocations": "e8b753c0d3cd525829ea910e5b813fa40f3d28456bcd2ee7b0a0346445e88583",
+      "json_benchmark": "8dfa161fa9a380ceab3d6c8a9bd5bdf37ca3993290171c8514c78d6e5b2a02c3"
+    },
+    "candidate": {
+      "json_extract_allocations": "423c06ee470458ce235da654f69474f92e37d041ce1929bd8f61f1a4baeeb5d7",
+      "json_benchmark": "5477c8baaee343cca5428d77550ca9589cb3a844cf4495cb4a6dddb5676254a4"
+    },
+    "static": {
+      "json_extract_allocations": "9a71339ce53d4be0c910a993dce8ff39dd24bad93fa12ebc92f4cf47d77801fa",
+      "json_benchmark": "87e714296ad5caf020d353f52fb1a415775c699f566e2bbf607ac4df809c222c"
+    },
+    "upstream": {
+      "json_extract_allocations": "d3e4e6a682eec132b2f51a5ec8266002641d61a449836cc5f53f4530be80b7f4",
+      "json_benchmark": "5661c38c4eeec8b154ca464d2435b3b4cadffc645949ed1f5bf5822df566a184"
+    }
+  }
+}
