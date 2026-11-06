@@ -16,6 +16,31 @@ pub(super) struct InitialIds {
     pub selector: Vec<u8>,
 }
 impl InitialIds {
+    /// Accepts only the fixed, unused namespace image produced by `new`.
+    pub(super) fn validate(
+        database_id: FileId,
+        database: DatabaseGeneration,
+        bank_a: &[u8],
+        bank_b: &[u8],
+        selector: &[u8],
+    ) -> Result<i64> {
+        if bank_a.len() != 2 * PAGE_SIZE || !bank_b.is_empty() || selector.len() != 2 * PAGE_SIZE {
+            return Err(corrupt("recovery requires initial ID journal lengths"));
+        }
+        let selected = select(
+            [&selector[..PAGE_SIZE], &selector[PAGE_SIZE..]],
+            [bank_a, bank_b],
+            database_id,
+            database,
+        )?;
+        let state = replay_selected(selected, [bank_a, bank_b])?;
+        let expected = Self::new(database_id, database, state.logical_floor)?;
+        if expected.bank_a != bank_a || expected.selector != selector {
+            return Err(corrupt("recovery requires the unused initial ID snapshot"));
+        }
+        Ok(state.logical_floor)
+    }
+
     /// Bank B is an existing empty file. The caller synchronizes both banks and selector
     /// before publishing the marked database, and supplies the materialized logical floor.
     pub(super) fn new(
@@ -388,6 +413,57 @@ fn corrupt(message: &str) -> LimboError {
 
 #[cfg(test)]
 mod codec {
+    #[test]
+    fn recovery_initial_ids_require_exact_initial_snapshot() {
+        let id = crate::io::FileId { dev: 17, ino: 23 };
+        let generation = super::DatabaseGeneration {
+            generation: 1,
+            checkpoint_timestamp: 31,
+        };
+        let initial = super::InitialIds::new(id, generation, -700).unwrap();
+        assert_eq!(
+            super::InitialIds::validate(id, generation, &initial.bank_a, &[], &initial.selector)
+                .unwrap(),
+            -700
+        );
+        assert!(super::InitialIds::validate(
+            id,
+            generation,
+            &initial.bank_a,
+            &[0],
+            &initial.selector
+        )
+        .is_err());
+        let mut trailing = initial.bank_a.clone();
+        trailing.push(0);
+        assert!(
+            super::InitialIds::validate(id, generation, &trailing, &[], &initial.selector).is_err()
+        );
+        let mut damaged = initial.selector.clone();
+        damaged[16] ^= 1;
+        assert!(
+            super::InitialIds::validate(id, generation, &initial.bank_a, &[], &damaged).is_err()
+        );
+        assert!(super::InitialIds::validate(
+            crate::io::FileId { dev: 17, ino: 24 },
+            generation,
+            &initial.bank_a,
+            &[],
+            &initial.selector
+        )
+        .is_err());
+        assert!(super::InitialIds::validate(
+            id,
+            super::DatabaseGeneration {
+                generation: 2,
+                ..generation
+            },
+            &initial.bank_a,
+            &[],
+            &initial.selector
+        )
+        .is_err());
+    }
     #[test]
     fn initial_ids_mirror_a_valid_quiescent_floor_snapshot() {
         let id = crate::io::FileId { dev: 17, ino: 23 };
