@@ -12,6 +12,7 @@ pub(super) const RECORD_SIZE: usize = 128;
 const MAGIC: [u8; 8] = *b"TMVCCM01";
 const VERSION: u32 = 1;
 const CHECKPOINT_INTENT_VERSION: u32 = 2;
+const DOWNGRADE_INTENT_VERSION: u32 = 3;
 const CHECKSUM_OFFSET: usize = 124;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,14 +67,29 @@ impl ManifestRecord {
         self.checkpoint.is_some() || self.downgrade.is_some()
     }
 
-    pub(super) fn begin_downgrade(self, _basename_wal_id: FileId) -> Result<Self> {
-        Err(LimboError::InvalidArgument(
-            "downgrade codec is not implemented".into(),
-        ))
+    /// Encodes a transition request, not proof that physical materialization finished.
+    /// Only the future coordinator-owned quiescent token may authorize publication.
+    pub(super) fn begin_downgrade(mut self, basename_wal_id: FileId) -> Result<Self> {
+        if self.requires_recovery()
+            || self.prefix.end_offset != 0
+            || self.log_salt != 0
+            || basename_wal_id.dev != self.database_id.dev
+            || basename_wal_id == self.database_id
+        {
+            return Err(LimboError::InvalidArgument(
+                "invalid shared downgrade source".into(),
+            ));
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        self.downgrade = Some(DowngradeIntent { basename_wal_id });
+        Ok(self)
     }
 
     pub(super) fn begin_checkpoint(mut self, source_checkpoint_timestamp: u64) -> Result<Self> {
-        if self.checkpoint.is_some()
+        if self.requires_recovery()
             || source_checkpoint_timestamp > self.prefix.committed_timestamp
             || (self.prefix.end_offset == 0
                 && source_checkpoint_timestamp != self.prefix.committed_timestamp)
@@ -128,7 +144,9 @@ impl ManifestRecord {
     pub(super) fn encode(self) -> [u8; RECORD_SIZE] {
         let mut bytes = [0; RECORD_SIZE];
         bytes[..8].copy_from_slice(&MAGIC);
-        let version = if self.checkpoint.is_some() {
+        let version = if self.downgrade.is_some() {
+            DOWNGRADE_INTENT_VERSION
+        } else if self.checkpoint.is_some() {
             CHECKPOINT_INTENT_VERSION
         } else {
             VERSION
@@ -151,6 +169,10 @@ impl ManifestRecord {
             bytes[80..88].copy_from_slice(&intent.source_checkpoint_timestamp.to_le_bytes());
             bytes[88..96].copy_from_slice(&intent.target_generation.to_le_bytes());
         }
+        if let Some(intent) = self.downgrade {
+            bytes[80..88].copy_from_slice(&intent.basename_wal_id.dev.to_le_bytes());
+            bytes[88..96].copy_from_slice(&intent.basename_wal_id.ino.to_le_bytes());
+        }
         let checksum = crc32c::crc32c(&bytes[..CHECKSUM_OFFSET]);
         bytes[CHECKSUM_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
         bytes
@@ -170,7 +192,12 @@ impl ManifestRecord {
             return Ok(None);
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if bytes[..8] != MAGIC || !matches!(version, VERSION | CHECKPOINT_INTENT_VERSION) {
+        if bytes[..8] != MAGIC
+            || !matches!(
+                version,
+                VERSION | CHECKPOINT_INTENT_VERSION | DOWNGRADE_INTENT_VERSION
+            )
+        {
             return Err(LimboError::InvalidArgument(
                 "incompatible MVCC commit manifest format".into(),
             ));
@@ -215,6 +242,21 @@ impl ManifestRecord {
                 target_generation,
             });
         }
+        if version == DOWNGRADE_INTENT_VERSION {
+            let basename_wal_id = FileId {
+                dev: read_u64(80),
+                ino: read_u64(88),
+            };
+            if record.sequence < 2
+                || record.prefix.end_offset != 0
+                || record.log_salt != 0
+                || basename_wal_id.dev != record.database_id.dev
+                || basename_wal_id == record.database_id
+            {
+                return Err(LimboError::Corrupt("invalid MVCC downgrade intent".into()));
+            }
+            record.downgrade = Some(DowngradeIntent { basename_wal_id });
+        }
         Ok(Some(record))
     }
 }
@@ -251,6 +293,23 @@ pub(super) fn select_latest(
         [Some(first), Some(second)] if first.sequence > second.sequence => (0, first, second),
         [Some(first), Some(second)] => (1, second, first),
     };
+    if previous.downgrade.is_some() {
+        return Err(LimboError::Corrupt(
+            "MVCC downgrade intent is terminal".into(),
+        ));
+    }
+    if newest.downgrade.is_some()
+        && (previous.requires_recovery()
+            || previous.sequence.checked_add(1) != Some(newest.sequence)
+            || previous.log_generation != newest.log_generation
+            || previous.prefix != newest.prefix
+            || previous.log_salt != 0
+            || newest.log_salt != 0)
+    {
+        return Err(LimboError::Corrupt(
+            "invalid MVCC downgrade manifest transition".into(),
+        ));
+    }
     let valid_checkpoint_transition = match (previous.checkpoint, newest.checkpoint) {
         (None, None) => true,
         (None, Some(_)) => {
