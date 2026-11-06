@@ -38,6 +38,8 @@ const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
+const MULTIPROCESS_FRESH_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_fresh_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -471,6 +473,79 @@ fn multiprocess_async_open_child_process() {
     let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(count_test_rows(&conn), 1);
+}
+
+#[test]
+fn multiprocess_open_reinitializes_unpublished_coordination_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("unpublished-header.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let shm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
+    // A creator that died after sizing the file but before publishing the header.
+    std::fs::File::create(&shm_path)
+        .unwrap()
+        .set_len(1 << 16)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key)")
+        .unwrap();
+}
+
+/// Concurrent first opens of a new database must all succeed.
+#[test]
+fn concurrent_fresh_multiprocess_open_succeeds() {
+    const ROUNDS: usize = 20;
+    const OPENERS: usize = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let current_exe = std::env::current_exe().unwrap();
+
+    for round in 0..ROUNDS {
+        let db_path = dir.path().join(format!("fresh-open-{round}.db"));
+        let start_file = dir.path().join(format!("start-{round}"));
+        let children: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                Command::new(&current_exe)
+                    .arg(MULTIPROCESS_FRESH_OPEN_CHILD_TEST)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env("TURSO_MULTIPROCESS_DB_PATH", &db_path)
+                    .env("TURSO_MULTIPROCESS_START_FILE", &start_file)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        std::fs::write(&start_file, b"go").unwrap();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "round {round}: concurrent fresh open failed: stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// Child half of `concurrent_fresh_multiprocess_open_succeeds`.
+#[test]
+fn multiprocess_fresh_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let start_file = std::env::var_os("TURSO_MULTIPROCESS_START_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    wait_for_file(&start_file);
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let _db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
 }
 
 /// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
@@ -3130,4 +3205,219 @@ fn subprocess_idle_begin_sees_table_created_by_other_process() {
     let rows = result.unwrap();
     assert_eq!(rows.len(), 1);
     conn.execute("commit").unwrap();
+}
+
+#[test]
+fn old_shared_index_capacity_rebuilds_from_wal_on_exclusive_open() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgrade.db");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), path.to_str().unwrap()).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("CREATE TABLE test(id INTEGER)").unwrap();
+        conn.execute("INSERT INTO test VALUES(42)").unwrap();
+    }
+    DATABASE_MANAGER.lock().clear();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.with_extension("db-tshm"))
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let mut version = [0; 4];
+    file.read_exact(&mut version).unwrap();
+    assert_eq!(u32::from_le_bytes(version), 1);
+    file.seek(SeekFrom::Start(28)).unwrap();
+    file.write_all(&64u32.to_le_bytes()).unwrap();
+    file.seek(SeekFrom::Start(36)).unwrap();
+    file.write_all(&(64u32 * 4096).to_le_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    assert!(db
+        .shared_wal
+        .read()
+        .metadata
+        .loaded_from_disk_scan
+        .load(Ordering::Acquire));
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM test")[0][0]
+            .as_int()
+            .unwrap(),
+        42
+    );
+    conn.execute("INSERT INTO test VALUES(43)").unwrap();
+    assert_eq!(count_test_rows(&conn), 2);
+}
+
+#[test]
+#[ignore = "writes about 150 MB to cross the shared-index capacity"]
+fn sql_reopened_writer_grows_shared_index_with_old_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sql-overflow.db");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), path.to_str().unwrap()).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("PRAGMA page_size = 512").unwrap();
+        conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value BLOB)")
+            .unwrap();
+        conn.execute("INSERT INTO test VALUES (1, X'616263')")
+            .unwrap();
+        assert_eq!(
+            get_rows(&conn, "PRAGMA page_size")[0][0].as_int().unwrap(),
+            512
+        );
+    }
+    DATABASE_MANAGER.lock().clear();
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    assert!(!db
+        .shared_wal
+        .read()
+        .metadata
+        .loaded_from_disk_scan
+        .load(Ordering::Acquire));
+    assert!(db.shared_wal.read().runtime.frame_cache.lock().is_empty());
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(count_test_rows(&reader), 1);
+    conn.execute("INSERT INTO test VALUES (2, zeroblob(140000000))")
+        .unwrap();
+    assert!(authority.snapshot().max_frame > 262144);
+    assert!(!authority.frame_index_overflowed());
+    assert_eq!(count_test_rows(&reader), 1);
+    assert_eq!(
+        get_rows(&conn, "SELECT length(value) FROM test WHERE id=2")[0][0]
+            .as_int()
+            .unwrap(),
+        140000000
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    reader.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO test VALUES (3, X'646566')")
+        .unwrap();
+    assert_eq!(count_test_rows(&conn), 3);
+}
+
+#[test]
+#[ignore = "writes about 150 MB across two processes"]
+fn subprocess_reopened_writer_grows_shared_index_with_old_reader() {
+    let dir = tempfile::tempdir().expect("create test directory");
+    let path = dir.path().join("subprocess-growth.db");
+    let db_path = path.to_str().expect("UTF-8 database path");
+    let ready = dir.path().join("reader-ready");
+    let release = dir.path().join("reader-release");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), db_path).expect("open initial writer");
+        let conn = db
+            .connect(ConnectOpts::new())
+            .expect("connect initial writer");
+        conn.wal_auto_actions_disable();
+        conn.execute("PRAGMA page_size = 512")
+            .expect("set page size");
+        conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value BLOB)")
+            .expect("create table");
+        conn.execute("INSERT INTO test VALUES (1, X'616263')")
+            .expect("insert original row");
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "multiprocess_tests::multiprocess_growth_reader_child_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("TURSO_MULTIPROCESS_DB_PATH", &path)
+            .env("TURSO_MULTIPROCESS_READY_FILE", &ready)
+            .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start reader process");
+        wait_for_file(&ready);
+        drop(conn);
+        drop(db);
+        remove_file_from_database_registry(db_path);
+        let db = open_multiprocess_db(io, db_path).expect("reopen writer");
+        assert!(!db
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        let conn = db
+            .connect(ConnectOpts::new())
+            .expect("connect reopened writer");
+        conn.wal_auto_actions_disable();
+        conn.execute("INSERT INTO test VALUES (2, zeroblob(140000000))")
+            .expect("grow WAL beyond former capacity");
+        let authority = db
+            .shared_wal_coordination()
+            .expect("get authority")
+            .expect("shared authority");
+        assert!(authority.snapshot().max_frame > 262144);
+        assert!(!authority.frame_index_overflowed());
+        std::fs::write(&release, b"done").expect("release reader");
+        let output = child.wait_with_output().expect("wait for reader");
+        assert!(
+            output.status.success(),
+            "reader failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn multiprocess_growth_reader_child_process() {
+    let Some(path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE").expect("ready path");
+    let release = std::path::PathBuf::from(
+        std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE").expect("release path"),
+    );
+    let db = open_multiprocess_db(
+        multiprocess_test_io(),
+        path.to_str().expect("UTF-8 database path"),
+    )
+    .expect("open reader");
+    let conn = db.connect(ConnectOpts::new()).expect("connect reader");
+    conn.execute("BEGIN").expect("begin old snapshot");
+    assert_eq!(count_test_rows(&conn), 1);
+    std::fs::write(ready, b"ready").expect("announce snapshot");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer did not finish growth"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(count_test_rows(&conn), 1);
+    conn.execute("ROLLBACK").expect("release old snapshot");
+    assert_eq!(count_test_rows(&conn), 2);
+    assert_eq!(
+        get_rows(&conn, "SELECT length(value) FROM test WHERE id=2")[0][0]
+            .as_int()
+            .expect("blob length"),
+        140000000
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
 }
