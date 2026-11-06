@@ -290,6 +290,11 @@ impl Database {
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
         {
             let mut syms = self.builtin_syms.write();
+            #[cfg(feature = "experimental_dense_ivf")]
+            syms.index_methods.insert(
+                crate::index_method::experimental_dense_ivf::NAME.to_string(),
+                Arc::new(crate::index_method::experimental_dense_ivf::DenseIvf),
+            );
             syms.index_methods.insert(
                 TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME.to_string(),
                 Arc::new(VectorSparseInvertedIndexMethod),

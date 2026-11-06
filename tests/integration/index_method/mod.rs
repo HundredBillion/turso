@@ -1,3 +1,5 @@
+#[cfg(feature = "experimental_dense_ivf")]
+mod dense_ivf;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 mod json;
 

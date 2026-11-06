@@ -63,6 +63,7 @@ crossbeam-epoch = "0.9.18"
 
 [features]
 default = ["test_helper", "fts", "io_uring"]
+experimental_dense_ivf = ["turso_core/experimental_dense_ivf"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]

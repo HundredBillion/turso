@@ -569,6 +569,25 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             }
             Some(captured)
         }
+        #[cfg(feature = "experimental_dense_ivf")]
+        (
+            Expr::Binary(left, ast::Operator::Equals, right),
+            Expr::Binary(query_left, ast::Operator::Equals, query_right),
+        ) => {
+            let mut left = try_capture_parameters(left, query_left)?;
+            for (key, value) in try_capture_parameters(right, query_right)? {
+                if left
+                    .get(&key)
+                    .is_some_and(|old| !exprs_are_equivalent(old, &value))
+                {
+                    return None;
+                }
+                left.insert(key, value);
+            }
+            Some(left)
+        }
+        #[cfg(feature = "experimental_dense_ivf")]
+        (Expr::RowId { .. }, Expr::RowId { .. }) if pattern == query => Some(captured),
         (Expr::Variable(var), expr) => {
             // Named parameters (:x) are not placeholders; positional ones —
             // bare ? and explicit ?N — are.

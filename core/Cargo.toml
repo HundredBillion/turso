@@ -32,6 +32,7 @@ baseline = [
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+experimental_dense_ivf = []
 # Harness-side observability: turns on aristo's instrument surface so the
 # logical-log conformance DTs can read private LogicalLog state (header
 # version, pending running CRC) and construct LogRecords. Off by default;

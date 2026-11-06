@@ -22,6 +22,8 @@ use crate::{
 
 pub mod backing_btree;
 pub mod backing_store;
+#[cfg(feature = "experimental_dense_ivf")]
+pub mod experimental_dense_ivf;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 pub mod fts;
 pub mod toy_vector_sparse_ivf;
