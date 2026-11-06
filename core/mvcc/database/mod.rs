@@ -1003,6 +1003,15 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Flag: a depended-on transaction aborted; this transaction must abort too.
     /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
     abort_now: AtomicBool,
+    /// A peer commit replaced a version this local writer intended to change.
+    peer_conflicted: AtomicBool,
+    #[cfg(test)]
+    before_chain_mutation: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// Transaction IDs that depend on this transaction (notified on commit/abort).
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
@@ -1050,9 +1059,30 @@ impl<A: RowVersionAllocator> Transaction<A> {
             log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
+            peer_conflicted: AtomicBool::new(false),
+            #[cfg(test)]
+            before_chain_mutation: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn ensure_peer_unconflicted(&self) -> Result<()> {
+        if self.peer_conflicted.load(Ordering::Acquire) {
+            return Err(LimboError::WriteWriteConflict);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_before_chain_mutation(&self) {
+        let hook = self.before_chain_mutation.lock().take();
+        if let Some((arrived, resume)) = hook {
+            arrived.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap();
         }
     }
 
@@ -3096,6 +3126,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         turso_assert_eq!(tx.state, TransactionState::Active);
                     }
                 }
+
+                tx.ensure_peer_unconflicted()?;
 
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
@@ -5467,6 +5499,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
+        #[cfg(test)]
+        tx.pause_before_chain_mutation();
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5548,6 +5583,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5687,6 +5723,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
+        #[cfg(test)]
+        tx.pause_before_chain_mutation();
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -5709,6 +5748,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     if !self.index_versions_still_mapped(rows, &arc_key, &row_versions) {
                         continue;
                     }
+                    tx.ensure_peer_unconflicted()?;
                     let chain_in_write_set =
                         chain_has_version_written_by(&locked_row_versions, tx_id);
                     for rv in locked_row_versions.iter_mut().rev() {
@@ -5762,6 +5802,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if !self.table_versions_still_mapped(&id, &row_versions) {
                     continue;
                 }
+                tx.ensure_peer_unconflicted()?;
                 let chain_in_write_set = chain_has_version_written_by(&locked_row_versions, tx_id);
                 for rv in locked_row_versions.iter_mut().rev() {
                     // A transaction cannot delete a version that it cannot see.
@@ -8755,11 +8796,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is inserted in the correct order. Returns a reference to the modified version chain,
     /// and whether the chain was already in the write set of the transaction that created
     /// `row_version`.
-    fn insert_version(
-        &self,
-        id: RowID,
-        row_version: RowVersion,
-    ) -> Result<(RowVersions<A>, bool), TryReserveError> {
+    fn insert_version(&self, id: RowID, row_version: RowVersion) -> Result<(RowVersions<A>, bool)> {
         // Retry if GC unlinked this slot while we waited for the write lock.
         loop {
             let row_versions = self.get_or_create_table_row_versions(id.clone())?;
@@ -8767,12 +8804,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.table_versions_still_mapped(&id, &row_versions) {
                 continue;
             }
+            self.ensure_version_writer_unconflicted(&row_version)?;
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
             self.bump_table_rows_epoch();
             return Ok((row_versions, chain_in_write_set));
         }
+    }
+
+    // Call while holding the chain lock: the peer importer marks conflicting writers
+    // under that same lock before replacing any pending end tags.
+    fn ensure_version_writer_unconflicted(&self, version: &RowVersion) -> Result<()> {
+        for timestamp in [version.begin(), version.end()] {
+            if let Some(TxTimestampOrID::TxID(tx_id)) = timestamp {
+                let tx = self
+                    .txs
+                    .get(&tx_id)
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                tx.value().ensure_peer_unconflicted()?;
+            }
+        }
+        Ok(())
     }
 
     /// True if `arc` is still the mapped value for `id`.
@@ -8844,6 +8897,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
             }
+            self.ensure_version_writer_unconflicted(&row_version)?;
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);

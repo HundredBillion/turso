@@ -434,7 +434,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let result = store.insert_version(row_id, row_version);
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
     assert!(store.rows.is_empty());
 }
 
@@ -8036,6 +8036,8 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
+        peer_conflicted: AtomicBool::new(false),
+        before_chain_mutation: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
@@ -9827,6 +9829,8 @@ fn transaction_display() {
         log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
+        peer_conflicted: AtomicBool::new(false),
+        before_chain_mutation: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
@@ -25755,4 +25759,114 @@ fn peer_import_header_cookie_change_does_not_hide_unknown_index() {
         .mvcc_store
         .prepare_recovery_frame(&db.conn, &ctx, frame)
         .is_err());
+}
+
+fn assert_peer_import_rejects_paused_writer(deleting: bool, index: bool) {
+    {
+        let db = MvccTestDb::new();
+        let row = if index {
+            let info = Arc::new(
+                crate::types::IndexInfo::new(
+                    crate::alloc::vec![crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
+                        nulls_order: None,
+                    }],
+                    false,
+                    1,
+                    false,
+                )
+                .unwrap(),
+            );
+            let record = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+            let key = SortableIndexKey::new_from_payload_in(&record, info, TursoAllocator).unwrap();
+            Row::new_index_row(RowID::new((-22).into(), RowKey::Record(Arc::new(key))))
+        } else {
+            generate_simple_string_row((-22).into(), 1, "local")
+        };
+        let id = row.id.clone();
+        db.mvcc_store.insert_table_id_to_rootpage(id.table_id, None);
+        let tx_id = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        let index_id = index.then_some(id.table_id);
+        db.mvcc_store
+            .insert_to_table_or_index(tx_id, row.clone(), index_id)
+            .unwrap();
+        let chain = if let RowKey::Record(key) = &id.row_id {
+            db.mvcc_store
+                .index_rows
+                .get(&id.table_id)
+                .unwrap()
+                .value()
+                .get(key)
+                .unwrap()
+                .value()
+                .clone()
+        } else {
+            db.mvcc_store.rows.get(&id).unwrap().value().clone()
+        };
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        *db.mvcc_store
+            .txs
+            .get(&tx_id)
+            .unwrap()
+            .value()
+            .before_chain_mutation
+            .lock() = Some((arrived_tx, resume_rx));
+        std::thread::scope(|scope| {
+            let store = &db.mvcc_store;
+            let writer = scope.spawn(move || {
+                if deleting {
+                    store
+                        .delete_from_table_or_index(tx_id, id, index_id, None)
+                        .map(|_| ())
+                } else {
+                    store.insert_to_table_or_index(tx_id, row, index_id)
+                }
+            });
+            arrived_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap();
+            {
+                let mut versions = chain.write();
+                db.mvcc_store
+                    .txs
+                    .get(&tx_id)
+                    .unwrap()
+                    .value()
+                    .peer_conflicted
+                    .store(true, Ordering::Release);
+                versions[0].set_end(Some(TxTimestampOrID::Timestamp(50)));
+            }
+            resume_tx.send(()).unwrap();
+            assert!(
+                matches!(writer.join().unwrap(), Err(LimboError::WriteWriteConflict)),
+                "stale writer proceeded: deleting={deleting}"
+            );
+        });
+        assert_eq!(chain.read().len(), 1);
+        assert_eq!(chain.read()[0].end(), Some(TxTimestampOrID::Timestamp(50)));
+        db.mvcc_store
+            .rollback_tx(tx_id, db.conn.pager.load().clone(), &db.conn, 0);
+    }
+}
+
+#[test]
+fn peer_import_rejects_table_insert_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(false, false);
+}
+#[test]
+fn peer_import_rejects_table_delete_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(true, false);
+}
+#[test]
+fn peer_import_rejects_index_insert_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(false, true);
+}
+#[test]
+fn peer_import_rejects_index_delete_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(true, true);
 }

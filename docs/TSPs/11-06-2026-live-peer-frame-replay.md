@@ -63,3 +63,20 @@
 ## Remaining delivery boundaries
 
 This work does not replace mode-marker upgrade/downgrade, global row/table/sequence reservations, quiescent checkpoint/reclamation, retained-log-cap admission, validated C/PHP URI plumbing or full PHP-worker acceptance. All remain required before issue completion.
+
+## Execution evidence (partial)
+
+Frame preparation and schema-cookie staging are implemented in `ebc2e3932`,
+`350193f39`, and `e89b45992`. Savepoint rollback now clears only transaction-owned
+end tags. The existing recovery suite passed 51 tests; savepoint coverage passed
+21 tests.
+
+The writer race fixture pauses real table/index insert and delete calls after
+initial transaction validation, then simulates a peer installing a committed end
+under the same chain lock. The original table insert resumed successfully, which
+is the observed behavioral red. Mutation guards now return WriteWriteConflict
+under the chain lock; all four race variants and the three earlier peer-import
+regressions pass. The broader MVCC database suite passes 539 tests with 6 ignored.
+The private conflict flag is not yet set by a production importer. SQL result and
+admission checks, atomic frame installation and all Task 3 integration remain
+unfinished; these tests do not establish end-to-end shared-mode behavior.
