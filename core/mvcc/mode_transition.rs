@@ -1,6 +1,6 @@
 use super::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
 use super::shared_authority::PublishedPrefix;
-use super::shared_ids::{DatabaseGeneration, InitialIds, INITIAL_RETAINED_BYTES};
+use super::shared_ids::{DatabaseGeneration, InitialIds, MIN_HISTORY_LIMIT};
 use crate::io::FileId;
 use crate::{LimboError, Result};
 use std::fs::{self, File, OpenOptions};
@@ -58,9 +58,9 @@ impl<B: OfflineBackend> OfflineModeChange<B> {
     }
 
     pub(super) fn upgrade(&mut self) -> Result<()> {
-        if self.history_limit < INITIAL_RETAINED_BYTES {
+        if self.history_limit < MIN_HISTORY_LIMIT {
             return Err(LimboError::InvalidArgument(
-                "shared MVCC history limit must fit the initial ID journal".into(),
+                "shared MVCC history limit must be at least 32 KiB".into(),
             ));
         }
         require_linux_platform()?;
@@ -266,9 +266,9 @@ fn prepare_namespace(
     logical_floor: i64,
     history_limit: u64,
 ) -> Result<()> {
-    if history_limit < INITIAL_RETAINED_BYTES {
+    if history_limit < MIN_HISTORY_LIMIT {
         return Err(LimboError::InvalidArgument(
-            "shared MVCC history limit must fit the initial ID journal".into(),
+            "shared MVCC history limit must be at least 32 KiB".into(),
         ));
     }
     let ids = InitialIds::new(
@@ -691,15 +691,38 @@ pub(super) mod tests {
 
     #[test]
     fn mode_transition_invalid_limit_rejects_before_backend_work() {
+        for limit in [0, MIN_HISTORY_LIMIT - 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("existing.db");
+            let backend = PagerBackend::create(&path);
+            let touched = backend.materialized.clone();
+            let mut transition =
+                OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, limit);
+            let error = transition.upgrade().unwrap_err();
+            assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(error.to_string().contains("history limit"));
+        }
+    }
+
+    #[test]
+    fn mode_transition_invalid_id_floor_preserves_existing_namespace() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing.db");
-        let backend = PagerBackend::create(&path);
-        let touched = backend.materialized.clone();
-        let mut transition =
-            OfflineModeChange::new(backend, OfflinePrerequisite::AllOlderWorkersStopped, 0);
-        let error = transition.upgrade().unwrap_err();
-        assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(error.to_string().contains("history limit"));
+        let namespace = dir.path().join("existing");
+        fs::create_dir(&namespace).unwrap();
+        fs::write(namespace.join("logical"), b"existing bytes").unwrap();
+        let result = prepare_namespace(
+            &namespace,
+            FileId { dev: 1, ino: 2 },
+            0,
+            0,
+            MIN_HISTORY_LIMIT,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(namespace.join("logical")).unwrap(),
+            b"existing bytes"
+        );
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 1);
     }
 
     #[test]

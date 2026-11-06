@@ -18,6 +18,8 @@ pub(super) struct SharedMvccFiles {
     pub physical_coordination: Arc<MappedSharedWalCoordination>,
     pub authority: Arc<SharedMvccAuthority>,
     pub namespace: PathBuf,
+    pub id_banks: [Arc<dyn File>; 2],
+    pub id_selector: Arc<dyn File>,
 }
 
 impl SharedMvccFiles {
@@ -69,6 +71,28 @@ impl SharedMvccFiles {
         let coordination_native =
             NativeFile::open(&namespace.join("physical-tshm"), database_id.dev)?;
         let authority_native = NativeFile::open(&namespace.join("authority"), database_id.dev)?;
+        let ids_native = [
+            NativeFile::open(&namespace.join("ids-a"), database_id.dev)?,
+            NativeFile::open(&namespace.join("ids-b"), database_id.dev)?,
+            NativeFile::open(&namespace.join("ids-selector"), database_id.dev)?,
+        ];
+        let other_ids = [
+            database_id,
+            logical_native.id,
+            manifest_native.id,
+            wal_native.id,
+            coordination_native.id,
+            authority_native.id,
+        ];
+        for (index, file) in ids_native.iter().enumerate() {
+            if other_ids.contains(&file.id)
+                || ids_native[..index].iter().any(|other| other.id == file.id)
+            {
+                return Err(LimboError::InvalidArgument(
+                    "shared ID journals must have distinct native file identities".into(),
+                ));
+            }
+        }
         if manifest_native.file.metadata().map_err(fs_error)?.len() != (SLOT_SIZE * 2) as u64 {
             return Err(LimboError::Corrupt(
                 "invalid shared MVCC manifest length".into(),
@@ -84,6 +108,26 @@ impl SharedMvccFiles {
             &namespace.join("logical"),
             content_flags,
             logical_native.id,
+        )?;
+        let id_banks = [
+            open_verified(
+                &io,
+                &namespace.join("ids-a"),
+                OpenFlags::NoLock,
+                ids_native[0].id,
+            )?,
+            open_verified(
+                &io,
+                &namespace.join("ids-b"),
+                OpenFlags::NoLock,
+                ids_native[1].id,
+            )?,
+        ];
+        let id_selector = open_verified(
+            &io,
+            &namespace.join("ids-selector"),
+            OpenFlags::NoLock,
+            ids_native[2].id,
         )?;
         let manifest = open_verified(
             &io,
@@ -119,6 +163,8 @@ impl SharedMvccFiles {
             physical_coordination,
             authority,
             namespace,
+            id_banks,
+            id_selector,
         })
     }
 }
@@ -271,6 +317,78 @@ mod tests {
                 crate::io::get_file_id(namespace.join("physical-tshm").to_str().unwrap()).unwrap()
             )
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_files_id_journals_are_writable_for_readonly_participants() {
+        let (_dir, path, io, main, id) = native_fixture();
+        let namespace = namespace_for(&path, id).unwrap();
+        let paths = ["ids-a", "ids-b", "ids-selector"].map(|name| namespace.join(name));
+        let before = paths.each_ref().map(|path| std::fs::read(path).unwrap());
+        let files =
+            SharedMvccFiles::open_existing(io.clone(), main, id, &path, 65536, true).unwrap();
+        let _guard = files.authority.try_acquire().unwrap();
+        for (file, index) in [(&files.id_banks[0], 0), (&files.id_selector, 2)] {
+            let buffer = Arc::new(crate::Buffer::new_temporary(before[index].len()));
+            buffer.as_mut_slice().copy_from_slice(&before[index]);
+            let completion = file
+                .pwrite(0, buffer, crate::Completion::new_write(|_| {}))
+                .unwrap();
+            io.wait_for_completion(completion).unwrap();
+            assert_eq!(
+                file.file_id().unwrap(),
+                Some(crate::io::get_file_id(paths[index].to_str().unwrap()).unwrap())
+            );
+        }
+        let completion = files.id_banks[1]
+            .truncate(0, crate::Completion::new_trunc(|_| {}))
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        assert_eq!(
+            paths.each_ref().map(|path| std::fs::read(path).unwrap()),
+            before
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_files_rejects_id_aliases_and_symlinks_without_mutation() {
+        for (target, source, symlink) in [
+            ("ids-a", "ids-b", false),
+            ("ids-selector", "manifest", false),
+            ("ids-b", "main", false),
+            ("ids-a", "ids-b", true),
+        ] {
+            let (_dir, path, io, main, id) = native_fixture();
+            let namespace = namespace_for(&path, id).unwrap();
+            let target = namespace.join(target);
+            let source = if source == "main" {
+                path.clone()
+            } else {
+                namespace.join(source)
+            };
+            std::fs::remove_file(&target).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&source, &target).unwrap();
+            } else {
+                std::fs::hard_link(&source, &target).unwrap();
+            }
+            let main_before = std::fs::read(&path).unwrap();
+            let before: Vec<_> = std::fs::read_dir(&namespace)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect();
+            assert!(SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), main_before);
+            for (path, bytes) in before {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]
