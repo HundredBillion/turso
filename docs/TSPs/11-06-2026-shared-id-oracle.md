@@ -75,3 +75,25 @@ expectations, type complexity, redundant clones, and detached futures. An initia
 strict library invocation stopped on the pre-existing JSON cache's unfulfilled
 `new_without_default` expectation; no source allowance was added there. Changed
 Rust files pass formatting and whitespace checks.
+
+### Checked temporary transaction ownership
+
+The runtime constructor takes the requesting connection, a continuously held publication guard,
+and the recovered ID identity. It validates the guard's authority, the replay context's exact
+manifest generation/prefix and materialized base, and the local committed frontier. A local
+Preparing transaction makes construction return BUSY, because ordinary MVCC visibility can
+otherwise read its speculative versions. The oracle uses checked committed timestamp + 1,
+without a new global registration, and a separate pinned-read pager. Its local transaction
+protects local version retention; its retained I/O pin protects the physical generation.
+
+The opaque context supplies its own store and transaction ID to the adapter. Dropping it rolls
+back only that temporary transaction and releases only its pager read mark. The adapter must
+drop cursors before the context. Detached physical callbacks retain their own authority pins,
+so cancellation cannot allow checkpoint mutation before backend retirement. A caller-provided
+pager or a connection from another runtime cannot establish this provenance.
+
+The adapter creates this context lazily for each query and drops its cursor and context before
+returning a fact. It stores no context while ID journals load, reconcile dead owners, or append.
+Keeping the context's authority pin for the entire reservation operation would deadlock those
+stages' physical-retirement waits. Any callback retained after a fact still owns its individual
+read pin, so the journal cannot acknowledge through an outstanding read.

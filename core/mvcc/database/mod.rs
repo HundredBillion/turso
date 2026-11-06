@@ -78,7 +78,13 @@ mod shared_refresh;
 pub(crate) const SHARED_MVCC_VERSION: u8 = crate::mvcc::mode_transition::SHARED_MVCC_VERSION;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
+mod shared_oracle;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
 mod shared_runtime;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
@@ -999,6 +1005,8 @@ enum BeginTimestamp {
     Local,
     #[cfg(host_shared_wal)]
     Shared(super::shared_authority::SnapshotRegistration),
+    #[cfg(host_shared_wal)]
+    SharedOracle(u64),
 }
 
 /// Transaction
@@ -7107,6 +7115,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             BeginTimestamp::Local => None,
             #[cfg(host_shared_wal)]
             BeginTimestamp::Shared(registration) => Some(registration.begin_timestamp),
+            #[cfg(host_shared_wal)]
+            BeginTimestamp::SharedOracle(timestamp) => Some(*timestamp),
         };
         let mut snapshot = Some(snapshot);
         let mut publish = |ts| {
@@ -7142,6 +7152,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             );
             let transaction = match snapshot.take().expect("snapshot published once") {
                 BeginTimestamp::Local => transaction,
+                #[cfg(host_shared_wal)]
+                BeginTimestamp::SharedOracle(_) => transaction,
                 #[cfg(host_shared_wal)]
                 BeginTimestamp::Shared(registration) => {
                     let mut transaction = transaction;

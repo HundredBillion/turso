@@ -136,6 +136,27 @@ impl SharedMvccRuntime {
         }))
     }
 
+    pub(super) fn validate_oracle_identity(
+        &self,
+        guard: &crate::mvcc::shared_authority::AuthorityGuard,
+        identity: RecoveryIdentity,
+    ) -> Result<()> {
+        if !guard.belongs_to(&Arc::downgrade(&self.files.authority))
+            || guard.published()? != identity.prefix
+            || !guard.incarnation_ready()?
+            || !self
+                .replay
+                .lock()
+                .as_ref()
+                .is_some_and(|replay| replay.matches_oracle_identity(identity))
+        {
+            return Err(LimboError::InvalidArgument(
+                "oracle requires exact refreshed shared identity".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn main_file(&self) -> Arc<dyn File> {
         self.main.clone()
     }
@@ -722,4 +743,92 @@ fn shared_runtime_export_fixture_for_release_probe() {
     let (path, limit) = shared_runtime_fixture(directory);
     std::fs::write(directory.join("history-limit"), limit.to_string()).unwrap();
     println!("prepared fixture {}", path.display());
+}
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_oracle_native_keeps_outer_snapshot_and_rejects_unresolved_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let db = crate::Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    )
+    .unwrap();
+    let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+    let store = db.get_mv_store().as_ref().unwrap().clone();
+    let base_timestamp = store.last_committed_tx_ts.load(Ordering::Acquire);
+    connection
+        .execute("UPDATE preserved SET value='oracle committed' WHERE id=1")
+        .unwrap();
+    connection.execute("BEGIN CONCURRENT").unwrap();
+    connection.execute("SELECT * FROM preserved").unwrap();
+    let store = db.get_mv_store().as_ref().unwrap().clone();
+    let runtime = store.shared_runtime.get().unwrap();
+    let outer = connection.get_mv_tx();
+    let before = store.txs.iter().count();
+    assert!(connection.get_pager().holds_read_lock());
+    let guard = runtime.files.authority.try_acquire().unwrap();
+    let mut load =
+        ManifestLoad::new(runtime.files.manifest.clone(), guard, runtime.database_id).unwrap();
+    let loaded = loop {
+        match load.poll().unwrap() {
+            IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+            IOResult::Done(loaded) => break loaded,
+        }
+    };
+    let identity = RecoveryIdentity {
+        database: DatabaseGeneration {
+            generation: loaded.record().log_generation(),
+            checkpoint_timestamp: base_timestamp,
+        },
+        prefix: loaded.record().prefix(),
+    };
+    assert!(identity.prefix.committed_timestamp > identity.database.checkpoint_timestamp);
+    let guard = loaded.into_guard().unwrap();
+    let registrations = guard.live_registrations().unwrap().len();
+    let mut stale = identity;
+    stale.database.generation += 1;
+    assert!(store
+        .begin_shared_oracle(&connection, &guard, stale)
+        .is_err());
+    let oracle = store
+        .begin_shared_oracle(&connection, &guard, identity)
+        .unwrap();
+    assert!(oracle.matches_guard(&guard));
+    assert_eq!(store.txs.iter().count(), before + 1);
+    assert_eq!(guard.live_registrations().unwrap().len(), registrations);
+    assert!(!guard.io_retired(), "oracle scope must retain authority");
+    assert_eq!(connection.get_mv_tx(), outer);
+    let temporary = oracle.tx_id();
+    drop(oracle);
+    assert!(store.txs.get(&temporary).is_none());
+    assert_eq!(store.txs.iter().count(), before);
+    assert_eq!(connection.get_mv_tx(), outer);
+    assert!(connection.get_pager().holds_read_lock());
+    let outer_id = outer.unwrap().0;
+    store
+        .txs
+        .get(&outer_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(
+            identity.prefix.committed_timestamp + 1,
+        ));
+    assert!(matches!(
+        store.begin_shared_oracle(&connection, &guard, identity),
+        Err(LimboError::Busy)
+    ));
+    store
+        .txs
+        .get(&outer_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Active);
+    guard.finish().unwrap();
+    connection.execute("ROLLBACK").unwrap();
 }
