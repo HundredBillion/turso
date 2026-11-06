@@ -1423,3 +1423,7 @@ pub(super) mod journal {
         }
     }
 }
+
+#[cfg(all(test, not(shuttle)))]
+#[path = "shared_ids/native_process.rs"]
+mod native_process;

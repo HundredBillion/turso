@@ -467,7 +467,9 @@ fn invalid(message: &str) -> LimboError {
 mod tests {
     use super::*;
     use crate::io::{File, FileSyncType, SharedWalLockKind};
-    use crate::mvcc::shared_authority::{authority_for_test, SharedMvccAuthority};
+    use crate::mvcc::shared_authority::{
+        authority_for_test, authority_for_test_unreconciled, SharedMvccAuthority,
+    };
     use crate::sync::atomic::{AtomicBool, AtomicUsize};
 
     enum Mutation {
@@ -648,7 +650,9 @@ mod tests {
         identity: RecoveryIdentity,
     }
     fn fixture() -> Fixture {
-        let authority = authority_for_test(TestFile::new(100, Vec::new()));
+        fixture_with_authority(authority_for_test(TestFile::new(100, Vec::new())))
+    }
+    fn fixture_with_authority(authority: Arc<SharedMvccAuthority>) -> Fixture {
         let id = FileId { dev: 1, ino: 2 };
         let database = DatabaseGeneration {
             generation: 1,
@@ -2167,7 +2171,14 @@ mod tests {
     #[test]
     fn id_witness_abort_never_releases_authority_before_backend_retirement() {
         for cancel_at in 0..4 {
-            let f = writable_fixture();
+            let f = fixture_with_authority(authority_for_test_unreconciled(TestFile::new(
+                100,
+                Vec::new(),
+            )));
+            f.selector.writable.store(true, Ordering::Release);
+            let guard = f.authority.try_acquire().unwrap();
+            assert!(!guard.incarnation_ready().unwrap());
+            guard.finish().unwrap();
             f.selector.delay_mutations.store(true, Ordering::Release);
             let mut mirror = loaded(&f).mirror_current_witness().unwrap();
             for step in 0..=cancel_at {
@@ -2184,6 +2195,8 @@ mod tests {
                     f.selector.retire();
                     let mut guard = f.authority.try_acquire().unwrap();
                     guard.recover(f.identity.prefix).unwrap();
+                    assert!(!guard.incarnation_ready().unwrap());
+                    assert!(guard.register_snapshot().is_err());
                     guard.finish().unwrap();
                     break;
                 }
