@@ -1795,6 +1795,20 @@ impl StreamingLogicalLogReader {
         encrypted_payload_chunk_size: usize,
     ) -> Self {
         let file_size = file.size().expect("failed to get file size") as usize;
+        Self::new_with_size(
+            file,
+            encryption_ctx,
+            encrypted_payload_chunk_size,
+            file_size,
+        )
+    }
+
+    fn new_with_size(
+        file: Arc<dyn File>,
+        encryption_ctx: Option<EncryptionContext>,
+        encrypted_payload_chunk_size: usize,
+        file_size: usize,
+    ) -> Self {
         let decrypt_scratch = encryption_ctx
             .as_ref()
             .map(|enc_ctx| Vec::with_capacity(encrypted_payload_chunk_size + enc_ctx.tag_size()))
@@ -1823,6 +1837,14 @@ impl StreamingLogicalLogReader {
 
     pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
         Self::new_internal(file, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+    }
+
+    /// Construct without inspecting the file; the first header or prefix operation reports I/O errors.
+    pub(crate) fn new_deferred(
+        file: Arc<dyn File>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
+        Self::new_with_size(file, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE, 0)
     }
 
     /// Restrict reads to a published log prefix and require its ending checksum.
@@ -4174,6 +4196,8 @@ mod tests {
     struct SlowReadFile {
         data: Vec<u8>,
         max_read: usize,
+        size_queries: std::sync::atomic::AtomicUsize,
+        size_failure: std::sync::atomic::AtomicBool,
         pending: std::sync::Mutex<std::collections::VecDeque<(u64, Completion)>>,
     }
 
@@ -4182,6 +4206,8 @@ mod tests {
             Self {
                 data,
                 max_read,
+                size_queries: std::sync::atomic::AtomicUsize::new(0),
+                size_failure: std::sync::atomic::AtomicBool::new(false),
                 pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
             }
         }
@@ -4232,6 +4258,13 @@ mod tests {
             unimplemented!("SlowReadFile is read-only")
         }
         fn size(&self) -> crate::Result<u64> {
+            self.size_queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.size_failure.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(LimboError::InternalError(
+                    "injected metadata failure".into(),
+                ));
+            }
             Ok(self.data.len() as u64)
         }
         fn truncate(&self, _len: u64, _c: Completion) -> crate::Result<Completion> {
@@ -6476,6 +6509,18 @@ mod tests {
         assert!(reader.next_frame_blocking(&io).unwrap().is_none());
         assert_eq!(reader.last_valid_offset() as u64, end_offset);
         assert_eq!(reader.running_crc(), running_crc);
+    }
+
+    #[test]
+    fn shared_deferred_reader_reports_metadata_errors_only_when_polled() {
+        use std::sync::atomic::Ordering;
+        let file = Arc::new(SlowReadFile::new(Vec::new(), 64));
+        file.size_failure.store(true, Ordering::SeqCst);
+        let mut reader = StreamingLogicalLogReader::new_deferred(file.clone(), None);
+        assert_eq!(file.size_queries.load(Ordering::SeqCst), 0);
+        assert!(reader.try_read_header_nonblock().is_err());
+        assert_eq!(file.size_queries.load(Ordering::SeqCst), 1);
+        assert!(file.pending.lock().unwrap().is_empty());
     }
 
     #[test]
