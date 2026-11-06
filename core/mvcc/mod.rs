@@ -32,6 +32,9 @@
 //! * Garbage collection
 
 pub mod clock;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod commit_manifest;
 pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
