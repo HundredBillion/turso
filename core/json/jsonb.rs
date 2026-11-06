@@ -2595,7 +2595,7 @@ impl Jsonb {
         path: &JsonPath,
         mode: PathOperationMode,
     ) -> Result<Vec<JsonTraversalResult>> {
-        self.navigate_path_internal(path, mode, true)
+        self.navigate_path_internal::<true>(path, mode)
     }
 
     pub(crate) fn search_path(
@@ -2604,7 +2604,7 @@ impl Jsonb {
         operation: &mut SearchOperation,
     ) -> Result<bool> {
         let stack =
-            match self.navigate_path_internal(path, PathOperationMode::ReplaceExisting, false) {
+            match self.navigate_path_internal::<false>(path, PathOperationMode::ReplaceExisting) {
                 Ok(stack) => stack,
                 Err(LimboError::OutOfMemory) => return Err(LimboError::OutOfMemory),
                 Err(_) => return Ok(false),
@@ -2616,11 +2616,10 @@ impl Jsonb {
         }
     }
 
-    fn navigate_path_internal(
+    fn navigate_path_internal<const CREATE_INTERMEDIATES: bool>(
         &mut self,
         path: &JsonPath,
         mode: PathOperationMode,
-        create_intermediates: bool,
     ) -> Result<Vec<JsonTraversalResult>> {
         let mut path_iter = path.elements.iter().peekable();
         let mut pos = 0;
@@ -2638,7 +2637,7 @@ impl Jsonb {
                 path_iter.peek().is_some()
             };
 
-            let segment_mode = if is_intermediate_segment && create_intermediates {
+            let segment_mode = if is_intermediate_segment && CREATE_INTERMEDIATES {
                 PathOperationMode::Upsert
             } else {
                 mode
