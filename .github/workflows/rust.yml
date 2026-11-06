@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b374fe08662e57535088dacb6658ef6b43685277
+          ref: 6f1083925f20c5e78e850ee63a52e249d6b5c2b8
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,14 +25,14 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = b374fe086
+          test "$(git rev-parse --short=9 HEAD)" = 6f1083925
           rustc -Vv | tee rustc.txt
       - name: Native cleanup proof checks
         run: |
           set -o pipefail
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup -- --test-threads=1 --nocapture 2>&1 | tee cleanup-green.log
-          grep -q '3 passed; 0 failed' cleanup-green.log
-      - name: Removing sidecar identity proof must fail replacement control
+          grep -q '4 passed; 0 failed' cleanup-green.log
+      - name: Removing identity and raw-path proofs must fail controls
         run: |
           cp core/mvcc/mode_transition/staging_cleanup.rs /tmp/cleanup-verified.rs
           python3 - <<'PYCODE'
@@ -40,22 +40,28 @@ jobs:
           s=open(p).read()
           line='        require_identity(&self.path, identity(file)?)?;'
           assert s.count(line)==1
-          open(p,'w').write(s.replace(line,''))
+          s=s.replace(line,'')
+          raw='let mut wal = staging.as_os_str().to_owned();'
+          assert s.count(raw)==1
+          s=s.replace(raw,'let wal = format!("{}-wal", staging.display());')
+          s=s.replace('        wal.push("-wal");','')
+          open(p,'w').write(s)
           PYCODE
           set +e
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup_revalidates -- --test-threads=1 --nocapture 2>&1 | tee cleanup-negative.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup -- --test-threads=1 --nocapture 2>&1 | tee cleanup-negative.log
           status=${PIPESTATUS[0]}
           set -e
           cp /tmp/cleanup-verified.rs core/mvcc/mode_transition/staging_cleanup.rs
           test "$status" -ne 0
-          grep -q '0 passed; 1 failed' cleanup-negative.log
+          grep -q '2 passed; 2 failed' cleanup-negative.log
           grep -q 'unwrap_err()' cleanup-negative.log
+          grep -q 'raw-name staging WAL was orphaned' cleanup-negative.log
       - name: Restored exact source passes
         run: |
           git diff --exit-code
           set -o pipefail
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api staging_cleanup -- --test-threads=1 --nocapture 2>&1 | tee cleanup-restored.log
-          grep -q '3 passed; 0 failed' cleanup-restored.log
+          grep -q '4 passed; 0 failed' cleanup-restored.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
