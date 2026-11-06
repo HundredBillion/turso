@@ -3603,6 +3603,31 @@ impl Program {
         // state machine cannot run its own error cleanup. abort() is the first
         // statement cleanup path that still owns that commit_state.
         state.commit_state.cleanup_mvcc_checkpoint_state();
+        #[cfg(all(host_shared_wal, unix))]
+        if matches!(err, None | Some(LimboError::Busy))
+            && matches!(
+                self.insns.get(state.pc as usize).map(|(insn, _)| insn),
+                Some(Insn::AutoCommit {
+                    auto_commit: true,
+                    rollback: false,
+                    ..
+                })
+            )
+        {
+            // Only a literal COMMIT may leave its explicit transaction active.
+            // The state machine proves the cap rejected it before any I/O and
+            // has already restored Active before permitting this drop.
+            if let CommitState::CommittingMvcc { state_machine } = &mut state.commit_state {
+                if state_machine
+                    .inner_mut()
+                    .preserve_shared_preflight_on_drop()
+                {
+                    state.commit_state = CommitState::Ready;
+                    self.connection.auto_commit.store(false, Ordering::SeqCst);
+                    state.auto_txn_cleanup = TxnCleanup::None;
+                }
+            }
+        }
         // If a CommitStateMachine was non-terminal when the program was
         // aborted — Statement dropped mid-IO yield, or `?` propagated a Busy
         // out of BeginCommitLogicalLog / SyncLogicalLog — release the locks

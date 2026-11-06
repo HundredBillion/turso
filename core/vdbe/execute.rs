@@ -22143,10 +22143,12 @@ mod shared_begin_tests {
             let tx = f.connection.get_mv_tx();
             assert!(tx.is_some());
             let mut commit = f.connection.prepare("COMMIT").unwrap();
-            assert!(matches!(
-                commit.run_with_row_callback(|_| Ok(())),
-                Err(LimboError::Busy)
-            ));
+            for _ in 0..2 {
+                assert!(matches!(
+                    commit.run_with_row_callback(|_| Ok(())),
+                    Err(LimboError::Busy)
+                ));
+            }
             if reset {
                 commit.reset().unwrap();
             }
@@ -22178,6 +22180,16 @@ mod shared_begin_tests {
             ));
             assert_eq!(f.connection.get_mv_tx(), tx);
             f.connection.execute("ROLLBACK").unwrap();
+            check_value("a");
+            assert!(matches!(
+                f.connection.execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "c".repeat(90_000)
+                )),
+                Err(LimboError::Busy)
+            ));
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(f.connection.get_auto_commit());
             check_value("a");
         }
     }
