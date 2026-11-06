@@ -4307,6 +4307,7 @@ pub fn op_transaction(
     match result {
         Ok(result) => Ok(result),
         Err(err) => {
+            state.reset_shared_begin();
             state.active_op_state.clear();
             Err(err)
         }
@@ -4397,6 +4398,41 @@ fn begin_fresh_mvcc_tx(
             Err(err)
         }
     }
+}
+
+/// Shared admission imports the durable prefix before taking any new pager snapshot.
+#[allow(clippy::too_many_arguments)]
+fn begin_fresh_mvcc_tx_nonblock(
+    mv_store: &MvStore,
+    pager: &Arc<Pager>,
+    mode: &TransactionMode,
+    connection: &Arc<Connection>,
+    expected_schema_generation: Option<u64>,
+    database_id: usize,
+    state: &mut ProgramState,
+) -> IOResultOr<u64> {
+    #[cfg(all(host_shared_wal, unix))]
+    if mv_store.is_shared() {
+        return mv_store.begin_shared_nonblock(
+            connection,
+            pager.clone(),
+            matches!(mode, TransactionMode::Write),
+            expected_schema_generation,
+            database_id,
+            &mut state.shared_begin,
+        );
+    }
+    #[cfg(not(all(host_shared_wal, unix)))]
+    let _ = (database_id, state);
+    begin_fresh_mvcc_tx(
+        mv_store,
+        pager,
+        mode,
+        connection,
+        expected_schema_generation,
+    )
+    .map(IOResult::Done)
+    .map_err(Into::into)
 }
 
 fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> IOResultOr<u32> {
@@ -4744,21 +4780,24 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
-                            match begin_fresh_mvcc_tx(
+                            match begin_fresh_mvcc_tx_nonblock(
                                 mv_store,
                                 &pager,
                                 &effective_mode,
                                 &conn,
                                 None,
+                                *db,
+                                state,
                             ) {
-                                Ok(tx_id) => {
+                                Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+                                Ok(IOResult::Done(tx_id)) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
                                     if conn.get_auto_commit() && !conn.is_nested_stmt() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }
                                 }
-                                Err(err) => return Err(err.into()),
+                                Err(err) => return Err(err),
                             }
                         } else if write {
                             // Upgrade: attached DB has a Read/Concurrent tx but the
@@ -4808,17 +4847,19 @@ pub fn op_transaction_inner(
                             // there and forces a reprepare against the published roots — without
                             // the old non-atomic post-begin recheck (which also tripped on
                             // publishes strictly after our snapshot).
-                            let expected_schema_generation =
-                                match conn.mvcc_begin_schema_generation() {
-                                    Ok(generation) => generation,
-                                    Err(err) => {
-                                        if started_read_tx {
-                                            conn.set_tx_state(current_state);
-                                            state.auto_txn_cleanup = TxnCleanup::None;
-                                        }
-                                        return Err(err.into());
+                            let expected_schema_generation = match state
+                                .captured_shared_schema_generation()
+                                .map_or_else(|| conn.mvcc_begin_schema_generation(), Ok)
+                            {
+                                Ok(generation) => generation,
+                                Err(err) => {
+                                    if started_read_tx {
+                                        conn.set_tx_state(current_state);
+                                        state.auto_txn_cleanup = TxnCleanup::None;
                                     }
-                                };
+                                    return Err(err.into());
+                                }
+                            };
                             #[cfg(any(test, injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
@@ -4842,14 +4883,17 @@ pub fn op_transaction_inner(
                             } else {
                                 *tx_mode
                             };
-                            match begin_fresh_mvcc_tx(
+                            match begin_fresh_mvcc_tx_nonblock(
                                 mv_store,
                                 &pager,
                                 &fresh_mode,
                                 &conn,
                                 expected_schema_generation,
+                                *db,
+                                state,
                             ) {
-                                Ok(tx_id) => {
+                                Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+                                Ok(IOResult::Done(tx_id)) => {
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, fresh_mode)));
@@ -4869,7 +4913,7 @@ pub fn op_transaction_inner(
                                         conn.set_tx_state(current_state);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
-                                    return Err(err.into());
+                                    return Err(err);
                                 }
                             }
                         } else if updated {
@@ -5510,6 +5554,32 @@ pub fn op_savepoint(
                     }
                 }
             }
+            #[cfg(all(host_shared_wal, unix))]
+            if let Some(mv_store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+                if conn.get_mv_tx_id().is_none() {
+                    let fresh_mode = if conn.begin_concurrent_is_pending() {
+                        TransactionMode::Concurrent
+                    } else {
+                        TransactionMode::Read
+                    };
+                    let tx_id = return_if_io!(
+                        state,
+                        begin_fresh_mvcc_tx_nonblock(
+                            mv_store,
+                            pager,
+                            &fresh_mode,
+                            &conn,
+                            None,
+                            crate::MAIN_DB_ID,
+                            state
+                        )
+                    );
+                    conn.set_mv_tx(Some((tx_id, fresh_mode)));
+                    if conn.get_tx_state().no_btree_tx_open() {
+                        conn.set_tx_state(TransactionState::Read);
+                    }
+                }
+            }
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -5624,9 +5694,8 @@ pub fn op_savepoint(
             .map_err(Into::into)
         }
         SavepointOp::Release => {
-            // A RELEASE that commits the transaction may suspend on I/O inside
-            // op_auto_commit after the savepoint was already removed. On
-            // re-entry, resume that commit instead of looking up the savepoint again.
+            // Outermost RELEASE retains its savepoints until commit succeeds.
+            // If commit suspended, resume it without restarting the release path.
             if !matches!(state.commit_state, CommitState::Ready) {
                 return op_auto_commit(program, state, &release_commit_insn(), pager);
             }
@@ -15583,12 +15652,31 @@ pub fn op_sequence_begin_inner_tx(
         }
     }
 
-    let inner_tx_id = mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
-        pager.clone(),
-        None,
-        CheckpointReadLockState::NotHeld,
-        conn.portable_logical_changes_enabled(),
-    )?;
+    #[cfg(all(host_shared_wal, unix))]
+    let shared_inner = mv_store.is_shared();
+    #[cfg(not(all(host_shared_wal, unix)))]
+    let shared_inner = false;
+    let inner_tx_id = if shared_inner {
+        return_if_io!(
+            state,
+            begin_fresh_mvcc_tx_nonblock(
+                &mv_store,
+                pager,
+                &TransactionMode::Concurrent,
+                &conn,
+                None,
+                *db,
+                state
+            )
+        )
+    } else {
+        mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
+            pager.clone(),
+            None,
+            CheckpointReadLockState::NotHeld,
+            conn.portable_logical_changes_enabled(),
+        )?
+    };
     conn.set_mv_tx_for_db(
         *db,
         Some((
@@ -19843,11 +19931,25 @@ fn op_journal_mode_inner(
 
                 let prev_mode_raw = return_if_io!(state, header_result);
 
-                let prev_mode_version = prev_mode_raw
-                    .to_version()
-                    .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
-
-                let prev_mode = journal_mode::JournalMode::from(prev_mode_version);
+                #[cfg(all(host_shared_wal, unix))]
+                let shared = mv_store.as_ref().is_some_and(|store| store.is_shared());
+                #[cfg(not(all(host_shared_wal, unix)))]
+                let shared = false;
+                let prev_mode = if shared {
+                    #[cfg(all(host_shared_wal, unix))]
+                    if prev_mode_raw.0 != crate::mvcc::database::SHARED_MVCC_VERSION {
+                        return Err(LimboError::Corrupt(
+                            "shared MVCC database lost its format marker".into(),
+                        )
+                        .into());
+                    }
+                    journal_mode::JournalMode::Mvcc
+                } else {
+                    let version = prev_mode_raw.to_version().map_err(|val| {
+                        LimboError::Corrupt(format!("Invalid read_version: {val}"))
+                    })?;
+                    journal_mode::JournalMode::from(version)
+                };
                 state.active_op_state.journal_mode().prev_mode = Some(prev_mode);
 
                 // If no new mode specified, just return current mode
@@ -19876,6 +19978,13 @@ fn op_journal_mode_inner(
                     state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
+                }
+
+                if shared {
+                    return Err(LimboError::InvalidArgument(
+                        "changing shared MVCC journal mode requires an offline transition".into(),
+                    )
+                    .into());
                 }
 
                 if *db != crate::MAIN_DB_ID {
@@ -21760,5 +21869,440 @@ mod tests {
             result.is_ok(),
             "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
+    }
+}
+
+#[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
+mod shared_begin_tests {
+    use super::*;
+    use crate::io::{Buffer, File, PlatformIO, SharedWalLockKind};
+    use crate::{ConnectOpts, Database, EngineDialect, OpenOptions, IO};
+    use std::os::unix::fs::MetadataExt;
+
+    #[derive(Default)]
+    struct DelayedReads {
+        enabled: std::sync::atomic::AtomicBool,
+        release_retained: std::sync::atomic::AtomicBool,
+        pending: crate::sync::Mutex<Vec<(Arc<dyn File>, u64, Completion)>>,
+        retained: crate::sync::Mutex<Vec<Completion>>,
+    }
+    struct DelayedManifestFile {
+        inner: Arc<dyn File>,
+        reads: Arc<DelayedReads>,
+    }
+    impl File for DelayedManifestFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn file_id(&self) -> Result<Option<crate::io::FileId>> {
+            self.inner.file_id()
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            if self.reads.enabled.load(Ordering::SeqCst) {
+                self.reads
+                    .pending
+                    .lock()
+                    .push((self.inner.clone(), pos, c.clone()));
+                Ok(c)
+            } else {
+                self.inner.pread(pos, c)
+            }
+        }
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, kind: crate::io::FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, kind)
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+    struct DelayedIo {
+        inner: PlatformIO,
+        reads: Arc<DelayedReads>,
+    }
+    impl crate::io::Clock for DelayedIo {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+    impl IO for DelayedIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            if std::path::Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == "manifest")
+            {
+                Ok(Arc::new(DelayedManifestFile {
+                    inner,
+                    reads: self.reads.clone(),
+                }))
+            } else {
+                Ok(inner)
+            }
+        }
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn supports_shared_wal_coordination(&self) -> bool {
+            self.inner.supports_shared_wal_coordination()
+        }
+        fn step(&self) -> Result<()> {
+            if self.reads.release_retained.load(Ordering::SeqCst) {
+                self.reads.retained.lock().clear();
+            }
+            let pending = std::mem::take(&mut *self.reads.pending.lock());
+            for (file, offset, completion) in pending {
+                let physical = file.pread(offset, completion)?;
+                self.reads.retained.lock().push(physical);
+            }
+            self.inner.step()
+        }
+    }
+
+    struct Fixture {
+        connection: Arc<Connection>,
+        authority_file: Arc<dyn File>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_io(Arc::new(PlatformIO::new().unwrap()))
+        }
+        fn with_io(io: Arc<dyn IO>) -> Self {
+            Self::with_io_and_limit(io, None)
+        }
+        fn with_io_and_limit(io: Arc<dyn IO>, limit: Option<u64>) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, limit) = match limit {
+                Some(limit) => (
+                    crate::mvcc::database::shared_runtime_fixture_with_limit(
+                        directory.path(),
+                        limit,
+                    ),
+                    limit,
+                ),
+                None => crate::mvcc::database::shared_runtime_fixture(directory.path()),
+            };
+            let database = Database::open(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenOptions::new(Arc::new(EngineDialect)).with_shared_mvcc_for_test(limit),
+            )
+            .unwrap();
+            let connection = database.connect(ConnectOpts::new()).unwrap();
+            assert!(connection.mv_store().as_ref().unwrap().is_shared());
+            let metadata = std::fs::metadata(&path).unwrap();
+            let authority = directory.path().join(format!(
+                ".turso-mvcc-{:016x}-{:016x}/authority",
+                metadata.dev(),
+                metadata.ino()
+            ));
+            let authority_file = io
+                .open_file(authority.to_str().unwrap(), OpenFlags::NoLock, false)
+                .unwrap();
+            Self {
+                _directory: directory,
+                connection,
+                authority_file,
+            }
+        }
+        fn hold_publication(&self) {
+            assert!(self
+                .authority_file
+                .shared_wal_try_lock_byte(1, true, SharedWalLockKind::LinuxOfd)
+                .unwrap());
+        }
+        fn release_publication(&self) {
+            self.authority_file
+                .shared_wal_unlock_byte(1, SharedWalLockKind::LinuxOfd)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_vdbe_fresh_read_and_savepoint_obey_publication_barrier() {
+        for sql in ["SELECT value FROM preserved", "SAVEPOINT held"] {
+            let f = Fixture::new();
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(!f.connection.pager.load().holds_read_lock());
+            f.hold_publication();
+            let result = f.connection.execute(sql);
+            assert!(
+                matches!(result, Err(LimboError::Busy)),
+                "shared fresh admission bypassed publication barrier for {sql}: {result:?}"
+            );
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(!f.connection.pager.load().holds_read_lock());
+            f.release_publication();
+            f.connection.execute(sql).unwrap();
+            if sql.starts_with("SAVEPOINT") {
+                f.connection.execute("ROLLBACK").unwrap();
+            }
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(!f.connection.pager.load().holds_read_lock());
+        }
+    }
+    #[test]
+    fn shared_vdbe_journal_mode_reports_mvcc_and_requires_offline_transition() {
+        let f = Fixture::new();
+        for sql in ["PRAGMA journal_mode", "PRAGMA journal_mode=mvcc"] {
+            let mut statement = f.connection.prepare(sql).unwrap();
+            let mut rows = 0;
+            statement
+                .run_with_row_callback(|row| {
+                    assert_eq!(row.get::<&str>(0)?, "mvcc");
+                    rows += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+        assert!(matches!(
+            f.connection.execute("PRAGMA journal_mode=wal"),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        let bytes = std::fs::read(&f.connection.db.path).unwrap();
+        assert_eq!(
+            &bytes[18..20],
+            &[crate::mvcc::database::SHARED_MVCC_VERSION; 2]
+        );
+    }
+    #[test]
+    fn shared_vdbe_sequence_admission_preserves_outer_snapshot_when_busy() {
+        let f = Fixture::new();
+        f.connection.execute("BEGIN CONCURRENT").unwrap();
+        f.connection.execute("SELECT value FROM preserved").unwrap();
+        let outer = f.connection.get_mv_tx();
+        assert!(outer.is_some());
+        assert!(f.connection.pager.load().holds_read_lock());
+        let statement = f.connection.prepare("SELECT 1").unwrap();
+        let mut state = ProgramState::new(2, 0);
+        let instruction = Insn::SequenceBeginInnerTx {
+            db: crate::MAIN_DB_ID,
+            path_kind_reg: 0,
+            saved_outer_reg: 1,
+        };
+        f.hold_publication();
+        for _ in 0..2 {
+            let error = match op_sequence_begin_inner_tx(
+                statement.get_program(),
+                &mut state,
+                &instruction,
+                statement.get_pager(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("sequence admission bypassed publication barrier"),
+            };
+            assert!(matches!(*error, LimboError::Busy));
+            assert_eq!(f.connection.get_mv_tx(), outer);
+            assert!(f.connection.pager.load().holds_read_lock());
+            assert!(state.sequence_inner_tx_pending.is_none());
+        }
+        f.release_publication();
+        f.connection.execute("SELECT value FROM preserved").unwrap();
+        assert_eq!(f.connection.get_mv_tx(), outer);
+        f.connection.execute("ROLLBACK").unwrap();
+        assert!(f.connection.get_mv_tx().is_none());
+        assert!(!f.connection.pager.load().holds_read_lock());
+    }
+
+    #[test]
+    fn shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop() {
+        for reset in [true, false] {
+            let f =
+                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "a".repeat(90_000)
+                ))
+                .unwrap();
+            f.connection.execute("BEGIN CONCURRENT").unwrap();
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "b".repeat(90_000)
+                ))
+                .unwrap();
+            let tx = f.connection.get_mv_tx();
+            assert!(tx.is_some());
+            let mut commit = f.connection.prepare("COMMIT").unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    commit.run_with_row_callback(|_| Ok(())),
+                    Err(LimboError::Busy)
+                ));
+            }
+            if reset {
+                commit.reset().unwrap();
+            }
+            drop(commit);
+            assert_eq!(
+                f.connection.get_mv_tx(),
+                tx,
+                "cap Busy discarded explicit transaction"
+            );
+            assert!(!f.connection.get_auto_commit());
+            let check_value = |expected: &str| {
+                let mut rows = 0;
+                f.connection
+                    .prepare("SELECT length(value), substr(value,1,1) FROM preserved")
+                    .unwrap()
+                    .run_with_row_callback(|row| {
+                        assert_eq!(row.get::<i64>(0)?, 90_000);
+                        assert_eq!(row.get::<&str>(1)?, expected);
+                        rows += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(rows, 1);
+            };
+            check_value("b");
+            assert!(matches!(
+                f.connection.execute("COMMIT"),
+                Err(LimboError::Busy)
+            ));
+            assert_eq!(f.connection.get_mv_tx(), tx);
+            f.connection.execute("ROLLBACK").unwrap();
+            check_value("a");
+            assert!(matches!(
+                f.connection.execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "c".repeat(90_000)
+                )),
+                Err(LimboError::Busy)
+            ));
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(f.connection.get_auto_commit());
+            check_value("a");
+        }
+    }
+
+    #[test]
+    fn shared_vdbe_release_cap_busy_retains_named_savepoints_on_reset_or_drop() {
+        for reset in [true, false] {
+            let f =
+                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "a".repeat(90_000)
+                ))
+                .unwrap();
+            f.connection.execute("SAVEPOINT held").unwrap();
+            f.connection
+                .execute(format!(
+                    "UPDATE preserved SET value='{}'",
+                    "b".repeat(90_000)
+                ))
+                .unwrap();
+            f.connection.execute("SAVEPOINT nested").unwrap();
+            let tx = f.connection.get_mv_tx();
+            assert!(tx.is_some());
+            let names = || {
+                f.connection.with_named_savepoints(|frames| {
+                    frames
+                        .iter()
+                        .map(|frame| frame.name.clone())
+                        .collect::<Vec<_>>()
+                })
+            };
+            let mut release = f.connection.prepare("RELEASE held").unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    release.run_with_row_callback(|_| Ok(())),
+                    Err(LimboError::Busy)
+                ));
+                assert_eq!(names(), ["held", "nested"]);
+            }
+            if reset {
+                release.reset().unwrap();
+            }
+            drop(release);
+            assert_eq!(
+                f.connection.get_mv_tx(),
+                tx,
+                "cap Busy discarded RELEASE transaction"
+            );
+            assert!(!f.connection.get_auto_commit());
+            assert_eq!(names(), ["held", "nested"]);
+            assert!(matches!(
+                f.connection.execute("RELEASE held"),
+                Err(LimboError::Busy)
+            ));
+            assert_eq!(names(), ["held", "nested"]);
+            f.connection.execute("ROLLBACK TO held").unwrap();
+            assert_eq!(names(), ["held"]);
+            let mut rows = 0;
+            f.connection
+                .prepare("SELECT length(value), substr(value,1,1) FROM preserved")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    assert_eq!(row.get::<i64>(0)?, 90_000);
+                    assert_eq!(row.get::<&str>(1)?, "a");
+                    rows += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, 1);
+            f.connection.execute("RELEASE held").unwrap();
+            assert!(f.connection.get_auto_commit());
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(names().is_empty());
+        }
+    }
+
+    #[test]
+    fn shared_vdbe_reset_during_admission_retains_physical_read_ownership() {
+        let reads = Arc::new(DelayedReads::default());
+        let io = Arc::new(DelayedIo {
+            inner: PlatformIO::new().unwrap(),
+            reads: reads.clone(),
+        });
+        let f = Fixture::with_io(io.clone());
+        let mut statement = f.connection.prepare("SELECT value FROM preserved").unwrap();
+        reads.enabled.store(true, Ordering::SeqCst);
+        assert!(matches!(statement.step().unwrap(), StepResult::IO));
+        assert!(!reads.pending.lock().is_empty());
+        assert!(f.connection.get_mv_tx().is_none());
+        assert!(!f.connection.pager.load().holds_read_lock());
+        reads.enabled.store(false, Ordering::SeqCst);
+        statement.reset().unwrap();
+        assert!(reads.pending.lock().is_empty());
+        assert!(!reads.retained.lock().is_empty());
+        assert!(!f
+            .authority_file
+            .shared_wal_try_lock_byte(1, true, SharedWalLockKind::LinuxOfd)
+            .unwrap());
+        reads.release_retained.store(true, Ordering::SeqCst);
+        io.step().unwrap();
+        f.hold_publication();
+        f.release_publication();
+        let mut rows = 0;
+        statement
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get::<&str>(0)?, "durable payload");
+                rows += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(f.connection.get_mv_tx().is_none());
+        assert!(!f.connection.pager.load().holds_read_lock());
     }
 }

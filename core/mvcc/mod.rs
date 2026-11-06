@@ -31,12 +31,41 @@
 //! * Optimistic reads and writes
 //! * Garbage collection
 
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod checkpoint_gate;
 pub mod clock;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod commit_manifest;
 pub mod cursor;
 pub mod database;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod guarded_file;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod mode_transition;
+#[cfg(all(host_shared_wal, unix))]
+pub(crate) use mode_transition::recovery::PreparedMarkerRecovery;
 pub mod persistent_storage;
 #[cfg(feature = "conn_raw_api")]
 pub mod portable_logical;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod read_pinned_file;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod shared_authority;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod shared_commit;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_files;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod shared_ids;
 #[cfg(any(test, injected_yields))]
 pub(crate) mod yield_hooks;
 pub mod yield_points;

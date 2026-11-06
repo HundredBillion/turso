@@ -2005,13 +2005,20 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        // Private memory targets and VFS backends without shared WAL keep their local WAL.
+        db_opts = db_opts.with_multiprocess_wal(
+            db_opts.enable_multiprocess_wal
+                && !is_memory_like(&opts.path)
+                && io.supports_shared_wal_coordination(),
+        );
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts.clone())
+                .skip_db_opts_check_on_registry_hit(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -2538,8 +2545,16 @@ impl Connection {
         if self.is_closed() {
             return Ok(());
         }
-        self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
+        // Live statements may still own page-1 IO; finish it before rollback releases init_lock.
+        pager.drain_page1_io()?;
+        self.with_all_attached_pagers_with_index(|pagers| {
+            for (_, pager) in pagers {
+                pager.drain_page1_io()?;
+            }
+            Ok::<(), LimboError>(())
+        })?;
+        self.closed.store(true, Ordering::SeqCst);
 
         match self.get_tx_state() {
             TransactionState::None => {
@@ -2932,7 +2947,9 @@ impl Connection {
         };
 
         let pager = self.get_pager_from_database_index(&database_id)?;
-        pager.set_initial_page_size(size)?;
+        if !pager.set_initial_page_size(size)? {
+            return Ok(());
+        }
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the

@@ -427,14 +427,14 @@ fn mv_store_skiplist_allocations_are_fallible() {
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
     let row_version = RowVersion {
         id: 1,
-        begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        begin: PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
         end: PackedTs::pack(None),
         data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let result = store.insert_version(row_id, row_version);
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
     assert!(store.rows.is_empty());
 }
 
@@ -8036,6 +8036,10 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
+        peer_conflicted: AtomicBool::new(false),
+        #[cfg(host_shared_wal)]
+        shared_snapshot: None,
+        before_mutation_lock: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
@@ -9827,6 +9831,10 @@ fn transaction_display() {
         log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
+        peer_conflicted: AtomicBool::new(false),
+        #[cfg(host_shared_wal)]
+        shared_snapshot: None,
+        before_mutation_lock: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
@@ -25291,6 +25299,7 @@ impl YieldInjector for ParkAfterCollectThenArmFault {
 #[derive(Debug, Default)]
 struct OneShotAllocFault {
     armed: AtomicBool,
+    skip: AtomicU64,
     fired: AtomicU64,
     failed_allocation: Mutex<Option<String>>,
 }
@@ -25303,7 +25312,16 @@ unsafe impl crate::alloc::ApiAllocator for OneShotFaultAlloc {
         &self,
         layout: crate::alloc::Layout,
     ) -> std::result::Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
-        if self.0.armed.swap(false, Ordering::SeqCst) {
+        if self.0.armed.load(Ordering::SeqCst)
+            && self
+                .0
+                .skip
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_err()
+            && self.0.armed.swap(false, Ordering::SeqCst)
+        {
             self.0.fired.fetch_add(1, Ordering::SeqCst);
             *self.0.failed_allocation.lock() =
                 Some(std::backtrace::Backtrace::force_capture().to_string());
@@ -25401,4 +25419,1052 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+#[test]
+fn recovery_decodes_entire_frame_before_mutating_store_or_context() {
+    let db = MvccTestDb::new();
+    let row = generate_simple_string_row((-22).into(), 1, "must not be installed");
+    let rowid = row.id.clone();
+    let before_schema = db.conn.schema.read().clone();
+    let mut ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 17,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: [123].into_iter().collect(),
+        current_schema: before_schema.clone(),
+        index_infos: HashMap::default(),
+    };
+    let frame = vec![
+        ParsedOp::UpsertTable {
+            table_id: rowid.table_id,
+            rowid: rowid.clone(),
+            record_bytes: crate::types::value_blob_from_slice(row.payload()).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+        ParsedOp::UpsertIndex {
+            table_id: (-999).into(),
+            payload: crate::types::value_blob_from_slice(&[0xff]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    assert!(db
+        .mvcc_store
+        .recover_process_frame(&db.conn, &mut ctx, frame)
+        .is_err());
+    assert!(db.mvcc_store.rows.get(&rowid).is_none());
+    assert!(db
+        .mvcc_store
+        .table_id_to_rootpage
+        .get(&rowid.table_id)
+        .is_none());
+    assert_eq!(ctx.max_commit_ts_seen, 17);
+    assert!(ctx.dropped_root_pages.contains(&123));
+    assert!(Arc::ptr_eq(&before_schema, &db.conn.schema.read()));
+    assert!(Arc::ptr_eq(&before_schema, &ctx.current_schema));
+}
+
+#[test]
+fn recovery_preparation_preserves_active_local_version_chains() {
+    let db = MvccTestDb::new();
+    let row = generate_simple_string_row((-22).into(), 1, "local uncommitted");
+    let rowid = row.id.clone();
+    db.mvcc_store
+        .insert_table_id_to_rootpage(rowid.table_id, None);
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store.insert(tx_id, row).unwrap();
+    let chain = db.mvcc_store.rows.get(&rowid).unwrap().value().clone();
+    let local_version_id = chain.read()[0].id;
+    let schema = db.conn.schema.read().clone();
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: schema.clone(),
+        index_infos: HashMap::default(),
+    };
+    let peer = generate_simple_string_row(rowid.table_id, 1, "peer committed");
+    let prepared = db
+        .mvcc_store
+        .prepare_recovery_frame(
+            &db.conn,
+            &ctx,
+            vec![ParsedOp::UpsertTable {
+                table_id: rowid.table_id,
+                rowid: rowid.clone(),
+                record_bytes: crate::types::value_blob_from_slice(peer.payload()).unwrap(),
+                commit_ts: 20,
+                btree_resident: false,
+            }],
+        )
+        .unwrap();
+    assert_eq!(prepared.decoded_frame.len(), 1);
+    assert!(Arc::ptr_eq(
+        &chain,
+        db.mvcc_store.rows.get(&rowid).unwrap().value()
+    ));
+    assert_eq!(chain.read().len(), 1);
+    assert_eq!(chain.read()[0].id, local_version_id);
+    assert_eq!(chain.read()[0].begin(), Some(TxTimestampOrID::TxID(tx_id)));
+    assert_eq!(chain.read()[0].end(), None);
+    assert!(Arc::ptr_eq(&schema, &db.conn.schema.read()));
+    assert_eq!(ctx.max_commit_ts_seen, 0);
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), &db.conn, 0);
+}
+
+#[test]
+fn recovery_preparation_rejects_logical_root_rebinding_before_installation() {
+    let db = MvccTestDb::new();
+    let table_id = MVTableId::from(-22);
+    db.mvcc_store
+        .insert_table_id_to_rootpage(table_id, Some(22));
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    let record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("peer_table")),
+            Value::Text(Text::new("peer_table")),
+            Value::from_i64(-22),
+            Value::Text(Text::new("CREATE TABLE peer_table(v TEXT)")),
+        ],
+        5,
+    )
+    .unwrap();
+    let frame = vec![ParsedOp::UpsertTable {
+        table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+        rowid: RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(1)),
+        record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+        commit_ts: 20,
+        btree_resident: false,
+    }];
+    assert!(db
+        .mvcc_store
+        .prepare_recovery_frame(&db.conn, &ctx, frame)
+        .is_err());
+    assert_eq!(db.mvcc_store.current_root_page(&table_id), Some(22));
+    assert!(ctx.schema_rows.is_empty());
+}
+
+#[test]
+fn recovery_preparation_rejects_empty_mixed_or_unrepresentable_timestamps() {
+    let db = MvccTestDb::new();
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    for timestamps in [vec![], vec![20, 21], vec![1 << 62]] {
+        let frame = timestamps
+            .into_iter()
+            .map(|commit_ts| ParsedOp::DeleteTable {
+                rowid: RowID::new((-22).into(), RowKey::Int(1)),
+                record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+                pk_record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+                commit_ts,
+                btree_resident: false,
+            })
+            .collect();
+        assert!(db
+            .mvcc_store
+            .prepare_recovery_frame(&db.conn, &ctx, frame)
+            .is_err());
+    }
+    assert_eq!(ctx.max_commit_ts_seen, 0);
+}
+
+#[test]
+fn peer_import_preparation_pairs_schema_with_incoming_header_cookie() {
+    for schema_change in [false, true] {
+        let db = MvccTestDb::new();
+        let before = db.conn.schema.read().clone();
+        let ctx = RecoverCtx {
+            reader: Box::new(StreamingLogicalLogReader::new(
+                db.mvcc_store.get_logical_log_file(),
+                None,
+            )),
+            preserved_table_valued_functions: Vec::new(),
+            cookie: 0,
+            persistent_tx_ts_max: 0,
+            replay_cutoff_ts: 0,
+            max_commit_ts_seen: 0,
+            schema_rows: HashMap::default(),
+            type_sqls: BTreeMap::new(),
+            dropped_root_pages: HashSet::default(),
+            current_schema: before.clone(),
+            index_infos: HashMap::default(),
+        };
+        let mut frame = Vec::new();
+        if schema_change {
+            let record = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")),
+                    Value::Text(Text::new("peer_table")),
+                    Value::Text(Text::new("peer_table")),
+                    Value::from_i64(-22),
+                    Value::Text(Text::new("CREATE TABLE peer_table(v TEXT)")),
+                ],
+                5,
+            )
+            .unwrap();
+            frame.push(ParsedOp::UpsertTable {
+                table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+                rowid: RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(1)),
+                record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+                commit_ts: 20,
+                btree_resident: false,
+            });
+        }
+        let mut header = DatabaseHeader::default();
+        header.schema_cookie = 77.into();
+        frame.push(ParsedOp::UpdateHeader {
+            header,
+            commit_ts: 20,
+        });
+        let prepared = db
+            .mvcc_store
+            .prepare_recovery_frame(&db.conn, &ctx, frame)
+            .unwrap();
+        assert_eq!(
+            prepared
+                .schema_after
+                .as_ref()
+                .map(|schema| schema.schema_version),
+            Some(77)
+        );
+        assert!(Arc::ptr_eq(&before, &db.conn.schema.read()));
+        assert_eq!(ctx.current_schema.schema_version, before.schema_version);
+    }
+}
+
+#[test]
+fn peer_import_savepoint_cleanup_preserves_committed_end_markers() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES(1, 'before')")
+        .unwrap();
+    db.conn.execute("BEGIN CONCURRENT").unwrap();
+    db.conn.execute("SAVEPOINT before_delete").unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let peer_timestamp = db.mvcc_store.clock.get_timestamp(crate::mvcc::clock::no_op);
+    let mut imported_ends = Vec::new();
+    let mut mark = |chain: &RowVersions<crate::alloc::DynAllocator>, is_index| {
+        let mut versions = chain.write();
+        for version in versions.iter_mut() {
+            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                version.set_end(Some(TxTimestampOrID::Timestamp(peer_timestamp)));
+                imported_ends.push((chain.clone(), version.id, is_index));
+            }
+        }
+    };
+    for entry in db.mvcc_store.rows.iter() {
+        mark(entry.value(), false);
+    }
+    for index in db.mvcc_store.index_rows.iter() {
+        for entry in index.value().iter() {
+            mark(entry.value(), true);
+        }
+    }
+    assert!(imported_ends.iter().any(|(_, _, index)| !index));
+    assert!(imported_ends.iter().any(|(_, _, index)| *index));
+    db.conn.execute("ROLLBACK TO before_delete").unwrap();
+    let changed: Vec<_> = imported_ends
+        .into_iter()
+        .filter_map(|(chain, id, is_index)| {
+            let versions = chain.read();
+            let version = versions.iter().find(|version| version.id == id).unwrap();
+            (version.end() != Some(TxTimestampOrID::Timestamp(peer_timestamp))).then_some(is_index)
+        })
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "committed ends erased (true=index): {changed:?}"
+    );
+    db.conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn peer_import_header_cookie_change_does_not_hide_unknown_index() {
+    let db = MvccTestDb::new();
+    let ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            db.mvcc_store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 0,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+    let frame = vec![
+        ParsedOp::UpdateHeader {
+            header,
+            commit_ts: 20,
+        },
+        ParsedOp::UpsertIndex {
+            table_id: (-999).into(),
+            payload: crate::types::value_blob_from_slice(&[0xff]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    assert!(db
+        .mvcc_store
+        .prepare_recovery_frame(&db.conn, &ctx, frame)
+        .is_err());
+}
+
+fn assert_peer_import_rejects_paused_writer(deleting: bool, index: bool) {
+    {
+        let db = MvccTestDb::new();
+        let row = if index {
+            let info = Arc::new(
+                crate::types::IndexInfo::new(
+                    crate::alloc::vec![crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
+                        nulls_order: None,
+                    }],
+                    false,
+                    1,
+                    false,
+                )
+                .unwrap(),
+            );
+            let record = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+            let key = SortableIndexKey::new_from_payload_in(&record, info, TursoAllocator).unwrap();
+            Row::new_index_row(RowID::new((-22).into(), RowKey::Record(Arc::new(key))))
+        } else {
+            generate_simple_string_row((-22).into(), 1, "local")
+        };
+        let id = row.id.clone();
+        db.mvcc_store.insert_table_id_to_rootpage(id.table_id, None);
+        let tx_id = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        let index_id = index.then_some(id.table_id);
+        db.mvcc_store
+            .insert_to_table_or_index(tx_id, row.clone(), index_id)
+            .unwrap();
+        let chain = if let RowKey::Record(key) = &id.row_id {
+            db.mvcc_store
+                .index_rows
+                .get(&id.table_id)
+                .unwrap()
+                .value()
+                .get(key)
+                .unwrap()
+                .value()
+                .clone()
+        } else {
+            db.mvcc_store.rows.get(&id).unwrap().value().clone()
+        };
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        *db.mvcc_store
+            .txs
+            .get(&tx_id)
+            .unwrap()
+            .value()
+            .before_mutation_lock
+            .lock() = Some((arrived_tx, resume_rx));
+        std::thread::scope(|scope| {
+            let store = &db.mvcc_store;
+            let writer = scope.spawn(move || {
+                if deleting {
+                    store
+                        .delete_from_table_or_index(tx_id, id, index_id, None)
+                        .map(|_| ())
+                } else {
+                    store.insert_to_table_or_index(tx_id, row, index_id)
+                }
+            });
+            arrived_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap();
+            {
+                let mut versions = chain.write();
+                db.mvcc_store
+                    .txs
+                    .get(&tx_id)
+                    .unwrap()
+                    .value()
+                    .peer_conflicted
+                    .store(true, Ordering::Release);
+                versions[0].set_end(Some(TxTimestampOrID::Timestamp(50)));
+            }
+            resume_tx.send(()).unwrap();
+            assert!(
+                matches!(writer.join().unwrap(), Err(LimboError::WriteWriteConflict)),
+                "stale writer proceeded: deleting={deleting}"
+            );
+        });
+        assert_eq!(chain.read().len(), 1);
+        assert_eq!(chain.read()[0].end(), Some(TxTimestampOrID::Timestamp(50)));
+        db.mvcc_store
+            .rollback_tx(tx_id, db.conn.pager.load().clone(), &db.conn, 0);
+    }
+}
+
+#[test]
+fn peer_import_rejects_table_insert_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(false, false);
+}
+#[test]
+fn peer_import_rejects_table_delete_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(true, false);
+}
+#[test]
+fn peer_import_rejects_index_insert_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(false, true);
+}
+#[test]
+fn peer_import_rejects_index_delete_paused_before_chain_lock() {
+    assert_peer_import_rejects_paused_writer(true, true);
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_installs_frame_preserving_old_snapshot_and_local_chain() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let id = RowID::new((-22).into(), RowKey::Int(1));
+    store.insert_table_id_to_rootpage(id.table_id, None);
+    let before = generate_simple_string_row(id.table_id, 1, "before");
+    let chain = store.get_or_create_table_row_versions(id.clone()).unwrap();
+    store
+        .insert_version_raw(
+            &mut chain.write(),
+            RowVersion::new(
+                store.get_version_id(),
+                Some(TxTimestampOrID::Timestamp(1)),
+                None,
+                before.data.clone(),
+                false,
+            ),
+        )
+        .unwrap();
+    store.clock.reset(10);
+    let reader = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+    let writer = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+    store
+        .insert(
+            writer,
+            generate_simple_string_row(id.table_id, 1, "pending local"),
+        )
+        .unwrap();
+    let local_id = chain
+        .read()
+        .iter()
+        .find(|v| v.begin() == Some(TxTimestampOrID::TxID(writer)))
+        .unwrap()
+        .id;
+    let mut ctx = RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 1,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: db.conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    };
+    let after = generate_simple_string_row(id.table_id, 1, "after");
+    let second = generate_simple_string_row(id.table_id, 2, "second");
+    let mut frame: Vec<_> = [&after, &second]
+        .into_iter()
+        .map(|row| ParsedOp::UpsertTable {
+            table_id: row.id.table_id,
+            rowid: row.id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(row.payload()).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        })
+        .collect();
+    let old_cookie = store.global_header.read().unwrap().schema_cookie.get();
+    let mut incoming_header = store.global_header.read().unwrap();
+    incoming_header.schema_cookie = 77.into();
+    frame.push(ParsedOp::UpdateHeader {
+        header: incoming_header,
+        commit_ts: 20,
+    });
+    let mut prepared = Some(store.prepare_recovery_frame(&db.conn, &ctx, frame).unwrap());
+    store
+        .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+        .unwrap();
+    assert!(Arc::ptr_eq(&chain, store.rows.get(&id).unwrap().value()));
+    assert!(chain
+        .read()
+        .iter()
+        .any(|v| v.id == local_id && v.begin() == Some(TxTimestampOrID::TxID(writer))));
+    assert!(store
+        .txs
+        .get(&writer)
+        .unwrap()
+        .value()
+        .peer_conflicted
+        .load(Ordering::Acquire));
+    assert_eq!(store.read(reader, &id).unwrap(), Some(before));
+    assert_eq!(store.read(reader, &second.id).unwrap(), None);
+    let later = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+    assert_eq!(store.read(later, &id).unwrap(), Some(after));
+    assert_eq!(store.read(later, &second.id).unwrap(), Some(second));
+    assert_eq!(ctx.max_commit_ts_seen, 20);
+    assert_eq!(store.global_header.read().unwrap().schema_cookie.get(), 77);
+    assert_eq!(ctx.current_schema.schema_version, 77);
+    assert_eq!(db.conn.schema.read().schema_version, 77);
+    assert_eq!(db.db.schema.lock().schema_version, 77);
+    assert_eq!(
+        store
+            .txs
+            .get(&reader)
+            .unwrap()
+            .value()
+            .header
+            .read()
+            .schema_cookie
+            .get(),
+        old_cookie
+    );
+    assert_eq!(
+        store
+            .txs
+            .get(&later)
+            .unwrap()
+            .value()
+            .header
+            .read()
+            .schema_cookie
+            .get(),
+        77
+    );
+    for tx in [writer, reader, later] {
+        store.rollback_tx(tx, db.conn.pager.load().clone(), &db.conn, 0);
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn empty_peer_context<C: LogicalClock, A: ConcurrentAllocator>(
+    store: &MvStore<C, A>,
+    conn: &Arc<Connection>,
+) -> RecoverCtx {
+    RecoverCtx {
+        reader: Box::new(StreamingLogicalLogReader::new(
+            store.get_logical_log_file(),
+            None,
+        )),
+        preserved_table_valued_functions: Vec::new(),
+        cookie: 0,
+        persistent_tx_ts_max: 0,
+        replay_cutoff_ts: 0,
+        max_commit_ts_seen: 1,
+        schema_rows: HashMap::default(),
+        type_sqls: BTreeMap::new(),
+        dropped_root_pages: HashSet::default(),
+        current_schema: conn.schema.read().clone(),
+        index_infos: HashMap::default(),
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_allocation_failures_preserve_chains_and_retry_same_frame() {
+    let mut failures = 0;
+    let mut reached_success = false;
+    for skip in 0..32 {
+        let db = MvccTestDb::new();
+        let fault = Arc::new(OneShotAllocFault::default());
+        let store = MvStore::new_in(
+            MvccClock::new(),
+            test_mvcc_storage("peer-allocation-log"),
+            OneShotFaultAlloc(fault.clone()),
+            false,
+        )
+        .unwrap();
+        store.insert_table_id_to_rootpage((-22).into(), None);
+        let writer = 7;
+        store.txs.insert(
+            writer,
+            new_tx_in::<OneShotFaultAlloc>(writer, 10, TransactionState::Active),
+        );
+        let mut chains = Vec::new();
+        for rowid in [1, 2] {
+            let row = generate_simple_string_row((-22).into(), rowid, "before");
+            let chain = store
+                .get_or_create_table_row_versions(row.id.clone())
+                .unwrap();
+            store
+                .insert_version_raw(
+                    &mut chain.write(),
+                    RowVersion::new(
+                        store.get_version_id(),
+                        Some(TxTimestampOrID::Timestamp(1)),
+                        None,
+                        row.data,
+                        false,
+                    ),
+                )
+                .unwrap();
+            chains.push(chain);
+        }
+        store
+            .insert(
+                writer,
+                generate_simple_string_row((-22).into(), 1, "pending local"),
+            )
+            .unwrap();
+        let before: Vec<_> = chains
+            .iter()
+            .map(|chain| format!("{:?}", &*chain.read()))
+            .collect();
+        let count_before = store.live_version_count_approx.load(Ordering::Relaxed);
+        let schema_before = db.conn.schema.read().clone();
+        let mut ctx = empty_peer_context(&store, &db.conn);
+        let frame = [1, 2]
+            .into_iter()
+            .map(|rowid| {
+                let row = generate_simple_string_row((-22).into(), rowid, "after");
+                ParsedOp::UpsertTable {
+                    table_id: row.id.table_id,
+                    rowid: row.id,
+                    record_bytes: crate::types::value_blob_from_slice(row.data.as_deref().unwrap())
+                        .unwrap(),
+                    commit_ts: 20,
+                    btree_resident: false,
+                }
+            })
+            .collect();
+        let mut prepared = Some(store.prepare_recovery_frame(&db.conn, &ctx, frame).unwrap());
+        fault.skip.store(skip, Ordering::SeqCst);
+        fault.armed.store(true, Ordering::SeqCst);
+        let result = store.install_peer_frame(&db.conn, &mut ctx, &mut prepared);
+        fault.armed.store(false, Ordering::SeqCst);
+        if fault.fired.load(Ordering::SeqCst) == 0 {
+            result.unwrap();
+            assert!(prepared.is_none());
+            reached_success = true;
+            break;
+        }
+        failures += 1;
+        assert!(
+            matches!(result, Err(LimboError::OutOfMemory)),
+            "skip={skip}, result={result:?}"
+        );
+        assert!(prepared.is_some());
+        assert_eq!(ctx.max_commit_ts_seen, 1);
+        assert_eq!(
+            store.live_version_count_approx.load(Ordering::Relaxed),
+            count_before
+        );
+        assert!(Arc::ptr_eq(&schema_before, &db.conn.schema.read()));
+        assert!(!store
+            .txs
+            .get(&writer)
+            .unwrap()
+            .value()
+            .peer_conflicted
+            .load(Ordering::Acquire));
+        for (chain, before) in chains.iter().zip(&before) {
+            assert_eq!(format!("{:?}", &*chain.read()), *before);
+        }
+        store
+            .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+            .unwrap();
+        assert!(prepared.is_none());
+        assert_eq!(ctx.max_commit_ts_seen, 20);
+        for chain in &chains {
+            assert_eq!(
+                chain
+                    .read()
+                    .iter()
+                    .filter(|v| v.begin() == Some(TxTimestampOrID::Timestamp(20)))
+                    .count(),
+                1
+            );
+        }
+    }
+    assert!(
+        reached_success,
+        "fault sweep did not reach the complete allocation sequence"
+    );
+    assert!(
+        failures >= 2,
+        "must exercise dirty-key allocations: {failures}"
+    );
+    #[cfg(nightly)]
+    assert!(
+        failures >= 4,
+        "nightly must also exercise both chain copies: {failures}"
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_rejects_exhausted_logical_id_before_publication() {
+    let db = MvccTestDb::new();
+    let mut ctx = empty_peer_context(&db.mvcc_store, &db.conn);
+    let row = generate_simple_string_row(i64::MIN.into(), 1, "never published");
+    let frame = vec![ParsedOp::UpsertTable {
+        table_id: row.id.table_id,
+        rowid: row.id.clone(),
+        record_bytes: crate::types::value_blob_from_slice(row.payload()).unwrap(),
+        commit_ts: 20,
+        btree_resident: false,
+    }];
+    let mut prepared = Some(
+        db.mvcc_store
+            .prepare_recovery_frame(&db.conn, &ctx, frame)
+            .unwrap(),
+    );
+    assert!(matches!(
+        db.mvcc_store
+            .install_peer_frame(&db.conn, &mut ctx, &mut prepared),
+        Err(LimboError::Corrupt(_))
+    ));
+    assert!(prepared.is_some());
+    assert_eq!(ctx.max_commit_ts_seen, 1);
+    assert!(db.mvcc_store.rows.get(&row.id).is_none());
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_create_drop_preserves_schema_record_identity() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let mut ctx = empty_peer_context(store, &db.conn);
+    let record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("ephemeral")),
+            Value::Text(Text::new("ephemeral")),
+            Value::from_i64(-42),
+            Value::Text(Text::new("CREATE TABLE ephemeral(v TEXT)")),
+        ],
+        5,
+    )
+    .unwrap();
+    let id = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(900));
+    let frame = vec![
+        ParsedOp::UpsertTable {
+            table_id: id.table_id,
+            rowid: id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+        ParsedOp::DeleteTable {
+            rowid: id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+            pk_record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    let mut prepared = Some(store.prepare_recovery_frame(&db.conn, &ctx, frame).unwrap());
+    store
+        .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+        .unwrap();
+    assert!(!ctx.schema_rows.contains_key(&900));
+    let chain = store.rows.get(&id).unwrap().value().clone();
+    let versions = chain.read();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].begin(), Some(TxTimestampOrID::Timestamp(20)));
+    assert_eq!(versions[0].end(), Some(TxTimestampOrID::Timestamp(20)));
+    assert_eq!(
+        versions[0].data.as_deref().unwrap(),
+        record.as_blob().as_slice()
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_delete_replaces_pending_end_and_rollback_preserves_it() {
+    for index in [false, true] {
+        let db = MvccTestDb::new();
+        let store = &db.mvcc_store;
+        let row = if index {
+            let info = Arc::new(
+                crate::types::IndexInfo::new(
+                    crate::alloc::vec![crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
+                        nulls_order: None,
+                    }],
+                    false,
+                    1,
+                    false,
+                )
+                .unwrap(),
+            );
+            let record = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+            Row::new_index_row(RowID::new(
+                (-22).into(),
+                RowKey::Record(Arc::new(
+                    SortableIndexKey::new_from_payload_in(&record, info, TursoAllocator).unwrap(),
+                )),
+            ))
+        } else {
+            generate_simple_string_row((-22).into(), 1, "before")
+        };
+        let id = row.id.clone();
+        let index_id = index.then_some(id.table_id);
+        store.insert_table_id_to_rootpage(id.table_id, None);
+        let version = RowVersion::new(
+            store.get_version_id(),
+            Some(TxTimestampOrID::Timestamp(1)),
+            None,
+            row.data.clone(),
+            false,
+        );
+        let chain = if let RowKey::Record(key) = &id.row_id {
+            store
+                .insert_index_version(id.table_id, key.clone(), version)
+                .unwrap()
+                .1
+        } else {
+            store.insert_version(id.clone(), version).unwrap().0
+        };
+        store.clock.reset(10);
+        let reader = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+        let writer = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+        assert!(store
+            .delete_from_table_or_index(writer, id.clone(), index_id, None)
+            .unwrap());
+        assert_eq!(chain.read()[0].end(), Some(TxTimestampOrID::TxID(writer)));
+        let mut ctx = empty_peer_context(store, &db.conn);
+        let op = if index {
+            StreamingResult::DeleteIndexRow {
+                row: row.clone(),
+                rowid: id.clone(),
+                commit_ts: 20,
+                btree_resident: false,
+            }
+        } else {
+            StreamingResult::DeleteTableRow {
+                rowid: id.clone(),
+                commit_ts: 20,
+                btree_resident: false,
+            }
+        };
+        let mut prepared = Some(PreparedRecoveryFrame {
+            commit_timestamp: 20,
+            decoded_frame: crate::alloc::vec![op],
+            schema_rows_after: None,
+            type_sqls_after: None,
+            schema_after: None,
+            index_infos: HashMap::default(),
+        });
+        store
+            .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+            .unwrap();
+        assert_eq!(chain.read()[0].end(), Some(TxTimestampOrID::Timestamp(20)));
+        assert_eq!(
+            store
+                .read_from_table_or_index(reader, &id, index_id)
+                .unwrap(),
+            Some(row)
+        );
+        let later = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+        assert_eq!(
+            store
+                .read_from_table_or_index(later, &id, index_id)
+                .unwrap(),
+            None
+        );
+        store.rollback_tx(writer, db.conn.pager.load().clone(), &db.conn, 0);
+        assert_eq!(chain.read()[0].end(), Some(TxTimestampOrID::Timestamp(20)));
+        for tx in [reader, later] {
+            store.rollback_tx(tx, db.conn.pager.load().clone(), &db.conn, 0);
+        }
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_rejects_commit_paused_before_clock_lock() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    store.insert_table_id_to_rootpage((-22).into(), None);
+    store.clock.reset(10);
+    let writer = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+    store
+        .insert(writer, generate_simple_string_row((-22).into(), 1, "local"))
+        .unwrap();
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    *store
+        .txs
+        .get(&writer)
+        .unwrap()
+        .value()
+        .before_mutation_lock
+        .lock() = Some((arrived_tx, resume_rx));
+    let mut ctx = empty_peer_context(store, &db.conn);
+    let peer = generate_simple_string_row((-22).into(), 1, "peer");
+    let frame = vec![ParsedOp::UpsertTable {
+        table_id: peer.id.table_id,
+        rowid: peer.id.clone(),
+        record_bytes: crate::types::value_blob_from_slice(peer.payload()).unwrap(),
+        commit_ts: 20,
+        btree_resident: false,
+    }];
+    let mut prepared = Some(store.prepare_recovery_frame(&db.conn, &ctx, frame).unwrap());
+    std::thread::scope(|scope| {
+        let conn = &db.conn;
+        let commit = scope.spawn(move || {
+            let mut state = CommitStateMachine::new(
+                CommitState::Initial,
+                writer,
+                store.clone(),
+                conn.clone(),
+                crate::MAIN_DB_ID,
+                store.commit_coordinator.clone(),
+                store.global_header.clone(),
+            )
+            .unwrap();
+            StateTransition::step(&mut state, store)
+        });
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap();
+        store
+            .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(
+            matches!(commit.join().unwrap(), Err(LimboError::WriteWriteConflict)),
+            "commit entered Preparing after peer conflict"
+        );
+    });
+    // Dropping the failed commit state rolls the local transaction back.
+    assert!(store.txs.get(&writer).is_none());
+    assert!(store
+        .rows
+        .get(&peer.id)
+        .unwrap()
+        .value()
+        .read()
+        .iter()
+        .any(|version| version.begin() == Some(TxTimestampOrID::Timestamp(20))));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_publishes_dropped_physical_roots_for_checkpoint() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    store.insert_table_id_to_rootpage((-42).into(), Some(42));
+    let mut ctx = empty_peer_context(store, &db.conn);
+    let record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table")),
+            Value::Text(Text::new("ephemeral")),
+            Value::Text(Text::new("ephemeral")),
+            Value::from_i64(42),
+            Value::Text(Text::new("CREATE TABLE ephemeral(v TEXT)")),
+        ],
+        5,
+    )
+    .unwrap();
+    let id = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(900));
+    let frame = vec![
+        ParsedOp::UpsertTable {
+            table_id: id.table_id,
+            rowid: id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(record.as_blob()).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+        ParsedOp::DeleteTable {
+            rowid: id.clone(),
+            record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+            pk_record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+            commit_ts: 20,
+            btree_resident: false,
+        },
+    ];
+    let mut prepared = Some(store.prepare_recovery_frame(&db.conn, &ctx, frame).unwrap());
+    store
+        .install_peer_frame(&db.conn, &mut ctx, &mut prepared)
+        .unwrap();
+    assert!(!ctx.schema_rows.contains_key(&900));
+    assert!(ctx.dropped_root_pages.contains(&42));
+    assert!(db.conn.db.schema.lock().dropped_root_pages.contains(&42));
+    let chain = store.rows.get(&id).unwrap().value().clone();
+    let versions = chain.read();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].begin(), Some(TxTimestampOrID::Timestamp(20)));
+    assert_eq!(versions[0].end(), Some(TxTimestampOrID::Timestamp(20)));
+    assert_eq!(
+        versions[0].data.as_deref().unwrap(),
+        record.as_blob().as_slice()
+    );
 }

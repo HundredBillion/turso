@@ -2487,7 +2487,7 @@ fn convert_to_args(
                 value: value.as_str().to_string(),
             },
             Value::Blob(value) => server_proto::Value::Blob {
-                value: Bytes::copy_from_slice(&value),
+                value: Bytes::from_owner(value),
             },
         })
         .collect()
@@ -4041,6 +4041,26 @@ mod tests {
         },
         Result,
     };
+
+    #[test]
+    fn push_blob_arguments_keep_the_owned_allocation() {
+        let blob = turso_core::Value::from_slice(&[1, 2, 3, 4]).unwrap();
+        let turso_core::Value::Blob(value) = &blob else {
+            unreachable!();
+        };
+        let original_ptr = value.as_ptr();
+        let mut args = super::convert_to_args([blob]);
+        let server_proto::Value::Blob { value } = args.pop().unwrap() else {
+            panic!("expected blob argument");
+        };
+        assert_eq!(value.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(value.as_ptr(), original_ptr);
+        let retained = value.clone();
+        drop(value);
+        drop(args);
+        assert_eq!(retained.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(retained.as_ptr(), original_ptr);
+    }
 
     struct TestPollResult(Vec<u8>);
 

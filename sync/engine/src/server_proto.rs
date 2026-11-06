@@ -448,13 +448,13 @@ mod i64_as_str {
 }
 
 pub(crate) mod bytes_as_base64 {
-    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use base64::{display::Base64Display, engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use bytes::Bytes;
+    use serde::de::Error as _;
     use serde::{de, ser};
-    use serde::{de::Error as _, Serialize as _};
 
     pub fn serialize<S: ser::Serializer>(value: &Bytes, ser: S) -> Result<S::Ok, S::Error> {
-        STANDARD_NO_PAD.encode(value).serialize(ser)
+        ser.collect_str(&Base64Display::new(value, &STANDARD_NO_PAD))
     }
 
     pub fn deserialize<'de, D: de::Deserializer<'de>>(de: D) -> Result<Bytes, D::Error> {
@@ -541,6 +541,109 @@ pub(crate) mod bytes_as_base64_pad {
             D::Error::invalid_value(de::Unexpected::Str(text), &"binary data encoded as base64")
         })?;
         Ok(Bytes::from(bytes))
+    }
+}
+
+#[cfg(test)]
+mod blob_serialization_tests {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use bytes::Bytes;
+
+    use super::Value;
+
+    #[test]
+    fn blob_json_matches_known_unpadded_base64_vectors() {
+        for (input, encoded) in [
+            ("", ""),
+            ("f", "Zg"),
+            ("fo", "Zm8"),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg"),
+            ("fooba", "Zm9vYmE"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            let value = Value::Blob {
+                value: Bytes::copy_from_slice(input.as_bytes()),
+            };
+            let json = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"blob","base64":"{encoded}"}}"#).as_bytes()
+            );
+            assert_eq!(serde_json::from_slice::<Value>(&json).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn blob_json_round_trips_across_encoder_chunk_boundaries() {
+        for len in 0..=3 * 768 + 3 {
+            let input: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let expected = STANDARD_NO_PAD.encode(&input);
+            let value = Value::Blob {
+                value: input.into(),
+            };
+            let json = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"blob","base64":"{expected}"}}"#).as_bytes(),
+                "input length {len}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&json).unwrap(),
+                value,
+                "input length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_json_accepts_padded_input_and_rejects_invalid_base64() {
+        assert_eq!(
+            serde_json::from_str::<Value>(r#"{"type":"blob","base64":"Zg=="}"#).unwrap(),
+            Value::Blob {
+                value: Bytes::from_static(b"f"),
+            }
+        );
+        for invalid in ["!", "A", "Z=g", "Zg\n"] {
+            let json = serde_json::json!({ "type": "blob", "base64": invalid });
+            assert!(serde_json::from_slice::<Value>(&serde_json::to_vec(&json).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn blob_json_writes_base64_in_bounded_chunks() {
+        #[derive(Default)]
+        struct ChunkWriter {
+            output: Vec<u8>,
+            largest_write: usize,
+        }
+
+        impl std::io::Write for ChunkWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.largest_write = self.largest_write.max(bytes.len());
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let value = Value::Blob {
+            value: vec![255; 4096].into(),
+        };
+        let mut writer = ChunkWriter::default();
+        serde_json::to_writer(&mut writer, &value).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&writer.output).unwrap(),
+            value
+        );
+        assert!(
+            writer.largest_write <= 1024,
+            "largest write: {}",
+            writer.largest_write
+        );
     }
 }
 
