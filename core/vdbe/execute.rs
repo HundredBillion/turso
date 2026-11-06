@@ -21851,3 +21851,104 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
+mod shared_begin_tests {
+    use super::*;
+    use crate::io::{File, PlatformIO, SharedWalLockKind};
+    use crate::{ConnectOpts, Database, EngineDialect, OpenOptions, IO};
+    use std::os::unix::fs::MetadataExt;
+
+    struct Fixture {
+        connection: Arc<Connection>,
+        authority_file: Arc<dyn File>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+            let database = Database::open(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenOptions::new(Arc::new(EngineDialect)).with_shared_mvcc_for_test(limit),
+            )
+            .unwrap();
+            let connection = database.connect(ConnectOpts::new()).unwrap();
+            assert!(connection.mv_store().unwrap().is_shared());
+            let metadata = std::fs::metadata(&path).unwrap();
+            let authority = directory.path().join(format!(
+                ".turso-mvcc-{:016x}-{:016x}/authority",
+                metadata.dev(),
+                metadata.ino()
+            ));
+            let authority_file = io
+                .open_file(authority.to_str().unwrap(), OpenFlags::NoLock, false)
+                .unwrap();
+            Self {
+                _directory: directory,
+                connection,
+                authority_file,
+            }
+        }
+        fn hold_publication(&self) {
+            assert!(self
+                .authority_file
+                .shared_wal_try_lock_byte(1, true, SharedWalLockKind::LinuxOfd)
+                .unwrap());
+        }
+        fn release_publication(&self) {
+            self.authority_file
+                .shared_wal_unlock_byte(1, SharedWalLockKind::LinuxOfd)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_vdbe_fresh_read_and_savepoint_obey_publication_barrier() {
+        for sql in ["SELECT value FROM preserved", "SAVEPOINT held"] {
+            let f = Fixture::new();
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(!f.connection.pager.load().holds_read_lock());
+            f.hold_publication();
+            let result = f.connection.execute(sql);
+            assert!(
+                matches!(result, Err(LimboError::Busy)),
+                "shared fresh admission bypassed publication barrier for {sql}: {result:?}"
+            );
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(!f.connection.pager.load().holds_read_lock());
+            f.release_publication();
+            f.connection.execute(sql).unwrap();
+            if sql.starts_with("SAVEPOINT") {
+                f.connection.execute("ROLLBACK").unwrap();
+            }
+            assert!(f.connection.get_mv_tx().is_none());
+            assert!(!f.connection.pager.load().holds_read_lock());
+        }
+    }
+    #[test]
+    fn shared_vdbe_journal_mode_reports_mvcc_and_requires_offline_transition() {
+        let f = Fixture::new();
+        for sql in ["PRAGMA journal_mode", "PRAGMA journal_mode=mvcc"] {
+            let mut statement = f.connection.prepare(sql).unwrap();
+            statement
+                .run_with_row_callback(|row| {
+                    assert_eq!(row.get::<&str>(0)?, "mvcc");
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            f.connection.execute("PRAGMA journal_mode=wal"),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        let bytes = std::fs::read(&f.connection.db.path).unwrap();
+        assert_eq!(
+            &bytes[18..20],
+            &[crate::mvcc::database::SHARED_MVCC_VERSION; 2]
+        );
+    }
+}
