@@ -42,7 +42,8 @@ jobs:
       - name: Native strict file and independent mapping checks
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_files -- --test-threads=1 --nocapture 2>&1 | tee shared-files.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_runtime_native_database_open -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-open.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_preserves_base_and_separates_readonly_handles -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-open.log
+          grep -q '1 passed; 0 failed' native-open.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Preserve exact source and expected failure
         if: always()
