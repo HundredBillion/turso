@@ -22,7 +22,7 @@ The dedicated oracle pager validates the supplied main and WAL handles against t
 
 Use `MvccLazyCursor::new` with the temporary explicit TxID. Exact rowid seek supplies RowExists; the committed cursor's last row supplies the maximum. Resolve domain names and roots from committed schema rather than the outer connection schema or speculative root-map entries.
 
-AUTOINCREMENT must preserve ordinary sqlite_sequence behavior: first matching row in rowid order, NOCASE name comparison, and AddImm integer coercion. Use `vdbe::execute::extract_int_value`; do not replace duplicate rows with their maximum or reject accepted noninteger values. The logical floor combines committed schema/root bounds with the separately durable reservation floor.
+MVCC AUTOINCREMENT follows the existing implicit sequence allocation path (`translate/insert.rs`), with sqlite_sequence synchronized as a mirror. Preserve `ClaimSequence(value)` around that assigned cursor value; do not substitute `ReserveRow { autoincrement: true }` using only the mirror. The private policy's AUTOINCREMENT-floor seam needs authoritative backing-sequence reconciliation if a future runtime path actually uses it. In the ordinary non-MVCC fallback, sqlite_sequence uses the first matching row in rowid order, NOCASE name comparison, and AddImm integer coercion (`vdbe::execute::extract_int_value`); those rules do not make it the MVCC cursor. The logical floor combines committed schema/root bounds with the separately durable reservation floor.
 
 ## Validation sequence
 
