@@ -31,6 +31,9 @@
 //! * Optimistic reads and writes
 //! * Garbage collection
 
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod checkpoint_gate;
 pub mod clock;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
