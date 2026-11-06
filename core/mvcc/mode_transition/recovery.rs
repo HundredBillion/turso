@@ -508,6 +508,8 @@ mod tests {
                 })
                 .unwrap();
         }
+        // The prepared fixture has canonical initial IDs and no prior owners.
+        guard.reconcile_incarnation(0).unwrap();
         let registration = guard.register_snapshot().unwrap();
         guard.finish().unwrap();
         assert!(matches!(
