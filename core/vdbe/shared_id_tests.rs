@@ -123,6 +123,7 @@ fn shared_id_opcode_native_sequence_preserves_saved_outer_owner() {
     let outer = first.get_mv_tx_id_for_db(0).unwrap();
     let store = first.mv_store().as_ref().unwrap().clone();
     let snapshot = store.read_snapshot_ts(outer);
+    eprintln!("sequence ownership phase: first nextval");
     let allocated = integers(&first, "SELECT nextval('owner_sequence')")[0];
     assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
     assert_eq!(store.read_snapshot_ts(outer), snapshot);
@@ -132,6 +133,7 @@ fn shared_id_opcode_native_sequence_preserves_saved_outer_owner() {
         [100]
     );
     assert!(integers(&second, "SELECT id FROM preserved WHERE value='outer'").is_empty());
+    eprintln!("sequence ownership phase: preopened peer nextval");
     let later = integers(&second, "SELECT nextval('owner_sequence')")[0];
     assert!(later > allocated);
     first.execute("ROLLBACK").unwrap();
