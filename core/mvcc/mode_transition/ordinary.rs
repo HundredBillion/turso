@@ -114,6 +114,12 @@ pub(super) fn resume_prepared_marker(
 }
 
 impl OrdinaryOfflineBackend {
+    pub(super) fn create_staged(_path: &Path) -> Result<Self> {
+        Err(LimboError::InvalidArgument(
+            "fresh offline initialization is not implemented".into(),
+        ))
+    }
+
     pub(super) fn open(path: &Path, _: OfflinePrerequisite) -> Result<Self> {
         super::require_linux_platform()?;
         let native = open_native(path)?;
@@ -337,6 +343,55 @@ mod tests {
         let conn = db.connect(crate::ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode=mvcc; CREATE TABLE kept(id INTEGER PRIMARY KEY, value TEXT); CREATE INDEX kept_value ON kept(value); INSERT INTO kept VALUES(1,'retained')").unwrap();
         conn.close().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires native Linux ext-family filesystem"
+    )]
+    fn offline_backend_initializes_and_publishes_fresh_database_without_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging.db");
+        let destination = dir.path().join("published.db");
+        let backend = OrdinaryOfflineBackend::create_staged(&staging).unwrap();
+        super::super::OfflineModeChange::new(
+            backend,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+            64 * 1024 * 1024,
+        )
+        .publish_new(&destination)
+        .unwrap();
+        assert!(!staging.exists());
+        super::super::validate_shared_open(&destination).unwrap();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let db = crate::Database::open(
+            io,
+            destination.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.prepare("SELECT count(*) FROM sqlite_schema")
+            .unwrap()
+            .run_with_row_callback(|_| Ok(()))
+            .unwrap();
+        drop(conn);
+        drop(db);
+        let before = std::fs::read(&destination).unwrap();
+        let other_stage = dir.path().join("other.db");
+        let backend = OrdinaryOfflineBackend::create_staged(&other_stage).unwrap();
+        assert!(super::super::OfflineModeChange::new(
+            backend,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+            64 * 1024 * 1024
+        )
+        .publish_new(&destination)
+        .is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), before);
+        assert!(OrdinaryOfflineBackend::create_staged(&destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), before);
     }
 
     #[test]
