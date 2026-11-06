@@ -67,6 +67,22 @@ pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_bootstrap;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod shared_refresh;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+pub(crate) const SHARED_MVCC_VERSION: u8 = crate::mvcc::mode_transition::SHARED_MVCC_VERSION;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_runtime;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(crate) use shared_runtime::{SharedBeginState, SharedMvccRuntime, SharedOpenState};
+
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
@@ -970,6 +986,12 @@ impl<A: RowVersionAllocator> WriteSet<A> {
     }
 }
 
+enum BeginTimestamp {
+    Local,
+    #[cfg(host_shared_wal)]
+    Shared(super::shared_authority::SnapshotRegistration),
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
@@ -979,6 +1001,8 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     tx_id: u64,
     /// The transaction begin timestamp.
     begin_ts: u64,
+    #[cfg(host_shared_wal)]
+    shared_snapshot: Option<Box<Mutex<Option<super::shared_authority::SnapshotRegistration>>>>,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
@@ -1060,6 +1084,8 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             peer_conflicted: AtomicBool::new(false),
+            #[cfg(host_shared_wal)]
+            shared_snapshot: None,
             #[cfg(test)]
             before_mutation_lock: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
@@ -4438,6 +4464,8 @@ pub(crate) struct GcDebugSnapshot {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_runtime: std::sync::OnceLock<Arc<SharedMvccRuntime>>,
     pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
@@ -4631,6 +4659,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
+    pub(crate) fn is_shared(&self) -> bool {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.shared_runtime.get().is_some()
+        }
+        #[cfg(not(all(host_shared_wal, unix)))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn allocator(&self) -> A {
         self.alloc.clone()
     }
@@ -4700,6 +4739,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
+            #[cfg(all(host_shared_wal, unix))]
+            shared_runtime: std::sync::OnceLock::new(),
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
@@ -6807,6 +6848,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         checkpoint_read_guard: CheckpointReadLockState,
         portable_logical_changes: bool,
     ) -> Result<TxID> {
+        self.begin_tx_at_snapshot(
+            pager,
+            expected_schema_generation,
+            checkpoint_read_guard,
+            portable_logical_changes,
+            BeginTimestamp::Local,
+        )
+    }
+
+    fn begin_tx_at_snapshot(
+        &self,
+        pager: Arc<Pager>,
+        expected_schema_generation: Option<u64>,
+        checkpoint_read_guard: CheckpointReadLockState,
+        portable_logical_changes: bool,
+        snapshot: BeginTimestamp,
+    ) -> Result<TxID> {
         turso_assert!(
             !checkpoint_read_guard.is_held() || !self.experimental_mvcc_passive_checkpoint,
             "passive MVCC begin must not hold the blocking checkpoint read guard"
@@ -6852,7 +6910,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
         let mut schema_change_unpublished = false;
-        let begin_ts = self.clock.get_timestamp(|ts| {
+        let shared_timestamp = match &snapshot {
+            BeginTimestamp::Local => None,
+            #[cfg(host_shared_wal)]
+            BeginTimestamp::Shared(registration) => Some(registration.begin_timestamp),
+        };
+        let mut snapshot = Some(snapshot);
+        let mut publish = |ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
             // same clock, so it cannot interleave between this capture and the insert.
@@ -6875,18 +6939,40 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 schema_change_unpublished = true;
                 return;
             }
-            self.txs.insert(
+            let transaction = Transaction::new(
                 tx_id,
-                Transaction::new(
-                    tx_id,
-                    ts,
-                    header,
-                    read_mark,
-                    schema_generation,
-                    portable_logical_changes,
-                ),
+                ts,
+                header,
+                read_mark,
+                schema_generation,
+                portable_logical_changes,
             );
-        });
+            let transaction = match snapshot.take().expect("snapshot published once") {
+                BeginTimestamp::Local => transaction,
+                #[cfg(host_shared_wal)]
+                BeginTimestamp::Shared(registration) => {
+                    let mut transaction = transaction;
+                    transaction.shared_snapshot = Some(Box::new(Mutex::new(Some(registration))));
+                    transaction
+                }
+            };
+            self.txs.insert(tx_id, transaction);
+        };
+        let begin_ts = if let Some(timestamp) = shared_timestamp {
+            self.clock
+                .publish_observed(timestamp, || {
+                    publish(timestamp);
+                    Ok(())
+                })
+                .inspect_err(|_| {
+                    if !passive {
+                        self.blocking_checkpoint_lock.unlock();
+                    }
+                })?;
+            timestamp
+        } else {
+            self.clock.get_timestamp(publish)
+        };
         if schema_stale || schema_change_unpublished {
             if !passive {
                 self.blocking_checkpoint_lock.unlock();
@@ -6956,6 +7042,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.txs.remove(&tx_id);
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
+            }
+            // Removed skip-list entries can outlive logical transaction completion.
+            #[cfg(host_shared_wal)]
+            if let Some(registration) = &tx.shared_snapshot {
+                drop(registration.lock().take());
             }
             return;
         }
