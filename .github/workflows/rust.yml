@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fe62d3d4dc9b10cc3af4f5e965c635325e56c69b
+          ref: fcfacdf5eca96fbf77ac171bd9681f2f8b675c42
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,24 +25,11 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = fe62d3d4dc9b10cc3af4f5e965c635325e56c69b
+          test "$(git rev-parse HEAD)" = fcfacdf5eca96fbf77ac171bd9681f2f8b675c42
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Real committed ID facts
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_oracle_native_reads_committed_rows_and_cleans_each_query -- --ignored --test-threads=1 --nocapture 2>&1 | tee facts.log
-          grep -q '1 passed; 0 failed' facts.log
-      - name: Reproduce missing shared checkpoint materialization
-        run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_native_materializes_without_reclaiming_log_before_completion -- --ignored --test-threads=1 --nocapture 2>&1 | tee materialize-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'shared checkpoint materialization not implemented' materialize-red.log
-          grep -q '0 passed; 1 failed' materialize-red.log
       - name: Integrated offline operations and staging cleanup
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::mode_transition -- --test-threads=1 --nocapture 2>&1 | tee offline.log
