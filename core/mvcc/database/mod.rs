@@ -1003,6 +1003,15 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Flag: a depended-on transaction aborted; this transaction must abort too.
     /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
     abort_now: AtomicBool,
+    /// A peer commit replaced a version this local writer intended to change.
+    peer_conflicted: AtomicBool,
+    #[cfg(test)]
+    before_mutation_lock: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// Transaction IDs that depend on this transaction (notified on commit/abort).
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
@@ -1050,9 +1059,30 @@ impl<A: RowVersionAllocator> Transaction<A> {
             log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
+            peer_conflicted: AtomicBool::new(false),
+            #[cfg(test)]
+            before_mutation_lock: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn ensure_peer_unconflicted(&self) -> Result<()> {
+        if self.peer_conflicted.load(Ordering::Acquire) {
+            return Err(LimboError::WriteWriteConflict);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_before_mutation_lock(&self) {
+        let hook = self.before_mutation_lock.lock().take();
+        if let Some((arrived, resume)) = hook {
+            arrived.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap();
         }
     }
 
@@ -3097,6 +3127,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
                 }
 
+                tx.ensure_peer_unconflicted()?;
+                #[cfg(test)]
+                tx.pause_before_mutation_lock();
+
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
                 // Consider the example:
@@ -3118,8 +3152,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
+                let mut peer_conflict = false;
 
                 let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                    // Import holds this same clock lock through publication. A
+                    // commit may have waited after its initial conflict check.
+                    peer_conflict = tx.peer_conflicted.load(Ordering::Acquire);
                     turso_assert!(
                         ts > tx.begin_ts,
                         "end_ts must be strictly greater than begin_ts"
@@ -3174,10 +3212,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
-                    if can_commit_tx || read_only {
+                    if !peer_conflict && (can_commit_tx || read_only) {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
                 });
+                if peer_conflict {
+                    return Err(LimboError::WriteWriteConflict);
+                }
                 // We allow reads from happening. Exlusive means there is a single writer.
                 if exclusive_conflict && !read_only {
                     return Err(LimboError::WriteWriteConflict);
@@ -4253,7 +4294,7 @@ fn replay_frame_timestamp(frame: &[ParsedOp]) -> Result<u64> {
     };
     let committed = frame
         .first()
-        .map(&timestamp)
+        .map(timestamp)
         .ok_or_else(|| LimboError::Corrupt("empty recovery frame".into()))?;
     if committed > PackedTs::VALUE_MASK || frame.iter().any(|op| timestamp(op) != committed) {
         return Err(LimboError::Corrupt(
@@ -4804,9 +4845,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             table_id.into()
         };
-        if minimum <= self.next_table_id.load(Ordering::SeqCst) {
-            self.next_table_id.store(minimum - 1, Ordering::SeqCst);
-        }
+        self.next_table_id.fetch_min(minimum - 1, Ordering::SeqCst);
     }
 
     /// Insert a live `table_id -> root_page` binding (bootstrap/recovery, or an
@@ -5467,6 +5506,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
+        #[cfg(test)]
+        tx.pause_before_mutation_lock();
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5487,8 +5529,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Single SkipMap traversal: pass in a fresh Arc; the SkipMap
                 // returns the canonical Arc (ours on miss, an existing one
                 // on hit), which we hand to savepoint tracking.
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions, chain_in_write_set) = self
+                    .insert_index_version_for_writers(
+                        index_id,
+                        sortable_key,
+                        row_version,
+                        [Some(tx), None],
+                    )?;
                 if !chain_in_write_set {
                     tx.add_to_write_set(
                         RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
@@ -5515,7 +5562,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                    self.insert_version_for_writers(id.clone(), row_version, [Some(tx), None])?;
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 tx.record_created_table_version(id.clone(), version_id);
@@ -5548,6 +5595,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5565,8 +5613,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions, chain_in_write_set) = self
+                    .insert_index_version_for_writers(
+                        index_id,
+                        sortable_key,
+                        row_version,
+                        [Some(tx), None],
+                    )?;
                 if !chain_in_write_set {
                     tx.add_to_write_set(
                         RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
@@ -5588,7 +5641,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                    self.insert_version_for_writers(id.clone(), row_version, [Some(tx), None])?;
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -5687,6 +5740,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
+        #[cfg(test)]
+        tx.pause_before_mutation_lock();
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -5709,6 +5765,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     if !self.index_versions_still_mapped(rows, &arc_key, &row_versions) {
                         continue;
                     }
+                    tx.ensure_peer_unconflicted()?;
                     let chain_in_write_set =
                         chain_has_version_written_by(&locked_row_versions, tx_id);
                     for rv in locked_row_versions.iter_mut().rev() {
@@ -5762,6 +5819,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if !self.table_versions_still_mapped(&id, &row_versions) {
                     continue;
                 }
+                tx.ensure_peer_unconflicted()?;
                 let chain_in_write_set = chain_has_version_written_by(&locked_row_versions, tx_id);
                 for rv in locked_row_versions.iter_mut().rev() {
                     // A transaction cannot delete a version that it cannot see.
@@ -7302,9 +7360,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
                 return false;
             }
-            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-                version.set_end(None);
-            }
+            version.clear_end_if_owned_by(tx_id);
             true
         });
         (before - versions.len(), restores_rowid)
@@ -7609,7 +7665,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 for rv in versions.iter_mut() {
                     if rv.id == version_id {
                         restored_rowid = rollback_restores_rowid(tx_id, rv);
-                        rv.set_end(None);
+                        rv.clear_end_if_owned_by(tx_id);
                         tracing::debug!(
                             "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                             rowid.table_id,
@@ -7631,7 +7687,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
                         if rv.id == version_id {
-                            rv.set_end(None);
+                            rv.clear_end_if_owned_by(tx_id);
                             tracing::debug!(
                                 "rollback_savepoint: restored index version(table_id={}, version_id={})",
                                 table_id,
@@ -8757,11 +8813,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is inserted in the correct order. Returns a reference to the modified version chain,
     /// and whether the chain was already in the write set of the transaction that created
     /// `row_version`.
-    fn insert_version(
+    #[cfg(test)]
+    fn insert_version(&self, id: RowID, row_version: RowVersion) -> Result<(RowVersions<A>, bool)> {
+        let writers = self.version_writers(&row_version)?;
+        self.insert_version_for_writers(
+            id,
+            row_version,
+            [
+                writers[0].as_ref().map(|tx| tx.value()),
+                writers[1].as_ref().map(|tx| tx.value()),
+            ],
+        )
+    }
+
+    fn insert_version_for_writers(
         &self,
         id: RowID,
         row_version: RowVersion,
-    ) -> Result<(RowVersions<A>, bool), TryReserveError> {
+        writers: [Option<&Transaction<A>>; 2],
+    ) -> Result<(RowVersions<A>, bool)> {
         // Retry if GC unlinked this slot while we waited for the write lock.
         loop {
             let row_versions = self.get_or_create_table_row_versions(id.clone())?;
@@ -8769,12 +8839,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.table_versions_still_mapped(&id, &row_versions) {
                 continue;
             }
+            for writer in writers.into_iter().flatten() {
+                writer.ensure_peer_unconflicted()?;
+            }
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
             self.bump_table_rows_epoch();
             return Ok((row_versions, chain_in_write_set));
         }
+    }
+
+    // Resolve transaction references before taking a chain lock. Normal local
+    // writes already retain their transaction and bypass this lookup.
+    fn version_writers(&self, version: &RowVersion) -> Result<[Option<TxEntry<'_, A>>; 2]> {
+        let mut writers = [None, None];
+        for (slot, timestamp) in writers.iter_mut().zip([version.begin(), version.end()]) {
+            if let Some(TxTimestampOrID::TxID(tx_id)) = timestamp {
+                *slot = Some(
+                    self.txs
+                        .get(&tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?,
+                );
+            }
+        }
+        Ok(writers)
     }
 
     /// True if `arc` is still the mapped value for `id`.
@@ -8833,6 +8922,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: Arc<SortableIndexKey>,
         row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>, bool)> {
+        let writers = self.version_writers(&row_version)?;
+        self.insert_index_version_for_writers(
+            index_id,
+            key,
+            row_version,
+            [
+                writers[0].as_ref().map(|tx| tx.value()),
+                writers[1].as_ref().map(|tx| tx.value()),
+            ],
+        )
+    }
+
+    fn insert_index_version_for_writers(
+        &self,
+        index_id: MVTableId,
+        key: Arc<SortableIndexKey>,
+        row_version: RowVersion,
+        writers: [Option<&Transaction<A>>; 2],
+    ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>, bool)> {
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         // Same drain-retry as `insert_version`.
@@ -8845,6 +8953,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let mut versions = row_versions.write();
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
+            }
+            for writer in writers.into_iter().flatten() {
+                writer.ensure_peer_unconflicted()?;
             }
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
@@ -9968,6 +10079,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         frame: Vec<ParsedOp>,
     ) -> Result<PreparedRecoveryFrame> {
         let commit_timestamp = replay_frame_timestamp(&frame)?;
+        let incoming_schema_cookie = frame.iter().rev().find_map(|op| match op {
+            ParsedOp::UpdateHeader { header, .. } => Some(header.schema_cookie.get()),
+            _ => None,
+        });
         let schema_rows = &ctx.schema_rows;
         let type_sqls = &ctx.type_sqls;
         let current_schema = ctx.current_schema.clone();
@@ -10094,7 +10209,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // schema_rows_after is Some if the frame changes the schema
         let schema_rows_after = schema_rows_after;
 
-        let schema_after = match schema_rows_after.as_ref() {
+        let mut schema_after = match schema_rows_after.as_ref() {
             Some(schema_rows_after) => {
                 let type_sqls_after = type_sqls_after.as_ref().unwrap_or(type_sqls);
                 Some(self.recover_build_schema(
@@ -10108,6 +10223,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             None => None,
         };
 
+        if let Some(cookie) = incoming_schema_cookie {
+            let prepared_cookie = schema_after
+                .as_ref()
+                .unwrap_or(&current_schema)
+                .schema_version;
+            if prepared_cookie != cookie {
+                let schema = schema_after.get_or_insert_with(|| current_schema.clone());
+                Schema::try_make_mut(schema)?.schema_version = cookie;
+            }
+        }
+
         if schema_rows_after.is_some() {
             // Cached IndexInfo values are tied to a specific schema. Clear
             // before decoding a schema-changing frame so this frame chooses
@@ -10117,6 +10243,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         {
             let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
+                if schema_rows_after.is_none() {
+                    return false;
+                }
                 let Some(schema_after) = schema_after.as_ref() else {
                     return false;
                 };
@@ -10166,14 +10295,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // - If the frame does not change schema, `current_schema` is
                 //   both the before and after schema.
                 let index_info = match op_kind {
-                        IndexOpKind::Upsert if schema_after.is_some() => after,
-                        IndexOpKind::Delete if schema_after.is_some() => before,
+                        IndexOpKind::Upsert if schema_rows_after.is_some() => after,
+                        IndexOpKind::Delete if schema_rows_after.is_some() => before,
                         IndexOpKind::Upsert | IndexOpKind::Delete => before,
                     }
                     .ok_or_else(|| {
                         let expected_schema = match op_kind {
-                            IndexOpKind::Upsert if schema_after.is_some() => "post-frame",
-                            IndexOpKind::Delete if schema_after.is_some() => "pre-frame",
+                            IndexOpKind::Upsert if schema_rows_after.is_some() => "post-frame",
+                            IndexOpKind::Delete if schema_rows_after.is_some() => "pre-frame",
                             IndexOpKind::Upsert | IndexOpKind::Delete => "current",
                         };
                         LimboError::InternalError(format!(
@@ -10552,6 +10681,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // pre-frame schema. Do not carry those IndexInfo values into
                 // later frames after current_schema has changed.
                 index_infos.clear();
+            } else if let Some(schema_after) = schema_after {
+                install_schema(schema_after.clone());
+                current_schema = schema_after;
+                index_infos.clear();
             }
 
             Ok(())
@@ -10566,6 +10699,264 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ctx.current_schema = current_schema;
         ctx.index_infos = index_infos;
         replay_result
+    }
+
+    // The shared authority must exclude peer commits/checkpoints throughout this
+    // call. Admission uses the same authority before issuing a snapshot timestamp.
+    #[allow(dead_code)]
+    fn install_peer_frame(
+        &self,
+        connection: &Arc<Connection>,
+        ctx: &mut RecoverCtx,
+        prepared: &mut Option<PreparedRecoveryFrame>,
+    ) -> Result<()> {
+        let frame = prepared.as_ref().ok_or_else(|| {
+            LimboError::InvalidArgument("peer frame was already installed".into())
+        })?;
+        let timestamp = frame.commit_timestamp;
+        if timestamp <= ctx.max_commit_ts_seen || timestamp > PackedTs::VALUE_MASK {
+            return Err(LimboError::Corrupt(
+                "non-monotonic live replay frame".into(),
+            ));
+        }
+        // Each request keeps log order. Targets are subsequently deduplicated and
+        // locked by Arc address, independently of the different index comparators.
+        let mut requests: Vec<(Row, bool, bool)> = Vec::new();
+        requests.try_reserve(frame.decoded_frame.len())?;
+        let mut roots = Vec::new();
+        roots.try_reserve(frame.decoded_frame.len().saturating_mul(2))?;
+        let mut header = None;
+        let mut dropped_roots = ctx.dropped_root_pages.clone();
+        for op in &frame.decoded_frame {
+            let (row, delete, resident) = match op {
+                StreamingResult::UpsertTableRow {
+                    row,
+                    btree_resident,
+                    ..
+                } => {
+                    if row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let (root, has_btree) =
+                            self.validate_recovery_schema_root(row.payload())?;
+                        if has_btree && root < 0 {
+                            roots.push(MVTableId::from(root));
+                        }
+                        if has_btree && root > 0 {
+                            dropped_roots.remove(&root);
+                        }
+                    }
+                    (row.clone(), false, *btree_resident)
+                }
+                StreamingResult::UpsertIndexRow {
+                    row,
+                    btree_resident,
+                    ..
+                } => (row.clone(), false, *btree_resident),
+                StreamingResult::DeleteIndexRow { row, .. } => (row.clone(), true, true),
+                StreamingResult::DeleteTableRow { rowid, .. } => {
+                    let prior_in_frame = requests
+                        .iter()
+                        .rev()
+                        .find_map(|(row, delete, _)| (!delete && row.id == *rowid).then_some(row));
+                    let data: &[u8] = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        prior_in_frame
+                            .map(|row| row.payload())
+                            .or_else(|| {
+                                ctx.schema_rows
+                                    .get(&rowid.row_id.to_int_or_panic())
+                                    .map(|record| record.as_blob().as_slice())
+                            })
+                            .unwrap_or(&[])
+                    } else {
+                        &[]
+                    };
+                    if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID && !data.is_empty() {
+                        let (root, has_btree) = self.validate_recovery_schema_root(data)?;
+                        if has_btree && root > 0 {
+                            dropped_roots.insert(root);
+                        }
+                    }
+                    (
+                        Row::new_table_row_in(rowid.clone(), data, self.alloc.clone())?,
+                        true,
+                        true,
+                    )
+                }
+                StreamingResult::UpdateHeader {
+                    header: incoming, ..
+                } => {
+                    header = Some(*incoming);
+                    continue;
+                }
+                StreamingResult::Eof => {
+                    return Err(LimboError::Corrupt("EOF inside live frame".into()))
+                }
+            };
+            roots.push(row.id.table_id);
+            requests.push((row, delete, resident));
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.iter().any(|id| i64::from(*id) == i64::MIN) {
+            return Err(LimboError::Corrupt(
+                "logical table id cannot be lowered".into(),
+            ));
+        }
+        // Global logical-ID reservation must make these sets disjoint. Do not
+        // adopt a mapping which a concurrent local rollback is entitled to remove.
+        for tx in self.txs.iter() {
+            if tx
+                .value()
+                .created_table_ids
+                .lock()
+                .iter()
+                .any(|id| roots.binary_search(id).is_ok())
+            {
+                return Err(LimboError::Corrupt(
+                    "peer frame overlaps a local unpublished table id".into(),
+                ));
+            }
+        }
+        for id in &roots {
+            self.table_id_to_rootpage
+                .try_get_or_insert(*id, RootEntry::live(None))?;
+        }
+        let mut targets = Vec::new();
+        targets.try_reserve(requests.len())?;
+        let mut request_chains = Vec::new();
+        request_chains.try_reserve(requests.len())?;
+        let mut allocators = Vec::new();
+        allocators.try_reserve(requests.len())?;
+        for (row, delete, _) in &mut requests {
+            let chain = match &row.id.row_id {
+                RowKey::Int(rowid) => {
+                    if !*delete {
+                        allocators.push((self.get_rowid_allocator(&row.id.table_id), *rowid));
+                    }
+                    self.get_or_create_table_row_versions(row.id.clone())?
+                }
+                RowKey::Record(key) => {
+                    let index = self.get_or_create_index_rows(row.id.table_id)?;
+                    let entry = self.get_or_create_index_key_entry(index.value(), key.clone())?;
+                    row.id.row_id = RowKey::Record(entry.key().clone());
+                    entry.value().clone()
+                }
+            };
+            request_chains.push(Arc::as_ptr(&chain) as usize);
+            targets.push((row.id.clone(), chain));
+        }
+        targets.sort_unstable_by_key(|(_, chain)| Arc::as_ptr(chain) as usize);
+        targets.dedup_by(|(_, a), (_, b)| Arc::ptr_eq(a, b));
+        let mut dirty_entries = Vec::new();
+        dirty_entries.try_reserve(targets.len())?;
+        for (id, _) in &targets {
+            dirty_entries.push(
+                self.checkpoint_dirty_keys_for(id)
+                    .try_get_or_insert(id.clone(), AtomicU64::new(0))?,
+            );
+        }
+        self.clock.publish_observed(timestamp, || -> Result<()> {
+            for tx in self.txs.iter() {
+                match tx.value().state.load() {
+                    TransactionState::Active if tx.value().begin_ts >= timestamp => {
+                        return Err(LimboError::Corrupt("live snapshot is newer than an unimported peer frame".into()));
+                    }
+                    TransactionState::Preparing(_) | TransactionState::Committed(_) => return Err(LimboError::Busy),
+                    _ => {}
+                }
+            }
+            let mut guards = Vec::new();
+            guards.try_reserve(targets.len())?;
+            for (id, chain) in &targets {
+                let guard = chain.write();
+                let mapped = match &id.row_id {
+                    RowKey::Int(_) => self.table_versions_still_mapped(id, chain),
+                    RowKey::Record(key) => self.index_rows.get(&id.table_id).is_some_and(|index| self.index_versions_still_mapped(index.value(), key, chain)),
+                };
+                if !mapped { return Err(LimboError::Busy); }
+                guards.push(guard);
+            }
+            if dirty_entries.iter().any(|entry| entry.is_removed()) { return Err(LimboError::Busy); }
+            let mut staged = Vec::new();
+            staged.try_reserve(guards.len())?;
+            let mut conflicts = Vec::new();
+            for (index, versions) in guards.iter().enumerate() {
+                let address = Arc::as_ptr(&targets[index].1) as usize;
+                let additions = request_chains.iter().filter(|candidate| **candidate == address).count();
+                let mut copy = <RowVersionChain<A> as TursoVecInExt<RowVersion, A>>::new_in(self.alloc.clone());
+                copy.try_reserve_exact(versions.len().checked_add(additions).ok_or(LimboError::OutOfMemory)?)?;
+                conflicts.try_reserve(versions.len().saturating_mul(2))?;
+                for version in versions.iter() {
+                    copy.push(version.clone());
+                    // SkipMap entries pin lifetime, not a mutex. Retain references
+                    // now so marking conflicts during publication is infallible.
+                    for tag in [version.begin(), version.end()] {
+                        if let Some(TxTimestampOrID::TxID(id)) = tag {
+                            if let Some(tx) = self.txs.get(&id) {
+                                if tx.value().state.load() == TransactionState::Active { conflicts.push(tx); }
+                            }
+                        }
+                    }
+                }
+                staged.push(copy);
+            }
+            for ((row, delete, resident), address) in requests.iter().zip(&request_chains) {
+                let target = targets.binary_search_by_key(address, |(_, chain)| Arc::as_ptr(chain) as usize).expect("resolved replay chain");
+                let versions = &mut staged[target];
+                if *delete {
+                    if let Some(existing) = versions.iter_mut().rev().find(|version| {
+                        let begin = matches!(version.begin(), Some(TxTimestampOrID::Timestamp(begin)) if begin <= timestamp)
+                            || (version.begin().is_none() && matches!(version.end(), Some(TxTimestampOrID::TxID(_))));
+                        begin && matches!(version.end(), None | Some(TxTimestampOrID::TxID(_)))
+                    }) {
+                        existing.set_end(Some(TxTimestampOrID::Timestamp(timestamp)));
+                        continue;
+                    }
+                    if versions.iter().any(|version| version.begin().is_none() && version.end() == Some(TxTimestampOrID::Timestamp(timestamp))) { continue; }
+                }
+                let version = RowVersion::new(self.get_version_id(),
+                    (!delete).then_some(TxTimestampOrID::Timestamp(timestamp)),
+                    delete.then_some(TxTimestampOrID::Timestamp(timestamp)), row.data.clone(), *resident);
+                if !delete {
+                    if let Some(existing) = versions.iter_mut().find(|version| version.begin() == Some(TxTimestampOrID::Timestamp(timestamp))) {
+                        *existing = version;
+                        continue;
+                    }
+                }
+                let begin = self.resolve_begin_timestamp(&version.begin());
+                let position = versions.iter().rposition(|v| self.resolve_begin_timestamp(&v.begin()) <= begin).map_or(0, |index| index + 1);
+                versions.insert(position, version);
+            }
+            let added: usize = staged.iter().zip(&guards).map(|(after, before)| after.len() - before.len()).sum();
+            // Everything below is allocation-free. Old snapshots cannot see the
+            // new timestamp, and admission remains locked until metadata agrees.
+            let prepared = prepared.take().expect("validated peer frame remains pending");
+            for tx in conflicts { tx.value().peer_conflicted.store(true, Ordering::Release); }
+            for (guard, replacement) in guards.iter_mut().zip(staged) { **guard = replacement; }
+            for entry in &dirty_entries { entry.value().fetch_max(timestamp, Ordering::AcqRel); }
+            self.live_version_count_approx.fetch_add(added, Ordering::Relaxed);
+            self.bump_table_rows_epoch();
+            self.bump_index_rows_epoch();
+            // Never acquire schema/header locks while holding version-chain locks.
+            drop(guards);
+            for (allocator, rowid) in &allocators { allocator.insert_row_id_maybe_update(*rowid); }
+            for id in &roots { self.bump_next_table_id_below(*id, None); }
+            if let Some(header) = header { self.global_header.write().replace(header); }
+            let schema_changed = prepared.schema_after.is_some();
+            if let Some(schema) = prepared.schema_after {
+                *connection.schema.write() = schema.clone();
+                *connection.db.schema.lock() = schema.clone();
+                ctx.current_schema = schema;
+                self.last_committed_schema_change_ts.fetch_max(timestamp, Ordering::AcqRel);
+                self.bump_schema_generation();
+            }
+            if let Some(rows) = prepared.schema_rows_after { ctx.schema_rows = rows; }
+            if let Some(types) = prepared.type_sqls_after { ctx.type_sqls = types; }
+            ctx.index_infos = if schema_changed { HashMap::default() } else { prepared.index_infos };
+            ctx.dropped_root_pages = dropped_roots;
+            ctx.max_commit_ts_seen = timestamp;
+            self.last_committed_tx_ts.fetch_max(timestamp, Ordering::AcqRel);
+            Ok(())
+        })
     }
 
     /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
@@ -11048,6 +11439,12 @@ impl RowVersion {
         // A delete (or any end change) means the B-tree no longer reflects this version's current
         // state until a checkpoint re-materializes it; the GC must not reclaim it before then.
         self.materialized_at = WalPos::ORIGIN;
+    }
+
+    fn clear_end_if_owned_by(&mut self, tx_id: TxID) {
+        if self.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+            self.set_end(None);
+        }
     }
 
     /// Replace `begin`/`end` references to `tx_id` with the committed

@@ -19,6 +19,8 @@
 - Prepare replacement contents while chain mutation is excluded. Preserve local TxID versions and the existing chain Arcs referenced by transaction write sets.
 - Missing logical root IDs may be pre-created with no physical root. Existing physical bindings remain unchanged until quiescent checkpoint. Schema drops retain backing/root mappings needed by old snapshots.
 - Complete all decoding, schema validation, payload/index-info allocation, chain cloning/capacity allocation, and bookkeeping preparation before modifying visible version contents. Empty pre-created entries are the only permitted preflight residue.
+- A peer commit may conflict with a pending local end=TxID marker. Mark that local writer conflicted before replacing its marker; fail it explicitly with WriteWriteConflict before further results or commit. Recheck conflict state under each mutation chain lock so an operation paused after an initial state check cannot overwrite an imported committed end. Do not perform rollback while holding importer chain guards.
+- Full and savepoint rollback may clear only end markers still owned by the rolling-back TxID. Committed peer timestamps survive cleanup. Read-only snapshots remain live; conflicting writers retain registrations until normal rollback cleanup.
 - Publication has no I/O, fallible allocation or schema parsing. Update local imported boundary only after all chain contents/header/schema state are installed.
 - Shared authority remains owned throughout import and actual transaction insertion/commit validation. Do not expose the public opt-in until the entire protocol is connected and acceptance passes.
 
@@ -43,6 +45,7 @@
 - [ ] Apply prepared state without failure points, then publish the imported watermark/schema generation.
 - [ ] Inject allocation failures at each preparation stage with active local TxID versions as well as committed rows; retry the same frame and prove no duplicate rows, ended versions, skipped operations or lost local writes.
 - [ ] Race local insert/delete/rollback/GC with import; prove old snapshots stay stable and later snapshots see the complete peer frame.
+- [ ] Deterministically pause a writer after its initial transaction-state check and before chain-lock acquisition; import a conflicting peer commit, resume it, and require a defined conflict without stale mutation. Exercise table/index updates and savepoint cleanup.
 
 ## Task 3: Yielding admission and commit integration
 
@@ -60,3 +63,45 @@
 ## Remaining delivery boundaries
 
 This work does not replace mode-marker upgrade/downgrade, global row/table/sequence reservations, quiescent checkpoint/reclamation, retained-log-cap admission, validated C/PHP URI plumbing or full PHP-worker acceptance. All remain required before issue completion.
+
+## Execution evidence (partial)
+
+Frame preparation and schema-cookie staging are implemented in `ebc2e3932`,
+`350193f39`, and `e89b45992`. Savepoint rollback now clears only transaction-owned
+end tags. The existing recovery suite passed 51 tests; savepoint coverage passed
+21 tests.
+
+The writer race fixture pauses real table/index insert and delete calls after
+initial transaction validation, then simulates a peer installing a committed end
+under the same chain lock. The original table insert resumed successfully, which
+is the observed behavioral red. Mutation guards now return WriteWriteConflict
+under the chain lock; all four race variants and the three earlier peer-import
+regressions pass. The broader MVCC database suite passes 539 tests with 6 ignored.
+The private conflict flag is not yet set by a production importer. SQL result and
+admission checks, atomic frame installation and all Task 3 integration remain
+unfinished; these tests do not establish end-to-end shared-mode behavior.
+
+The private live installer now resolves canonical chains, locks them in Arc-address
+order under the local admission clock, stages replacement contents and conflict
+references, and publishes only after all fallible preparation succeeds. It keeps
+the prepared frame in an Option on failure and consumes it only at publication.
+Missing empty map entries, zero dirty-key placeholders, conservative cursor-epoch
+bumps and unused local version/timestamp numbers may remain after preparation
+fails; visible versions, schema/header, conflict flags and imported watermark do
+not change. The shared authority must still exclude concurrent commit/checkpoint
+work; that caller integration is not yet implemented.
+
+Native stable validation passes 545 MVCC database tests with 6 ignored. Coverage
+includes old/new snapshots, preserved local chain identity, table/index pending
+end replacement and rollback, schema/header publication, CREATE/DROP identity,
+logical-ID exhaustion, and dirty-map allocation failures followed by retry of the
+same prepared frame. The allocator-enabled pinned-nightly job must additionally
+exercise the chain-copy allocation sites before accepting that failure coverage.
+A separate commit race test observed a commit entering Preparing after peer
+invalidation; the commit now rechecks under the admission clock. The new test also
+asserts failed-state cleanup preserves the imported peer version.
+
+Logical-table allocator lowering uses atomic fetch_min so concurrent local
+reservations cannot be overwritten. Imported i64::MIN table IDs are rejected
+before publication. Global table/row/sequence reservation integration remains a
+separate required task; this local monotonicity repair does not provide it.

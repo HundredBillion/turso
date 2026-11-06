@@ -45,6 +45,9 @@ jobs:
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest -- --test-threads=1 --nocapture
 
+      - name: Local MVCC and peer import regressions
+        run: >-
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=1
       - name: Offline mode transitions and atomic publication
         run: >-
           cargo test --locked -p turso_core --lib --features conn_raw_api mode_transition_ -- --test-threads=1 --nocapture
@@ -101,3 +104,22 @@ jobs:
         with:
           name: php-worker-controls
           path: php-results/
+
+  nightly-peer-import:
+    if: github.repository == 'HundredBillion/turso'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-17
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-nightly-peer-import
+          cache-on-failure: true
+      - name: Peer import atomicity with actual fallible chain allocations
+        env:
+          RUSTFLAGS: --cfg nightly
+        run: >-
+          cargo +nightly-2025-12-17 test --locked -p turso_core --lib --features conn_raw_api peer_import_ -- --test-threads=1 --nocapture

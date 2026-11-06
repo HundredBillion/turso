@@ -96,11 +96,25 @@ An opted-in database requires explicit safe downgrade before older binaries can
 reopen it. The user approved this compatibility policy on 2026-11-06. No header
 value has yet been allocated or changed in the implementation.
 
+A marker rejects future old opens; it cannot revoke an already-open old read-only
+handle that holds no database lock. The user approved requiring an explicit
+offline upgrade with every older worker stopped, including those unlocked
+readers. Ordinary shared-mode URI opening must reject an existing old-format
+database rather than silently upgrading it. The transition command/procedure
+must state this stopped-worker prerequisite; an exclusive database lock alone
+cannot verify it.
+
+For a newly created database, the final pathname must not expose an ordinary or
+empty header before the new marker is durable. Publish a fully initialized,
+marked inode atomically without overwriting a racing creator, and synchronize
+its identity-specific sidecars and parent directory. The concrete publication
+implementation and old-reader race tests remain required.
+
 Upgrade and downgrade must follow these transitions:
 
 | Transition | Required ownership and durable action | Crash recovery |
 | --- | --- | --- |
-| Start upgrade | Exclusive ordinary database lock, no legacy or protocol participants | Before any durable marker, ordinary old-format recovery remains valid |
+| Start upgrade | Explicit offline action after all older workers are stopped; exclusive ordinary database lock and no protocol participants | Before any durable marker, ordinary old-format recovery remains valid |
 | Prepare upgrade | Finish ordinary MVCC recovery/checkpoint; synchronize database and sidecars | Reopen through ordinary recovery if the marker is still old |
 | Publish new marker | Write matching read/write versions through the pager and synchronize the complete checkpoint | Old readers reject a durable new marker; new readers reconcile incomplete physical WAL work |
 | Enable protocol admission | Create/validate coordination epoch only after marker durability | No shared-mode commit can precede durable old-reader exclusion |
@@ -110,7 +124,9 @@ Upgrade and downgrade must follow these transitions:
 | Finish downgrade | Remove only unused logical coordination metadata after all protocol handles leave | Idle old-generation workers must fail mode validation before any new operation |
 
 The upgrade/downgrade commands and error mapping need explicit tests with an old
-executable, including an old read-only handle already open at upgrade start.
+executable, including an old read-only handle already open before a shared-mode URI request.
+That ordinary request must reject implicit upgrade. The explicit offline
+transition is exercised only after the operator has stopped the older workers.
 Changing a marker directly with a byte write is not an implementation of this
 transition protocol.
 
@@ -290,7 +306,7 @@ receive the error within their deadline.
 | C | Begin/commit integration and conflict validation | Barriers prove overlap; fresh snapshots see peer commits; old snapshots remain stable; same-row, delete and unique-key conflicts cannot both succeed |
 | D | IDs, sequences and schema coordination | Concurrent allocations differ; rollback/restart preserves committed floors; explicit IDs, overflow and sequence watermarks are covered |
 | E | Checkpoint, epoch reload and reclamation | Long reader delays checkpoint; log cap bounds growth; release permits reclamation; sleeping worker reloads; death at every persistent transition recovers |
-| F | C/PHP opt-in and process acceptance | SQLite3 and PDO processes run full CRUD, deadlines, rollback, read-only/TEMP/ATTACH and external acknowledgement-ledger recovery |
+| F | C/PHP opt-in and process acceptance | PDO URI processes run shared-mode CRUD, deadlines, rollback, read-only/TEMP/ATTACH and external acknowledgement-ledger recovery; ordinary SQLite3 remains regression coverage |
 | G | Regression and equal-durability comparison | Storage issue #14 integrated; default modes remain compatible; original issue #11383 rolling restarts exercised; compare actual PHP workers with SQLite |
 
 Each stage needs executable tests that first fail against its preceding source,
@@ -339,3 +355,12 @@ not establish Linux cross-process support.
 Storage issue #14 currently owns changes to read-only activation and I/O guards.
 Integrate its verified commit before final combined runtime validation. Do not
 copy or independently rewrite those guards while that work is in progress.
+
+## Initial PHP binding scope
+
+The user approved PDO-only shared-mode support for the initial release on
+2026-11-06. PDO can forward the explicit URI to the compatibility API. PHP's
+SQLite3 class expands its filename before calling that API, so its ordinary
+behavior stays unchanged; no filename rewrite or vendor open-flag API is added.
+Shared-mode acceptance requires PDO URI opens and explicit capability attestation.
+The SQLite3 class remains covered for ordinary-mode compatibility.
