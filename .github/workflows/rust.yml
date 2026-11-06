@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 88c5fc910314289b3c99f9c9e9e2da85dee2e769
+          ref: eac0d6bc24ded8476cfcea460de18172c32d7dbe
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,20 +25,16 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 88c5fc910314289b3c99f9c9e9e2da85dee2e769
+          test "$(git rev-parse HEAD)" = eac0d6bc24ded8476cfcea460de18172c32d7dbe
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Concrete ordinary offline upgrade has no implementation yet
+      - name: Concrete native offline upgrade and exclusion
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_upgrades_real_mvcc_data -- --test-threads=1 --nocapture 2>&1 | tee offline-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'ordinary offline backend is not implemented' offline-red.log
-          grep -q '0 passed; 1 failed' offline-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api offline_backend_ -- --test-threads=1 --nocapture 2>&1 | tee offline-green.log
+          grep -q '3 passed; 0 failed' offline-green.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Preserve exact source and expected failure
         if: always()
         uses: actions/upload-artifact@v4
