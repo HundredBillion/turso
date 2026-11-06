@@ -880,3 +880,297 @@ mod tests {
         bytes[CHECKSUM_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
     }
 }
+#[cfg(all(test, any(target_os = "linux", target_os = "macos"), not(shuttle)))]
+mod process_tests {
+    use super::super::shared_authority::SharedMvccAuthority;
+    use super::*;
+    use crate::io::{OpenFlags, SyscallIO};
+    use crate::mvcc::database::{LogRecord, PackedTs, RowVersion, TxTimestampOrID, WalPos};
+    use crate::mvcc::persistent_storage::logical_log::{LogicalLog, StreamingLogicalLogReader};
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    const DATABASE_ID: FileId = FileId { dev: 1, ino: 2 };
+    const CHILD_TEST: &str = "mvcc::commit_manifest::process_tests::commit_manifest_process_child";
+
+    fn boundary() {
+        println!("MANIFEST_READY");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+    }
+
+    struct PausingFile {
+        inner: Arc<dyn File>,
+        phase: String,
+    }
+    impl File for PausingFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, offset: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(offset, c)
+        }
+        fn pwrite(&self, offset: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            let c = self.inner.pwrite(offset, buffer, c)?;
+            assert!(c.succeeded());
+            if self.phase == "written" {
+                boundary();
+            }
+            Ok(c)
+        }
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            if self.phase == "before_sync" {
+                boundary();
+            }
+            let c = self.inner.sync(c, sync_type)?;
+            assert!(c.succeeded());
+            if self.phase == "synced" {
+                boundary();
+            }
+            Ok(c)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(n, c)
+        }
+    }
+
+    fn open(io: &Arc<dyn crate::IO>, dir: &std::path::Path, name: &str) -> Arc<dyn File> {
+        io.open_file(
+            dir.join(name).to_str().unwrap(),
+            OpenFlags::Create | OpenFlags::NoLock,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn synced_write(path: &std::path::Path, bytes: &[u8]) {
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn seed(dir: &std::path::Path) {
+        let io: Arc<dyn crate::IO> = Arc::new(SyscallIO::new().unwrap());
+        let mut log = LogicalLog::new(open(&io, dir, "log"), io.clone(), None);
+        for timestamp in [10, 20] {
+            let row = crate::mvcc::database::tests::generate_simple_string_row(
+                (-2).into(),
+                timestamp as i64,
+                "durable payload",
+            );
+            let version = RowVersion {
+                id: timestamp,
+                begin: PackedTs::pack(Some(TxTimestampOrID::Timestamp(timestamp))),
+                end: PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: WalPos::ORIGIN,
+            };
+            io.wait_for_completion(
+                log.log_tx(LogRecord::for_test(timestamp, &[(row.id, version)], None))
+                    .unwrap(),
+            )
+            .unwrap();
+            io.wait_for_completion(log.sync(FileSyncType::FullFsync).unwrap())
+                .unwrap();
+            let record = ManifestRecord::new(
+                timestamp / 10,
+                DATABASE_ID,
+                1,
+                log.header().unwrap().salt,
+                PublishedPrefix {
+                    committed_timestamp: timestamp,
+                    end_offset: log.offset,
+                    running_crc: log.running_crc,
+                },
+            )
+            .unwrap();
+            if timestamp == 10 {
+                let mut block = [0; SLOT_SIZE];
+                block[..RECORD_SIZE].copy_from_slice(&record.encode());
+                synced_write(&dir.join("manifest"), &block);
+            } else {
+                synced_write(&dir.join("successor"), &record.encode());
+            }
+        }
+        synced_write(&dir.join("acknowledged"), &10u64.to_le_bytes());
+        std::fs::File::open(dir).unwrap().sync_all().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_manifest_process_death_preserves_acknowledged_log_prefix() {
+        for phase in [
+            "before_write",
+            "written",
+            "before_sync",
+            "synced",
+            "published",
+            "acknowledged",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(dir.path());
+            let mut publisher = spawn(dir.path(), phase);
+            publisher.kill();
+            let mut recovery = spawn(dir.path(), "recover");
+            recovery.kill();
+        }
+    }
+
+    #[test]
+    fn commit_manifest_process_fixture_has_synced_real_log_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path());
+        let io: Arc<dyn crate::IO> = Arc::new(SyscallIO::new().unwrap());
+        let mut load =
+            ManifestLoad::start(open(&io, dir.path(), "manifest"), None, DATABASE_ID).unwrap();
+        let IOResult::Done(loaded) = load.poll().unwrap() else {
+            panic!("syscall load yields")
+        };
+        let next = ManifestRecord::decode(&std::fs::read(dir.path().join("successor")).unwrap())
+            .unwrap()
+            .unwrap();
+        for record in [loaded.record, next] {
+            let mut reader = StreamingLogicalLogReader::new(open(&io, dir.path(), "log"), None)
+                .with_committed_prefix(record.prefix.end_offset, record.prefix.running_crc)
+                .unwrap();
+            reader.read_header(&io).unwrap();
+            let mut frames = 0;
+            while let Some(frame) = reader.next_frame_blocking(&io).unwrap() {
+                assert_eq!(frame.len(), 1);
+                frames += 1;
+            }
+            assert_eq!(frames, record.prefix.committed_timestamp / 10);
+        }
+    }
+
+    #[test]
+    fn commit_manifest_process_child() {
+        let Ok(dir) = std::env::var("TURSO_MANIFEST_PROCESS_DIR") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let phase = std::env::var("TURSO_MANIFEST_PROCESS_PHASE").unwrap();
+        let io: Arc<dyn crate::IO> = Arc::new(SyscallIO::new().unwrap());
+        let authority = SharedMvccAuthority::open(
+            &io,
+            dir.join("authority").to_str().unwrap(),
+            DATABASE_ID,
+            8192,
+        )
+        .unwrap();
+        let guard = authority.try_acquire().unwrap();
+        let file: Arc<dyn File> = Arc::new(PausingFile {
+            inner: open(&io, dir, "manifest"),
+            phase: phase.clone(),
+        });
+        let mut load = ManifestLoad::new(file, guard, DATABASE_ID).unwrap();
+        let IOResult::Done(mut loaded) = load.poll().unwrap() else {
+            panic!("syscall load yields")
+        };
+        let log_file = open(&io, dir, "log");
+        let mut reader = StreamingLogicalLogReader::new(log_file, None)
+            .with_committed_prefix(
+                loaded.record.prefix.end_offset,
+                loaded.record.prefix.running_crc,
+            )
+            .unwrap();
+        reader.read_header(&io).unwrap();
+        assert_eq!(reader.header().unwrap().salt, loaded.record.log_salt);
+        let mut frames = 0;
+        while let Some(frame) = reader.next_frame_blocking(&io).unwrap() {
+            assert_eq!(frame.len(), 1);
+            frames += 1;
+        }
+        assert_eq!(frames, loaded.record.prefix.committed_timestamp / 10);
+        let acknowledged = u64::from_le_bytes(
+            std::fs::read(dir.join("acknowledged"))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        // A complete unacknowledged successor is acceptable only because its log prefix was synced before publication and verified above.
+        assert!(loaded.record.prefix.committed_timestamp >= acknowledged);
+        loaded
+            .guard
+            .as_mut()
+            .unwrap()
+            .recover(loaded.record.prefix)
+            .unwrap();
+        if phase == "recover" {
+            loaded.guard.take().unwrap().finish().unwrap();
+            boundary();
+            return;
+        }
+        let next = ManifestRecord::decode(&std::fs::read(dir.join("successor")).unwrap())
+            .unwrap()
+            .unwrap();
+        if phase == "before_write" {
+            boundary();
+        }
+        let mut publication = loaded.publish(next).unwrap();
+        let IOResult::Done(mut durable) = publication.poll().unwrap() else {
+            panic!("syscall publish yields")
+        };
+        let mut guard = durable.guard.take().unwrap();
+        guard.recover(durable.record.prefix).unwrap();
+        guard.finish().unwrap();
+        if phase == "published" {
+            boundary();
+        }
+        synced_write(
+            &dir.join("acknowledged"),
+            &durable.record.prefix.committed_timestamp.to_le_bytes(),
+        );
+        boundary();
+    }
+
+    fn spawn(dir: &std::path::Path, phase: &str) -> ChildProcess {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env("TURSO_MANIFEST_PROCESS_DIR", dir)
+            .env("TURSO_MANIFEST_PROCESS_PHASE", phase)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut child = ChildProcess(child);
+        let stdout = child.0.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("MANIFEST_READY") {
+                    let _ = sender.send(());
+                    return;
+                }
+            }
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|error| panic!("phase {phase}: {error}"));
+        child
+    }
+
+    struct ChildProcess(Child);
+    impl ChildProcess {
+        fn kill(&mut self) {
+            self.0.kill().unwrap();
+            self.0.wait().unwrap();
+        }
+    }
+    impl Drop for ChildProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
