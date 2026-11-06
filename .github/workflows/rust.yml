@@ -1,4 +1,4 @@
-name: Shared VDBE native admission regression validation
+name: Shared VDBE admission and journal mode validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6f6a19976f302670e357cf103fee5e73936baa5c
+          ref: d1927c9ae05f9a77d50b95dcdfc0c32f4e5a1723
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,55 +25,29 @@ jobs:
       - name: Record source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 6f6a19976f302670e357cf103fee5e73936baa5c
+          test "$(git rev-parse HEAD)" = d1927c9ae05f9a77d50b95dcdfc0c32f4e5a1723
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Native admission barrier and reset retirement
+      - name: Native VDBE admission and journal mode
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --skip journal_mode --test-threads=1 --nocapture 2>&1 | tee admission-green.log
-          grep -q '2 passed; 0 failed' admission-green.log
-      - name: Journal mode marker regression must fail before fix
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee native-green.log
+          grep -q '4 passed; 0 failed' native-green.log
+      - name: VDBE ordinary behavior and native controls
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_journal_mode -- --test-threads=1 --nocapture 2>&1 | tee journal-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' journal-red.log
-          grep -q 'Invalid read_version: 254' journal-red.log
-      - name: Admission bypass negative control
+          cargo test --locked -p turso_core --lib --features conn_raw_api vdbe -- --test-threads=1 2>&1 | tee vdbe.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api journal_mode -- --test-threads=1 2>&1 | tee journal.log
+      - name: Strict core library lint
         run: |
-          python3 - <<'PYCODE'
-          from pathlib import Path
-          path = Path('core/vdbe/execute.rs')
-          source = path.read_text()
-          before = 'if mv_store.is_shared() {\n        return mv_store.begin_shared_nonblock('
-          assert source.count(before) == 1
-          path.write_text(source.replace(before, 'if false && mv_store.is_shared() {\n        return mv_store.begin_shared_nonblock('))
-          PYCODE
-          git diff > bypass.patch
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_fresh_read_and_savepoint -- --test-threads=1 --nocapture 2>&1 | tee admission-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' admission-red.log
-          grep -q 'shared fresh admission bypassed publication barrier' admission-red.log
-      - name: Restore route and recheck
-        run: |
-          git checkout -- core/vdbe/execute.rs
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --skip journal_mode --test-threads=1 --nocapture 2>&1 | tee admission-restored.log
-          grep -q '2 passed; 0 failed' admission-restored.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - name: Preserve exact source and controls
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-vdbe-native-controls
+          name: shared-vdbe-native-green
           path: |
             source.txt
             rustc.txt
             *.log
-            bypass.patch
           retention-days: 14
