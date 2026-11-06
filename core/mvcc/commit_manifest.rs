@@ -278,10 +278,24 @@ struct LoadedManifest {
     record: ManifestRecord,
 }
 
-struct DurableManifest {
+pub(super) struct DurableManifest {
     guard: Option<AuthorityGuard>,
     slot: usize,
     record: ManifestRecord,
+}
+
+impl DurableManifest {
+    pub(super) fn prefix(&self) -> PublishedPrefix {
+        self.record.prefix
+    }
+
+    fn publish(mut self) -> Result<AuthorityGuard> {
+        let mut guard = self.guard.take().ok_or_else(|| {
+            LimboError::InvalidArgument("manifest publication has no authority".into())
+        })?;
+        guard.publish_committed(&self)?;
+        Ok(guard)
+    }
 }
 
 struct ManifestPublication {
@@ -1117,18 +1131,17 @@ mod process_tests {
             boundary();
         }
         let mut publication = loaded.publish(next).unwrap();
-        let IOResult::Done(mut durable) = publication.poll().unwrap() else {
+        let IOResult::Done(durable) = publication.poll().unwrap() else {
             panic!("syscall publish yields")
         };
-        let mut guard = durable.guard.take().unwrap();
-        guard.recover(durable.record.prefix).unwrap();
-        guard.finish().unwrap();
+        let committed_timestamp = durable.prefix().committed_timestamp;
+        durable.publish().unwrap().finish().unwrap();
         if phase == "published" {
             boundary();
         }
         synced_write(
             &dir.join("acknowledged"),
-            &durable.record.prefix.committed_timestamp.to_le_bytes(),
+            &committed_timestamp.to_le_bytes(),
         );
         boundary();
     }
