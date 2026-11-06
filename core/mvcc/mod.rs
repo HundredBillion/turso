@@ -43,6 +43,9 @@ pub mod database;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 mod guarded_file;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod read_pinned_file;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
 mod mode_transition;

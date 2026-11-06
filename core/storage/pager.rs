@@ -3223,6 +3223,11 @@ impl Pager {
         Ok(())
     }
 
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn uses_shared_state(&self, shared: &Arc<SharedPagerState>) -> bool {
+        Arc::ptr_eq(&self.shared, shared)
+    }
+
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
         let value = self.shared.page_size.load(Ordering::SeqCst);
