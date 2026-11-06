@@ -249,7 +249,7 @@ mod tests {
             namespace.join("manifest"),
         ];
         let before: Vec<_> = content.iter().map(|p| std::fs::read(p).unwrap()).collect();
-        let files = SharedMvccFiles::open_existing(io, main, id, &path, 8192, true).unwrap();
+        let files = SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).unwrap();
         assert_eq!(files.namespace, namespace);
         assert_eq!(files.main.file_id().unwrap(), Some(id));
         for file in [&files.main, &files.logical, &files.physical_wal] {
@@ -305,7 +305,7 @@ mod tests {
             .unwrap();
         let id = main.file_id().unwrap().unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 8192, true).is_err());
+        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!namespace_for(&path, id).unwrap().exists());
     }
@@ -319,6 +319,9 @@ mod tests {
             "physical-wal",
             "physical-tshm",
             "authority",
+            "ids-a",
+            "ids-b",
+            "ids-selector",
         ] {
             let (_dir, path, io, main, id) = native_fixture();
             let namespace = namespace_for(&path, id).unwrap();
@@ -331,7 +334,7 @@ mod tests {
                     (path, bytes)
                 })
                 .collect();
-            assert!(SharedMvccFiles::open_existing(io, main, id, &path, 8192, false).is_err());
+            assert!(SharedMvccFiles::open_existing(io, main, id, &path, 65536, false).is_err());
             assert!(!namespace.join(missing).exists());
             for (path, bytes) in before {
                 assert_eq!(std::fs::read(path).unwrap(), bytes);
@@ -343,12 +346,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn shared_files_live_mapping_unlink_cannot_create_replacement_authority() {
         let (_dir, path, io, main, id) = native_fixture();
-        let live = SharedMvccFiles::open_existing(io.clone(), main.clone(), id, &path, 8192, true)
+        let live = SharedMvccFiles::open_existing(io.clone(), main.clone(), id, &path, 65536, true)
             .unwrap();
         let authority_id = live.authority.file_id().unwrap();
         let authority_path = live.namespace.join("authority");
         std::fs::remove_file(&authority_path).unwrap();
-        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 8192, true).is_err());
+        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).is_err());
         assert!(!authority_path.exists());
         assert_eq!(live.authority.file_id().unwrap(), authority_id);
     }
@@ -367,13 +370,13 @@ mod tests {
                 ..id
             },
             &path,
-            8192,
+            65536,
             true
         )
         .is_err());
         assert_eq!(std::fs::read(namespace.join("authority")).unwrap(), before);
         std::fs::write(namespace.join("manifest"), [0; SLOT_SIZE]).unwrap();
-        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 8192, true).is_err());
+        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).is_err());
         assert_eq!(std::fs::read(namespace.join("authority")).unwrap(), before);
     }
 
@@ -390,7 +393,7 @@ mod tests {
         let manifest = namespace_for(&path, id).unwrap().join("manifest");
         std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o400)).unwrap();
         let before = std::fs::read(&manifest).unwrap();
-        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 8192, true).is_err());
+        assert!(SharedMvccFiles::open_existing(io, main, id, &path, 65536, true).is_err());
         assert_eq!(std::fs::read(&manifest).unwrap(), before);
     }
 
@@ -413,7 +416,7 @@ mod tests {
             main,
             FileId { dev: 0, ino: 0 },
             &path,
-            8192,
+            65536,
             false
         )
         .is_err());
