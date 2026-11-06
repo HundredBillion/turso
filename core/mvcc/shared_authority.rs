@@ -441,6 +441,11 @@ impl AuthorityGuard {
         })
     }
 
+    #[allow(dead_code)]
+    pub(super) fn reconcile_incarnation(&mut self, _durable_owner_epoch: u64) -> Result<()> {
+        self.require_recovered()
+    }
+
     pub(super) fn register_snapshot(&mut self) -> Result<SnapshotRegistration> {
         let prefix = self.published()?;
         let begin_timestamp = self.allocate_timestamp()?;
@@ -618,6 +623,45 @@ mod tests {
 
     const CHILD_TEST: &str = "mvcc::shared_authority::tests::authority_child";
     const DATABASE_ID: FileId = FileId { dev: 1, ino: 2 };
+
+    #[test]
+    fn authority_incarnation_does_not_reuse_durable_owner_after_mapped_state_loss() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination");
+        let authority = open(&path);
+        initialize(&authority);
+        let mut guard = authority.try_acquire().unwrap();
+        let snapshot = guard.register_snapshot().unwrap();
+        let acknowledged_owner = (snapshot.epoch, snapshot.begin_timestamp);
+        guard.finish().unwrap();
+        drop(snapshot);
+        drop(authority);
+
+        // Preserve the durable reservation's owner while restoring older coordination bytes.
+        // A process-kill test cannot simulate this loss of unsynchronized mapped updates.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(
+            &(acknowledged_owner.0 - 1).to_le_bytes(),
+            EPOCH_OFFSET as u64,
+        )
+        .unwrap();
+        file.write_all_at(&1u64.to_le_bytes(), NEXT_TIMESTAMP_OFFSET as u64)
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let authority = open(&path);
+        initialize(&authority);
+        let mut guard = authority.try_acquire().unwrap();
+        guard.reconcile_incarnation(acknowledged_owner.0).unwrap();
+        let snapshot = guard.register_snapshot().unwrap();
+        assert!(snapshot.epoch > acknowledged_owner.0);
+        assert_ne!(
+            (snapshot.epoch, snapshot.begin_timestamp),
+            acknowledged_owner
+        );
+        guard.finish().unwrap();
+    }
 
     #[test]
     fn authority_existing_only_does_not_recreate_unlinked_live_mapping() {
