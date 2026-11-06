@@ -1476,6 +1476,19 @@ impl Database {
         let mut state = OpenDbAsyncState::new();
         state.offline_marker_recovery = Some(proof.clone());
         let db = io.block(|| Self::do_open_async(&mut state, io.clone(), path, &options))?;
+        let wal_id = db
+            .shared_wal
+            .read()
+            .runtime
+            .file
+            .as_ref()
+            .ok_or_else(|| LimboError::Corrupt("offline recovery WAL is missing".into()))?
+            .file_id()?;
+        if wal_id != Some(proof.ordinary_wal_id()) {
+            return Err(LimboError::InvalidArgument(
+                "offline recovery WAL identity changed".into(),
+            ));
+        }
         proof.revalidate()?;
         Ok(db)
     }

@@ -47,6 +47,14 @@ pub(super) fn resume_prepared_marker(
     let connection = db.connect(crate::ConnectOpts::new())?;
     connection.execute("PRAGMA synchronous=FULL")?;
     let pager = connection.get_pager();
+    let physical_floor = pager
+        .io
+        .block(|| pager.with_header(|header| -i64::from(header.database_size.get().max(1))))?;
+    if proof.logical_floor() > physical_floor {
+        return Err(LimboError::Corrupt(
+            "prepared ID floor does not cover materialized roots".into(),
+        ));
+    }
     let marker = pager
         .io
         .block(|| pager.with_header(|header| (header.read_version.0, header.write_version.0)))?;
