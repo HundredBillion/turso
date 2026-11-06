@@ -247,6 +247,11 @@ The configured history budget accounts for both reservation bank sizes, selector
 current recovered logical prefix end offset; calculate the total under authority,
 using the supplied `RecoveryIdentity` rather than a stale process-local estimate. Before exceeding it, return bounded contention and request a quiescent checkpoint; do not silently grow an unlimited reservation tail. If the irreducible compact state itself exceeds the configured budget, return an explicit resource error. This is a tunable byte budget, not a permanent number-of-tables limit. Peak compaction allowance includes both old and new snapshots; preflight must not start a transition that cannot retain the last complete bank.
 
+The ordinary append preflight conservatively counts existing physical tail bytes, including
+abandoned unacknowledged bytes, before truncation. It can therefore return BUSY before it
+can reclaim that tail. Recovery or quiescent compaction must provide bounded reclamation;
+ordinary append must not relax the live-history budget to make progress.
+
 Read-only participants can inspect reservation watermarks and liveness under authority but do not mutate reservation banks or repair tails. Mutating reconciliation is deferred to a writer/recovery owner; unavailable writable recovery returns an explicit error. Existing authority coordination bookkeeping remains governed by the approved read-only metadata policy.
 
 ## Implementation tasks and review gates
@@ -378,3 +383,26 @@ The live-owner timestamp boundary test also rejects the authority's reserved
 maximum timestamp, while leaving recovered checkpoint timestamp decoding unchanged.
 No reservation append, durable acknowledgement, compaction, dead-owner reclamation
 or real allocator/VM integration is enabled by this loader milestone.
+
+
+## Owned journal append milestone evidence
+
+Thirty-one focused shared-ID tests pass after adding owned append publication.
+The first durable-append test failed against the unimplemented operation. The
+implemented operation stages replay, sequence and byte-budget checks before any
+mutation, trims only the active bank's unacknowledged tail, synchronizes the new
+record, then writes and FULL-syncs each selector copy. It returns its owned state
+and guard only after backend I/O retirement. Pending generation transitions reject
+ordinary append. The caller still supplies a policy-validated change; this layer
+does not choose or authorize automatic IDs.
+
+Six append tests cover mirrored durable bytes, seven mutation failure boundaries,
+all seven delayed operations, abort at every operation with authority held until
+backend retirement, repeated append using the same bindings, and preflight errors
+with no writes. Failure tests reconstruct selection from durable byte images and
+require a complete old or new floor. Budget coverage includes the inactive bank's
+physical size. Root independently reviewed preflight and durability ordering.
+
+This is deterministic component evidence, not process-crash or real-filesystem
+acceptance. The reservation policy, committed-oracle adapter, liveness reconciliation,
+quiescent compaction and coordinated sidecar/runtime initialization remain open.
