@@ -420,18 +420,95 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
     group.finish();
 }
 
+// Validation-only controls: preserve one physical fixture across engine builds.
+fn control_open(path: &str) -> Arc<Database> {
+    Database::open_file_with_flags(
+        Arc::new(PlatformIO::new().unwrap()),
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap()
+}
+
+fn control_rows(db: &Arc<Database>, conn: &Arc<turso_core::Connection>, sql: &str) -> String {
+    let mut statement = conn.query(sql).unwrap().unwrap();
+    let columns = statement.num_columns();
+    let mut output = String::new();
+    loop {
+        match statement.step().unwrap() {
+            StepResult::Row => {
+                for column in 0..columns {
+                    output.push_str(&format!(
+                        "{:?}\t",
+                        statement.row().unwrap().get_value(column)
+                    ));
+                }
+                output.push('\n');
+            }
+            StepResult::Done => return output,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            other => panic!("unexpected control query result: {other:?}"),
+        }
+    }
+}
+
+fn control_verify(db: &Arc<Database>, conn: &Arc<turso_core::Connection>) {
+    let mut statement = conn
+        .query("SELECT id, title, body FROM docs ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let mut count = 0;
+    loop {
+        match statement.step().unwrap() {
+            StepResult::Row => {
+                let row = statement.row().unwrap();
+                assert_eq!(row.get::<i64>(0).unwrap(), count);
+                assert_eq!(row.get::<String>(1).unwrap(), format!("segment {count}"));
+                let marker = if count == 0 { "needle" } else { "haystack" };
+                assert_eq!(
+                    row.get::<String>(2).unwrap(),
+                    format!("common {marker} term in independently committed document {count}")
+                );
+                count += 1;
+            }
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            other => panic!("unexpected fixture validation result: {other:?}"),
+        }
+    }
+    assert_eq!(count, 1024);
+}
+
 /// Benchmark: top-k query after many single-row commits.
 ///
 /// This isolates the read amplification caused by accumulating many small
 /// Tantivy segments and guards the effectiveness of automatic maintenance.
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
+    if let Ok(destination) = std::env::var("FTS_CONTROL_CREATE") {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = setup_fts_churn_db(&temp_dir, 1024);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        control_verify(&db, &conn);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+        drop(conn);
+        drop(db);
+        let wal = temp_dir.path().join("fts_bench.db-wal");
+        assert!(!wal.exists() || std::fs::metadata(wal).unwrap().len() == 0);
+        std::fs::copy(temp_dir.path().join("fts_bench.db"), destination).unwrap();
+        return;
+    }
     let mut group = criterion.benchmark_group("FTS Segment Churn");
     group.sample_size(20);
 
-    for commit_count in [64, 256, 1024] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = setup_fts_churn_db(&temp_dir, commit_count);
+    for commit_count in [1024] {
+        let fixture =
+            std::env::var("FTS_CONTROL_FIXTURE").expect("preserved fixture path is required");
+        let db = control_open(&fixture);
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let dense_sql = "SELECT fts_score(body, 'common') AS score, id \
                          FROM docs \
@@ -446,6 +523,29 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
         assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 10);
         let mut stmt = conn.query(sparse_sql).unwrap().unwrap();
         assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 1);
+
+        control_verify(&db, &conn);
+        let metadata = std::path::PathBuf::from(std::env::var("FTS_CONTROL_METADATA").unwrap());
+        std::fs::create_dir_all(&metadata).unwrap();
+        for (name, sql) in [
+            (
+                "documents",
+                "SELECT id, title, body FROM docs ORDER BY id".to_owned(),
+            ),
+            (
+                "schema",
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY name"
+                    .to_owned(),
+            ),
+            ("plan", format!("EXPLAIN QUERY PLAN {sparse_sql}")),
+            ("bytecode", format!("EXPLAIN {sparse_sql}")),
+        ] {
+            std::fs::write(
+                metadata.join(format!("{name}.txt")),
+                control_rows(&db, &conn, &sql),
+            )
+            .unwrap();
+        }
 
         group.bench_function(
             BenchmarkId::new("top_10_query", format!("{commit_count}_commits")),
@@ -851,7 +951,7 @@ fn check_fts_searcher_cache_query(conn: &Arc<turso_core::Connection>, db: &Arc<D
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
+    targets = bench_fts_segment_churn_query
 }
 
 #[cfg(feature = "test_helper")]
