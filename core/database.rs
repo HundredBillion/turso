@@ -6,6 +6,8 @@
 mod readonly;
 #[cfg(all(host_shared_wal, unix))]
 mod shared_oracle;
+#[cfg(all(host_shared_wal, unix))]
+pub(crate) mod shared_physical;
 use readonly::ReadonlyStorage;
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
