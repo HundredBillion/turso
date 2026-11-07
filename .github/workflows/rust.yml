@@ -1,4 +1,4 @@
-name: Shared checkpoint coordinator native validation
+name: Shared physical connection native validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 16d52b9b4977dc3d47abf2526903f2a624249cec
+          ref: 784b38afc2ddfae50bd25e7f9f9a6ee98490a37d
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,9 +25,15 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 16d52b9b4977dc3d47abf2526903f2a624249cec
+          test "$(git rev-parse HEAD)" = 784b38afc2ddfae50bd25e7f9f9a6ee98490a37d
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
+      - name: Private physical connection plumbing and completed image
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_physical_connection_ -- --test-threads=1 --nocapture 2>&1 | tee physical-portable.log
+          grep -q '3 passed; 0 failed' physical-portable.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_physical_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-native.log
+          grep -q '1 passed; 0 failed' physical-native.log
       - name: Native coordinator publication and bounded quiescence
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_coordinator_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee coordinator-green.log
