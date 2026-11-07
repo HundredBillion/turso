@@ -91,4 +91,16 @@ Names below are proposed private seams, not existing capabilities or completed p
 - [ ] Cover first completed-manifest-slot durability, loss of that newer slot, prepared-ID selection, and already-finalized target-only selection without inventing source identity.
 - [ ] Hand verified staging plus proof to generation reload, then reclaim logical bytes and release authority/admission only through the complete coordinator tail.
 
-This plan records an audit and proposed implementation seams. No physical-reader factory, recovery entry, or CompletedPhysicalProof was implemented or validated by this audit.
+## Bounded factory milestone (2026-11-06)
+
+The audit above did not implement recovery. The separately approved factory subset is now implemented at `784b38afc`: `SharedPhysicalConnection` consumes retained storage/configuration, constructs an independent readonly bootstrap Database and pager, reparses physical schema, and explicitly assigns the same parsed Arc to both private caches. It neither opens a pathname nor joins the registry. No source Database or dummy MvStore is required.
+
+The caller must supply a readonly storage facade with physical read pins and must already have verified/reconciled empty physical WAL under retained authority. The factory does not validate authority, marker identity, checkpoint completion, or persistent metadata semantics; it returns only a connection for staging reads. Empty/unretained storage and unsupported encryption/codec/durable-storage configurations are rejected. This narrow factory is not `PhysicalBaseParts` or `CompletedPhysicalProof`.
+
+Evidence:
+- Portable missing-factory RED: the retained-main test reached the explicit unimplemented error (zero passed, one failed).
+- Portable GREEN: three tests cover retained-main reads with zero schema cookie and no registry/path-open/write attempts; physical MVCC metadata and sequence parsing without changes to the source schema/root/watermark; and empty/unretained input rejection.
+- Native run [42318232064](https://github.com/HundredBillion/turso/actions/runs/42318232064) checked exact source `784b38afc2ddfae50bd25e7f9f9a6ee98490a37d`. The real completed marker254 fixture passed using retained runtime main wrapped in ReadPinnedFile and DatabaseFile. It read the materialized payload and exact persisted checkpoint timestamp, preserved source state/main bytes, and verified read pins retired before returning control to the caller.
+- The same run passed coordinator3, completion3, ID-finalization3, guarded15, shared221 (20 explicitly ignored), native materialization/open/commit two each, and strict library Clippy. Local format/diff checks and strict library Clippy also passed.
+
+Task 1 fact collection/validation, Task 2 delayed factory cancellation tests, and Task 3 evidence/recovery integration remain unfinished. The factory's native success is not end-to-end recovery or public-mode acceptance.
