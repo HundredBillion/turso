@@ -1,3 +1,6 @@
+#[path = "shared_checkpoint_recovery_bootstrap.rs"]
+mod shared_checkpoint_recovery_bootstrap;
+
 use super::*;
 use crate::io::FileSyncType;
 use crate::mvcc::database::shared_runtime::shared_store_claim::SharedStoreReservation;
@@ -17,6 +20,10 @@ impl ReclaimedRecoveredCheckpoint {
     pub(in crate::mvcc) fn proof(&self) -> &CompletedCheckpointProof {
         self.recovered.proof()
     }
+    #[cfg(test)]
+    pub(in crate::mvcc) fn config_for_test(&self) -> &Arc<RecoveryOpenConfig> {
+        &self.recovered.config
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -30,6 +37,7 @@ enum Phase {
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryLogReclamation {
     runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
     parts: Option<PhysicalBaseParts>,
     finalized: Option<FinalizedIds>,
     suspended: Option<SuspendedFinalizedIds>,
@@ -59,6 +67,7 @@ impl FinalizedRecoveredCheckpoint {
         )?;
         Ok(RecoveryLogReclamation {
             runtime: self.runtime,
+            config: self.config,
             parts: Some(self.parts),
             finalized: None,
             suspended: Some(suspended),
@@ -188,6 +197,7 @@ impl RecoveryLogReclamation {
                     return Ok(IOResult::Done(ReclaimedRecoveredCheckpoint {
                         recovered: FinalizedRecoveredCheckpoint {
                             runtime: self.runtime.clone(),
+                            config: self.config.clone(),
                             parts: self.parts.take().unwrap(),
                             finalized: self.finalized.take().unwrap(),
                             pause: self.pause.take().unwrap(),

@@ -422,3 +422,26 @@ fn checkpoint_recovery_reclaim_native_log_rejects_changed_evidence() {
         assert!(fixture.runtime.replay.lock().is_none());
     }
 }
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_preserves_captured_config() {
+    let (fixture, trace, finalized) = log_fixture(usize::MAX, false, usize::MAX);
+    let config = finalized.config.clone();
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+    assert_reclaimed(&fixture, &trace, &reclaimed);
+    assert!(Arc::ptr_eq(&config, reclaimed.config_for_test()));
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_missing_ready() {
+    let (fixture, trace, finalized) = log_fixture(usize::MAX, false, usize::MAX);
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+    assert_reclaimed(&fixture, &trace, &reclaimed);
+    let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+    let _ready = fixture.io.block(|| Ok(bootstrap.poll()?)).unwrap();
+    panic!("stub returned recovery readiness without a Database");
+}

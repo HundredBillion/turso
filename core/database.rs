@@ -9,6 +9,8 @@ mod shared_connection;
 mod shared_oracle;
 #[cfg(all(host_shared_wal, unix))]
 pub(crate) mod shared_physical;
+#[cfg(all(host_shared_wal, unix))]
+pub(crate) mod shared_recovered;
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
