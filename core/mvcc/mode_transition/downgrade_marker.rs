@@ -100,9 +100,15 @@ impl CompletedDowngradeMarker {
         }
     }
     pub(in crate::mvcc) fn cleanup(self) -> Result<()> {
-        Err(invalid(
-            "completed downgrade namespace cleanup is not implemented",
-        ))
+        let result = self
+            ._proof
+            .revalidate()
+            .and_then(|()| self._proof.files().cleanup_completed(self._proof.record()));
+        result.map_err(|error| {
+            invalid(&format!(
+                "database is ordinary WAL; downgrade cleanup remains incomplete: {error}"
+            ))
+        })
     }
 }
 

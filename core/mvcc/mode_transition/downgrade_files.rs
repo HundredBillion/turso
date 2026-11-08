@@ -342,6 +342,63 @@ impl DowngradeFiles {
         }
         Ok(())
     }
+    pub(super) fn cleanup_completed(
+        &self,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+    ) -> Result<()> {
+        self.revalidate_marker()?;
+        require_marker(&self.main.file, 2)?;
+        self.require_mirrored(record)?;
+        if self.wal.file.metadata().map_err(fs_error)?.len() != 0 {
+            return Err(invalid(
+                "downgrade cleanup requires a checkpointed basename WAL",
+            ));
+        }
+        let expected: std::collections::HashSet<_> =
+            self.files.iter().map(|file| file.path.clone()).collect();
+        let actual: std::collections::HashSet<_> = std::fs::read_dir(&self.namespace)
+            .map_err(fs_error)?
+            .map(|entry| entry.map(|entry| entry.path()).map_err(fs_error))
+            .collect::<Result<_>>()?;
+        if expected != actual {
+            return Err(invalid("unexpected downgrade namespace entry"));
+        }
+        let parent = self
+            .main
+            .path
+            .parent()
+            .ok_or_else(|| invalid("missing database parent"))?;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(parent)
+            .map_err(fs_error)?;
+        if let Some(log) = &self.log {
+            log.revalidate()?;
+            std::fs::remove_file(&log.path).map_err(fs_error)?;
+            directory.sync_all().map_err(fs_error)?;
+            #[cfg(test)]
+            super::downgrade_marker::crash_barrier("cleanup-log");
+        }
+        for file in self.files.iter().skip(1) {
+            file.revalidate()?;
+            std::fs::remove_file(&file.path).map_err(fs_error)?;
+            #[cfg(test)]
+            super::downgrade_marker::crash_barrier(&format!(
+                "cleanup-{}",
+                file.path.file_name().unwrap().to_string_lossy()
+            ));
+        }
+        self.namespace_file.sync_all().map_err(fs_error)?;
+        self.files[0].revalidate()?;
+        std::fs::remove_file(&self.files[0].path).map_err(fs_error)?;
+        self.namespace_file.sync_all().map_err(fs_error)?;
+        #[cfg(test)]
+        super::downgrade_marker::crash_barrier("cleanup-manifest");
+        std::fs::remove_dir(&self.namespace).map_err(fs_error)?;
+        directory.sync_all().map_err(fs_error)?;
+        Ok(())
+    }
     pub(in crate::mvcc) fn manifest(&self) -> Arc<dyn IoFile> {
         self.manifest.clone()
     }

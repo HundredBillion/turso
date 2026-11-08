@@ -1203,4 +1203,48 @@ mod tests {
             .unwrap();
         assert_eq!(rows, ["ok"]);
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_cleanup_native_rejects_unknown_or_replaced_files_before_unlink() {
+        for replacement in [false, true] {
+            let mut fixture = installed_fixture();
+            let mut preparing = fixture
+                .installed
+                .take()
+                .unwrap()
+                .begin_downgrade(
+                    fixture.connection.clone(),
+                    OfflinePrerequisite::AllOlderWorkersStopped,
+                )
+                .unwrap();
+            let intent = fixture.io.block(|| preparing.poll()).unwrap();
+            let completed =
+                crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent).unwrap();
+            let changed = if replacement {
+                let path = fixture.namespace.join("ids-a");
+                std::fs::rename(&path, fixture._directory.path().join("original-ids-a")).unwrap();
+                std::fs::write(&path, b"unrelated replacement").unwrap();
+                path
+            } else {
+                let path = fixture.namespace.join("unexpected");
+                std::fs::write(&path, b"unrelated addition").unwrap();
+                path
+            };
+            let before = unchanged_files(&fixture);
+            let changed_bytes = std::fs::read(&changed).unwrap();
+            let error = completed
+                .cleanup()
+                .err()
+                .expect("unsafe cleanup must reject");
+            assert!(error
+                .to_string()
+                .contains("database is ordinary WAL; downgrade cleanup remains incomplete"));
+            assert_unchanged(&before);
+            assert_eq!(std::fs::read(changed).unwrap(), changed_bytes);
+            assert_eq!(
+                std::fs::read_dir(&fixture.namespace).unwrap().count(),
+                if replacement { 8 } else { 9 }
+            );
+        }
+    }
 }
