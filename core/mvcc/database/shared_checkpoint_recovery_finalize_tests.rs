@@ -951,3 +951,50 @@ fn checkpoint_recovery_reclaim_native_fresh_log_without_admission() {
         ));
     }
 }
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_rejects_second_store() {
+    let fixture = fresh_fixture(false);
+    let first = Arc::new(
+        MvStore::new(
+            crate::mvcc::clock::MvccClock::new(),
+            fixture.runtime.storage(),
+            false,
+        )
+        .unwrap(),
+    );
+    first
+        .attach_shared_runtime(fixture.runtime.clone())
+        .unwrap();
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let first = first.clone();
+            let runtime = fixture.runtime.clone();
+            joins.push(scope.spawn(move || first.attach_shared_runtime(runtime)));
+        }
+        for join in joins {
+            join.join().unwrap().unwrap();
+        }
+    });
+    let second = MvStore::new(
+        crate::mvcc::clock::MvccClock::new(),
+        fixture.runtime.storage(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        second
+            .attach_shared_runtime(fixture.runtime.clone())
+            .is_err(),
+        "a second Store attached to an already claimed runtime"
+    );
+    drop(first);
+    assert!(
+        second
+            .attach_shared_runtime(fixture.runtime.clone())
+            .is_err(),
+        "dropping the first Store reopened its runtime claim"
+    );
+}
