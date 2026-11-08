@@ -20,6 +20,19 @@ fn shared_idle_generation_native_cancel_partial_replay_then_retry_latest() {
     run_idle_generation_case("cancel");
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_idle_generation_native_cancel_physical_inspection_before_and_after_callback() {
+    for role in [
+        "physical-1-before",
+        "physical-1-after",
+        "physical-2-before",
+        "physical-2-after",
+    ] {
+        run_idle_generation_case(role);
+    }
+}
+
 fn run_idle_generation_case(role: &str) {
     let old_process = Mutex::new(None);
     let fixture = shared_completed_checkpoint_fixture(|path| {
@@ -91,7 +104,7 @@ fn run_idle_generation_case(role: &str) {
             "empty completed record was not overwritten"
         );
     }
-    if role == "cancel" {
+    if role == "cancel" || role.starts_with("physical-") {
         old.send("cancel");
         let cancelled = old.receive();
         assert!(cancelled.starts_with("CANCELLED "), "{cancelled}");
@@ -152,12 +165,16 @@ fn shared_idle_generation_native_child() {
         .unwrap();
     let role = std::env::var("TURSO_IDLE_GENERATION_ROLE").unwrap();
     let hold = role == "hold";
-    let (io, delayed) = if role == "cancel" {
+    let (io, delayed) = if role == "cancel" || role.starts_with("physical-") {
         let canonical = std::fs::canonicalize(&path).unwrap();
         let id = crate::io::get_file_id(canonical.to_str().unwrap()).unwrap();
         let namespace = crate::mvcc::mode_transition::namespace_for(&canonical, id).unwrap();
-        let (io, control) =
-            super::shared_connection_tests::delaying_native_read(namespace.join("logical"));
+        let read_path = if role == "cancel" {
+            namespace.join("logical")
+        } else {
+            canonical
+        };
+        let (io, control) = super::shared_connection_tests::delaying_native_read(read_path);
         (io, Some(control))
     } else {
         (
@@ -208,7 +225,18 @@ fn shared_idle_generation_native_child() {
         match line.unwrap().as_str() {
             "cancel" => {
                 let control = delayed.as_ref().unwrap();
-                control.delay_after_reads(3);
+                let physical = role.starts_with("physical-");
+                let before_callback = !role.ends_with("-after");
+                let read_number = if physical {
+                    role.split('-').nth(1).unwrap().parse().unwrap()
+                } else {
+                    3
+                };
+                control.delay_after_reads(read_number);
+                let previous_frontier = store.last_committed_tx_ts.load(Ordering::Acquire);
+                let previous_roots = store.table_id_to_rootpage.load_full();
+                let previous_schema = database.schema.lock().clone();
+                let previous_replay = runtime.replay.lock().as_ref().unwrap().clone();
                 let mut open = runtime.begin_open().unwrap();
                 io.block(|| open.poll_manifest()).unwrap();
                 let latest = open
@@ -239,31 +267,53 @@ fn shared_idle_generation_native_child() {
                 };
                 let partial = store.last_committed_tx_ts.load(Ordering::Acquire);
                 let base = store.durable_txid_max.load(Ordering::Acquire);
-                assert!(
-                    base < partial && partial < latest,
-                    "base={base} partial={partial} latest={latest}"
-                );
-                assert!(runtime.replay.lock().is_none());
+                if physical {
+                    assert_eq!(partial, previous_frontier);
+                    assert!(Arc::ptr_eq(
+                        &previous_roots,
+                        &store.table_id_to_rootpage.load_full()
+                    ));
+                    assert!(Arc::ptr_eq(&previous_schema, &database.schema.lock()));
+                    assert!(Arc::ptr_eq(
+                        &previous_replay,
+                        runtime.replay.lock().as_ref().unwrap()
+                    ));
+                } else {
+                    assert!(
+                        base < partial && partial < latest,
+                        "base={base} partial={partial} latest={latest}"
+                    );
+                    assert!(runtime.replay.lock().is_none());
+                }
+                if !before_callback {
+                    held.complete();
+                }
                 drop(waiter);
                 drop(open);
                 assert!(matches!(
                     runtime.files.authority.try_acquire(),
                     Err(LimboError::Busy)
                 ));
-                held.complete();
+                assert!(matches!(runtime.begin_open(), Err(LimboError::Busy)));
+                if before_callback {
+                    held.complete();
+                }
                 assert!(matches!(
                     runtime.files.authority.try_acquire(),
                     Err(LimboError::Busy)
                 ));
+                assert!(matches!(runtime.begin_open(), Err(LimboError::Busy)));
                 drop(held);
                 let guard = runtime.files.authority.try_acquire().unwrap();
                 drop(guard);
-                cancelled = Some((
-                    base,
-                    partial,
-                    latest,
-                    store.clock.get_timestamp(crate::mvcc::clock::no_op),
-                ));
+                if !physical {
+                    cancelled = Some((
+                        base,
+                        partial,
+                        latest,
+                        store.clock.get_timestamp(crate::mvcc::clock::no_op),
+                    ));
+                }
                 reply(&format!(
                     "CANCELLED base={base} partial={partial} latest={latest}"
                 ));
