@@ -1,4 +1,4 @@
-name: Recovered checkpoint ID finalization validation
+name: Recovered checkpoint logical reclamation validation
 on:
   workflow_dispatch:
 permissions:
@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a15fabb1a9f9aae285ebc9fb6e42162c7b112d8b
+          ref: e7d7b3dc64456d44452053fc8f4218bbac254820
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,71 +28,25 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = a15fabb1a9f9aae285ebc9fb6e42162c7b112d8b
+          test "$(git rev-parse HEAD)" = e7d7b3dc64456d44452053fc8f4218bbac254820
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
-      - name: Existing sealed recovery entry and physical inspection
+      - name: Existing recovered finalization prerequisites
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
-          grep -q '3 passed; 0 failed' entry.log
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical.log
-          grep -q '1 passed; 0 failed' physical.log
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ids_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids.log
-          grep -q '1 passed; 0 failed' ids.log
-      - name: Recovered confirmation and actual-file rejection
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalized.log
+          grep -q '7 passed; 0 failed' finalized.log
+      - name: Genuine logical reclamation stub RED
         run: |
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-green.log
-          grep -q '8 passed; 0 failed' confirmation-green.log
-      - name: Fresh recovered ID finalization keeps admission paused
-        run: |
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-green.log
-          grep -q '7 passed; 0 failed' finalization-green.log
-      - name: Final physical retirement causal control
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/shared_ids/checkpoint_finalize.rs'
-          s=open(p).read()
-          old='                    if !loaded.guard.io_retired() {\n                        let waiter = loaded.guard.retirement_completion();\n                        self.finished = false;\n                        return Ok(IOResult::IO(IOCompletions(waiter)));\n                    }\n'
-          assert s.count(old)==1
-          s=s.replace(old,'')
-          open(p,'w').write(s)
-          PYCONTROL
           set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_witness_and_final_bank_wait_for_physical_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-red.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_fresh_log_without_admission -- --ignored --test-threads=1 --nocapture 2>&1 | tee stub-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'recovered ID finalization escaped before physical retirement 9' retirement-red.log
-          grep -q '0 passed; 1 failed' retirement-red.log
-          git checkout -- core/mvcc/shared_ids/checkpoint_finalize.rs
-      - name: Restored recovered finalization and existing finalizer
-        run: |
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-restored.log
-          grep -q '7 passed; 0 failed' finalization-restored.log
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api id_checkpoint_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee existing-finalizer.log
-          grep -q '3 passed; 0 failed' existing-finalizer.log
-      - name: ID protocol and authority siblings
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee ids-protocol.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' ids-protocol.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority::tests:: -- --test-threads=1 2>&1 | tee authority.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' authority.log
-      - name: Full MVCC coverage
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' mvcc.log
-      - name: Strict library lint
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
-      - name: Source integrity
-        run: |
-          cargo fmt --all --check
-          git diff --exit-code
+          grep -q 'recovered logical reclamation is not implemented' stub-red.log
+          grep -q '0 passed; 1 failed' stub-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: recovered-checkpoint-finalization
-          path: |
-            source.txt
-            *.log
+          name: recovered-reclaim-stub
+          path: '*.log'
