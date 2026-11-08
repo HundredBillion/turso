@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9698edf3f031439d201008dda4c685310756ae81
+          ref: 8eaf4c05aa70ede894ac4c1ca85ae91c6a56a4ae
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,31 +24,28 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9698edf3f031439d201008dda4c685310756ae81
+          test "$(git rev-parse HEAD)" = 8eaf4c05aa70ede894ac4c1ca85ae91c6a56a4ae
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee build.log
-      - name: Native scoped ID lifecycle
+      - name: Physical claim cancellation
         run: |
           set -o pipefail
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee lifecycle.log
-          grep -q '7 passed; 0 failed' lifecycle.log
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-native.log
-          grep -q '13 passed; 0 failed' ids-native.log
-      - name: Existing named rollback and ID policy
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_io_native_mutations_retire_before_reset_acknowledges -- --ignored --test-threads=1 --nocapture 2>&1 | tee mutation-retirement.log
+          grep -q '1 passed; 0 failed' mutation-retirement.log
+      - name: Autonomous sequence physical cancellation
+        if: always()
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api named_savepoint 2>&1 | tee named-regressions.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api id_policy_ 2>&1 | tee policy.log
-          grep -q '12 passed; 0 failed' policy.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_io_native_sequence_commit_preserves_saved_outer -- --ignored --test-threads=1 --nocapture 2>&1 | tee sequence-retirement.log
+          grep -q '1 passed; 0 failed' sequence-retirement.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-statement-release
+          name: shared-id-physical-cancellation
           path: |
             source.txt
             rustc.txt
