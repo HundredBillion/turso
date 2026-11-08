@@ -243,3 +243,138 @@ fn respects_sqlite_posix_owner(name: &str) {
         .open_file(path.to_str().unwrap(), OpenFlags::None, false)
         .unwrap();
 }
+
+#[test]
+#[ignore = "native Linux64 unsupported-lock subprocess helper"]
+fn linux_unsupported_lock_child() {
+    let path = std::env::var("TURSO_ORDINARY_LOCK_PATH").unwrap();
+    // Deny only OFD lock syscalls in this disposable child test thread. This
+    // exercises the actual open-error and destructor paths without an old kernel.
+    let mut filters = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 3,
+            k: libc::SYS_fcntl as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: if cfg!(target_endian = "little") {
+                24
+            } else {
+                28
+            },
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::F_OFD_SETLK as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EOPNOTSUPP as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filters.len() as u16,
+        filter: filters.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+        0
+    );
+    let io = backend("syscall");
+    let error = match io.open_file(&path, OpenFlags::None, false) {
+        Err(error) => error,
+        Ok(_) => panic!("denied OFD lock must fail open"),
+    };
+    assert!(matches!(error, LimboError::LockingError(_)), "{error}");
+    for flags in [OpenFlags::NoLock, OpenFlags::ReadOnly] {
+        drop(io.open_file(&path, flags, false).unwrap());
+    }
+    println!("UNSUPPORTED_OFD_RETURNED_WITHOUT_DROP_PANIC");
+}
+
+#[test]
+#[ignore = "requires native Linux64 seccomp syscall error injection"]
+fn linux_ordinary_lock_native_unsupported_lock_drops_safely() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unsupported.db");
+    fixture(&path);
+    let output = wait_output(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "io::unix::ordinary_lock_tests::linux_unsupported_lock_child",
+                "--nocapture",
+            ])
+            .env("TURSO_ORDINARY_LOCK_PATH", path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("UNSUPPORTED_OFD_RETURNED_WITHOUT_DROP_PANIC"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+        "{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux64 and Python SQLite"]
+fn linux_ordinary_lock_native_descriptor_clone_keeps_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("duplicate.db");
+    fixture(&path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let retained = file.try_clone().unwrap();
+    let owner = UnixFile {
+        file,
+        path: path.to_str().unwrap().to_string(),
+    };
+    owner.lock_file(true).unwrap();
+    drop(owner);
+    sqlite_blocked(&path);
+    drop(retained);
+    let _released = backend("syscall")
+        .open_file(path.to_str().unwrap(), OpenFlags::None, false)
+        .unwrap();
+}

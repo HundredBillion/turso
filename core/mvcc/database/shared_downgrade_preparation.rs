@@ -1287,10 +1287,7 @@ mod tests {
             };
             let before = unchanged_files(&fixture);
             let changed_bytes = std::fs::read(&changed).unwrap();
-            let error = completed
-                .cleanup()
-                .err()
-                .expect("unsafe cleanup must reject");
+            let error = completed.cleanup().expect_err("unsafe cleanup must reject");
             assert!(error
                 .to_string()
                 .contains("database is ordinary WAL; downgrade cleanup remains incomplete"));
@@ -1454,8 +1451,7 @@ mod tests {
                 &path,
                 OfflinePrerequisite::AllOlderWorkersStopped,
             )
-            .err()
-            .expect("unproven cleanup must reject");
+            .expect_err("unproven cleanup must reject");
             if phase == "cleanup-start" {
                 assert!(error
                     .to_string()

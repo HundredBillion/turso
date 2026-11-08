@@ -331,3 +331,16 @@ files rejected before unlink. Strict Linux library lint/format and Windows check
 also passed. Downloaded logs are retained under
 `.local/issue-resolution/downgrade-partial-cd5` in the root checkout. These results
 do not clear the separately confirmed ordinary lock lifetime defect.
+
+The OFD prototype also changes ordinary Linux64 opens on kernels older than 3.15
+or filesystems/kernels that reject OFD locking: those opens now fail with the
+existing locking-error result instead of silently using process-scoped locks.
+This affects ordinary mode, not only the already-OFD-dependent shared mode.
+ReadOnly/NoLock still do not acquire this ordinary lock. Linux64 Drop relies on
+closing the descriptor, with no extra unlock syscall, so unsupported acquisition
+returns a normal locking error rather than panicking while dropping the failed
+handle. A child-only seccomp fault returns EOPNOTSUPP for the actual OFD syscall
+to test that error path; another test retains a duplicated descriptor to require
+ownership until the final native descriptor closes. The final compatibility decision must account for that older-kernel
+tradeoff. Non-Linux Unix and Linux32 retain the existing implementation. We do not
+add a fallback that would reintroduce the demonstrated alias-close loss.

@@ -904,6 +904,9 @@ impl File for UringFile {
     }
 }
 
+// OFD ownership follows the descriptor lifetime; an extra unlock can also fail on
+// kernels that rejected acquisition. Other Unix targets retain their original locks.
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 impl Drop for UringFile {
     fn drop(&mut self) {
         self.unlock_file().expect("Failed to unlock file");
