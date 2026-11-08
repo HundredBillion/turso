@@ -477,3 +477,54 @@ fn watermark_durable_files(
     visit(root, root, &mut files);
     files
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_provisional_table_accepts_inserts_before_commit() {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("CREATE TABLE provisional(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    first
+        .execute("INSERT INTO provisional(value) VALUES('generated')")
+        .unwrap();
+    first
+        .execute("INSERT INTO provisional(id,value) VALUES(99,'explicit')")
+        .unwrap();
+    assert_eq!(integers(&first, "SELECT count(*) FROM provisional"), [2]);
+    first.execute("COMMIT").unwrap();
+    second.execute("SELECT count(*) FROM preserved").unwrap();
+    assert_eq!(integers(&second, "SELECT count(*) FROM provisional"), [2]);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_provisional_sequence_watermark_before_commit() {
+    let (_directory, first, _) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("CREATE SEQUENCE provisional_sequence START 5 INCREMENT 2")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    assert_eq!(
+        integers(&first, "SELECT nextval('provisional_sequence')"),
+        [5]
+    );
+    assert_eq!(
+        integers(
+            &first,
+            "SELECT sequence_watermark_experimental('provisional_sequence')"
+        ),
+        [5]
+    );
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    first.execute("COMMIT").unwrap();
+    assert_eq!(
+        integers(
+            &first,
+            "SELECT sequence_watermark_experimental('provisional_sequence')"
+        ),
+        [7]
+    );
+}

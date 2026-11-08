@@ -832,3 +832,11 @@ from an older local store. Further checks cover standalone/read-only reads,
 unchanged durable files, uncalled/non-unit/descending/CYCLE boundaries, invalid
 names/NULL, and suspended-read reset and backend retirement. Main-only oracle
 support remains explicit; attached shared readers are not silently redirected.
+
+The shared initial boundary is the committed uncalled backing value (for example,
+1). Ordinary mode still returns NULL before its local watermark map is populated;
+this path is unchanged. The shared value is an exclusive safe-scan boundary, not
+an allocation. A backing domain absent from the committed schema currently fails
+closed, including a sequence created only inside the requesting uncommitted
+transaction; that schedule needs an explicit compatibility test before claiming
+complete sequence behavior.
