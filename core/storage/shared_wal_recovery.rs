@@ -166,6 +166,7 @@ mod tests {
         Writer,
         Checkpoint,
         Reader(SharedReaderSlot),
+        SharedReader(SharedReaderSlot),
     }
     impl Participant {
         fn acquire(mapping: &MappedSharedWalCoordination, role: &str) -> Self {
@@ -180,7 +181,9 @@ mod tests {
                     Self::Checkpoint
                 }
                 "wal-reader" => Self::Reader(mapping.register_reader(owner, 7).unwrap()),
-                "main-reader" => Self::Reader(mapping.register_db_file_reader(owner).unwrap()),
+                "main-reader" => {
+                    Self::SharedReader(mapping.register_db_file_reader(owner).unwrap())
+                }
                 _ => panic!("unknown physical participant"),
             }
         }
@@ -189,6 +192,7 @@ mod tests {
                 Self::Writer => mapping.release_writer(mapping.owner_record()),
                 Self::Checkpoint => mapping.release_checkpoint(mapping.owner_record()),
                 Self::Reader(slot) => mapping.unregister_reader(slot),
+                Self::SharedReader(slot) => mapping.unregister_reader_for_snapshot(slot),
             }
         }
         fn assert_unchanged(&self, mapping: &MappedSharedWalCoordination) {
@@ -197,7 +201,7 @@ mod tests {
                 Self::Checkpoint => {
                     assert_eq!(mapping.checkpoint_owner(), Some(mapping.owner_record()))
                 }
-                Self::Reader(slot) => {
+                Self::Reader(slot) | Self::SharedReader(slot) => {
                     assert_eq!(mapping.reader_owner(slot.slot_index), Some(slot.owner))
                 }
             }
