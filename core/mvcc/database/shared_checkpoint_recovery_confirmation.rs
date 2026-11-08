@@ -1,3 +1,6 @@
+#[path = "shared_checkpoint_recovery_finalize.rs"]
+mod shared_checkpoint_recovery_finalize;
+
 use super::*;
 use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
 use crate::mvcc::shared_authority::AuthorityGuard;

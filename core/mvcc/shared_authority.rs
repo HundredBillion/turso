@@ -294,6 +294,24 @@ impl SharedMvccAuthority {
         })
     }
 
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(in crate::mvcc) fn recovery_state_for_test(&self) -> Result<(u64, bool, u64)> {
+        let ready = match self.load(INCARNATION_READY_OFFSET) {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "invalid shared incarnation readiness".into(),
+                ))
+            }
+        };
+        Ok((
+            self.load(EPOCH_OFFSET),
+            ready,
+            self.load(NEXT_TIMESTAMP_OFFSET),
+        ))
+    }
+
     fn initialize(&self, database_id: FileId, history_limit: u64) {
         for offset in (8..MAP_LEN).step_by(8) {
             self.store(offset, 0);
