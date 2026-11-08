@@ -90,3 +90,55 @@ toolchain and the one-line control diff.
 No engine behavior, ordinary-mode path or public activation changed. This is
 bounded CREATE/publication evidence, not coverage of every ALTER/DROP/index DDL,
 DDL crash recovery, arbitrary I/O failure, or the complete PHP release gate.
+
+## Independent-worker DML and API audit (2026-11-08)
+
+Existing `shared_commit_native_` tests already covered separate stores, overlapping
+updates, stable/fresh readers and reopening acknowledged writes. The existing
+process harness covered sequence-owner liveness and schema publication. Neither
+was evidence for real-process delete/secondary-UNIQUE conflicts or an external
+ACK ledger across multi-row rolling restarts, so the new cases reuse the schema
+worker protocol rather than introducing another service or retry layer.
+
+Exact test source `4c4cbb97bec4444c00d15c08a41aca42ca823834` passed Linux native
+run https://github.com/HundredBillion/turso/actions/runs/42484506488:
+
+- Update/update, delete/update, and secondary-UNIQUE conflicts, each in both worker
+  orders. Both processes first hold explicit snapshots. Updates reject the losing
+  write with `Busy` during staging. Delete/update and UNIQUE cases stage both
+  writes, then reject the losing COMMIT with `WriteWriteConflict`. UNIQUE cases
+  use distinct primary keys; the shared secondary key is the conflict. A fresh
+  process verifies exactly the accepted state and `PRAGMA integrity_check='ok'`.
+- Disjoint updates, a delete and an insert stage in two processes before either
+  commits, and both commits succeed in either order. Fresh-process rows and
+  integrity checks match the independent expected state.
+- Three FULL multi-row commits transfer10 between two balances and append one
+  transfer record in the same transaction. A surviving controller fsyncs an
+  external ACK record only after COMMIT replies. A long-lived reader retains
+  `[100,100]` and zero transfer rows throughout; fresh workers observe each
+  acknowledged version. Workers exit/reopen, including asserted SIGKILL after
+  the second acknowledged commit. A final new process verifies `[70,130]`, exact
+  transfer IDs1–3, total30, and integrity. Main-file bytes remain unchanged,
+  keeping this test within one physical generation.
+
+All5 parent tests and strict library Clippy passed. Artifact
+`shared-worker-acceptance-audit` records source/toolchain/logs. The first tracer
+run42483728194 passed the ACK/restart case but incorrectly required both updating
+workers to stage successfully; its `Busy` result was an allowed early conflict,
+not a product failure. Phase-specific tests in42484118213 confirmed that behavior
+before the disjoint-write/integrity controls were added. No engine code changed.
+
+C API source audit: `sqlite3_step` drives the current core statement once through
+`run_one_step_blocking`; Busy and WriteWriteConflict map to SQLITE_BUSY, while
+SchemaConflict maps to SQLITE_SCHEMA. `sqlite3_exec` stops/finalizes at the first
+error and has no transaction replay loop. Core schema reprepare handles
+SchemaUpdated, not SchemaConflict, and the busy handler resumes execution state.
+These are source findings, not new-mode PHP end-to-end evidence. One separate
+mapping inconsistency remains: core/open handling maps BusySnapshot to busy,
+while C's step error mapper falls through to SQLITE_ERROR. Its producer found in
+this audit is ordinary WAL snapshot upgrade; no actual shared-mode counterexample
+or C behavior change is claimed here.
+
+Public C/PDO opt-in remains rejected. These process tests do not establish PHP
+acceptance, power-loss/torn-write recovery, every partial-statement error path,
+checkpoint-generation transitions, or a fix for the legacy-WAL report11383.
