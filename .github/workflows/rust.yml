@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: feff5190cf8b828d14ad4e92762d5b244f6db5b7
+          ref: ff22860d14918724e3781f907babba0dab2a2793
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = feff5190cf8b828d14ad4e92762d5b244f6db5b7
+          test "$(git rev-parse HEAD)" = ff22860d14918724e3781f907babba0dab2a2793
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
