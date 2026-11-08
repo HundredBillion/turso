@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f267be5c950201d698632d2624958017eb3dfa9c
+          ref: d47369981ca18a03fecf8abc51c1d2f2911e88c8
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,21 +28,18 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f267be5c950201d698632d2624958017eb3dfa9c
+          test "$(git rev-parse HEAD)" = d47369981ca18a03fecf8abc51c1d2f2911e88c8
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Native creation, preparation and marker controls
+      - name: Fresh terminal resume expected RED
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
-          grep -q '^test result: ok. 2 passed; 0 failed;' creation.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
-          grep -q '^test result: ok. 7 passed; 0 failed;' preparation.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --skip old_handle_close --test-threads=1 --nocapture 2>&1 | tee marker.log
-          grep -q '^test result: ok. 3 passed; 0 failed;' marker.log
-      - name: Strict library lint and formatting
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '^test result: FAILED. 0 passed; 1 failed;' resume-red.log
+          grep -q 'fresh terminal downgrade must resume without a live installed source' resume-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
