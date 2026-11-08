@@ -47,6 +47,62 @@ jobs:
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
+      - name: Causal boundary controls and restored complete source
+        run: |
+          set -e
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_generation_reload.rs'
+          s=open(p).read(); old='checkpoint_timestamp > prefix.committed_timestamp'
+          assert s.count(old)==1
+          s=s.replace(old,'checkpoint_timestamp < source_frontier || '+old)
+          open(p,'w').write(s)
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture > lower-base-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_generation_reload.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' lower-base-control-red.log
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_current_base.rs'
+          s=open(p).read(); old='if ids.logical_floor() > -physical_pages {'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,'if false && ids.logical_floor() > -physical_pages {'))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_rejects_physical_extent_without_id_floor -- --ignored --test-threads=1 --nocapture > extent-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_current_base.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' extent-control-red.log
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_runtime.rs'
+          s=open(p).read(); old='if result.is_err() && self.current.installed {'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,'if false && result.is_err() && self.current.installed {'))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture > finish-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_runtime.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' finish-control-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture 2>&1 | tee cancel-restored-green.log
+          grep -q '1 passed; 0 failed' cancel-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_rejects_physical_extent_without_id_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent-restored-green.log
+          grep -q '1 passed; 0 failed' extent-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-restored-green.log
+          grep -q '1 passed; 0 failed' finish-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 2>&1 | tee constructor-green.log
+          grep -q '6 passed; 0 failed' constructor-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee ready-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee full-core-green.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo fmt --all -- --check
+          git diff --exit-code
       - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -56,3 +112,4 @@ jobs:
             source.txt
             rustc.txt
             '*green.log'
+            '*red.log'
