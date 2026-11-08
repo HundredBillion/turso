@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1465e2cd562d6a88edda2d9423148a1589b7234b
+          ref: 75f2ededbb7d525324dc499bef5664e3148efa84
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1465e2cd562d6a88edda2d9423148a1589b7234b
+          test "$(git rev-parse HEAD)" = 75f2ededbb7d525324dc499bef5664e3148efa84
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -36,21 +36,10 @@ jobs:
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalized.log
           grep -q '7 passed; 0 failed' finalized.log
-      - name: Genuine logical reclamation stub RED
+      - name: Recovered logical reclamation and ownership
         run: |
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_fresh_log_without_admission -- --ignored --test-threads=1 --nocapture 2>&1 | tee stub-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'recovered logical reclamation is not implemented' stub-red.log
-          grep -q '0 passed; 1 failed' stub-red.log
-      - name: Linear Store claim and sealed finalized-ID suspension
-        run: |
-          for test in checkpoint_recovery_reclaim_native_rejects_second_store checkpoint_recovery_reclaim_native_reservation_is_linear checkpoint_recovery_reclaim_native_finalized_suspension; do
-            timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api "$test" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$test.log"
-            grep -q '1 passed; 0 failed' "$test.log"
-          done
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee reclaim.log
+          grep -q '5 passed; 0 failed' reclaim.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
