@@ -1,4 +1,4 @@
-name: Actual source Store lifetime GREEN
+name: Fresh recovery selection sealed endpoint
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a6da7aa8654cde26c8a4ebc8863381a963f0d537
+          ref: 7717dcc35203fa51760bbad26451c13937eac782
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,41 +27,34 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = a6da7aa8654cde26c8a4ebc8863381a963f0d537
+          test "$(git rev-parse HEAD)" = 7717dcc35203fa51760bbad26451c13937eac782
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-bootstrap-green.log
-          grep -q '14 passed; 0 failed' merged-bootstrap-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-committed-green.log
-          grep -q '5 passed; 0 failed' merged-committed-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-precommit-green.log
-          grep -q '4 passed; 0 failed' merged-precommit-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee actual-store-green.log
-          grep -q '6 passed; 0 failed' actual-store-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fresh-selection-green.log
+          grep -q '5 passed; 0 failed' fresh-selection-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee selection-retirement-green.log
+          grep -q '2 passed; 0 failed' selection-retirement-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee normal-bootstrap-green.log
+          grep -q '14 passed; 0 failed' normal-bootstrap-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee source-store-green.log
+          grep -q '6 passed; 0 failed' source-store-green.log
           python3 - <<'PATCH'
-          p='core/mvcc/database/shared_checkpoint_intent_store.rs'
-          s=open(p).read()
-          pairs=[('    lease: Arc<PublicationLease>,','    lease: Weak<PublicationLease>,'),('            lease: authority_owner,','            lease: Arc::downgrade(&authority_owner),'),('        Weak::ptr_eq(&Arc::downgrade(&self.lease), lease)','        Weak::ptr_eq(&self.lease, lease)')]
-          for old,new in pairs:
-              assert s.count(old)==1,(old,s.count(old))
-              s=s.replace(old,new)
-          open(p,'w').write(s)
+          p='core/mvcc/database/shared_checkpoint_recovery.rs'
+          s=open(p).read(); old='            || !pause.belongs_to(&runtime.gate)\n'; assert s.count(old)==1
+          open(p,'w').write(s.replace(old,''))
           PATCH
-          for selector in callee_error_drops_store_before_native_authority retained_store_clone_keeps_native_authority; do
-            set +e
-            cargo test --locked -p turso_core --lib --features conn_raw_api "intent_source_store_native_$selector" -- --ignored --test-threads=1 --nocapture > "$selector-red.log" 2>&1
-            code=$?
-            set -e
-            cat "$selector-red.log"
-            test "$code" -ne 0
-            grep -q '0 passed; 1 failed' "$selector-red.log"
-          done
-          grep -q 'original guard error released native authority before Store destruction' callee_error_drops_store_before_native_authority-red.log
-          grep -q 'owner drop released native authority while a real Store clone survived' retained_store_clone_keeps_native_authority-red.log
-          git restore core/mvcc/database/shared_checkpoint_intent_store.rs
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee actual-store-restored-green.log
-          grep -q '6 passed; 0 failed' actual-store-restored-green.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_fresh_selection_rejects_foreign_pause -- --ignored --test-threads=1 --nocapture > foreign-pause-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_checkpoint_recovery.rs
+          cat foreign-pause-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' foreign-pause-red.log
+          grep -q 'foreign pause authorized fresh recovery' foreign-pause-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fresh-selection-restored-green.log
+          grep -q '5 passed; 0 failed' fresh-selection-restored-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
@@ -71,33 +64,4 @@ jobs:
           name: committed-physical-wal-green
           path: |
             *.txt
-            *.log
-
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_INCREMENTAL: 0
-      CARGO_PROFILE_DEV_DEBUG: 0
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: a6da7aa8654cde26c8a4ebc8863381a963f0d537
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Windows library boundary check
-        run: |
-          set -euo pipefail
-          rustc --version
-          git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = a6da7aa8654cde26c8a4ebc8863381a963f0d537
-          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-check.log
-          git diff --exit-code
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: source-store-windows
-          path: |
-            source.txt
             *.log
