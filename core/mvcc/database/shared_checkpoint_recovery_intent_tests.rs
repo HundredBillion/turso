@@ -32,11 +32,18 @@ fn inspect_crash(fixture: &IntentCrashFixture, point: CrashPoint) -> CheckpointR
         .filter(|record| record.checkpoint_intent().is_some())
         .count();
     match point {
+        CrashPoint::BeforeWalHeader
+        | CrashPoint::TornWalHeader
+        | CrashPoint::BeforeWalFrame
+        | CrashPoint::TornWalFrame
+        | CrashPoint::BeforeWalCommit => panic!("use the precommit WAL fixture inspector"),
         CrashPoint::SecondIntentWrite => {
             assert_eq!(intents, 1);
             assert_eq!(fixture.runtime.files.physical_wal.size().unwrap(), 0);
         }
-        CrashPoint::FirstMainBackfillWrite => {
+        CrashPoint::FirstMainBackfillWrite
+        | CrashPoint::PartialMainBackfill
+        | CrashPoint::MainSyncedBeforeWalTruncate => {
             assert_eq!(intents, 2);
             let file: Arc<dyn File> =
                 crate::mvcc::read_pinned_file::ReadPinnedFile::new_for_checkpoint_recovery(
@@ -52,7 +59,20 @@ fn inspect_crash(fixture: &IntentCrashFixture, point: CrashPoint) -> CheckpointR
             drop(wal);
         }
     }
-    assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+    match point {
+        CrashPoint::SecondIntentWrite
+        | CrashPoint::FirstMainBackfillWrite
+        | CrashPoint::BeforeWalHeader
+        | CrashPoint::TornWalHeader
+        | CrashPoint::BeforeWalFrame
+        | CrashPoint::TornWalFrame
+        | CrashPoint::BeforeWalCommit => {
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+        }
+        CrashPoint::PartialMainBackfill | CrashPoint::MainSyncedBeforeWalTruncate => {
+            assert_ne!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+        }
+    }
     fixture.assert_durable_unchanged();
     selection
 }
