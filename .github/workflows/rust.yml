@@ -1,4 +1,4 @@
-name: Precommit physical WAL genuine crash RED
+name: Physical WAL full crash-class targeted GREEN
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9d0f7dd2215834070ada89cc32e93d66072f52f6
+          ref: c957a99599d35f3c8facedd1d7e2416103ed651b
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,18 +27,37 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9d0f7dd2215834070ada89cc32e93d66072f52f6
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_genuine_crashes_preserve_source_main -- --ignored --test-threads=1 --nocapture 2>&1 | tee precommit-prerequisites.log
-          grep -q '1 passed; 0 failed' precommit-prerequisites.log
-          test "$(grep -c PRECOMMIT_SOURCE_UNCHANGED precommit-prerequisites.log)" = 10
+          test "$(git rev-parse HEAD)" = c957a99599d35f3c8facedd1d7e2416103ed651b
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee precommit-green.log
+          grep -q '4 passed; 0 failed' precommit-green.log
+          test "$(grep -c PRECOMMIT_SOURCE_UNCHANGED precommit-green.log)" = 10
+          test "$(grep -c PRECOMMIT_SOURCE_RECOVERED_ACK_RETAINED precommit-green.log)" = 10
+          test "$(grep -c PRECOMMIT_FULL_MAIN_BARRIER precommit-green.log)" = 5
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-io-green.log
+          grep -q '2 passed; 0 failed' physical-io-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee committed-green.log
+          grep -q '5 passed; 0 failed' committed-green.log
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_checkpoint_recovery_wal.rs'
+          s=open(p).read(); old='                    self.physical.as_ref().unwrap().install_empty(&evidence)?;'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,''))
+          PATCH
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_recovers_source_without_discarding_logical_ack -- --ignored --test-threads=1 --nocapture > precommit-recovery-red.log 2>&1
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_stale_odd_map_recovers_before_fresh_readonly_peer -- --ignored --test-threads=1 --nocapture > derived-repair-red.log 2>&1
           code=$?
           set -e
-          cat precommit-recovery-red.log
+          git restore core/mvcc/database/shared_checkpoint_recovery_wal.rs
+          cat derived-repair-red.log
           test "$code" -ne 0
-          grep -q '0 passed; 1 failed' precommit-recovery-red.log
-          grep -q 'nonempty physical WAL lacks a supported committed image' precommit-recovery-red.log
+          grep -q '0 passed; 1 failed' derived-repair-red.log
+          grep -q 'fresh peer cannot use an odd derived map' derived-repair-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee committed-restored-green.log
+          grep -q '5 passed; 0 failed' committed-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owner-green.log
+          grep -q '8 passed; 0 failed' owner-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-green.log
+          grep -q '9 passed; 0 failed' intent-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
