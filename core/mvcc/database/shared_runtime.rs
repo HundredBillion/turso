@@ -51,6 +51,7 @@ pub(crate) struct SharedOpenState {
     failed: bool,
     manifest_ready: bool,
     bindings: Vec<FileBinding>,
+    pin_physical_reads: bool,
 }
 
 #[derive(Default)]
@@ -188,6 +189,17 @@ impl SharedMvccRuntime {
     }
 
     pub(crate) fn begin_open(self: &Arc<Self>) -> Result<SharedOpenState> {
+        self.begin_open_with_read_policy(false)
+    }
+
+    pub(crate) fn begin_read_pinned_open(self: &Arc<Self>) -> Result<SharedOpenState> {
+        self.begin_open_with_read_policy(true)
+    }
+
+    fn begin_open_with_read_policy(
+        self: &Arc<Self>,
+        pin_physical_reads: bool,
+    ) -> Result<SharedOpenState> {
         let admission = self.gate.try_enter_admission()?;
         let guard = self.files.authority.try_acquire()?;
         let load = ManifestLoad::new(self.files.manifest.clone(), guard, self.database_id)?;
@@ -200,6 +212,7 @@ impl SharedMvccRuntime {
             failed: false,
             manifest_ready: false,
             bindings: Vec::new(),
+            pin_physical_reads,
         })
     }
 }
@@ -226,10 +239,17 @@ impl SharedOpenState {
                 }
                 let bindings = (|| {
                     let guard = loaded.guard()?;
-                    Ok::<_, LimboError>(vec![
-                        self.runtime.main.bind(guard)?,
-                        self.runtime.wal.bind(guard)?,
-                    ])
+                    Ok::<_, LimboError>(if self.pin_physical_reads {
+                        vec![
+                            self.runtime.main.bind_reads(guard)?,
+                            self.runtime.wal.bind_reads(guard)?,
+                        ]
+                    } else {
+                        vec![
+                            self.runtime.main.bind(guard)?,
+                            self.runtime.wal.bind(guard)?,
+                        ]
+                    })
                 })();
                 match bindings {
                     Ok(bindings) => self.bindings = bindings,
@@ -247,6 +267,36 @@ impl SharedOpenState {
                 Err(error.into())
             }
         }
+    }
+
+    pub(crate) fn validate_connection_generation(&self) -> Result<()> {
+        let record = self.loaded.as_ref().ok_or(LimboError::Busy)?.record();
+        let identity = self
+            .runtime
+            .replay
+            .lock()
+            .as_ref()
+            .ok_or(LimboError::Busy)?
+            .identity()?;
+        if record.database_id() != self.runtime.database_id
+            || record.log_generation() != identity.database.generation
+        {
+            return Err(LimboError::Busy);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_connection(&mut self) -> IOResultOr<()> {
+        let guard = self.loaded.as_ref().ok_or(LimboError::Busy)?.guard()?;
+        if !guard.io_retired() {
+            return Ok(IOResult::IO(crate::types::IOCompletions(
+                guard.retirement_completion(),
+            )));
+        }
+        self.loaded.take().unwrap().into_guard()?.finish()?;
+        self.bindings.clear();
+        self.admission = None;
+        Ok(IOResult::Done(()))
     }
 
     fn abort(&mut self) {

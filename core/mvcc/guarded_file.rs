@@ -45,6 +45,11 @@ impl GuardedFile {
         self.bind_with_reads(guard, true)
     }
 
+    /// Physical initialization reads retain authority until the backend releases their completion.
+    pub(super) fn bind_reads(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
+        self.bind_with_reads(guard, true)
+    }
+
     fn bind_with_reads(
         self: &Arc<Self>,
         guard: &AuthorityGuard,
