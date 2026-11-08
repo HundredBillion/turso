@@ -309,6 +309,11 @@ fn shared_generation_reload_native_installs_only_under_completed_checkpoint_auth
     let prepared = store
         .prepare_generation_reload(header, &schema, target)
         .unwrap();
+    fixture
+        .connection
+        .get_pager()
+        .reset_shared_generation()
+        .unwrap();
     prepared
         .install(&store, &fixture.proof, &fixture.guard)
         .unwrap();
