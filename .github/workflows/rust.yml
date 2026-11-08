@@ -150,4 +150,3 @@ jobs:
           $env:PATH = "$pwd\target\debug;$env:PATH"
           cargo test --locked -p turso_sqlite3 --lib --test compat -- --test-threads=2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
