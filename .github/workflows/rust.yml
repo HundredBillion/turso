@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 20b18a79e367efea7cf471a52cd40ada925944ec
+          ref: 9467d556bed3bfcd9c6bedd2c3bdc7436a5b11d3
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,9 +27,17 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 20b18a79e367efea7cf471a52cd40ada925944ec
-          cargo test --locked -p turso_core --lib --features conn_raw_api storage::shared_wal_coordination::recovery::tests::physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
+          test "$(git rev-parse HEAD)" = 9467d556bed3bfcd9c6bedd2c3bdc7436a5b11d3
+          cargo test --locked -p turso_core --lib --features conn_raw_api storage::shared_wal_coordination::recovery::tests::physical_wal_recovery_native_ -- --ignored --skip physical_wal_recovery_native_stale_probe_preserves_new_local_owner --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
           grep -q '3 passed; 0 failed' physical-owner-green.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_stale_probe_preserves_new_local_owner -- --ignored --test-threads=1 --nocapture > physical-probe-red.log 2>&1
+          code=$?
+          set -e
+          cat physical-probe-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' physical-probe-red.log
+          grep -q 'stale probe released the newly acquired local writer' physical-probe-red.log
           set +e
           cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_binding_retains_both_authorities_until_backend_retirement -- --ignored --test-threads=1 --nocapture > physical-binding-red.log 2>&1
           code=$?
