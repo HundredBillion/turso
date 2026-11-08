@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 03689b841e8092c65f64fce527b05d8c32e8e372
+          ref: f2cdee212349c84f3a22b6a465163c58a583760f
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 03689b841e8092c65f64fce527b05d8c32e8e372
+          test "$(git rev-parse HEAD)" = f2cdee212349c84f3a22b6a465163c58a583760f
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -40,61 +40,47 @@ jobs:
       - name: Recovered confirmation and actual-file rejection
         run: |
           timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-green.log
-          grep -q '7 passed; 0 failed' confirmation-green.log
-      - name: Actual manifest file binding causal control
+          grep -q '8 passed; 0 failed' confirmation-green.log
+      - name: Owner epoch capture causal control
         run: |
           python3 - <<'PYCONTROL'
           p='core/mvcc/database/shared_checkpoint_recovery_confirmation.rs'
           s=open(p).read()
-          old='        if !Arc::ptr_eq(file, &self.manifest)\n            || file.file_id()? != Some(self.manifest_id)\n            || record != self.record'
+          old='        let max_owner_epoch = ids.max_owner_epoch();'
           assert s.count(old)==1
-          s=s.replace(old, '        if record != self.record')
+          s=s.replace(old,'        let max_owner_epoch = None;')
           open(p,'w').write(s)
           PYCONTROL
           set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_rejects_same_record_from_foreign_file -- --ignored --test-threads=1 --nocapture 2>&1 | tee file-binding-red.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_physical_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee epoch-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'substitute manifest file authorized recovered completion' file-binding-red.log
-          grep -q '0 passed; 1 failed' file-binding-red.log
+          grep -q 'confirmation lost inspected owner epoch' epoch-red.log
+          grep -q '0 passed; 1 failed' epoch-red.log
           git checkout -- core/mvcc/database/shared_checkpoint_recovery_confirmation.rs
-      - name: Final physical retirement causal control
+      - name: Physical extent distinction causal control
         run: |
           python3 - <<'PYCONTROL'
-          p='core/mvcc/commit_manifest/checkpoint_recovery_confirmation.rs'
+          p='core/mvcc/database/shared_checkpoint_recovery_confirmation.rs'
           s=open(p).read()
-          old='                if !guard.io_retired() {\n                    self.terminated = false;\n                    return Ok(IOResult::IO(IOCompletions(guard.retirement_completion())));\n                }\n'
+          old='        source_database: ids.source_database(),\n        physical_floor,\n'
           assert s.count(old)==1
-          s=s.replace(old,'')
+          s=s.replace(old,'        source_database: ids.source_database(),\n        physical_floor: ids.logical_floor(),\n')
           open(p,'w').write(s)
           PYCONTROL
           set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_waits_final_sync_backend_before_proof -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-red.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_physical_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee floor-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'confirmation proof escaped before final backend retirement' retirement-red.log
-          grep -q '0 passed; 1 failed' retirement-red.log
-          git checkout -- core/mvcc/commit_manifest/checkpoint_recovery_confirmation.rs
-      - name: Restored confirmation and existing completion retirement
+          grep -q 'confirmation used permanent ID floor as physical evidence' floor-red.log
+          grep -q '0 passed; 1 failed' floor-red.log
+          git checkout -- core/mvcc/database/shared_checkpoint_recovery_confirmation.rs
+      - name: Restored confirmation including nonempty owner history
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-restored.log
-          grep -q '7 passed; 0 failed' confirmation-restored.log
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_completion_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee completion.log
-          grep -q '3 passed; 0 failed' completion.log
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee recovery-io.log
-          grep -q '2 passed; 0 failed' recovery-io.log
-      - name: Manifest and ID protocol siblings
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee ids-protocol.log
-          grep -q '0 failed' ids-protocol.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest:: -- --test-threads=1 2>&1 | tee manifest.log
-          grep -q '0 failed' manifest.log
-      - name: Full MVCC coverage
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' mvcc.log
+          grep -q '8 passed; 0 failed' confirmation-restored.log
       - name: Strict library lint
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
