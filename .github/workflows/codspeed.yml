@@ -35,7 +35,7 @@ jobs:
 
   discover:
     name: Discover benchmark shards
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 10
     outputs:
       benchmarks: ${{ steps.benchmarks.outputs.benchmarks }}
@@ -103,7 +103,7 @@ jobs:
 
   build-stable:
     name: "Build benchmarks (stable)"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
@@ -182,7 +182,7 @@ jobs:
   build-nightly:
     name: "Build benchmarks (nightly)"
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
@@ -260,7 +260,7 @@ jobs:
 
   benchmarks-stable:
     name: "Run benchmark (stable, ${{ matrix.shard.name }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs:
       - discover
       - build-stable
@@ -320,7 +320,7 @@ jobs:
 
   benchmarks-nightly:
     name: "Run benchmark (nightly, ${{ matrix.shard.name }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs:
       - discover
       - build-nightly
