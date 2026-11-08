@@ -16,7 +16,7 @@ A normal shared Core open that encounters a genuinely completed checkpoint with 
 
 ## Routing is read-only classification, not recovery evidence
 
-Add a narrow existing-codec selector inspection under the original ordinary admission and publication authority, before any Store allocation. Implement it inside shared_ids/io_protocol as a private child, reading the actual retained selector only (two fixed pages). Reuse select_witness for CRC, sequence, database identity and prepared-transition validation. Bind reads to the actual guard and wait for backend retirement, including after callback. Do not read whole ID banks just to classify every healthy open; full bank/journal validation remains in the existing actual bootstrap/recovery paths.
+Add a narrow existing-codec selector inspection under the original ordinary admission and publication authority, before any Store allocation. Implement it inside shared_ids/io_protocol as a private child, reading the actual retained selector only (two fixed pages). Reuse select_witness for CRC, sequence, database identity and prepared-transition validation. Create a read-only selected-manifest view of the actual retained selector and wait for backend retirement, including after callback. GuardedFile validates its original authority association, then delegates the existing ReadPinnedFile normal-manifest constructor; do not modify the selector binding slot, because dropping/rebinding under the same still-active lease is rejected and would break subsequent ID bootstrap/allocation. Do not read whole ID banks just to classify every healthy open; full bank/journal validation remains in the existing actual bootstrap/recovery paths.
 
 The constructor accepts the actual retained SharedIds and actual LoadedManifest; no arbitrary File/record/timestamp or caller-authored routing flags. The output carries only the original manifest/guard and a sealed route classification. It never clears mapped recovery, mirrors metadata, mutates banks, returns LoadedIds or establishes Ready.
 
@@ -83,3 +83,6 @@ INTENT later enters the same fresh paused-selection decision as a typed successo
 
 
 Parent correction: neither nonempty logical-file length nor invalid bytes after acknowledged end is durable checkpoint evidence. The first draft proposed tail-only recovery; that is rejected and removed before production. Matching prepared target IDs are the initial Normal signal; INTENT is a later separate typed authoritative branch. Tests explicitly preserve readonly/live-reader opens with complete, corrupt and torn tails at endpoint zero.
+
+
+Baseline exact merged source94f425dd9dfc866aad01a11049869d67d413588e (contains parentf4) native42520094911 SUCCESS: healthy live-reader1 and readonly complete/corrupt/torn-tail1 PASS, genuine pending-ID public-open0/1RED at current bootstrap diagnostic, strict Core tests Clippy1m26s/fmt/integrity PASS. Local union libcheck9.97s. No production routing was present for this observed counterexample. Parent approved continuing the source-audited probe/driver seam and requested explicit real table/row-ID allocation after healthy probe; added to the healthy case.

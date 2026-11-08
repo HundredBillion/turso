@@ -39,6 +39,18 @@ impl GuardedFile {
         })
     }
 
+    pub(super) fn selected_read_view(
+        self: &Arc<Self>,
+        manifest: &super::commit_manifest::LoadedManifest,
+    ) -> Result<Arc<super::read_pinned_file::ReadPinnedFile>> {
+        if !manifest.guard()?.belongs_to(&self.authority) {
+            return Err(LimboError::InvalidArgument(
+                "selected read file belongs to another authority".into(),
+            ));
+        }
+        super::read_pinned_file::ReadPinnedFile::for_manifest_replay(self.clone(), manifest)
+    }
+
     pub(super) fn bind(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
         self.bind_with_reads(guard, false, None)
     }

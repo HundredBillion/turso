@@ -180,7 +180,97 @@ fn shared_open_recovery_native_healthy_open_keeps_live_reader() {
         );
         reader.execute("ROLLBACK").unwrap();
         second
-            .execute("UPDATE preserved SET value='healthy peer still writes' WHERE id=1")
+            .execute("UPDATE preserved SET value='healthy peer still writes' WHERE id=1; CREATE TABLE allocated_after_probe(id INTEGER PRIMARY KEY); INSERT INTO allocated_after_probe DEFAULT VALUES")
             .unwrap();
     }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn shared_open_selector_native_matching_prepared_ids_are_readonly_facts() {
+    use crate::mvcc::shared_ids::io_protocol::open_selection::InitialIdRoute;
+    let fixture = crate::mvcc::database::shared_completed_checkpoint_fixture(|_| {
+        Arc::new(crate::io::SyscallIO::new().unwrap())
+    });
+    let runtime = fixture
+        .database
+        .get_mv_store()
+        .as_ref()
+        .unwrap()
+        .shared_runtime
+        .get()
+        .unwrap()
+        .clone();
+    let paths = [
+        fixture.path.clone(),
+        fixture.namespace.join("manifest"),
+        fixture.namespace.join("logical"),
+        fixture.namespace.join("physical-wal"),
+        fixture.namespace.join("ids-selector"),
+        fixture.namespace.join("ids-a"),
+        fixture.namespace.join("ids-b"),
+    ];
+    let before = paths.each_ref().map(|path| std::fs::read(path).unwrap());
+    let mut loading = ManifestLoad::new(
+        runtime.files.manifest.clone(),
+        fixture.guard,
+        runtime.database_id,
+    )
+    .unwrap();
+    let manifest = fixture.io.block(|| Ok(loading.poll()?)).unwrap();
+    let mut probing = runtime.ids.inspect_open_selector(manifest).unwrap();
+    let inspected = fixture.io.block(|| Ok(probing.poll()?)).unwrap();
+    let (manifest, route) = inspected.into_parts();
+    assert_eq!(route, InitialIdRoute::CompletedCheckpoint);
+    assert!(manifest.guard().unwrap().io_retired());
+    assert_eq!(
+        paths.each_ref().map(|path| std::fs::read(path).unwrap()),
+        before
+    );
+    drop(fixture.connection);
+    drop(fixture.database);
+    drop(fixture.ids);
+    drop(fixture.proof);
+    drop(manifest);
+    drop(fixture.pause);
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn shared_open_selector_native_healthy_handoff_keeps_bindings_free() {
+    use crate::mvcc::shared_ids::io_protocol::open_selection::InitialIdRoute;
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let database = crate::Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    )
+    .unwrap();
+    let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+    connection.execute("UPDATE preserved SET value='selector probe acknowledged' WHERE id=1; BEGIN; SELECT value FROM preserved").unwrap();
+    let store = database.get_mv_store().as_ref().unwrap().clone();
+    let runtime = store.shared_runtime.get().unwrap().clone();
+    let identity = runtime.replay.lock().as_ref().unwrap().identity().unwrap();
+    assert!(identity.prefix.end_offset > 0);
+    let admission = runtime.gate.try_enter_admission().unwrap();
+    let guard = runtime.files.authority.try_acquire().unwrap();
+    assert!(!guard.live_registrations().unwrap().is_empty());
+    let mut loading =
+        ManifestLoad::new(runtime.files.manifest.clone(), guard, runtime.database_id).unwrap();
+    let manifest = io.block(|| Ok(loading.poll()?)).unwrap();
+    let mut probing = runtime.ids.inspect_open_selector(manifest).unwrap();
+    let inspected = io.block(|| Ok(probing.poll()?)).unwrap();
+    let (manifest, route) = inspected.into_parts();
+    assert_eq!(route, InitialIdRoute::Healthy);
+    let mut ids = runtime
+        .ids
+        .load(manifest.into_guard().unwrap(), identity)
+        .unwrap();
+    let ids = io.block(|| Ok(ids.poll()?)).unwrap();
+    assert!(!ids.has_pending_checkpoint());
+    ids.into_guard().finish().unwrap();
+    drop(admission);
+    connection.execute("ROLLBACK; CREATE TABLE allocated_after_selector(id INTEGER PRIMARY KEY); INSERT INTO allocated_after_selector DEFAULT VALUES").unwrap();
 }

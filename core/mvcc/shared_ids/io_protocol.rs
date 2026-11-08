@@ -1,3 +1,6 @@
+#[path = "open_selection.rs"]
+pub(in crate::mvcc) mod open_selection;
+
 #[path = "current_generation.rs"]
 pub(in crate::mvcc) mod current_generation;
 

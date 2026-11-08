@@ -150,6 +150,7 @@ impl HeldManifestRead {
 #[derive(Default)]
 struct RecoveryIoControl {
     delay_manifest_read: crate::sync::atomic::AtomicBool,
+    delay_selector_read: crate::sync::atomic::AtomicBool,
     fail_slot_unlock: crate::sync::atomic::AtomicBool,
     pending_read: Mutex<Option<HeldManifestRead>>,
 }
@@ -158,6 +159,7 @@ struct RecoveryFile {
     inner: Arc<dyn File>,
     control: Arc<RecoveryIoControl>,
     manifest: bool,
+    selector: bool,
 }
 
 impl File for RecoveryFile {
@@ -171,11 +173,16 @@ impl File for RecoveryFile {
         self.inner.unlock_file()
     }
     fn pread(&self, offset: u64, completion: Completion) -> Result<Completion> {
-        if self.manifest
+        if (self.manifest
             && self
                 .control
                 .delay_manifest_read
-                .swap(false, Ordering::AcqRel)
+                .swap(false, Ordering::AcqRel))
+            || (self.selector
+                && self
+                    .control
+                    .delay_selector_read
+                    .swap(false, Ordering::AcqRel))
         {
             assert!(self
                 .control
@@ -267,11 +274,12 @@ impl crate::IO for RecoveryIo {
     ) -> Result<Arc<dyn File>> {
         let file = self.inner.open_file(path, flags, direct)?;
         let name = Path::new(path).file_name().and_then(|name| name.to_str());
-        if matches!(name, Some("manifest" | "authority")) {
+        if matches!(name, Some("manifest" | "authority" | "ids-selector")) {
             Ok(Arc::new(RecoveryFile {
                 inner: file,
                 control: self.control.clone(),
                 manifest: name == Some("manifest"),
+                selector: name == Some("ids-selector"),
             }))
         } else {
             Ok(file)
@@ -285,5 +293,91 @@ impl crate::IO for RecoveryIo {
     }
     fn step(&self) -> Result<()> {
         self.inner.step()
+    }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn shared_open_selector_native_cancel_and_wait_for_backend_retirement() {
+    for mode in ["before", "after", "wait"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let control = Arc::new(RecoveryIoControl::default());
+        let io: Arc<dyn crate::IO> = Arc::new(RecoveryIo {
+            inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+            control: control.clone(),
+        });
+        let database = crate::Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap().clone();
+        let mut opening = runtime.begin_read_pinned_open().unwrap();
+        io.block(|| opening.poll_manifest()).unwrap();
+        let manifest = opening.loaded.take().unwrap();
+        control.delay_selector_read.store(true, Ordering::Release);
+        let mut probing = runtime.ids.inspect_open_selector(manifest).unwrap();
+        let waiting = match probing.poll().unwrap() {
+            IOResult::IO(waiting) => waiting,
+            IOResult::Done(_) => panic!("selector facts escaped delayed read"),
+        };
+        let held = control.pending_read.lock().take().unwrap();
+        if mode != "before" {
+            held.complete();
+        }
+        drop(waiting);
+        if mode == "wait" {
+            let mut retirement = None;
+            for _ in 0..100 {
+                match probing.poll().unwrap() {
+                    IOResult::IO(waiting) if !waiting.0.finished() => {
+                        retirement = Some(waiting.0);
+                        break;
+                    }
+                    IOResult::IO(waiting) => io.wait_for_completion(waiting.0).unwrap(),
+                    IOResult::Done(_) => panic!("selector route escaped before backend retirement"),
+                }
+            }
+            let retirement = retirement.expect("selector backend retirement must be observable");
+            assert!(!retirement.finished());
+            assert!(matches!(
+                runtime.gate.try_pause_admission(),
+                Err(LimboError::Busy)
+            ));
+            drop(held);
+            assert!(retirement.finished());
+            let inspected = io.block(|| Ok(probing.poll()?)).unwrap();
+            let (manifest, route) = inspected.into_parts();
+            assert_eq!(
+                route,
+                crate::mvcc::shared_ids::io_protocol::open_selection::InitialIdRoute::Healthy
+            );
+            manifest.into_guard().unwrap().finish().unwrap();
+            drop(opening);
+        } else {
+            drop(probing);
+            drop(opening);
+            assert!(matches!(
+                runtime.files.authority.try_acquire(),
+                Err(LimboError::Busy)
+            ));
+            if mode == "before" {
+                held.complete();
+            }
+            assert!(matches!(
+                runtime.files.authority.try_acquire(),
+                Err(LimboError::Busy)
+            ));
+            drop(held);
+            drop(runtime.files.authority.try_acquire().unwrap());
+        }
+        connection
+            .execute("UPDATE preserved SET value='selector transport still works' WHERE id=1")
+            .unwrap();
     }
 }
