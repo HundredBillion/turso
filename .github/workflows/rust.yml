@@ -5,7 +5,7 @@ on:
       platform:
         type: choice
         default: all
-        options: [all, linux, windows, pdo]
+        options: [all, linux, windows, pdo, lint]
 permissions:
   contents: read
 env:
@@ -16,7 +16,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
   coordinator:
-    if: ${{ inputs.platform != 'windows' && inputs.platform != 'pdo' }}
+    if: ${{ inputs.platform != 'windows' && inputs.platform != 'pdo' && inputs.platform != 'lint' }}
     defaults:
       run:
         shell: bash
@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 166269aa38031fa55457178b880883d868941282
+          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -33,7 +33,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "166269aa38031fa55457178b880883d868941282"
+          test "$(git rev-parse HEAD)" = "57e1589300ee76f4e9b5b550d8729e40d5c91dfe"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -147,13 +147,13 @@ jobs:
           name: checkpoint-lifecycle-integration
           path: '*.log'
   windows:
-    if: ${{ inputs.platform != 'linux' && inputs.platform != 'pdo' }}
+    if: ${{ inputs.platform != 'linux' && inputs.platform != 'pdo' && inputs.platform != 'lint' }}
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 166269aa38031fa55457178b880883d868941282
+          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -180,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 166269aa38031fa55457178b880883d868941282
+          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -194,7 +194,7 @@ jobs:
           php -l bindings/c/tests/php_workers/worker.php
       - name: Exact source and supervisor controls
         run: |
-          test "$(git rev-parse HEAD)" = "166269aa38031fa55457178b880883d868941282"
+          test "$(git rev-parse HEAD)" = "57e1589300ee76f4e9b5b550d8729e40d5c91dfe"
           python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py' 2>&1 | tee supervisor.log
           python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output pdo-results/sqlite-control 2>&1 | tee sqlite-pdo.log
       - name: Build and attest actual Turso PDO library
@@ -234,3 +234,38 @@ jobs:
           path: |
             *.log
             pdo-results
+
+  native-lint:
+    if: ${{ inputs.platform == 'lint' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-authority
+          cache-on-failure: true
+      - name: Exact source and production lint
+        run: |
+          test "$(git rev-parse HEAD)" = "57e1589300ee76f4e9b5b550d8729e40d5c91dfe"
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee production-lint.log
+      - name: Strict core C SDK targets
+        run: |
+          cargo clippy --locked -p turso_core -p turso_sqlite3 -p turso_sdk_kit --all-targets --features turso_core/conn_raw_api,turso_core/bench,turso_core/io_uring -- -D warnings 2>&1 | tee all-targets-lint.log
+      - name: Actual final Store claim regression
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_rejects_second_store -- --ignored --test-threads=1 2>&1 | tee store-claim.log
+          grep -q '1 passed; 0 failed' store-claim.log
+          cargo fmt --all -- --check
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: combined-native-targets-lint
+          path: '*.log'
