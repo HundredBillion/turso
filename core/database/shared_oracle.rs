@@ -43,21 +43,20 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Database<A, F
         let page_size = source.get_page_size().ok_or_else(|| {
             LimboError::InvalidArgument("oracle source pager is not initialized".into())
         })?;
-        let reserved = source.get_reserved_space().ok_or_else(|| {
-            LimboError::InvalidArgument("oracle source pager layout is not initialized".into())
-        })?;
+        let reserved = source.get_reserved_space();
+        let io_context = source.io_ctx.read().clone();
         let wal: Option<Arc<dyn Wal>> = if source.has_wal() {
             let snapshot = self.shared_wal.read().last_checksum_and_max_frame();
-            Some(Arc::new(
-                WalFile::new_with_shared_coordination(
-                    self.io.clone(),
-                    self.shared_wal.clone(),
-                    runtime.physical_coordination(),
-                    snapshot,
-                    self.buffer_pool.clone(),
-                )
-                .with_read_file(physical_wal)?,
-            ))
+            let wal = WalFile::new_with_shared_coordination(
+                self.io.clone(),
+                self.shared_wal.clone(),
+                runtime.physical_coordination(),
+                snapshot,
+                self.buffer_pool.clone(),
+            )
+            .with_read_file(physical_wal)?;
+            wal.set_io_context(io_context.clone());
+            Some(Arc::new(wal))
         } else {
             None
         };
@@ -70,9 +69,9 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Database<A, F
             self.pager_state.clone(),
         )?;
         pager.set_page_size(page_size);
-        pager.set_reserved_space_bytes(reserved);
-        if reserved != CHECKSUM_REQUIRED_RESERVED_BYTES {
-            pager.reset_checksum_context();
+        *pager.io_ctx.write() = io_context;
+        if let Some(reserved) = reserved {
+            pager.set_reserved_space_bytes(reserved);
         }
         Ok(Arc::new(pager))
     }
@@ -173,6 +172,28 @@ mod tests {
         assert!(page.is_loaded());
         assert!(!page.is_locked());
         oracle.end_read_tx();
+        assert_eq!(source.holds_read_lock(), before);
+
+        let expected_reserved = source.get_reserved_space().unwrap();
+        source.reset_shared_generation().unwrap();
+        assert_eq!(source.get_reserved_space(), None);
+        let oracle = db
+            .shared_oracle_pager(
+                &source,
+                runtime,
+                runtime.main_file(),
+                runtime.physical_wal_file(),
+            )
+            .unwrap();
+        assert_eq!(oracle.get_reserved_space(), None);
+        oracle.begin_read_tx().unwrap();
+        let (page_size, reserved) = io
+            .block(|| oracle.with_header(|header| (header.page_size, header.reserved_space)))
+            .unwrap();
+        assert_eq!(Some(page_size), source.get_page_size());
+        assert_eq!(reserved, expected_reserved);
+        oracle.end_read_tx();
+        assert_eq!(source.get_reserved_space(), None);
         assert_eq!(source.holds_read_lock(), before);
     }
 }

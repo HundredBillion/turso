@@ -8,6 +8,7 @@ use crate::mvcc::shared_ids::policy::{CommittedIdOracle, IdFact, IdQuery};
 use crate::numeric::Numeric;
 use crate::schema::Sequence;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::sync::Arc;
 use crate::types::{SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_if_io, Connection, IOResult, LimboError, Result};
@@ -107,6 +108,23 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
             return Err(LimboError::InvalidArgument(
                 "committed ID oracle authority or prefix changed".into(),
             ));
+        }
+        let pager = self.context().pager();
+        if pager.get_reserved_space().is_none() {
+            let (page_size, reserved) = return_if_io!(
+                pager.with_header(|header| (header.page_size, header.reserved_space))
+            );
+            if pager.get_page_size() != Some(page_size)
+                || !page_size.has_valid_reserved_space(reserved)
+                || (reserved == CHECKSUM_REQUIRED_RESERVED_BYTES)
+                    != (pager.io_ctx.read().get_reserved_space_bytes()
+                        == CHECKSUM_REQUIRED_RESERVED_BYTES)
+            {
+                return Err(LimboError::InvalidArgument(
+                    "oracle header layout differs from the initialized database".into(),
+                ));
+            }
+            pager.set_reserved_space_bytes(reserved);
         }
         if self.request.is_some_and(|current| current != *request) {
             return Err(LimboError::InvalidArgument(
