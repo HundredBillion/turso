@@ -53,7 +53,7 @@ jobs:
           done
       - name: Strict library lint and source integrity
         run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api -- --deny=warnings 2>&1 | tee clippy.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
