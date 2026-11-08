@@ -175,7 +175,28 @@ fn mvcc_request_on_an_instance_without_mvcc_is_rejected() {
         DatabaseOpts::new().with_mvcc(true),
     )
     .unwrap();
-    assert!(Arc::ptr_eq(&first, &read_only));
+    assert!(read_only.is_readonly());
+    assert!(!read_only.mvcc_enabled());
+    let reader = read_only.connect(ConnectOpts::new()).unwrap();
+    assert!(matches!(
+        reader.execute("INSERT INTO t VALUES (0)"),
+        Err(LimboError::ReadOnly)
+    ));
+    first
+        .connect(ConnectOpts::new())
+        .unwrap()
+        .execute("INSERT INTO t VALUES (7)")
+        .unwrap();
+    let mut values = Vec::new();
+    reader
+        .prepare("SELECT x FROM t")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<i64>(0)?);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, vec![7]);
 }
 
 #[test]
