@@ -1,4 +1,4 @@
-name: Prepare peer schema counterexample
+name: Prepare peer schema refresh validation
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 0d95c591da225314272eb6401f5ae4f00fb8a3ae
+          ref: 061450b7883de0e9b686e6aab0d3993f671a6d3a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,22 +23,30 @@ jobs:
           cache-on-failure: true
       - name: Exact source and native filesystem
         run: |
-          test "$(git rev-parse HEAD)" = "0d95c591da225314272eb6401f5ae4f00fb8a3ae"
+          test "$(git rev-parse HEAD)" = "061450b7883de0e9b686e6aab0d3993f671a6d3a"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Verified existing peer preparation prerequisite
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native_peer_sequence_ddl -- --ignored --test-threads=1 2>&1 | tee prerequisite.log
           grep -q '1 passed; 0 failed' prerequisite.log
-      - name: Preparation without an intervening statement must expose stale schema
+      - name: Prepare directly after peer DDL
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee prepare-red.log
-          result=${PIPESTATUS[0]}
-          set -e
-          test "$result" -ne 0
-          grep -q '0 passed; 2 failed' prepare-red.log
-          grep -q 'prepare used the schema from before the peer committed' prepare-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee prepare-green.log
+          grep -q '2 passed; 0 failed' prepare-green.log
+      - name: Native ID and watermark regression coverage
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 2>&1 | tee ids.log
+          grep -q '13 passed; 0 failed' ids.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --skip shared_watermark_process_child --test-threads=1 2>&1 | tee watermark.log
+          grep -q '3 passed; 0 failed' watermark.log
+      - name: MVCC regression suite and strict lint
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=2 2>&1 | tee mvcc.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' mvcc.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          cargo fmt --all -- --check
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
