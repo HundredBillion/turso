@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 15196c7e8a1479de8f6035447c3c83486d5db276
+          ref: fda7b28bec7314b6129220bacddd1c430a838cbd
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,53 +28,39 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 15196c7e8a1479de8f6035447c3c83486d5db276
+          test "$(git rev-parse HEAD)" = fda7b28bec7314b6129220bacddd1c430a838cbd
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Exact Linux test lint diagnostics
+      - name: Inventory real ordinary ownership failures and SDK independently
         run: |
-          cargo clippy --locked -p turso_core --lib --tests --features conn_raw_api,bench,io_uring --message-format=json -- -D warnings > test-clippy.json 2> test-clippy.log
-      - name: Independent empty test harness diagnostic
-        if: always()
-        run: |
-          python3 - <<'PYCONTROL'
-          from pathlib import Path
-          Path('/tmp/empty_harness.rs').write_text(''.join(f'#[test] fn empty_{i}() {{}}\n' for i in range(3076)))
-          PYCONTROL
+          failed=0
+          for selector in 'mvcc::database::tests::' page_codec test_shm_; do
+            label=$(printf '%s' "$selector" | tr ':/' '__')
+            set +e
+            timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,bench "$selector" -- --test-threads=2 > "$label.log" 2>&1
+            code=$?
+            set -e
+            printf '%s\n' "$code" > "$label-status.txt"
+            tail -100 "$label.log"
+            if test "$code" -ne 0; then failed=1; fi
+          done
           set +e
-          clippy-driver --test /tmp/empty_harness.rs --edition=2021 --crate-name empty_harness --emit=metadata -o /tmp/empty_harness.rmeta --error-format=json -D clippy::large_stack_frames 2> empty-harness.json
+          timeout 600 cargo test --locked -p turso_sdk_kit --lib -- --test-threads=2 > sdk.log 2>&1
           code=$?
           set -e
-          printf '%s\n' "$code" > empty-harness-status.txt
-      - name: Strict production library lint
-        if: always()
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee library-clippy.log
-          cargo fmt --all --check
-      - name: Oversized production engine function causal control
-        run: |
-          cp core/lib.rs /tmp/accepted-lib.rs
-          trap 'cp /tmp/accepted-lib.rs core/lib.rs' EXIT
-          python3 - <<'PYCONTROL'
+          printf '%s\n' "$code" > sdk-status.txt
+          tail -100 sdk.log
+          if test "$code" -ne 0; then failed=1; fi
+          python3 - <<'PYCOUNTS'
+          import re
           from pathlib import Path
-          p = Path('core/lib.rs')
-          p.write_text(p.read_text() + '\npub fn validation_oversized_engine_frame() { let bytes = [0_u8; 600_000]; std::hint::black_box(bytes); }\n')
-          PYCONTROL
-          set +e
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring --message-format=json -- -D warnings > engine-control.json 2> engine-control.log
-          code=$?
-          set -e
-          test "$code" -ne 0
-          python3 - <<'PYCONTROL'
-          import json
-          from pathlib import Path
-          messages = [json.loads(line) for line in Path('engine-control.json').read_text().splitlines() if line.startswith('{')]
-          messages = [m['message'] for m in messages if m.get('reason') == 'compiler-message']
-          assert any((m.get('code') or {}).get('code') == 'clippy::large_stack_frames' and any(s['file_name'] == 'core/lib.rs' and s['is_primary'] for s in m['spans']) for m in messages)
-          PYCONTROL
-          cp /tmp/accepted-lib.rs core/lib.rs
-          git diff --exit-code
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee engine-restored.log
+          for file in [Path('mvcc__database__tests__.log'), Path('page_codec.log'), Path('test_shm_.log'), Path('sdk.log')]:
+              lines = [line for line in file.read_text().splitlines() if line.startswith('test result:')]
+              assert lines, file
+              match = re.search(r'(\d+) passed; (\d+) failed;', lines[-1])
+              assert match and sum(map(int, match.groups())) > 0, (file, lines[-1])
+          PYCOUNTS
+          test "$failed" -eq 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
