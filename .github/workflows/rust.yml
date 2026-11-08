@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 94f425dd9dfc866aad01a11049869d67d413588e
+          ref: 29e22f40ad9fb873bf4aae2a9f9fd0ce6d66d528
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
           cache-on-failure: true
       - name: Actual baseline source
         run: |
-          test "$(git rev-parse HEAD)" = 94f425dd9dfc866aad01a11049869d67d413588e
+          test "$(git rev-parse HEAD)" = 29e22f40ad9fb873bf4aae2a9f9fd0ce6d66d528
           test "$(id -u)" -ne 0
           rustc -Vv
       - name: Healthy live readers and unacknowledged tails
@@ -36,6 +36,12 @@ jobs:
             timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api "$filter" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$filter.log"
             grep -q '1 passed; 0 failed' "$filter.log"
           done
+      - name: Selector probe and existing transport lifetime
+        run: |
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_selector_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee selector.log
+          grep -q '3 passed; 0 failed' selector.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee existing-io.log
+          grep -q '2 passed; 0 failed' existing-io.log
       - name: Genuine pending checkpoint public open counterexample
         run: |
           set +e
