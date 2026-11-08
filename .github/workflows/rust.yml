@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 93bd5b10d2ea953a272b64e4c9d72a5109023520
+          ref: 9058a97e048b8bba9943b99dc6709b784d72b3cc
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,7 +23,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 93bd5b10d2ea953a272b64e4c9d72a5109023520
+          test "$(git rev-parse HEAD)" = 9058a97e048b8bba9943b99dc6709b784d72b3cc
           rustc -Vv | tee rustc.txt
       - name: Idle old process and new constructor reload current generation
         run: |
@@ -50,6 +50,19 @@ jobs:
       - name: Causal boundary controls and restored complete source
         run: |
           set -e
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_current_prefix.rs'
+          s=open(p).read(); old='MvStore::<C, A>::capture_table_valued_functions(&connection.schema.read())'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,'Vec::new()'))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture > tvf-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_current_prefix.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' tvf-control-red.log
           python3 - <<'PATCH'
           p='core/mvcc/database/shared_generation_reload.rs'
           s=open(p).read(); old='checkpoint_timestamp > prefix.committed_timestamp'
@@ -90,6 +103,8 @@ jobs:
           git restore core/mvcc/database/shared_runtime.rs
           test "$code" -ne 0
           grep -q '0 passed; 1 failed' finish-control-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-restored-green.log
+          grep -q '1 passed; 0 failed' idle-restored-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture 2>&1 | tee cancel-restored-green.log
           grep -q '1 passed; 0 failed' cancel-restored-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_rejects_physical_extent_without_id_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent-restored-green.log
