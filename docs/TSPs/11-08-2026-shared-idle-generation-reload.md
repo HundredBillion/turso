@@ -37,11 +37,11 @@ Use pinned Rust1.88, two jobs, debug disabled, no incremental compilation. Nativ
 
 **Blocked by:** Verified combined ready-handoff base.
 
-- [ ] Start an old-generation child process and warm its idle Store before the parent checkpoint.
-- [ ] Run the actual completed checkpoint and verified private ready handoff.
-- [ ] Commit twice afterward; assert the empty completion record has been overwritten and latest selected prefix is nonzero.
-- [ ] Keep a foreign new-generation reader active while the old child tries to refresh.
-- [ ] Observe exact baseline failure before changing production refresh code; preserve native ownership and durable-byte assertions.
+- [x] Start an old-generation child process and warm its idle Store before the parent checkpoint.
+- [x] Run the actual completed checkpoint and verified private ready handoff.
+- [x] Commit twice afterward; assert the empty completion record has been overwritten and latest selected prefix is nonzero.
+- [x] Keep a foreign new-generation reader active while the old child tries to refresh.
+- [x] Observe exact baseline failure before changing production refresh code; preserve native ownership and durable-byte assertions.
 
 ### Task 2: Selected current-base evidence and local installation
 
