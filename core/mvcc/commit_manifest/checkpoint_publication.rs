@@ -18,6 +18,34 @@ pub(in crate::mvcc) struct MirroredCheckpointIntent {
     guard: AuthorityGuard,
 }
 
+#[cfg(all(host_shared_wal, unix))]
+impl LoadedManifest {
+    pub(in crate::mvcc) fn mirror_recovered_checkpoint_intent(
+        mut self,
+        evidence: &crate::mvcc::database::RecoveryIntentEvidence,
+    ) -> Result<CheckpointIntentPublication> {
+        evidence.validate(&self.file, self.record, self.guard()?)?;
+        if !self.guard()?.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        let file = self.file.clone();
+        let publication = ManifestPublication {
+            file: file.clone(),
+            ownership: Arc::new(Mutex::new(self.guard.take())),
+            slot: 1 - self.slot,
+            record: self.record,
+            stage: PublicationStage::Start,
+        };
+        Ok(CheckpointIntentPublication {
+            file,
+            publication,
+            mirrored: false,
+            durable: None,
+            terminated: false,
+        })
+    }
+}
+
 impl LoadedManifest {
     pub(in crate::mvcc) fn begin_checkpoint_intent(
         self,
