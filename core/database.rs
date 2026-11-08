@@ -5282,11 +5282,8 @@ mod database_tests {
         codec: Arc<dyn PageCodec>,
         opts: DatabaseOpts,
     ) -> crate::Result<Arc<Database>> {
-        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
-        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
         let options = OpenOptions::new(Arc::new(EngineDialect))
-            .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(opts)
             .page_codec(codec);

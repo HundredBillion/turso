@@ -1813,6 +1813,8 @@ impl MvccTestDbNoConn {
         // If not, we will load the same database instance again.
         let path = self.path.as_ref().unwrap();
         remove_file_from_database_registry(path);
+        // A restart must release the fixture's old owner before opening a new one.
+        drop(self.db.take());
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
@@ -10660,6 +10662,7 @@ fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integri
     conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
 
     conn.close().unwrap();
+    drop(conn);
     force_close_for_artifact_tamper(&mut db);
 
     let sqlite = rusqlite::Connection::open(db_path).unwrap();
