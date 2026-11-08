@@ -196,12 +196,15 @@ impl SharedRefresh {
             record.database_id(),
         )?;
         if record.prefix().end_offset != 0 {
+            let file = crate::mvcc::read_pinned_file::ReadPinnedFile::for_manifest_replay(
+                self.file.clone(),
+                self.loaded.as_ref().unwrap(),
+            )?;
             state.context.reader = Box::new(
-                StreamingLogicalLogReader::new_deferred(self.file.clone(), None)
-                    .with_committed_prefix(
-                        record.prefix().end_offset,
-                        record.prefix().running_crc,
-                    )?,
+                StreamingLogicalLogReader::new_deferred(file, None).with_committed_prefix(
+                    record.prefix().end_offset,
+                    record.prefix().running_crc,
+                )?,
             );
         }
         self.header_read = false;
@@ -870,7 +873,11 @@ mod tests {
     }
     impl DelayedLogFile {
         fn retire(&self) {
+            drop(self.complete_retained());
+        }
+        fn complete_retained(&self) -> Completion {
             let (offset, completion) = self.pending.lock().take().unwrap();
+            let retained = completion.clone();
             let buffer = Arc::new(Buffer::new_temporary(
                 completion.as_read().buf().len().min(64),
             ));
@@ -892,6 +899,7 @@ mod tests {
                     )
                     .unwrap(),
             );
+            retained
         }
     }
     impl File for DelayedLogFile {
@@ -1003,7 +1011,16 @@ mod tests {
         }
         assert!(cancelled_after_import);
         drop(refresh);
-        delayed.retire();
+        assert!(
+            matches!(authority.try_acquire(), Err(LimboError::Busy)),
+            "cancelled replay released authority before physical callback"
+        );
+        let physical = delayed.complete_retained();
+        assert!(
+            matches!(authority.try_acquire(), Err(LimboError::Busy)),
+            "cancelled replay callback released backend authority"
+        );
+        drop(physical);
         assert!(authority.try_acquire().unwrap().requires_recovery());
         let mut refresh = replay
             .refresh(loaded(&io, record, &authority), file)

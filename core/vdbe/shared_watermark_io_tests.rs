@@ -251,3 +251,90 @@ impl crate::IO for DeferredIo {
         self.inner.step()
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_prepare_io_native_no_result_until_manifest_and_logical_backend_retire() {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+    for target in ["manifest", "logical"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+        let control = Arc::new(ReadControl::default());
+        let io: Arc<dyn crate::IO> = Arc::new(DeferredIo {
+            inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+            control: control.clone(),
+            target,
+        });
+        let options = OpenOptions::new(Arc::new(EngineDialect)).with_shared_mvcc_for_test(limit);
+        let first = Database::open(io, path.to_str().unwrap(), options.clone())
+            .unwrap()
+            .connect(ConnectOpts::new())
+            .unwrap();
+        let peer = Database::open(
+            Arc::new(crate::io::SyscallIO::new().unwrap()),
+            path.to_str().unwrap(),
+            options,
+        )
+        .unwrap()
+        .connect(ConnectOpts::new())
+        .unwrap();
+        peer.execute("CREATE TABLE newly_committed_prepare_io(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let before = watermark_durable_files(directory.path());
+        control.armed.store(true, Ordering::Release);
+        let (sender, receiver) = mpsc::channel();
+        let worker_connection = first.clone();
+        let worker = std::thread::spawn(move || {
+            let result = worker_connection
+                .prepare("SELECT id FROM newly_committed_prepare_io")
+                .map(|_| ());
+            sender.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let held = loop {
+            if let Some(read) = control.pending.lock().take() {
+                break read;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{target}: prepare did not submit physical read"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "{target}: prepare returned before callback"
+        );
+        let write = "INSERT INTO preserved(id,value) VALUES(92,'during prepare')";
+        assert!(
+            matches!(peer.execute(write), Err(crate::LimboError::Busy)),
+            "{target}: peer wrote during pending prepare read"
+        );
+        held.complete();
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "{target}: prepare returned before physical retirement"
+        );
+        assert!(
+            matches!(peer.execute(write), Err(crate::LimboError::Busy)),
+            "{target}: callback released prepare authority"
+        );
+        assert_eq!(watermark_durable_files(directory.path()), before);
+        drop(held);
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retired prepare did not return")
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(first.get_mv_tx_id_for_db(0), None);
+        assert_eq!(watermark_durable_files(directory.path()), before);
+        peer.execute(write).unwrap();
+    }
+}
