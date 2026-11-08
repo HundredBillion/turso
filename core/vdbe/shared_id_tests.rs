@@ -231,3 +231,36 @@ fn shared_id_stale_prepare_native_peer_sequence_ddl() {
         prepared.err()
     );
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_autoincrement_uses_durable_sequence() {
+    let (_directory, first, second) = pair_with_setup(Some(
+        "CREATE TABLE auto_ids(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+    ));
+    first.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO auto_ids(value) VALUES('first')")
+        .unwrap();
+    second
+        .execute("INSERT INTO auto_ids(value) VALUES('second')")
+        .unwrap();
+    let a = integers(&first, "SELECT id FROM auto_ids WHERE value='first'")[0];
+    let b = integers(&second, "SELECT id FROM auto_ids WHERE value='second'")[0];
+    assert!(
+        b > a,
+        "independent AUTOINCREMENT stores reused a sequence value"
+    );
+    first.execute("ROLLBACK").unwrap();
+    second.execute("COMMIT").unwrap();
+    first
+        .execute("INSERT INTO auto_ids(value) VALUES('after rollback')")
+        .unwrap();
+    assert!(
+        integers(
+            &first,
+            "SELECT id FROM auto_ids WHERE value='after rollback'"
+        )[0] > b
+    );
+}
