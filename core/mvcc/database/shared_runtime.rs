@@ -1327,3 +1327,7 @@ mod shared_physical_native_tests;
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_connection_tests.rs"]
 mod shared_connection_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_idle_generation_tests.rs"]
+mod shared_idle_generation_tests;
