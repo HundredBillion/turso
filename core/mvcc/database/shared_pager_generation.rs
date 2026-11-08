@@ -164,6 +164,19 @@ mod tests {
             pager.cache_get(1).unwrap().is_none(),
             "completed target retained an earlier pager cache"
         );
+        pager.begin_read_tx().unwrap();
+        assert!(
+            pager
+                .ensure_shared_generation(SharedPagerGeneration {
+                    database_id: runtime.database_id,
+                    generation: target.database.generation,
+                    checkpoint_timestamp: target.database.checkpoint_timestamp,
+                })
+                .is_ok(),
+            "completed certification did not install the target pager tag"
+        );
+        assert!(pager.holds_read_lock());
+        pager.end_read_tx();
         assert!(runtime.replay.lock().is_none());
         assert!(matches!(runtime.begin_open(), Err(LimboError::Busy)));
         fixture.guard.finish().unwrap();
