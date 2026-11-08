@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1d21a1c0bde48843b675cab914c28cc137162102
+          ref: 4fcfa455317875ec98fbfb41dae4d5a33621122c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1d21a1c0bde48843b675cab914c28cc137162102
+          test "$(git rev-parse HEAD)" = 4fcfa455317875ec98fbfb41dae4d5a33621122c
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -54,15 +54,51 @@ jobs:
         run: |
           timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee local-install-green.log
           grep -q '6 passed; 0 failed' local-install-green.log
-      - name: Missing certified readiness publication must fail
+      - name: Certified ready handoff and late failures
         run: |
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-green.log
+          grep -q '3 passed; 0 failed' ready-green.log
+      - name: Original connection equality causal control
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/database/shared_checkpoint_install.rs'
+          s=open(p).read()
+          a=s.index('        if !crate::sync::Weak::ptr_eq')
+          b=s.index('        let store =',a)
+          s=s[:a]+s[b:]
+          open(p,'w').write(s)
+          PYCONTROL
           set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_resumes_original_connection_and_new_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-red.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_rejects_foreign_connection_with_same_schema -- --ignored --test-threads=1 --nocapture 2>&1 | tee original-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'completed checkpoint readiness publication is not implemented' ready-red.log
-          grep -q '0 passed; 1 failed' ready-red.log
+          grep -q '0 passed; 1 failed' original-red.log
+          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
+      - name: Finish failure withdrawal causal control
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/database/shared_checkpoint_install.rs'
+          s=open(p).read()
+          old='        if result.is_err() {\n            runtime.replay.lock().take();\n        }\n'
+          assert s.count(old)==1
+          s=s.replace(old,'')
+          open(p,'w').write(s)
+          PYCONTROL
+          set +e
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_late_failures_leave_no_replay -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'failed readiness retained replay at 2' finish-red.log
+          grep -q '0 passed; 1 failed' finish-red.log
+          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
+      - name: Restored ready handoff and full MVCC
+        run: |
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-restored.log
+          grep -q '3 passed; 0 failed' ready-restored.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
+          grep -q '0 failed' mvcc.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
