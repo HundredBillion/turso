@@ -1,3 +1,6 @@
+#[path = "shared_pager_generation.rs"]
+mod shared_pager_generation;
+
 #[path = "shared_checkpoint.rs"]
 mod shared_checkpoint;
 
@@ -55,6 +58,8 @@ pub(crate) struct SharedOpenState {
     failed: bool,
     manifest_ready: bool,
     bindings: Vec<FileBinding>,
+    pin_physical_reads: bool,
+    connection_refreshed: bool,
 }
 
 #[derive(Default)]
@@ -192,6 +197,17 @@ impl SharedMvccRuntime {
     }
 
     pub(crate) fn begin_open(self: &Arc<Self>) -> Result<SharedOpenState> {
+        self.begin_open_with_read_policy(false)
+    }
+
+    pub(crate) fn begin_read_pinned_open(self: &Arc<Self>) -> Result<SharedOpenState> {
+        self.begin_open_with_read_policy(true)
+    }
+
+    fn begin_open_with_read_policy(
+        self: &Arc<Self>,
+        pin_physical_reads: bool,
+    ) -> Result<SharedOpenState> {
         let admission = self.gate.try_enter_admission()?;
         let guard = self.files.authority.try_acquire()?;
         let load = ManifestLoad::new(self.files.manifest.clone(), guard, self.database_id)?;
@@ -204,6 +220,8 @@ impl SharedMvccRuntime {
             failed: false,
             manifest_ready: false,
             bindings: Vec::new(),
+            pin_physical_reads,
+            connection_refreshed: false,
         })
     }
 }
@@ -230,10 +248,17 @@ impl SharedOpenState {
                 }
                 let bindings = (|| {
                     let guard = loaded.guard()?;
-                    Ok::<_, LimboError>(vec![
-                        self.runtime.main.bind(guard)?,
-                        self.runtime.wal.bind(guard)?,
-                    ])
+                    Ok::<_, LimboError>(if self.pin_physical_reads {
+                        vec![
+                            self.runtime.main.bind_reads(guard)?,
+                            self.runtime.wal.bind_reads(guard)?,
+                        ]
+                    } else {
+                        vec![
+                            self.runtime.main.bind(guard)?,
+                            self.runtime.wal.bind(guard)?,
+                        ]
+                    })
                 })();
                 match bindings {
                     Ok(bindings) => self.bindings = bindings,
@@ -251,6 +276,47 @@ impl SharedOpenState {
                 Err(error.into())
             }
         }
+    }
+
+    pub(crate) fn capture_connection_generation(
+        &self,
+    ) -> Result<crate::storage::pager::SharedPagerGeneration> {
+        self.runtime
+            .captured_pager_generation(self.loaded.as_ref().ok_or(LimboError::Busy)?.record())
+    }
+
+    pub(crate) fn finish_connection<C: LogicalClock, A: ConcurrentAllocator>(
+        &mut self,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+        captured: crate::storage::pager::SharedPagerGeneration,
+    ) -> IOResultOr<()> {
+        if !self.connection_refreshed {
+            if self.refresh.is_none() {
+                let replay = self.runtime.replay.lock().clone().ok_or(LimboError::Busy)?;
+                self.refresh = Some(
+                    replay.refresh(self.loaded.take().unwrap(), self.runtime.logical.clone())?,
+                );
+            }
+            self.loaded = Some(return_if_io!(self
+                .refresh
+                .as_mut()
+                .unwrap()
+                .poll(store, connection)));
+            self.connection_refreshed = true;
+        }
+        let guard = self.loaded.as_ref().ok_or(LimboError::Busy)?.guard()?;
+        if !guard.io_retired() {
+            return Ok(IOResult::IO(crate::types::IOCompletions(
+                guard.retirement_completion(),
+            )));
+        }
+        self.runtime
+            .certify_current_pager(connection, Some(captured), guard)?;
+        self.loaded.take().unwrap().into_guard()?.finish()?;
+        self.bindings.clear();
+        self.admission = None;
+        Ok(IOResult::Done(()))
     }
 
     fn abort(&mut self) {
@@ -494,7 +560,9 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                                 .into());
                             }
                             if loaded.guard().incarnation_ready()? {
-                                loaded.into_guard().finish()?;
+                                let guard = loaded.into_guard();
+                                runtime.certify_current_pager(connection, None, &guard)?;
+                                guard.finish()?;
                             } else {
                                 state.ids_mirror = Some(loaded.mirror_current_witness()?);
                             }
@@ -504,6 +572,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                             state.ids_mirror = None;
                             let (mut guard, maximum) = proof.into_guard_and_max_owner_epoch();
                             guard.reconcile_incarnation(maximum.unwrap_or(0))?;
+                            runtime.certify_current_pager(connection, None, &guard)?;
                             guard.finish()?;
                         }
                         open.bindings.clear();
@@ -1254,3 +1323,7 @@ fn shared_checkpoint_native_completion_requires_id_finalization_before_admission
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "../../database/shared_physical_native_tests.rs"]
 mod shared_physical_native_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_connection_tests.rs"]
+mod shared_connection_tests;

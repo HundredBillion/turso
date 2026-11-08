@@ -2,13 +2,24 @@ use super::*;
 use crate::mvcc::shared_authority::MAX_TIMESTAMP;
 use crate::sync::Weak;
 
+pub(in crate::mvcc) struct PhysicalBaseParts {
+    pub header: DatabaseHeader,
+    pub persistent_timestamp: u64,
+    pub schema: Arc<Schema>,
+    schema_rows: HashMap<i64, ImmutableRecord>,
+    type_sqls: BTreeMap<i64, String>,
+    table_valued_functions: Vec<Arc<crate::vtab::VirtualTable>>,
+}
+
+pub(in crate::mvcc) type PhysicalBaseReadState = SharedBaseContextState;
+
 #[derive(Default)]
-pub(super) struct SharedBaseContextState {
+pub(in crate::mvcc) struct SharedBaseContextState {
     stage: Stage,
     connection: Option<Weak<Connection>>,
     timestamp_state: ReadPersistentTxTsMaxState,
     persistent_timestamp: u64,
-    cookie: u32,
+    header: Option<DatabaseHeader>,
     statement: Option<Box<crate::Statement>>,
     schema_rows: HashMap<i64, ImmutableRecord>,
     type_sqls: BTreeMap<i64, String>,
@@ -36,23 +47,27 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
         connection: &Arc<Connection>,
         state: &mut SharedBaseContextState,
     ) -> IOResultOr<Box<RecoverCtx>> {
-        let result = state.poll(self, connection);
+        let parts = return_if_io!(state.poll(connection));
+        Ok(IOResult::Done(parts.into_context(self)))
+    }
+}
+
+impl SharedBaseContextState {
+    pub(in crate::mvcc) fn poll(
+        &mut self,
+        connection: &Arc<Connection>,
+    ) -> IOResultOr<PhysicalBaseParts> {
+        let result = self.poll_inner(connection);
         if result.is_err() {
-            *state = SharedBaseContextState {
+            *self = Self {
                 stage: Stage::Done,
                 ..Default::default()
             };
         }
         result
     }
-}
 
-impl SharedBaseContextState {
-    fn poll<C: LogicalClock, A: ConcurrentAllocator>(
-        &mut self,
-        store: &MvStore<C, A>,
-        connection: &Arc<Connection>,
-    ) -> IOResultOr<Box<RecoverCtx>> {
+    fn poll_inner(&mut self, connection: &Arc<Connection>) -> IOResultOr<PhysicalBaseParts> {
         if !connection.is_mvcc_bootstrap_connection() || connection.db.is_in_memory_db() {
             return Err(LimboError::InvalidArgument(
                 "shared base context requires a persistent bootstrap connection".into(),
@@ -87,19 +102,15 @@ impl SharedBaseContextState {
                     self.connection = Some(Arc::downgrade(connection));
                     let schema = connection.schema.read().clone();
                     self.table_valued_functions =
-                        MvStore::<C, A>::capture_table_valued_functions(&schema);
+                        crate::MvStore::capture_table_valued_functions(&schema);
                     self.schema = Some(schema);
                     self.stage = Stage::Timestamp;
                 }
                 Stage::Timestamp => {
-                    self.persistent_timestamp = return_if_io!(store
-                        .try_read_persistent_tx_ts_max_nonblock(
-                            connection,
-                            &mut self.timestamp_state
-                        ))
-                    .ok_or_else(|| {
-                        LimboError::Corrupt("shared database has no MVCC metadata table".into())
-                    })?;
+                    self.persistent_timestamp =
+                        return_if_io!(self.timestamp_state.poll(connection)).ok_or_else(|| {
+                            LimboError::Corrupt("shared database has no MVCC metadata table".into())
+                        })?;
                     if self.persistent_timestamp >= MAX_TIMESTAMP {
                         return Err(
                             LimboError::Corrupt("invalid shared base timestamp".into()).into()
@@ -108,11 +119,10 @@ impl SharedBaseContextState {
                     self.stage = Stage::Cookie;
                 }
                 Stage::Cookie => {
-                    self.cookie = return_if_io!(connection
+                    self.header = Some(return_if_io!(connection
                         .pager
                         .load()
-                        .with_header(|header| header.schema_cookie))
-                    .get();
+                        .with_header(|header| *header)));
                     self.statement = connection
                         .query(
                             "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
@@ -173,22 +183,14 @@ impl SharedBaseContextState {
                             ..Default::default()
                         },
                     );
-                    return Ok(IOResult::Done(Box::new(RecoverCtx {
-                        reader: Box::new(StreamingLogicalLogReader::new_deferred(
-                            store.get_logical_log_file(),
-                            store.storage.encryption_ctx(),
-                        )),
-                        preserved_table_valued_functions: completed.table_valued_functions,
-                        cookie: completed.cookie,
-                        persistent_tx_ts_max: completed.persistent_timestamp,
-                        replay_cutoff_ts: completed.persistent_timestamp,
-                        max_commit_ts_seen: completed.persistent_timestamp,
+                    return Ok(IOResult::Done(PhysicalBaseParts {
+                        header: completed.header.expect("base header captured"),
+                        persistent_timestamp: completed.persistent_timestamp,
+                        schema: completed.schema.expect("base schema captured"),
                         schema_rows: completed.schema_rows,
                         type_sqls: completed.type_sqls,
-                        dropped_root_pages: HashSet::default(),
-                        current_schema: completed.schema.expect("base schema captured"),
-                        index_infos: HashMap::default(),
-                    })));
+                        table_valued_functions: completed.table_valued_functions,
+                    }));
                 }
                 Stage::Done => {
                     return Err(LimboError::InvalidArgument(
@@ -201,12 +203,95 @@ impl SharedBaseContextState {
     }
 }
 
+impl PhysicalBaseParts {
+    pub(in crate::mvcc) fn into_context<C: LogicalClock, A: ConcurrentAllocator>(
+        self,
+        store: &MvStore<C, A>,
+    ) -> Box<RecoverCtx> {
+        Box::new(RecoverCtx {
+            reader: Box::new(StreamingLogicalLogReader::new_deferred(
+                store.get_logical_log_file(),
+                store.storage.encryption_ctx(),
+            )),
+            preserved_table_valued_functions: self.table_valued_functions,
+            cookie: self.header.schema_cookie.get(),
+            persistent_tx_ts_max: self.persistent_timestamp,
+            replay_cutoff_ts: self.persistent_timestamp,
+            max_commit_ts_seen: self.persistent_timestamp,
+            schema_rows: self.schema_rows,
+            type_sqls: self.type_sqls,
+            dropped_root_pages: HashSet::default(),
+            current_schema: self.schema,
+            index_infos: HashMap::default(),
+        })
+    }
+}
+
 #[cfg(all(test, not(shuttle)))]
 mod tests {
     use super::super::tests::MvccTestDbNoConn;
     use super::*;
     use crate::alloc::TryClone;
     use crate::DatabaseOpts;
+
+    #[test]
+    fn physical_base_parts_require_no_source_store_and_preserve_live_state() {
+        let (fixture, connection) = materialized();
+        let store = fixture.get_mvcc_store();
+        let persistent = store.durable_txid_max.load(Ordering::SeqCst);
+        store.set_sequence_watermark("physical_fact_sentinel", 9876);
+        connection.execute("CREATE TABLE log_only(value)").unwrap();
+        let live_schema = connection.db.schema.lock().clone();
+        let root = store.get_table_id_from_root_page(1);
+        let committed = store.last_committed_tx_ts.load(Ordering::SeqCst);
+        let path = &connection.db.path;
+        let main_before = std::fs::read(path).unwrap();
+        let log_before = std::fs::read(format!("{path}-log")).ok();
+        let file = connection
+            .db
+            .io
+            .open_file(
+                path,
+                crate::OpenFlags::ReadOnly | crate::OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let options = crate::OpenOptions::new(connection.db.dialect().clone())
+            .db_opts(connection.db.opts)
+            .storage(Arc::new(crate::storage::database::DatabaseFile::new(file)));
+        let mut opening = crate::database::shared_physical::SharedPhysicalConnection::new(
+            connection.db.io.clone(),
+            path.clone(),
+            options,
+        )
+        .unwrap();
+        let reader = connection.db.io.block(|| opening.poll()).unwrap();
+        assert!(reader.db.get_mv_store().is_none());
+        let mut state = PhysicalBaseReadState::default();
+        let parts = connection.db.io.block(|| state.poll(&reader)).unwrap();
+        assert_eq!(parts.persistent_timestamp, persistent);
+        assert!(parts.header.database_size.get() > 0);
+        assert!(parts
+            .schema
+            .get_table(NamespaceId::ROOT, "base_table")
+            .is_some());
+        assert!(parts
+            .schema
+            .get_table(NamespaceId::ROOT, "log_only")
+            .is_none());
+        assert!(!parts.schema_rows.is_empty());
+        assert_eq!(parts.type_sqls.len(), 1);
+        assert!(Arc::ptr_eq(&live_schema, &connection.db.schema.lock()));
+        assert_eq!(store.get_table_id_from_root_page(1), root);
+        assert_eq!(
+            store.sequence_watermark("physical_fact_sentinel"),
+            Some(9876)
+        );
+        assert_eq!(store.last_committed_tx_ts.load(Ordering::SeqCst), committed);
+        assert_eq!(std::fs::read(path).unwrap(), main_before);
+        assert_eq!(std::fs::read(format!("{path}-log")).ok(), log_before);
+        assert!(state.poll(&reader).is_err());
+    }
 
     fn materialized() -> (MvccTestDbNoConn, Arc<Connection>) {
         let fixture = MvccTestDbNoConn::new_with_random_db_with_opts(

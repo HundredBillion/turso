@@ -5,6 +5,8 @@
 
 mod readonly;
 #[cfg(all(host_shared_wal, unix))]
+mod shared_connection;
+#[cfg(all(host_shared_wal, unix))]
 mod shared_oracle;
 #[cfg(all(host_shared_wal, unix))]
 pub(crate) mod shared_physical;
@@ -445,6 +447,16 @@ pub(crate) enum InitState {
     ReadPage1 { pager: Box<Pager> },
 }
 
+impl InitState {
+    fn cancel(&mut self) {
+        if let Self::ReadPage1 { pager } = self {
+            if pager.holds_read_lock() {
+                pager.end_read_tx();
+            }
+        }
+    }
+}
+
 /// Sub state machine for [`Database::header_validation`], driven from
 /// [`OpenDbAsyncPhase::ValidatingHeader`]. Keeps WAL recovery on open
 /// non-blocking by yielding through its IO instead of `io.block`.
@@ -580,6 +592,8 @@ pub struct ConnectAsyncState {
     conn: Option<Arc<Connection>>,
     /// The in-flight `sqlite_stat1` scan.
     refresh: RefreshAnalyzeStatsState,
+    #[cfg(all(host_shared_wal, unix))]
+    shared: Option<shared_connection::SharedConnectState>,
 }
 
 impl ConnectAsyncState {
@@ -681,6 +695,9 @@ impl OpenDbAsyncState {
 
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
+        if let HeaderValidationState::Start { init } = &mut self.header_validation_state {
+            init.cancel();
+        }
         if let Some(storage) = &self.readonly_storage {
             storage.abort_bootstrap();
         }
@@ -1783,7 +1800,7 @@ impl Database {
                             .expect("shared mode requested"),
                         flags.contains(OpenFlags::ReadOnly),
                     )?;
-                    state.shared_open = Some(runtime.begin_open()?);
+                    state.shared_open = Some(runtime.begin_read_pinned_open()?);
                     state.shared_runtime = Some(runtime);
                     state.shared_request = Some(SharedOpenRequest {
                         path: path.to_owned(),
@@ -3294,13 +3311,20 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.shared_mvcc_runtime.is_some() {
+            let mut state = shared_connection::SharedConnectState::new(self, opts, context)?;
+            let connection = self.io.block(|| state.poll(self))?;
+            refresh_analyze_stats(&connection);
+            return Ok(connection);
+        }
         self._connect(false, None, opts, context, StatsRefresh::Blocking)
     }
 
     /// Non-blocking [`Self::connect`].
     ///
-    /// Creating the connection itself never waits, but the connect-time
-    /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
+    /// Connection initialization may need page I/O. The connect-time
+    /// ANALYZE stats refresh also runs a `SELECT` over `sqlite_stat1`, and that
     /// statement can have to wait: on page I/O, or on another transaction
     /// (a read that speculatively saw a version whose writer is still
     /// preparing waits for that writer at its own commit). `connect` pumps
@@ -3327,6 +3351,33 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
+                #[cfg(all(host_shared_wal, unix))]
+                let conn = if self.shared_mvcc_runtime.is_some() {
+                    if state.shared.is_none() {
+                        state.shared = Some(shared_connection::SharedConnectState::new(
+                            self,
+                            opts,
+                            ConnectionContext::default(),
+                        )?);
+                    }
+                    match state.shared.as_mut().unwrap().poll(self) {
+                        Ok(IOResult::Done(connection)) => connection,
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(error) => {
+                            state.shared = None;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    self._connect(
+                        false,
+                        None,
+                        opts,
+                        ConnectionContext::default(),
+                        StatsRefresh::Deferred,
+                    )?
+                };
+                #[cfg(not(all(host_shared_wal, unix)))]
                 let conn = self._connect(
                     false,
                     None,
@@ -3414,6 +3465,12 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
     ) -> Result<Arc<Connection>> {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.shared_mvcc_runtime.is_some()
+            && (pager.holds_read_lock() || pager.holds_write_lock())
+        {
+            return Err(LimboError::Busy);
+        }
         let conn = self.new_connection(
             is_mvcc_bootstrap_connection,
             pager,

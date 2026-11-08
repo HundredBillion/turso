@@ -182,6 +182,7 @@ impl MirroredCheckpointCompletion {
 }
 
 impl CheckpointIntentToken {
+    #[cfg(all(host_shared_wal, unix))]
     pub(in crate::mvcc) fn begin_completion(
         self,
         materialized: crate::mvcc::database::checkpoint_state_machine::MaterializedCheckpointProof,
