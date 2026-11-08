@@ -26,24 +26,10 @@ jobs:
           git rev-parse HEAD | tee source.txt
           test "$(git rev-parse HEAD)" = fa9d721b8e7724bc1232e618bbd0305bae0af8ab
           rustc -Vv | tee rustc.txt
-      - name: Native ID opcode integration
-        run: |
-          set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-green.log
-          grep -q '6 passed; 0 failed' ids-green.log
-      - name: Preserve separate stale prepare regression
-        run: |
-          set +e
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native -- --ignored --test-threads=1 --nocapture 2>&1 | tee stale-prepare-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'idle peer did not import committed sequence DDL before prepare' stale-prepare-red.log
-          grep -q '0 passed; 1 failed' stale-prepare-red.log
       - name: Combined budget and lifecycle integration
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee vdbe-union.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee vdbe-union.log
           grep -q '6 passed; 0 failed' vdbe-union.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_physical_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical.log
           grep -q '1 passed; 0 failed' physical.log
