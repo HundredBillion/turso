@@ -682,9 +682,9 @@ mod tests {
         );
     }
     fn assert_child_excluded(path: &std::path::Path) {
-        assert_child_excluded_with_failure(path, false);
+        require_lock_child_success(run_lock_child(path, false));
     }
-    fn assert_child_excluded_with_failure(path: &std::path::Path, fail: bool) {
+    fn run_lock_child(path: &std::path::Path, fail: bool) -> std::process::Output {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -717,7 +717,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let output = child.wait_with_output().unwrap();
+        child.wait_with_output().unwrap()
+    }
+    fn require_lock_child_success(output: std::process::Output) {
         assert!(
             String::from_utf8_lossy(&output.stdout)
                 .contains("test result: ok. 1 passed; 0 failed;"),
@@ -1336,8 +1338,15 @@ mod tests {
     fn shared_downgrade_marker_native_child_failure_is_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unused-control.db");
+        let output = run_lock_child(&path, true);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("test result: FAILED. 0 passed; 1 failed;"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("deliberate child failure control")
+        );
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_child_excluded_with_failure(&path, true);
+            require_lock_child_success(output);
         }));
         assert!(
             rejected.is_err(),
