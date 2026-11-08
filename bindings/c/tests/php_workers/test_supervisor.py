@@ -1,10 +1,10 @@
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 from run import Suite, Worker, snapshot_tree, verify_recovery
@@ -51,13 +51,15 @@ class SupervisorTests(unittest.TestCase):
         worker.name = "protocol-negative-control"
         worker.buffer = bytearray()
         worker.pending = 1
-        worker.suite = SimpleNamespace(args=SimpleNamespace(deadline=.2), record=lambda *a, **k: None)
+        worker.suite = SimpleNamespace(args=SimpleNamespace(deadline=0.2), record=lambda *a, **k: None)
         worker.process = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE)
+
         def cleanup():
             if worker.process.poll() is None:
                 worker.process.kill()
             worker.process.wait(timeout=2)
             worker.process.stdout.close()
+
         self.addCleanup(cleanup)
         return worker
 
@@ -79,9 +81,11 @@ class SupervisorTests(unittest.TestCase):
     def test_acknowledged_and_unreported_transactions_are_atomic(self):
         first = [["ack", 0, "a"], ["ack", 1, "b"]]
         second = [["unknown", 0, "c"], ["unknown", 1, "d"]]
-        ledger = [{"kind": "intent", "transaction": "ack", "rows": first},
-                  {"kind": "ack", "transaction": "ack", "rows": first},
-                  {"kind": "intent", "transaction": "unknown", "rows": second}]
+        ledger = [
+            {"kind": "intent", "transaction": "ack", "rows": first},
+            {"kind": "ack", "transaction": "ack", "rows": first},
+            {"kind": "intent", "transaction": "unknown", "rows": second},
+        ]
         outcomes = {"ack": "complete", "unknown": "complete-or-absent"}
         self.assertEqual(verify_recovery(ledger, outcomes, first), {"ack"})
         self.assertEqual(verify_recovery(ledger, outcomes, first + second), {"ack"})

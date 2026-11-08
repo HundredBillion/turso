@@ -14,6 +14,21 @@ pub(in crate::mvcc) struct RecoveredCheckpointIntent {
 }
 
 impl RecoveredCheckpointIntent {
+    pub(super) fn retained_runtime(&self) -> &Arc<SharedMvccRuntime> {
+        &self.runtime
+    }
+
+    pub(super) fn mirrored(&self) -> &MirroredCheckpointIntent {
+        &self.intent
+    }
+
+    pub(in crate::mvcc) fn begin_physical_wal_recovery(
+        self,
+        options: crate::OpenOptions,
+    ) -> Result<super::shared_checkpoint_recovery_wal::CheckpointPhysicalWalRecovery> {
+        super::shared_checkpoint_recovery_wal::CheckpointPhysicalWalRecovery::new(self, options)
+    }
+
     pub(in crate::mvcc) fn record(&self) -> ManifestRecord {
         self.intent.record()
     }

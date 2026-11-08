@@ -166,8 +166,8 @@ assert!(recovered.guard().published().is_err());
 
 - [x] Run the native fixture/mirror tests on an exact pinned source with explicit Bash and `set -euo pipefail`; preserve source SHA, raw parent summaries, actual RED/control logs and restored results. Use unquoted artifact globs inside YAML block paths.
 - [x] Run existing `checkpoint_recovery_entry_native_`, recovery physical inspection and completed-confirmation selectors to prove the intent slice does not broaden normal completion. Run manifest publication/codec and authority suites, then strict library Clippy and formatting.
-- [ ] Confirm Windows compilation with the new seam fully Unix-gated. Obtain independent source review and push the verified private component.
-- [ ] Hand off the sealed actual mirrored-intent owner for a separately reviewed physical-WAL recovery plan. Its next stage must validate actual committed WAL/main state and reconcile physical coordination before main-only inspection; it may not infer completion from timestamps or bypass existing completed-ID preparation/finalization.
+- [x] Confirm Windows compilation with the new seam fully Unix-gated. Obtain independent source review and push the verified private component.
+- [x] Hand off the sealed actual mirrored-intent owner for a separately reviewed physical-WAL recovery plan. Its next stage must validate actual committed WAL/main state and reconcile physical coordination before main-only inspection; it may not infer completion from timestamps or bypass existing completed-ID preparation/finalization.
 
 ## Design stress test and boundaries
 
@@ -189,4 +189,4 @@ The actual final Linux parent summaries are: intent9 passed; restored recovery24
 
 Three removals each produced the intended zero-pass/one-failure result: accepting a copied memory manifest, observing only one write/FULL sync, and returning an owner before backend retirement at operation3. Restoring the exact source preceded the24-test recovery run. The genuine missing-implementation RED is separately recorded by run42493100112 on `ed4502bee2ca597eb13045edc8dd65d5fc866f4a`; earlier compile and fixture framing failures are not counted as behavior RED.
 
-Raw source pins, parent summaries, removal-control logs and run archives are retained in `.local/issue-resolution/interrupted-intent-mirroring/`, including artifact13624265407 under `final-28f/`. Independent final source review and the next-stage handoff remain explicit completion gates above.
+Raw source pins, parent summaries, removal-control logs and run archives are retained in `.local/issue-resolution/interrupted-intent-mirroring/`, including artifact13624265407 under `final-28f/`. The parent independently reviewed the complete production seal/adapter and accepted the final native/Windows evidence. The next physical-WAL stage is specified separately in `11-08-2026-interrupted-checkpoint-physical-wal.md`; it remains gated on design review.

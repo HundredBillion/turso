@@ -648,6 +648,8 @@ pub struct OpenDbAsyncState {
     #[cfg(all(host_shared_wal, unix))]
     offline_downgrade: Option<Arc<mvcc::PreparedDowngradeMarker>>,
     #[cfg(all(host_shared_wal, unix))]
+    offline_downgrade_cleanup: Option<Arc<mvcc::PreparedDowngradeCleanup>>,
+    #[cfg(all(host_shared_wal, unix))]
     shared_request: Option<SharedOpenRequest>,
     #[cfg(all(host_shared_wal, unix))]
     shared_open: Option<mvcc::database::SharedOpenState>,
@@ -688,6 +690,8 @@ impl OpenDbAsyncState {
             offline_marker_recovery: None,
             #[cfg(all(host_shared_wal, unix))]
             offline_downgrade: None,
+            #[cfg(all(host_shared_wal, unix))]
+            offline_downgrade_cleanup: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_request: None,
             #[cfg(all(host_shared_wal, unix))]
@@ -811,6 +815,8 @@ pub struct DatabaseSharedState<
     offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
     #[cfg(all(host_shared_wal, unix))]
     offline_downgrade: Option<Arc<mvcc::PreparedDowngradeMarker>>,
+    #[cfg(all(host_shared_wal, unix))]
+    offline_downgrade_cleanup: Option<Arc<mvcc::PreparedDowngradeCleanup>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
@@ -1025,6 +1031,8 @@ impl Database {
                 offline_marker_recovery: None,
                 #[cfg(all(host_shared_wal, unix))]
                 offline_downgrade: None,
+                #[cfg(all(host_shared_wal, unix))]
+                offline_downgrade_cleanup: None,
             }),
             canonical: None,
             requested_readonly: false,
@@ -1504,6 +1512,44 @@ impl Database {
             .storage(Arc::new(storage::database::DatabaseFile::new(file)));
         let mut state = OpenDbAsyncState::new();
         state.offline_downgrade = Some(proof.clone());
+        let db = io.block(|| Self::do_open_async(&mut state, io.clone(), path, &options))?;
+        let wal = db
+            .shared_wal
+            .read()
+            .runtime
+            .file
+            .clone()
+            .ok_or_else(|| LimboError::Corrupt("downgrade WAL is missing".into()))?;
+        if !Arc::ptr_eq(&wal, &proof.wal_file()) || wal.file_id()? != Some(proof.wal_id()) {
+            return Err(LimboError::InvalidArgument(
+                "downgrade WAL alias changed".into(),
+            ));
+        }
+        proof.revalidate()?;
+        Ok(db)
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn open_offline_downgrade_cleanup(
+        proof: Arc<mvcc::PreparedDowngradeCleanup>,
+    ) -> Result<Arc<Self>> {
+        proof.revalidate()?;
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new()?);
+        let path = proof
+            .path()
+            .to_str()
+            .ok_or_else(|| LimboError::InvalidArgument("downgrade path must be UTF-8".into()))?;
+        let file = proof.main_file();
+        if file.file_id()? != Some(proof.database_id()) {
+            return Err(LimboError::InvalidArgument(
+                "downgrade main identity changed".into(),
+            ));
+        }
+        let options = OpenOptions::new(Arc::new(crate::dialect::EngineDialect))
+            .flags(OpenFlags::NoLock | OpenFlags::ReadOnly)
+            .storage(Arc::new(storage::database::DatabaseFile::new(file)));
+        let mut state = OpenDbAsyncState::new();
+        state.offline_downgrade_cleanup = Some(proof.clone());
         let db = io.block(|| Self::do_open_async(&mut state, io.clone(), path, &options))?;
         let wal = db
             .shared_wal
@@ -2022,6 +2068,9 @@ impl Database {
                         shared
                             .offline_downgrade
                             .clone_from(&state.offline_downgrade);
+                        shared
+                            .offline_downgrade_cleanup
+                            .clone_from(&state.offline_downgrade_cleanup);
                     }
 
                     // Header validation + WAL recovery runs as a sub state
@@ -2766,7 +2815,8 @@ impl Database {
                     #[cfg(all(host_shared_wal, unix))]
                     let reject_log_in_wal = reject_log_in_wal
                         && self.offline_marker_recovery.is_none()
-                        && self.offline_downgrade.is_none();
+                        && self.offline_downgrade.is_none()
+                        && self.offline_downgrade_cleanup.is_none();
                     if reject_log_in_wal {
                         return Err(LimboError::Corrupt(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
@@ -2870,6 +2920,17 @@ impl Database {
                             }
                             #[cfg(unix)]
                             if let Some(proof) = self.offline_downgrade.as_ref() {
+                                if driver.is_none() {
+                                    proof.revalidate()?;
+                                    *driver = Some(storage::wal::OpenSharedWal::Build(
+                                        storage::sqlite3_ondisk::BuildSharedWal::begin(
+                                            &proof.wal_file(),
+                                        )?,
+                                    ));
+                                }
+                            }
+                            #[cfg(unix)]
+                            if let Some(proof) = self.offline_downgrade_cleanup.as_ref() {
                                 if driver.is_none() {
                                     proof.revalidate()?;
                                     *driver = Some(storage::wal::OpenSharedWal::Build(
@@ -5020,11 +5081,8 @@ mod database_tests {
         codec: Arc<dyn PageCodec>,
         opts: DatabaseOpts,
     ) -> crate::Result<Arc<Database>> {
-        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
-        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
         let options = OpenOptions::new(Arc::new(EngineDialect))
-            .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(opts)
             .page_codec(codec);

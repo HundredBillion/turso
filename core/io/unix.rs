@@ -6,7 +6,7 @@ use crate::io::FileSyncType;
 use crate::Result;
 use rustix::{
     fd::{AsFd, AsRawFd},
-    fs::{self, FlockOperation},
+    fs::FlockOperation,
 };
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
@@ -21,6 +21,43 @@ use tracing::{instrument, trace, Level};
 const MAX_PWRITE_LEN: usize = i32::MAX as usize;
 
 const MAX_IOV: usize = 1024;
+
+pub(crate) fn unix_file_lock(
+    fd: rustix::fd::BorrowedFd<'_>,
+    operation: FlockOperation,
+) -> std::io::Result<()> {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        let kind = match operation {
+            FlockOperation::NonBlockingLockExclusive => libc::F_WRLCK,
+            FlockOperation::NonBlockingLockShared => libc::F_RDLCK,
+            FlockOperation::NonBlockingUnlock => libc::F_UNLCK,
+            _ => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "ordinary file locks must be nonblocking",
+                ))
+            }
+        };
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = kind as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        // A zero length covers the entire inode, including SQLite's POSIX lock bytes.
+        loop {
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_SETLK, &lock) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    {
+        rustix::fs::fcntl_lock(fd, operation).map_err(std::io::Error::from)
+    }
+}
 
 pub struct UnixIO {}
 
@@ -286,9 +323,8 @@ impl File for UnixFile {
 
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
-        // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
-        // or the process exits or after an explicit unlock.
-        fs::fcntl_lock(
+        // Keep ordinary ownership independent of unrelated same-inode aliases on Linux.
+        unix_file_lock(
             fd,
             if exclusive {
                 FlockOperation::NonBlockingLockExclusive
@@ -296,8 +332,7 @@ impl File for UnixFile {
                 FlockOperation::NonBlockingLockShared
             },
         )
-        .map_err(|e| {
-            let io_error = std::io::Error::from(e);
+        .map_err(|io_error| {
             let message = match io_error.kind() {
                 ErrorKind::WouldBlock => format!(
                     "Failed locking file '{}'. File is locked by another process",
@@ -313,12 +348,8 @@ impl File for UnixFile {
 
     fn unlock_file(&self) -> Result<()> {
         let fd = self.file.as_fd();
-        fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
-                "Failed to release file lock: {}",
-                std::io::Error::from(e)
-            ))
-        })?;
+        unix_file_lock(fd, FlockOperation::NonBlockingUnlock)
+            .map_err(|e| LimboError::LockingError(format!("Failed to release file lock: {e}")))?;
         Ok(())
     }
 
@@ -588,6 +619,9 @@ fn trim_iovecs(iov: &mut Vec<libc::iovec>, mut n: usize) {
     }
 }
 
+// OFD ownership follows the descriptor lifetime; an extra unlock can also fail on
+// kernels that rejected acquisition. Other Unix targets retain their original locks.
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 impl Drop for UnixFile {
     fn drop(&mut self) {
         self.unlock_file().expect("Failed to unlock file");
@@ -634,3 +668,13 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_pointer_width = "64",
+    feature = "fs",
+    not(shuttle)
+))]
+#[path = "unix_lock_tests.rs"]
+mod ordinary_lock_tests;

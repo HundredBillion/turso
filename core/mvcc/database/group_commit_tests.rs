@@ -537,6 +537,7 @@ fn dropped_waiter_after_log_tx_still_commits() {
         .unwrap();
     setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
     setup.close().unwrap();
+    drop(setup);
 
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -617,6 +618,12 @@ fn dropped_waiter_after_log_tx_still_commits() {
     );
     ddl.execute("ROLLBACK").unwrap();
 
+    drop(commit_a);
+    drop(reader);
+    drop(ddl);
+    drop(conn_a);
+    drop(conn_b);
+    drop(store);
     db.restart();
     let reader = db.connect();
     assert_eq!(
