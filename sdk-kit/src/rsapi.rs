@@ -1870,6 +1870,10 @@ mod tests {
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
 
+    // A forked child temporarily inherits OFD ownership until exec closes its
+    // descriptors. Keep immediate same-file reopen checks outside that window.
+    static NATIVE_REOPEN_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn structured_constraint_errors_keep_sqlite_codes() {
         for kind in [
@@ -2102,6 +2106,7 @@ mod tests {
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn cached_sdk_join_preserves_existing_process_file_lock() {
+        let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
         use turso_core::IO;
 
         const CHILD_PATH: &str = "TURSO_SDK_LOCK_PROBE_PATH";
@@ -2246,6 +2251,7 @@ mod tests {
 
     #[test]
     pub fn page_codec_is_applied_to_sdk_connections() {
+        let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
         let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
@@ -2850,6 +2856,7 @@ mod tests {
 
         #[test]
         fn test_encryption() {
+            let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
             let temp_file = NamedTempFile::new().unwrap();
             let db_path = temp_file.path().to_str().unwrap();
 
