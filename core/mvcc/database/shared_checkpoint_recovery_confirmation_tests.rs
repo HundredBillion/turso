@@ -123,7 +123,7 @@ fn checkpoint_recovery_confirmation_native_rejects_same_record_from_foreign_file
         )
         .unwrap();
     let mut load = ManifestLoad::new(fake, guard, runtime.database_id).unwrap();
-    let loaded = fake_io.block(|| load.poll()).unwrap();
+    let loaded = fake_io.block(|| Ok(load.poll()?)).unwrap();
     let error = match loaded.mirror_recovered_completion(evidence) {
         Err(error) => error,
         Ok(_) => panic!("substitute manifest file authorized recovered completion"),
@@ -438,7 +438,7 @@ pub(super) fn fault_fixture_with_seed_and_io(
         .token
         .begin_completion(fixture.materialized, fixture.prepared)
         .unwrap();
-    let completed = fixture.io.block(|| publication.poll()).unwrap();
+    let completed = fixture.io.block(|| Ok(publication.poll()?)).unwrap();
     let (proof, mut guard, ids) = completed.into_parts();
     guard.publish_checkpoint(&proof).unwrap();
     let (guard, proof) = if target_only {
