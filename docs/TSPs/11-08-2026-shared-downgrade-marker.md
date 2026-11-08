@@ -1,6 +1,6 @@
 # Offline shared-to-WAL marker transition and recovery
 
-Status: proposed for root review; no production changes in this stage.
+Status: root approved the seam; genuine live marker regression is the first implementation gate.
 Base: verified preparation6640d5b8642625b9f63a2d56a24e0cc910d353bf,
 whose runtime16fd0d695 passed native/Windows42488827632.
 
@@ -41,7 +41,9 @@ zero registrations, retired prior I/O, unchanged path identities and empty logs.
 No guard release/reacquire or Ready publication occurs.
 
 The private raw opener uses owned Syscall aliases, actual main identity and the
-recorded basename WAL identity. For this capability only, raw254 or2 decode as
+recorded basename WAL identity. Feed the retained WAL Arc directly to the WAL
+scanner; ordinary OpenWal adds Create and therefore cannot provide the required
+no-recreation guarantee before its post-open identity check. For this capability only, raw254 or2 decode as
 ordinary WAL; it must never initialize an MVCC store, shared replay or namespace.
 The proof stays alive through all raw connection/storage drop paths. Opening the
 same main through the normal registry is not permitted.
@@ -114,7 +116,9 @@ Cleanup is a distinct phase after main marker2 is checkpointed/synced and the ra
 connection/storage have dropped. Retain main exclusion, native identities and the
 terminal intent fence throughout. Prevalidate every owned path and reject unknown
 namespace entries before removing anything. Revalidate each identity before
-unlink, following the existing operator-owned-path assumption (not claiming
+unlink. Also remove the retained valid header-only ordinary .db-log before the
+terminal manifest: normal WAL opens reject a nonempty logical-log sidecar. Include
+a real header-only-log ordinary-reopen regression. Follow the existing operator-owned-path assumption (not claiming
 protection against a hostile replacement after the final check).
 
 Do not call the current generic remove_namespace: it deletes the manifest first,
@@ -160,5 +164,5 @@ identity mismatch; never restore the shared marker or rebuild its namespace.
    manifest admission-fence and ordinary WAL tests; native Linux and Windows
    compilation gates remain explicit. Public C/PDO shared-mode rejection remains.
 
-No production code is authorized by this document until root reviews the concrete
-seam. No public operation/API or executable downgrade acceptance is claimed yet.
+Root approved the concrete seam, beginning with the live marker transaction
+before broader resume and cleanup implementation. No public operation/API or executable downgrade acceptance is claimed yet.

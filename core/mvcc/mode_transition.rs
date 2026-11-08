@@ -1,4 +1,5 @@
 pub(super) mod downgrade_files;
+pub(super) mod downgrade_marker;
 pub(super) mod operation;
 mod ordinary;
 pub(super) mod recovery;

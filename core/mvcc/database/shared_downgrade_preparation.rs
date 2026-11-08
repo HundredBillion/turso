@@ -491,4 +491,75 @@ mod tests {
         );
         assert_unchanged(&before);
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_marker_native_uses_real_wal_transaction_on_same_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture = installed_fixture();
+        let original_inode = std::fs::metadata(&fixture.path).unwrap().ino();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        let manifest = std::fs::read(fixture.namespace.join("manifest")).unwrap();
+        let marker = crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent)
+            .expect("genuine terminal intent must commit the ordinary WAL marker");
+        let main = std::fs::read(&fixture.path).unwrap();
+        assert_eq!(&main[18..20], &[2, 2]);
+        assert_eq!(
+            std::fs::metadata(&fixture.path).unwrap().ino(),
+            original_inode
+        );
+        assert_eq!(
+            std::fs::read(fixture.namespace.join("manifest")).unwrap(),
+            manifest
+        );
+        assert!(fixture.namespace.join("ids-selector").exists());
+        assert!(std::fs::read(format!("{}-wal", fixture.path.display()))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            fixture.io.open_file(
+                fixture.path.to_str().unwrap(),
+                crate::OpenFlags::None,
+                false
+            ),
+            Err(LimboError::LockingError(_))
+        ));
+        assert!(fixture.runtime.replay.lock().is_none());
+        drop(marker);
+        let db = Database::open(
+            fixture.io.clone(),
+            fixture.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        let mut rows = Vec::new();
+        connection
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, ["materialized shared row"]);
+        let mut integrity = Vec::new();
+        connection
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                integrity.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(integrity, ["ok"]);
+    }
 }
