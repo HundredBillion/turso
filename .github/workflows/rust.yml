@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: '89a751390ea4c707b32cda7a015d468cccfd3269'
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
@@ -77,6 +78,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: '89a751390ea4c707b32cda7a015d468cccfd3269'
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy,rustfmt
