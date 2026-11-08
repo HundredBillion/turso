@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9fc58f691cc2c3de28bc6bcee4d0eadb96d2878a
+          ref: 981efd91f6c70aecbeb7ff5e4bcbfcdc9d111d48
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9fc58f691cc2c3de28bc6bcee4d0eadb96d2878a
+          test "$(git rev-parse HEAD)" = 981efd91f6c70aecbeb7ff5e4bcbfcdc9d111d48
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
@@ -39,8 +39,10 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
           test "$code" = 101
-          grep -q '0 passed; 1 failed' lifecycle-red.log
+          grep -q '0 passed; 4 failed' lifecycle-red.log
           grep -q 'ROLLBACK TO acknowledged but retained scoped ID claims' lifecycle-red.log
+          grep -q 'failed statement rolled back but retained scoped ID claim' lifecycle-red.log
+          grep -q 'abandoned statement retained its scoped ID claim' lifecycle-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
