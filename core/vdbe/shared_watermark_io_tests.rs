@@ -8,6 +8,11 @@ use std::path::Path;
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_watermark_io_native_reset_drop_resume_retains_physical_reads() {
+    watermark_reads_with_layout_reset(false);
+    watermark_reads_with_layout_reset(true);
+}
+
+fn watermark_reads_with_layout_reset(reset_layout: bool) {
     for target in ["shared.db", "manifest", "ids-selector"] {
         for cancel in [
             "reset_before",
@@ -16,7 +21,7 @@ fn shared_watermark_io_native_reset_drop_resume_retains_physical_reads() {
             "drop_after",
             "resume",
         ] {
-            eprintln!("watermark read control {target}/{cancel}");
+            eprintln!("watermark read control {target}/{cancel}, reset_layout={reset_layout}");
             let directory = tempfile::tempdir().unwrap();
             let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
             let control = Arc::new(ReadControl::default());
@@ -44,6 +49,10 @@ fn shared_watermark_io_native_reset_drop_resume_retains_physical_reads() {
                     .prepare("SELECT sequence_watermark_experimental('delayed_sequence')")
                     .unwrap(),
             );
+            if reset_layout {
+                first.get_pager().reset_shared_generation().unwrap();
+                assert_eq!(first.get_pager().get_reserved_space(), None);
+            }
             control.armed.store(true, Ordering::Release);
             let mut captured = None;
             for _ in 0..1000 {

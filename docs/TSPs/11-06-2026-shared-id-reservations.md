@@ -971,7 +971,24 @@ https://github.com/HundredBillion/turso/actions/runs/42479545684.
 
 This validates the lifecycle branch, not its later checkpoint/pager union. That
 union's run42479473704 exposed two sequence-watermark failures after generation
-certification cleared a source pager layout memo; a separate fix is in progress.
+certification cleared a source pager layout memo. Source9c019ad35 fixes that seam:
+the independent read-pinned oracle copies the source transform configuration,
+reads its own header asynchronously when the memo is absent, and validates page
+size, reserved-space bounds and checksum mode before constructing a cursor. The
+request is captured before that read; the caller's pager/snapshot is unchanged.
+
+Run42480677435 passes factory1, lifecycle8, physical cancellation2 (16cases),
+IDs13, watermark identity1/deferred-I/O1 (30cases)/process1, peerprepare1, VDBE6,
+IDs75/3ignored, descriptors4 and strictliblint. Restoring the old source-memo
+requirement makes the reset-memo factory test fail (0pass/1fail); restoring the
+source passes1. The first factory run42480446821 exposed an old fixture assumption
+that connect populated the memo; the fixture now performs an actual table read
+before its populated-layout half, then explicitly resets for its uncached half.
+Evidence artifact `shared-sequence-oracle-layout` is attached to
+https://github.com/HundredBillion/turso/actions/runs/42480677435.
+The verified lifecycle milestone is merged through3c80d5744; its only runtime
+addition to the tested layout source is the separately validated2fb step-guard
+short-circuit ordering.
 Immediate idle-peer compilation after new DDL is also a separate tracked gate.
 Successful physical retirement tests do not establish arbitrary injected-I/O-error
 recovery or full shared-mode release readiness. Public activation remains off.
