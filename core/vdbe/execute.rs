@@ -22475,7 +22475,7 @@ mod shared_begin_tests {
     fn shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop() {
         for reset in [true, false] {
             let f =
-                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(192 * 1024));
             f.connection
                 .execute(format!(
                     "UPDATE preserved SET value='{}'",
@@ -22547,7 +22547,7 @@ mod shared_begin_tests {
     fn shared_vdbe_release_cap_busy_retains_named_savepoints_on_reset_or_drop() {
         for reset in [true, false] {
             let f =
-                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(192 * 1024));
             f.connection
                 .execute(format!(
                     "UPDATE preserved SET value='{}'",
