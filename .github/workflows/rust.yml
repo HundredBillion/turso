@@ -1,4 +1,4 @@
-name: SDK native reopen scope validation
+name: macOS sync stack counterexample
 on:
   workflow_dispatch:
 permissions:
@@ -7,64 +7,53 @@ defaults:
   run:
     shell: bash
 env:
-  CARGO_BUILD_JOBS: '2'
   CARGO_INCREMENTAL: '0'
-  CARGO_PROFILE_DEV_DEBUG: '0'
-  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_BACKTRACE: '1'
 jobs:
-  sdk:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: operator
-            source: 4fed1eea5878fc8c54e276246d8ad3b4093aa8b2
-            count: 43
-          - name: barrier-control
-            source: 17f34d097eb53f369d72c36b2ef974d3e3506916
-            count: 45
+  stack:
+    runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.source }}
-      - uses: dtolnay/rust-toolchain@1.88.0
+          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: fork-mvcc-authority
+          prefix-key: v1-rust
           cache-on-failure: true
-      - name: Exact SDK repeated contracts
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Matching workspace build
         run: |
-          git rev-parse HEAD | tee source.txt
+          git rev-parse HEAD HEAD^{tree} | tee source.txt
+          test "$(git rev-parse HEAD^{tree})" = 9eac9697b47bff664d84af86687fbe236fa4bb51
           rustc -Vv | tee rustc.txt
-          cargo tree --locked -p turso_sdk_kit -e features > sdk-features.txt
-          for repeat in 1 2 3; do
-            cargo test --locked -p turso_sdk_kit --lib -- --nocapture 2>&1 | tee "sdk-$repeat.log"
-            grep '^test result:' "sdk-$repeat.log" | tail -1 | grep -q '^test result: ok. ${{ matrix.count }} passed; 0 failed;'
-          done
-      - name: Actual inherited descriptor and barrier controls
-        if: matrix.name == 'barrier-control'
+          cargo build --verbose --locked --all-features 2>&1 | tee build.log
+      - name: Exact nextest counterexample
+        env:
+          NEXTEST_PROFILE: ci
+          LOCAL_SYNC_SERVER: ../../target/debug/tursodb
+          RUST_LOG: ''
         run: |
-          cargo test --locked -p turso_sdk_kit --lib codec_reopen_ -- --nocapture 2>&1 | tee barrier.log
-          grep '^test result:' barrier.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
-      - name: Ordinary and shared close
-        if: matrix.name == 'operator'
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api,bench test_close_persists_ -- --nocapture 2>&1 | tee ordinary-close.log
-          grep '^test result:' ordinary-close.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
-          cargo test --locked -p turso_core --lib --features conn_raw_api,bench shared_offline_operator_native_close_ -- --ignored --nocapture 2>&1 | tee shared-close.log
-          grep '^test result:' shared-close.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
-      - name: SDK strict lint
-        if: matrix.name == 'operator'
-        run: |
-          cargo clippy --locked -p turso_sdk_kit --all-targets --features turso_core/bench -- -D warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
-          git diff --exit-code
+          set +e
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'test(=database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base)' --no-tests=fail --failure-output=final 2>&1 | tee baseline.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "$status" > status.txt
+          test "$status" -eq 100
+          grep -q 'has overflowed its stack' baseline.log
+          grep -q '1 test run:.*0 passed.*1 failed' baseline.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sdk-native-reopen-${{ matrix.name }}
+          name: macos-sync-stack-baseline
           path: |
             *.log
             *.txt
+            target/nextest/ci/junit.xml
