@@ -27,7 +27,8 @@
 
 - `core/mvcc/database/shared_idle_generation_tests.rs`: genuine subprocess fixture and old/new reader counterexample; declared by the existing runtime test module.
 - `core/mvcc/shared_ids/current_generation.rs`: read-only active-bank selection and validation, using existing ID codecs/load infrastructure; no native snapshot eviction.
-- `core/mvcc/database/shared_idle_reload.rs`: current-base inspection/evidence and resumable local reload ownership.
+- `core/mvcc/database/shared_current_base.rs`: retained physical inspection and sealed current-base evidence.
+- `core/mvcc/database/shared_current_prefix.rs`: shared admission, preparation and constructor driver, preserving private replay until completion.
 - `core/mvcc/database/shared_generation_reload.rs`: distinct local-only installation entrypoint sharing preparation/publication mechanics with the existing completed-checkpoint installer without weakening that installer's proof requirements.
 - `core/mvcc/database/shared_runtime.rs`, `shared_refresh.rs`, and `core/database/shared_connection.rs`: normal admission and constructor handoff integration, preserving ordinary paths and platform guards.
 
@@ -47,27 +48,47 @@ Use pinned Rust1.88, two jobs, debug disabled, no incremental compilation. Nativ
 
 **Blocked by:** Task 1.
 
-- [ ] Add a read-only selected active-ID inspection path without global snapshot eviction.
-- [ ] Bind current physical base evidence to the selected normal manifest, active ID database generation/checkpoint timestamp, actual retained files and continuous authority.
-- [ ] Add a distinct local installation seam, preserving the existing completed-checkpoint installation preconditions.
-- [ ] Check zero local transactions and local mutation/GC exclusion, validate preparation freshness, and keep all allocation before publication.
-- [ ] Cover damaged metadata, mismatched physical timestamp/generation, stale preparation and local active transactions without publishing readiness.
+- [x] Add a read-only selected active-ID inspection path without global snapshot eviction.
+- [x] Bind current physical base evidence to the selected normal manifest, active ID database generation/checkpoint timestamp, actual retained files and continuous authority.
+- [x] Add a distinct local installation seam, preserving the existing completed-checkpoint installation preconditions.
+- [x] Check zero local transactions and local mutation/GC exclusion, validate preparation freshness, and keep all allocation before publication.
+- [x] Cover damaged metadata, mismatched physical timestamp/generation, stale preparation and local active transactions without publishing readiness.
 
 ### Task 3: Admission/replay integration and cancellation
 
 **Blocked by:** Task 2.
 
-- [ ] Drive local reload before ordinary shared snapshot registration on a generation mismatch, including new constructors where necessary.
-- [ ] Replay the selected bounded current prefix from the validated physical base; publish matching local schema/storage/replay/pager readiness only after success.
-- [ ] Preserve global prefix and foreign snapshot registrations; prove old reader view remains valid.
-- [ ] Cancel before/after physical read callbacks and after partial local mutation; retain backend authority and retry from fresh durable selection.
-- [ ] Prove the genuine counterexample passes and removal of the new reload path fails it again.
+- [x] Drive local reload before ordinary shared snapshot registration on a generation mismatch, including new constructors where necessary.
+- [x] Replay the selected bounded current prefix from the validated physical base; publish matching local schema/storage/replay/pager readiness only after success.
+- [x] Preserve global prefix and foreign snapshot registrations; prove old reader view remains valid.
+- [x] Cancel before/after physical read callbacks and after partial local mutation; retain backend authority and retry from fresh durable selection.
+- [x] Prove the genuine counterexample passes and removal of the new reload path fails it again.
 
 ### Task 4: Verification and review
 
 **Blocked by:** Tasks 1-3.
 
-- [ ] Run focused native old-peer/nonzero-prefix/foreign-reader tests and causal controls on exact pinned source.
-- [ ] Run combined IDs, watermark, saved-outer-transaction and generation suites.
-- [ ] Run appropriate ordinary/core regressions, strict Rust1.88 library lint and formatting; verify platform cfg boundaries.
-- [ ] Obtain independent whole-component review and push the verified component milestone, keeping public activation disabled.
+- [x] Run focused native old-peer/nonzero-prefix/foreign-reader tests and causal controls on exact pinned source.
+- [x] Run combined IDs, watermark, saved-outer-transaction and generation suites.
+- [x] Run appropriate ordinary/core regressions, strict Rust1.88 library lint and formatting; verify platform cfg boundaries.
+- [x] Obtain independent whole-component review and push the verified component milestone, keeping public activation disabled.
+
+
+## Verified component
+
+Engine source `3942c92fc97654b389541f49821cb7623fcf4a27` includes the published `a3fa3709e9916353c2af44f82786773c66dd56a9` lifecycle, budget-fixture and oracle-layout dependencies. The merge was clean; all fifteen incoming changed files remained byte-identical to the published dependency. The final component received independent source review, including owner validation before stable replay and preservation of caller-defined table functions before private schema replacement.
+
+The genuine baseline at `9459876e3abcfc382511d7b2a34fb63d4a810d51` failed the old-process read with an incompatible generation error in native run [42480322978](https://github.com/HundredBillion/turso/actions/runs/42480322978). It used a real finalized checkpoint and ready handoff, two later commits replacing both empty completion records, and an active foreign new-generation reader.
+
+Final native and platform validation:
+
+- [42487910358](https://github.com/HundredBillion/turso/actions/runs/42487910358): Linux full core **2,900 passed, 0 failed, 113 ignored**; broad MVCC **856 passed, 0 failed, 65 ignored**; strict Rust 1.88 library Clippy, formatting and source integrity; Windows library check with `bench,conn_raw_api`.
+- The same run passed the old connection/new constructor cases, partial logical replay cancellation, physical header/page-one cancellation before and after callback, final-release failure/retry, and rejection of a wrong Store or connection before replay and on resume. The final partial-replay trace was physical timestamp **10**, partial private frontier **12**, original selected frontier **15**, and freshly selected retry frontier **17**. Allocation clocks never decreased; foreign snapshots and durable bytes remained unchanged.
+- Current-ID inspection **4**, physical inspection **3**, closed local installation **2**, existing generation controls **14**, ID protocol **79 passed / 3 ignored**, native constructor controls **6**, and completed-checkpoint ready handoff **4** passed.
+- [42488559703](https://github.com/HundredBillion/turso/actions/runs/42488559703): five separate source-removal controls failed their intended assertion with exactly **0 passed / 1 failed**, then every restored case passed. These cover Store ownership, source-only function preservation, retry from a lower physical base, conservative physical-file ID bounds, and readiness withdrawal after failed authority release. Raw control logs are preserved in artifact `idle-generation-controls-3942`.
+- [42489397857](https://github.com/HundredBillion/turso/actions/runs/42489397857): the original counterexample passed, disabling the new-generation reload branch returned `Busy` instead of the acknowledged row (**0 passed / 1 failed**), and restoring the exact source passed again. This confirms the reload path remains necessary with the merged dependencies.
+- [42489084990](https://github.com/HundredBillion/turso/actions/runs/42489084990): native ID opcodes **13**, deferred watermark I/O **1** (30 internal cases), scoped lifecycle **8**, lifecycle I/O **2** including saved outer transactions, preparation **3** plus preparation I/O **1**, stale preparation **1**, watermark identity **1**, and schema publication **3** (16 internal cases).
+
+An earlier validation script allowed `tee` to hide two full-core failures in old 128 KiB budget fixtures. Those runs are not full-core success evidence. The final source uses the already verified 192 KiB fixtures from the published dependency, and final validation uses explicit Bash with `set -euo pipefail`; the full parent result was read directly. Artifact glob quoting was also corrected before preserving the raw control logs.
+
+Public activation remains disabled. Generation changes for attached database IDs remain rejected; the implemented reload is for the main shared database. The existing completed-checkpoint proof and its global-quiescence requirements remain unchanged. Integration with the separate fresh-confirmation/recovery component must preserve both its known-identity loader and the current-generation loader target.
