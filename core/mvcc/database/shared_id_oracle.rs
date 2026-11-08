@@ -16,6 +16,8 @@ enum Phase {
     Start,
     Last,
     Rowid,
+    SequenceEdge(bool),
+    SequenceRecord,
     Seek(i64),
     Rewind,
     SchemaRecord,
@@ -118,6 +120,17 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                     self.validate_domain(domain)?;
                 }
                 IdQuery::RowExists { domain, .. } => self.validate_domain(domain)?,
+                IdQuery::SequenceState { domain, .. } => {
+                    self.validate_domain(crate::mvcc::shared_ids::journal::Domain {
+                        sequence: false,
+                        ..domain
+                    })?;
+                    if !domain.sequence {
+                        return Err(LimboError::InvalidArgument(
+                            "sequence oracle requires a sequence domain".into(),
+                        ));
+                    }
+                }
                 IdQuery::LogicalFloor => {}
             }
             let header = self
@@ -127,9 +140,9 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
             self.floor = -i64::from(header.database_size.get()).max(1);
             let schema_table = i64::from(SQLITE_SCHEMA_MVCC_TABLE_ID);
             let intrinsic_schema = match *request {
-                IdQuery::RowFacts { domain, .. } | IdQuery::RowExists { domain, .. } => {
-                    domain.table == schema_table
-                }
+                IdQuery::RowFacts { domain, .. }
+                | IdQuery::RowExists { domain, .. }
+                | IdQuery::SequenceState { domain, .. } => domain.table == schema_table,
                 IdQuery::LogicalFloor => false,
             };
             self.phase = if intrinsic_schema {
@@ -147,6 +160,35 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                 Phase::Last => {
                     return_if_io!(cursor.last());
                     self.phase = Phase::Rowid;
+                }
+                Phase::SequenceEdge(descending) => {
+                    if descending {
+                        return_if_io!(cursor.rewind());
+                    } else {
+                        return_if_io!(cursor.last());
+                    }
+                    self.phase = Phase::SequenceRecord;
+                }
+                Phase::SequenceRecord => {
+                    let value = return_if_io!(cursor.rowid());
+                    let Some(value) = value else {
+                        return Ok(self.done(IdFact::SequenceState(None)));
+                    };
+                    let Some(record) = return_if_io!(cursor.record()) else {
+                        return Err(LimboError::Corrupt(
+                            "sequence backing row disappeared".into(),
+                        ));
+                    };
+                    let called = match record.get_value(1)? {
+                        ValueRef::Numeric(Numeric::Integer(0)) => false,
+                        ValueRef::Numeric(Numeric::Integer(1)) => true,
+                        _ => {
+                            return Err(LimboError::Corrupt(
+                                "sequence is_called is not boolean".into(),
+                            ))
+                        }
+                    };
+                    return Ok(self.done(IdFact::SequenceState(Some((value, called)))));
                 }
                 Phase::Rowid => {
                     let maximum = return_if_io!(cursor.rowid());
@@ -183,6 +225,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                                 autoincrement_floor: 0,
                             },
                             IdQuery::RowExists { .. } => IdFact::RowExists(false),
+                            IdQuery::SequenceState { .. } => return Err(LimboError::SchemaUpdated),
                         };
                         return Ok(self.done(fact));
                     };
@@ -199,9 +242,9 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                     let is_table = matches!(record.get_value(0)?, ValueRef::Text(kind) if kind.as_str() == "table");
                     self.floor = self.floor.min(-root.abs());
                     let requested = match *request {
-                        IdQuery::RowFacts { domain, .. } | IdQuery::RowExists { domain, .. } => {
-                            Some(domain.table)
-                        }
+                        IdQuery::RowFacts { domain, .. }
+                        | IdQuery::RowExists { domain, .. }
+                        | IdQuery::SequenceState { domain, .. } => Some(domain.table),
                         IdQuery::LogicalFloor => None,
                     };
                     if root != 0 && requested.is_some() {
@@ -242,6 +285,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
             IdQuery::RowFacts { .. } => Phase::Last,
             IdQuery::RowExists { value, .. } => Phase::Seek(value),
             IdQuery::LogicalFloor => unreachable!(),
+            IdQuery::SequenceState { descending, .. } => Phase::SequenceEdge(descending),
         }
     }
 

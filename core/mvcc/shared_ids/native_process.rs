@@ -240,6 +240,7 @@ impl CommittedIdOracle for EmptyOracle {
             },
             IdQuery::RowExists { .. } => IdFact::RowExists(false),
             IdQuery::LogicalFloor => IdFact::LogicalFloor(-1),
+            IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
         }))
     }
 }

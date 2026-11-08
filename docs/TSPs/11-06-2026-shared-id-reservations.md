@@ -809,3 +809,26 @@ The runtime owner reviewed this factor without a blocker. It compiled during the
 71-test portable ID run and passed library lint, but the recovered-proof positive
 and crash-reopen tests still require the physical evidence constructor. This entry
 is committed to unblock that integration; it is not native recovery acceptance.
+
+## Shared watermark reader continuation (2026-11-07)
+
+The scalar reader uses a separate yielding read state, because a standalone SELECT
+need not own a user transaction and a read-only participant must not allocate a
+claim. It retains one publication authority across committed-prefix refresh, a
+checked oracle read of the sequence backing row, and the journal's existing
+`LowestLiveSequenceClaim` query. Neither journal cleanup nor tail repair is part
+of this operation. Existing outer transactions keep their identity, snapshot, and
+uncommitted rows. No writer reacquires the checkpoint admission gate.
+
+The committed boundary uses `first_unsafe_sequence_watermark`: an uncalled row
+returns its value; called ascending non-CYCLE returns checked value + increment
+(with overflow retaining value); called descending/CYCLE retains value. The
+result is the numeric minimum of that boundary and live claims, matching the
+existing conservative local rule without promising descending/CYCLE scan order.
+
+Acceptance starts with an outer owner retaining allocation 1 while a peer commits
+allocation 2: both readers return 1; after outer rollback both return 3, including
+from an older local store. Further checks cover standalone/read-only reads,
+unchanged durable files, uncalled/non-unit/descending/CYCLE boundaries, invalid
+names/NULL, and suspended-read reset and backend retirement. Main-only oracle
+support remains explicit; attached shared readers are not silently redirected.

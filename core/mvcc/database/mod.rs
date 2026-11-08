@@ -92,7 +92,7 @@ pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
     SharedBeginState, SharedBootstrapState, SharedIdRequest, SharedIdResult, SharedIdState,
-    SharedMvccRuntime, SharedOpenState,
+    SharedMvccRuntime, SharedOpenState, SharedSequenceWatermarkState,
 };
 
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]

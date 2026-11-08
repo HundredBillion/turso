@@ -11206,6 +11206,7 @@ pub fn op_function(
                     Value::Text(text) => text.as_str(),
                     Value::Null => {
                         state.registers[*dest].set_value(Value::Null);
+                        state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
                     }
                     _ => {
@@ -11217,15 +11218,40 @@ pub fn op_function(
                 };
                 let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
                 #[cfg(all(host_shared_wal, unix))]
-                if program
+                if let Some(store) = program
                     .connection
                     .mv_store_for_db(namespace.database_id)
-                    .is_some_and(|store| store.is_shared())
+                    .filter(|store| store.is_shared())
                 {
-                    return Err(LimboError::InvalidArgument(
-                        "shared sequence watermark requires a global live-claim reader".into(),
-                    )
-                    .into());
+                    let name = crate::translate::sequence::sequence_backing_table_name(
+                        &mangle_name(namespace.id, &sequence.name),
+                    );
+                    let root = program
+                        .connection
+                        .with_schema(namespace.database_id, |schema| {
+                            schema
+                                .get_btree_table(NamespaceId::ROOT, &name)
+                                .map(|table| table.root_page)
+                        })
+                        .ok_or(LimboError::SchemaUpdated)?;
+                    let watermark = match store.shared_sequence_watermark_nonblock(
+                        &program.connection,
+                        namespace.database_id,
+                        root,
+                        sequence,
+                        &mut state.shared_watermark,
+                    )? {
+                        IOResult::Done(value) => value,
+                        IOResult::IO(io) => {
+                            return Ok(state.suspend_on_io(io));
+                        }
+                    };
+                    match watermark {
+                        Some(value) => state.registers[*dest].set_int(value),
+                        None => state.registers[*dest].set_value(Value::Null),
+                    }
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
                 }
                 let watermark = program
                     .connection

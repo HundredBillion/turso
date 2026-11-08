@@ -62,6 +62,7 @@ pub(in crate::mvcc) enum IdQuery {
     RowFacts { domain: Domain, autoincrement: bool },
     RowExists { domain: Domain, value: i64 },
     LogicalFloor,
+    SequenceState { domain: Domain, descending: bool },
 }
 #[derive(Clone, Copy, Debug)]
 pub(in crate::mvcc) enum IdFact {
@@ -71,6 +72,7 @@ pub(in crate::mvcc) enum IdFact {
     },
     RowExists(bool),
     LogicalFloor(i64),
+    SequenceState(Option<(i64, bool)>),
 }
 pub(in crate::mvcc) trait CommittedIdOracle: Send {
     fn identity(&self) -> RecoveryIdentity;

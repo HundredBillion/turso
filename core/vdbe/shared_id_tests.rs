@@ -103,17 +103,15 @@ fn shared_id_opcode_native_reserves_logical_tables_before_schema_commit() {
 
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
-fn shared_id_opcode_native_rejects_process_local_sequence_watermark() {
+fn shared_id_opcode_native_watermark_reads_uncalled_sequence() {
     let (_directory, first, _) = pair();
     first.execute("CREATE SEQUENCE shared_sequence").unwrap();
-    let error = first
-        .execute("SELECT sequence_watermark_experimental('shared_sequence')")
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires a global live-claim reader"),
-        "{error}"
+    assert_eq!(
+        integers(
+            &first,
+            "SELECT sequence_watermark_experimental('shared_sequence')"
+        ),
+        [1]
     );
 }
 

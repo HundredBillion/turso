@@ -1127,6 +1127,8 @@ pub struct ProgramState {
     pub(crate) shared_begin: crate::mvcc::database::SharedBeginState,
     #[cfg(all(host_shared_wal, unix))]
     pub(crate) shared_id: crate::mvcc::database::SharedIdState,
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) shared_watermark: crate::mvcc::database::SharedSequenceWatermarkState,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -1314,6 +1316,8 @@ impl ProgramState {
             shared_begin: Default::default(),
             #[cfg(all(host_shared_wal, unix))]
             shared_id: Default::default(),
+            #[cfg(all(host_shared_wal, unix))]
+            shared_watermark: Default::default(),
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1413,7 +1417,10 @@ impl ProgramState {
 
     pub(crate) fn reset_shared_id(&mut self) {
         #[cfg(all(host_shared_wal, unix))]
-        self.shared_id.reset();
+        {
+            self.shared_id.reset();
+            self.shared_watermark.reset();
+        }
     }
 
     pub(crate) fn reset_shared_begin(&mut self) {

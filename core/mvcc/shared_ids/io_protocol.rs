@@ -1115,6 +1115,7 @@ mod tests {
                 },
                 IdQuery::RowExists { value, .. } => IdFact::RowExists(self.maximum == Some(*value)),
                 IdQuery::LogicalFloor => IdFact::LogicalFloor(-1),
+                IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
             }))
         }
     }
@@ -1544,6 +1545,7 @@ mod tests {
                     autoincrement_floor: 100,
                 },
                 IdQuery::LogicalFloor => IdFact::LogicalFloor(-1000),
+                IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
                 IdQuery::RowExists { .. } => panic!("no random fallback below exhaustion"),
             }))
         }
