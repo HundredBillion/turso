@@ -1093,10 +1093,10 @@ fn checkpoint_recovery_reclaim_native_rejects_preexisting_store_before_mutation(
     assert!(fixture.runtime.replay.lock().is_none());
     let before = std::fs::read(fixture.namespace.join("logical")).unwrap();
     assert!(!before.is_empty());
-    assert!(matches!(
-        finalized.begin_log_reclamation(),
-        Err(LimboError::Busy)
-    ));
+    assert!(
+        matches!(finalized.begin_log_reclamation(), Err(LimboError::Busy)),
+        "reclamation accepted a runtime with a preexisting Store"
+    );
     assert_eq!(
         std::fs::read(fixture.namespace.join("logical")).unwrap(),
         before
