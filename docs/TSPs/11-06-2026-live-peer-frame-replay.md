@@ -105,3 +105,18 @@ Logical-table allocator lowering uses atomic fetch_min so concurrent local
 reservations cannot be overwritten. Imported i64::MIN table IDs are rejected
 before publication. Global table/row/sequence reservation integration remains a
 separate required task; this local monotonicity repair does not provide it.
+
+## Sequence descriptors during live import
+
+A live schema replacement now stages sequence descriptors before publishing the
+frame. New backing-table metadata comes from a row that survives the complete
+frame; a later deletion cannot supply the descriptor. An unchanged backing-table
+identity preserves its prior descriptor across unrelated DDL. AUTOINCREMENT table
+renaming preserves that identity while updating the descriptor name. Dropping
+and recreating a sequence uses the new domain and metadata. Missing or invalid
+new metadata rejects installation without advancing the visible schema or replay
+frontier, retaining the pending frame for retry.
+
+This is a private live-import repair. Ordinary startup recovery keeps its existing
+post-replay descriptor-loading path. It does not add prepare-time peer refresh,
+checkpoint recovery, or public shared-mode activation.
