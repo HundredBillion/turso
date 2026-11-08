@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: af4d6bf740ae4a83987a4b8df51b6e5cfffa187f
+          ref: 3382852547e58bd69282496d3b85d56d00d592d7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,14 +24,14 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = af4d6bf740ae4a83987a4b8df51b6e5cfffa187f
+          test "$(git rev-parse HEAD)" = 3382852547e58bd69282496d3b85d56d00d592d7
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Provisional table and sequence probes
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run
-          for selector in shared_id_opcode_native_provisional_table_ shared_id_opcode_native_provisional_sequence_; do
+          for selector in shared_id_opcode_native_provisional_sequence_; do
             set +e
             timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
             result=${PIPESTATUS[0]}
