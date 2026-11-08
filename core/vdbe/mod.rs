@@ -1857,7 +1857,7 @@ impl ProgramState {
     /// while FK bookkeeping still needs cleanup.
     pub fn end_statement(
         &mut self,
-        connection: &Connection,
+        connection: &Arc<Connection>,
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
@@ -1885,6 +1885,42 @@ impl ProgramState {
         if !self.has_stmt_transaction {
             return Ok(());
         }
+        let main_tx = self
+            .sequence_inner_tx_pending
+            .as_ref()
+            .filter(|pending| pending.db == crate::MAIN_DB_ID)
+            .and_then(|pending| pending.saved_outer.map(|(tx, _)| tx))
+            .or_else(|| connection.get_mv_tx_id());
+        #[cfg(all(host_shared_wal, unix))]
+        let mut shared_rollback = None;
+        #[cfg(all(host_shared_wal, unix))]
+        if end_statement == EndStatement::RollbackSavepoint {
+            if let Some(store) = connection
+                .mv_store()
+                .as_ref()
+                .filter(|store| store.is_shared())
+            {
+                if let Some(tx_id) = main_tx {
+                    if let Some(next_ordinal) = store.shared_statement_id_boundary(tx_id) {
+                        use crate::IOExt;
+                        let mut release = crate::mvcc::database::SharedIdState::default();
+                        pager.io.block(|| {
+                            store.shared_id_nonblock(
+                                connection,
+                                pager.clone(),
+                                tx_id,
+                                crate::MAIN_DB_ID,
+                                crate::mvcc::database::SharedIdRequest::ReleaseAfter {
+                                    next_ordinal,
+                                },
+                                &mut release,
+                            )
+                        })?;
+                        shared_rollback = Some((store.clone(), tx_id, release));
+                    }
+                }
+            }
+        }
         self.has_stmt_transaction = false;
 
         // The change log was empty when this write statement started (see
@@ -1903,7 +1939,7 @@ impl ProgramState {
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
-                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                    if let Some(tx_id) = main_tx {
                         mv_store.release_savepoint(tx_id);
                     }
                     connection.for_each_attached_mv_tx(|db_id, tx_id| {
@@ -1931,7 +1967,7 @@ impl ProgramState {
                 // Rollback pager/MVCC savepoint if one was opened.
                 let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
                     let mut err = None;
-                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                    if let Some(tx_id) = main_tx {
                         if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
                             err = Some(e);
                         }
@@ -2000,6 +2036,12 @@ impl ProgramState {
         }
         for p in &attached_pagers {
             p.stop_use_subjournal();
+        }
+        #[cfg(all(host_shared_wal, unix))]
+        if result.is_ok() {
+            if let Some((store, tx_id, mut release)) = shared_rollback {
+                store.finish_shared_local_rollback(tx_id, &mut release)?;
+            }
         }
         result
     }
@@ -3635,6 +3677,16 @@ impl Program {
         state.explicit_checkpoint_guard = None;
         state.reset_shared_begin();
         #[cfg(all(host_shared_wal, unix))]
+        if state.shared_named_rollback.is_none() {
+            if let Err(error) = state.shared_id.finish_pending_reservation() {
+                capture_abort_error(
+                    &mut abort_error,
+                    error,
+                    "Failed to retire shared ID reservation before rollback",
+                );
+            }
+        }
+        #[cfg(all(host_shared_wal, unix))]
         if let Err(error) =
             execute::finish_abandoned_shared_named_rollback(state, &self.connection, pager)
         {
@@ -3807,11 +3859,17 @@ impl Program {
             if let Some(pending) = state.sequence_inner_tx_pending.as_ref() {
                 if let Some((outer_tx_id, _)) = pending.saved_outer {
                     if let Some(mv_store) = self.connection.mv_store_for_db(pending.db) {
-                        if let Err(e) = mv_store.rollback_first_savepoint(outer_tx_id) {
-                            tracing::error!(
-                                "Failed to rollback outer-tx savepoint after sequence \
+                        #[cfg(all(host_shared_wal, unix))]
+                        let shared = mv_store.is_shared();
+                        #[cfg(not(all(host_shared_wal, unix)))]
+                        let shared = false;
+                        if !shared {
+                            if let Err(e) = mv_store.rollback_first_savepoint(outer_tx_id) {
+                                tracing::error!(
+                                    "Failed to rollback outer-tx savepoint after sequence \
                                  inner-tx aborted: {e}"
-                            );
+                                );
+                            }
                         }
                     }
                 }

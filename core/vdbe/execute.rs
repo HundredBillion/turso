@@ -5145,6 +5145,13 @@ pub fn op_transaction_inner(
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
+                // A durable shared claim can precede the first local row mutation.
+                // Even a simple insert needs an undo scope if it is abandoned there.
+                #[cfg(all(host_shared_wal, unix))]
+                let needs_stmt_journal = needs_stmt_journal
+                    || (in_explicit_txn
+                        && statement_writes_db
+                        && mv_store.as_ref().is_some_and(|store| store.is_shared()));
                 if needs_stmt_journal {
                     if is_main_db {
                         let res = state.begin_statement(
@@ -22652,11 +22659,10 @@ mod shared_begin_tests {
 
 #[cfg(all(host_shared_wal, unix))]
 fn finish_shared_named_rollback(state: &mut ProgramState, conn: &Arc<Connection>) -> Result<()> {
-    state.shared_id.finish_release()?;
-    if let Some((_, tx_id, _)) = state.shared_named_rollback.take() {
-        if let Some(store) = conn.mv_store().as_ref() {
-            store.finish_shared_local_rollback(tx_id);
-        }
+    if let Some((_, tx_id, _)) = state.shared_named_rollback.as_ref() {
+        let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
+        store.finish_shared_local_rollback(*tx_id, &mut state.shared_id)?;
+        state.shared_named_rollback = None;
     }
     Ok(())
 }

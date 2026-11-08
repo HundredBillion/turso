@@ -64,6 +64,39 @@ impl Debug for SharedIdState {
     }
 }
 impl SharedIdState {
+    // Complete only the already captured reservation, never its SQL opcode.
+    // Scoped rollback then releases even an append whose callback had not retired.
+    pub(crate) fn finish_pending_reservation(&mut self) -> Result<()> {
+        use crate::IOExt;
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        if matches!(pending.request, SharedIdRequest::ReleaseAfter { .. }) {
+            return Err(LimboError::Busy);
+        }
+        let connection = pending.connection.upgrade().ok_or(LimboError::Busy)?;
+        let pager = pending.pager.clone();
+        let tx_id = pending.tx_id;
+        let database_id = pending.database_id;
+        let request = pending.request;
+        let store = connection
+            .mv_store()
+            .as_ref()
+            .ok_or(LimboError::Busy)?
+            .clone();
+        pager.io.block(|| {
+            store.shared_id_nonblock(
+                &connection,
+                pager.clone(),
+                tx_id,
+                database_id,
+                request,
+                self,
+            )
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn finish_release(&mut self) -> Result<()> {
         if let Some((_, _, _, guard)) = self.released.take() {
             guard.finish()?;
@@ -336,9 +369,28 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
 }
 
 impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
-    pub(crate) fn finish_shared_local_rollback(&self, tx_id: TxID) {
-        if let Some(tx) = self.txs.get(&tx_id) {
-            tx.value().shared_pending_release.lock().take();
-        }
+    pub(crate) fn finish_shared_local_rollback(
+        &self,
+        tx_id: TxID,
+        state: &mut SharedIdState,
+    ) -> Result<()> {
+        let tx = self.txs.get(&tx_id).ok_or(LimboError::Busy)?;
+        let mut pending = tx.value().shared_pending_release.lock();
+        // Do not let another scope install its fence between native unlock and
+        // clearing this scope. Failed unlock retains the original fence.
+        state.finish_release()?;
+        pending.take();
+        Ok(())
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn shared_statement_id_boundary(&self, tx_id: TxID) -> Option<u64> {
+        let tx = self.txs.get(&tx_id)?;
+        let frames = tx.value().savepoint_stack.read();
+        frames
+            .last()
+            .filter(|frame| matches!(frame.kind, SavepointKind::Statement))
+            .and_then(|frame| frame.shared_id_boundary)
     }
 }

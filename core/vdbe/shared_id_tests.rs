@@ -858,3 +858,75 @@ fn shared_id_lifecycle_native_cancel_after_release_requires_local_undo() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_failed_sequence_statement_preserves_autonomous_value() {
+    let (_directory, first, second) = pair_with_setup(Some("CREATE SEQUENCE cleanup_sequence"));
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let snapshot = first.mv_store().as_ref().unwrap().read_snapshot_ts(outer);
+    first.execute("INSERT INTO preserved(id,value) VALUES(77,nextval('cleanup_sequence')),(1,nextval('cleanup_sequence'))")
+        .expect_err("existing key must abort the outer statement");
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(
+        first.mv_store().as_ref().unwrap().read_snapshot_ts(outer),
+        snapshot
+    );
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('cleanup_sequence')"
+        ),
+        [3],
+        "aborted statement retained sequence claims or rewound autonomous durable state"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    assert_eq!(integers(&second, "SELECT nextval('cleanup_sequence')"), [3]);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_named_rollback_preserves_earlier_sequence_claim() {
+    let (_directory, first, second) = pair_with_setup(Some(
+        "CREATE SEQUENCE prior_sequence; CREATE SEQUENCE scoped_sequence",
+    ));
+    first.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(integers(&first, "SELECT nextval('prior_sequence')"), [1]);
+    first.execute("SAVEPOINT scope").unwrap();
+    assert_eq!(integers(&first, "SELECT nextval('scoped_sequence')"), [1]);
+    first.execute("ROLLBACK TO scope").unwrap();
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('prior_sequence')"
+        ),
+        [1]
+    );
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('scoped_sequence')"
+        ),
+        [2]
+    );
+    first.execute("RELEASE scope").unwrap();
+    first.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('prior_sequence')"
+        ),
+        [2]
+    );
+}
