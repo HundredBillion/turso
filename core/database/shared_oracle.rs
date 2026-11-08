@@ -96,6 +96,7 @@ mod tests {
         )
         .unwrap();
         let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        connection.execute("SELECT * FROM preserved").unwrap();
         let source = connection.get_pager();
         let runtime = db.shared_mvcc_runtime.as_ref().unwrap();
         let foreign = Pager::new(
