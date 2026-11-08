@@ -1008,3 +1008,6 @@ fn shared_id_lifecycle_native_empty_scopes_do_not_create_journal_owners() {
         .unwrap();
     assert_eq!(integers(&first, "SELECT count(*) FROM preserved"), [2]);
 }
+
+#[path = "shared_schema_publication_tests.rs"]
+mod shared_schema_publication_tests;
