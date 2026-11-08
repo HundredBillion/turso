@@ -3424,16 +3424,21 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     let Ok(name) = CStr::from_ptr(name).to_str() else {
         return SQLITE_MISUSE;
     };
+    if !(-1..=1000).contains(&n_args) || name.len() > 255 {
+        return SQLITE_MISUSE;
+    }
     let name_c = CString::new(name).unwrap();
     let mut registration = match (func, step, final_) {
-        (Some(callback), _, _) => PendingFunction::Scalar(Box::into_raw(Box::new(ScalarBridge {
-            callback: std::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
-            >(callback),
-            user_data,
-            db,
-        }))),
+        (Some(callback), None, None) => {
+            PendingFunction::Scalar(Box::into_raw(Box::new(ScalarBridge {
+                callback: std::mem::transmute::<
+                    unsafe extern "C" fn(),
+                    unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+                >(callback),
+                user_data,
+                db,
+            })))
+        }
         (None, Some(step), Some(final_)) => {
             PendingFunction::Aggregate(Box::into_raw(Box::new(AggBridge {
                 step: std::mem::transmute::<
@@ -4088,6 +4093,19 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structured_error_messages_preserve_payload_without_category() {
+        for error in [
+            LimboError::Corrupt("Internal error: application payload".into()),
+            LimboError::ParseError("Parse error: application payload".into()),
+        ] {
+            let expected = error.bare_message().into_owned();
+            let mut message = ptr::null_mut();
+            handle_limbo_err(error, &mut message);
+            let message = unsafe { CString::from_raw(message) };
+            assert_eq!(message.to_str().unwrap(), expected);
+        }
+    }
 
     #[test]
     fn shared_mvcc_uri_options_preserve_values_and_readonly_access() {

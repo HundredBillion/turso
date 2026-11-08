@@ -25,6 +25,12 @@ an error before opening or creating database files; it must never silently open
 an ordinary database. Existing URI options retain their ordinary behavior.
 This parsing support does not establish cross-process transaction support.
 
+## Application functions
+
+`sqlite3_create_function_v2` supports scalar and aggregate callbacks. Incomplete
+or mixed scalar/aggregate callback combinations return `SQLITE_MISUSE`.
+Rejected registrations invoke `xDestroy` once when supplied.
+
 ## Testing Strategy
 
 We employ a dual-testing approach to ensure complete compatibility with SQLite:
