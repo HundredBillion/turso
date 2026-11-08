@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e72b821af8347283cce1d16e4d8dd566fd0e3888
+          ref: 28f55174b3ec300d137734ced23e5793448960ce
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,16 +27,95 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = e72b821af8347283cce1d16e4d8dd566fd0e3888
+          test "$(git rev-parse HEAD)" = 28f55174b3ec300d137734ced23e5793448960ce
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-native-green.log
-          grep -q '6 passed; 0 failed' intent-native-green.log
+          grep -q '9 passed; 0 failed' intent-native-green.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo fmt --all -- --check
+          git diff --exit-code
+      - name: Causal provenance mirror and retirement controls
+        run: |
+          set -euo pipefail
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_checkpoint_recovery_intent.rs'
+          s=open(p).read(); old='        validate_selection(&self.runtime, &self.manifest)?;'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,''))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_rejects_same_bytes_from_memory_manifest -- --ignored --test-threads=1 --nocapture > intent-provenance-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_checkpoint_recovery_intent.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' intent-provenance-control-red.log
+          python3 - <<'PATCH'
+          p='core/mvcc/commit_manifest/checkpoint_publication.rs'
+          s=open(p).read(); start=s.index('fn mirror_recovered_checkpoint_intent'); at=s.index('mirrored: false,',start)
+          s=s[:at]+s[at:].replace('mirrored: false,','mirrored: true,',1)
+          open(p,'w').write(s)
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_two_full_syncs_before_owner -- --ignored --test-threads=1 --nocapture > intent-second-mirror-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/commit_manifest/checkpoint_publication.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' intent-second-mirror-control-red.log
+          python3 - <<'PATCH'
+          p='core/mvcc/commit_manifest/checkpoint_publication.rs'
+          s=open(p).read(); start=s.index('impl CheckpointIntentPublication'); at=s.index('                if !guard.io_retired() {',start); end=s.index('                return Ok(IOResult::Done(MirroredCheckpointIntent',at)
+          s=s[:at]+s[end:]
+          open(p,'w').write(s)
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_cancel_retains_backend_until_retirement -- --ignored --test-threads=1 --nocapture > intent-retirement-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/commit_manifest/checkpoint_publication.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' intent-retirement-control-red.log
+          cat *control-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee recovery-restored-green.log
+          grep -q '24 passed; 0 failed' recovery-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest:: -- --test-threads=2 2>&1 | tee manifest-regression-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority:: -- --test-threads=2 2>&1 | tee authority-regression-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee full-core-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: interrupted-intent-mirror-green-e72b821af
+          name: interrupted-intent-mirror-green-28f55174b
           path: |
             source.txt
             *.log
+
+  intent-windows:
+    needs: intent-native-green
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 28f55174b3ec300d137734ced23e5793448960ce
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pager-generation-windows-0b37
+      - name: Check exact Windows source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 28f55174b3ec300d137734ced23e5793448960ce
+          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-check-green.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interrupted-intent-windows
+          path: windows-check-green.log
