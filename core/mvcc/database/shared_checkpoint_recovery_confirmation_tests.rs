@@ -342,8 +342,8 @@ impl crate::IO for ControlledIo {
 }
 pub(super) struct FaultFixture {
     pub(super) _directory: tempfile::TempDir,
-    io: Arc<dyn crate::IO>,
-    runtime: Arc<SharedMvccRuntime>,
+    pub(super) io: Arc<dyn crate::IO>,
+    pub(super) runtime: Arc<SharedMvccRuntime>,
     pub(super) path: PathBuf,
     pub(super) namespace: PathBuf,
     control: Arc<Control>,
@@ -365,6 +365,13 @@ fn fault_fixture(target_only: bool) -> FaultFixture {
     fault_fixture_with_seed(target_only, false)
 }
 pub(super) fn fault_fixture_with_seed(target_only: bool, seed_owner: bool) -> FaultFixture {
+    fault_fixture_with_seed_and_io(target_only, seed_owner, |io| io)
+}
+pub(super) fn fault_fixture_with_seed_and_io(
+    target_only: bool,
+    seed_owner: bool,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> FaultFixture {
     let control = Arc::new(Control::default());
     let earlier = Arc::new(Mutex::new(Vec::new()));
     let fixture = shared_prepared_checkpoint_fixture(|path| {
@@ -382,6 +389,7 @@ pub(super) fn fault_fixture_with_seed(target_only: bool, seed_owner: bool) -> Fa
             inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
             control: control.clone(),
         });
+        let io = decorate(io);
         if seed_owner {
             let database = crate::Database::open(
                 io.clone(),
