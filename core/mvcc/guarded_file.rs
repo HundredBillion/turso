@@ -50,6 +50,15 @@ impl GuardedFile {
         self.bind_with_reads(guard, true)
     }
 
+    pub(super) fn bind_physical_recovery(
+        self: &Arc<Self>,
+        guard: &AuthorityGuard,
+        physical: Arc<crate::storage::shared_wal_coordination::SharedWalRecoveryLocks>,
+    ) -> Result<FileBinding> {
+        let _ = physical;
+        self.bind_checkpoint(guard)
+    }
+
     fn bind_with_reads(
         self: &Arc<Self>,
         guard: &AuthorityGuard,
@@ -911,3 +920,7 @@ mod tests {
         guard.finish().unwrap();
     }
 }
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "guarded_file_physical_recovery_tests.rs"]
+mod physical_recovery_tests;
