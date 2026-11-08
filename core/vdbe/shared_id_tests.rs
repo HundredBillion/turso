@@ -144,6 +144,57 @@ fn shared_id_opcode_native_sequence_preserves_saved_outer_owner() {
     assert!(integers(&second, "SELECT nextval('owner_sequence')")[0] > later);
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_watermark_tracks_live_peer_and_committed_boundary() {
+    let (_directory, first, second) = pair_with_setup(Some("CREATE SEQUENCE watermark_sequence"));
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(100,'outer')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let snapshot = store.read_snapshot_ts(outer);
+    let allocated = integers(&first, "SELECT nextval('watermark_sequence')")[0];
+    let later = integers(&second, "SELECT nextval('watermark_sequence')")[0];
+    assert!(later > allocated);
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('watermark_sequence')"
+        ),
+        [allocated]
+    );
+    assert_eq!(
+        integers(
+            &first,
+            "SELECT sequence_watermark_experimental('watermark_sequence')"
+        ),
+        [allocated]
+    );
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE value='outer'"),
+        [100]
+    );
+    first.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        integers(
+            &first,
+            "SELECT sequence_watermark_experimental('watermark_sequence')"
+        ),
+        [later + 1]
+    );
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('watermark_sequence')"
+        ),
+        [later + 1]
+    );
+}
+
 #[derive(Debug)]
 struct AfterClaimYield(std::sync::atomic::AtomicBool);
 impl crate::mvcc::yield_points::YieldInjector for AfterClaimYield {
