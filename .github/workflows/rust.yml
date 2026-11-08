@@ -1,10 +1,10 @@
-name: Idle shared Store generation baseline
+name: Selected current ID base validation
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  idle-generation-red:
+  current-id-base:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -12,11 +12,10 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
-      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9459876e3abcfc382511d7b2a34fb63d4a810d51
+          ref: 6e63ebea7f749fc9c440d5e5552e7fb03996a888
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,26 +23,22 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9459876e3abcfc382511d7b2a34fb63d4a810d51
+          test "$(git rev-parse HEAD)" = 6e63ebea7f749fc9c440d5e5552e7fb03996a888
           rustc -Vv | tee rustc.txt
-          stat -f -c 'temporary filesystem: %T (%t)' /tmp
-      - name: Actual checkpoint and later commits must expose stale idle Store
+      - name: Current base evidence and existing ID protocol
         run: |
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-generation-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' idle-generation-red.log
-          grep -q 'idle old-generation process failed to refresh a nonempty newer generation' idle-generation-red.log
-          grep -q 'shared replay boundary changed incompatibly' idle-generation-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api id_current_base_ -- --test-threads=1 --nocapture 2>&1 | tee current-base-green.log
+          grep -q '4 passed; 0 failed' current-base-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee id-protocol-green.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo fmt --all -- --check
           git diff --exit-code
-      - name: Preserve exact evidence
+      - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: idle-generation-9459-red
+          name: selected-current-id-base-6e63
           path: |
             source.txt
             rustc.txt
-            idle-generation-red.log
+            '*green.log'
