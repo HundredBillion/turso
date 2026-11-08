@@ -441,4 +441,50 @@ mod tests {
         let guard = fixture.runtime.files.authority.try_acquire().unwrap();
         assert!(guard.requires_recovery());
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_prepare_native_rejects_manifest_backend_substitution() {
+        let mut fixture = installed_fixture();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let loaded = fixture
+            .io
+            .block(|| Ok(preparing.load.as_mut().unwrap().poll()?))
+            .unwrap();
+        preparing.load = None;
+        let bytes = std::fs::read(fixture.namespace.join("manifest")).unwrap();
+        let memory = crate::io::MemoryIO::new();
+        let file = memory
+            .open_file("substitute", crate::OpenFlags::Create, false)
+            .unwrap();
+        let buffer = Arc::new(crate::Buffer::new_temporary(bytes.len()));
+        buffer.as_mut_slice().copy_from_slice(&bytes);
+        drop(
+            file.pwrite(0, buffer, Completion::new_write(|_| {}))
+                .unwrap(),
+        );
+        let mut substitute = ManifestLoad::new(
+            file,
+            loaded.into_guard().unwrap(),
+            fixture.runtime.database_id,
+        )
+        .unwrap();
+        let loaded = memory.block(|| Ok(substitute.poll()?)).unwrap();
+        drop(substitute);
+        let before = unchanged_files(&fixture);
+        let result =
+            DowngradeIntentPublication::from_installed(loaded, preparing.source.take().unwrap());
+        assert!(
+            result.is_err(),
+            "same bytes from another manifest backend must not certify offline publication"
+        );
+        assert_unchanged(&before);
+    }
 }

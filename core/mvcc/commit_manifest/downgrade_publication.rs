@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(all(host_shared_wal, unix))]
 use crate::mvcc::database::InstalledDowngradeSource;
 
 /// Mirrors an intent; it does not certify physical materialization or quiescence.
@@ -9,6 +10,7 @@ pub(in crate::mvcc) struct DowngradeIntentPublication {
     mirrored: bool,
     durable: Option<DurableManifest>,
     terminated: bool,
+    #[cfg(all(host_shared_wal, unix))]
     source: Option<InstalledDowngradeSource>,
 }
 
@@ -16,10 +18,12 @@ pub(in crate::mvcc) struct MirroredDowngradeIntent {
     _file: Arc<dyn File>,
     record: ManifestRecord,
     guard: AuthorityGuard,
+    #[cfg(all(host_shared_wal, unix))]
     _source: Option<InstalledDowngradeSource>,
 }
 
 impl DowngradeIntentPublication {
+    #[cfg(all(host_shared_wal, unix))]
     pub(in crate::mvcc) fn from_installed(
         loaded: LoadedManifest,
         source: InstalledDowngradeSource,
@@ -57,6 +61,7 @@ impl DowngradeIntentPublication {
             mirrored: false,
             durable: None,
             terminated: false,
+            #[cfg(all(host_shared_wal, unix))]
             source: None,
         })
     }
@@ -84,6 +89,7 @@ impl DowngradeIntentPublication {
                     _file: self.file.clone(),
                     record: durable.record,
                     guard: durable.guard.take().unwrap(),
+                    #[cfg(all(host_shared_wal, unix))]
                     _source: self.source.take(),
                 }));
             }
