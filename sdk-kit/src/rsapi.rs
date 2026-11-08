@@ -2253,9 +2253,15 @@ mod tests {
             reserved_bytes: 1,
         });
 
-        {
+        let owners = {
             let db = open_database_with_page_codec(db_path, codec.clone());
             let conn = db.connect().unwrap();
+            let owners = (
+                Arc::downgrade(db.db.lock().unwrap().as_ref().unwrap()),
+                Arc::downgrade(&conn.connection),
+                Arc::downgrade(&conn.connection.get_pager()),
+                Arc::downgrade(&conn.connection.get_pager().db_file),
+            );
 
             let mut stmt = conn
                 .prepare_single("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
@@ -2271,7 +2277,18 @@ mod tests {
                 .prepare_single("PRAGMA wal_checkpoint(TRUNCATE)")
                 .unwrap();
             assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
-        }
+            owners
+        };
+        assert_eq!(
+            (
+                owners.0.strong_count(),
+                owners.1.strong_count(),
+                owners.2.strong_count(),
+                owners.3.strong_count()
+            ),
+            (0, 0, 0, 0),
+            "codec scope retained Database/Connection/Pager/Storage owners"
+        );
 
         let raw_database = std::fs::read(db_path).unwrap();
         assert_ne!(&raw_database[..16], b"SQLite format 3\0");
