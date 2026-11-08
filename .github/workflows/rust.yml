@@ -14,40 +14,111 @@ env:
 jobs:
   cli:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ab55ac39096114d78cafdc7d8fc670e0c8f2b275
+          ref: 2cf39bade5efe1e43fdb05a8c42f2335f8ebc11e
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
       - name: Exact non-test executable
+        id: build
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ab55ac39096114d78cafdc7d8fc670e0c8f2b275
+          test "$(git rev-parse HEAD)" = 2cf39bade5efe1e43fdb05a8c42f2335f8ebc11e
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
           cargo build --locked -p turso_cli --bin tursodb 2>&1 | tee build.log
           sha256sum target/debug/tursodb | tee binary-sha256.txt
           target/debug/tursodb --version | tee version.txt
           ldd target/debug/tursodb | tee libraries.txt
-      - name: Reject before mutation
+      - name: Actual CLI no-write and closed-worker operators
         run: |
-          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case no-write 2>&1 | tee no-write.log
-          grep -q '"result": "passed"' no-write.log
-      - name: Genuine closed-worker downgrade expected RED
+          failed=0
+          for case in no-write close roundtrip new stock busy; do
+            set +e
+            python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case "$case" > "$case.log" 2>&1
+            status=$?
+            set -e
+            echo "$status" > "$case-status.txt"
+            if test "$status" -ne 0; then failed=1; else grep -q '"result": "passed"' "$case.log"; fi
+          done
+          test "$failed" -eq 0
+      - name: Ordinary core SDK and native close contracts
+        if: always() && steps.build.outcome == 'success'
         run: |
+          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api,bench,fts -- --test-threads=2 2>&1 | tee core.log
+          grep '^test result:' core.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
+          cargo test --locked -p turso_core --lib --features conn_raw_api,bench,fts shared_offline_operator_native_close_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-close.log
+          grep '^test result:' native-close.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+          cargo test --locked -p turso_sdk_kit --lib 2>&1 | tee sdk.log
+          grep '^test result:' sdk.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
+      - name: Actual CLI resume after genuine native crash fixtures
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api,bench,fts --no-run --message-format=json > test-build.json 2> test-build.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows=[json.loads(line) for line in Path('test-build.json').read_text().splitlines()]
+          matches=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r.get('target',{}).get('name')=='turso_core' and r.get('profile',{}).get('test') and r.get('executable')]
+          assert len(matches)==1,matches
+          Path('test-binary.txt').write_text(matches[0])
+          PY
+          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --test-binary "$(cat test-binary.txt)" --case crash 2>&1 | tee crash.log
+          grep -q '"case": "crash", "result": "passed"' crash.log
+      - name: Causal close and missing orchestration controls
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          cp core/connection.rs /tmp/connection.good.rs
+          cp core/mvcc/database/shared_offline_downgrade.rs /tmp/offline.good.rs
+          trap 'cp /tmp/connection.good.rs core/connection.rs; cp /tmp/offline.good.rs core/mvcc/database/shared_offline_downgrade.rs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('core/connection.rs');s=p.read_text();old='            && !shared_mvcc\n';assert s.count(old)==1;p.write_text(s.replace(old,''))
+          PY
+          git diff > close-control.diff
+          cargo build --locked -p turso_cli --bin tursodb > close-control-build.log 2>&1
           set +e
-          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case roundtrip > roundtrip.log 2>&1
+          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case close > close-control.log 2>&1
           status=$?
           set -e
-          echo "$status" | tee roundtrip-status.txt
+          echo "$status" > close-control-status.txt
           test "$status" -eq 1
-          grep -q 'offline downgrade orchestration is not implemented' roundtrip.log
-          grep -q '1|after' roundtrip.log
+          grep -q 'shared close failed after observed committed data' close-control.log
+          grep -q '1|after' close-control.log
+          cp /tmp/connection.good.rs core/connection.rs
+          cat > core/mvcc/database/shared_offline_downgrade.rs <<'RUST'
+          use crate::mvcc::mode_transition::OfflinePrerequisite;
+          use crate::{LimboError, Result};
+          pub(in crate::mvcc) fn downgrade_existing(_: &std::path::Path, _:u64, _: OfflinePrerequisite)->Result<()> {
+              Err(LimboError::InvalidArgument("offline downgrade orchestration is not implemented".into()))
+          }
+          RUST
+          cargo build --locked -p turso_cli --bin tursodb > orchestration-control-build.log 2>&1
+          set +e
+          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case roundtrip > orchestration-control.log 2>&1
+          status=$?
+          set -e
+          echo "$status" > orchestration-control-status.txt
+          test "$status" -eq 1
+          grep -q 'offline downgrade orchestration is not implemented' orchestration-control.log
+          cp /tmp/offline.good.rs core/mvcc/database/shared_offline_downgrade.rs
+          git diff --exit-code
+          cargo build --locked -p turso_cli --bin tursodb > restored-build.log 2>&1
+          for case in close roundtrip; do
+            python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case "$case" 2>&1 | tee "restored-$case.log"
+            grep -q '"result": "passed"' "restored-$case.log"
+          done
+      - name: Strict source lint and formatting
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          cargo clippy --locked -p turso_core -p turso_cli --all-targets --features turso_core/bench -- -D warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -55,4 +126,18 @@ jobs:
           path: |
             *.log
             *.txt
+            *.diff
           retention-days: 14
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2cf39bade5efe1e43fdb05a8c42f2335f8ebc11e
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-windows
+          cache-on-failure: true
+      - run: cargo check --locked -p turso_core -p turso_cli --lib --bins
