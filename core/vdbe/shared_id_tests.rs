@@ -615,3 +615,6 @@ fn shared_watermark_identity_native_rejects_mismatched_backing_root() {
 
 #[path = "shared_watermark_io_tests.rs"]
 mod shared_watermark_io_tests;
+
+#[path = "shared_watermark_process_tests.rs"]
+mod shared_watermark_process_tests;
