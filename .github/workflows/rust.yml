@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 230a61cc8b2593c1deb9bdfd9b881b00b6831180
+          ref: 90bdad780e3ba2651dc4859e4b0d7a9737518bb3
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,27 +28,25 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 230a61cc8b2593c1deb9bdfd9b881b00b6831180
+          test "$(git rev-parse HEAD)" = 90bdad780e3ba2651dc4859e4b0d7a9737518bb3
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
-      - name: Real private database factory and ownership
+      - name: Actual normal recovery Ready and native ownership controls
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api recovery_open_config -- --nocapture 2>&1 | tee config.log
           grep -q '5 passed; 0 failed' config.log
-          for test in checkpoint_recovery_bootstrap_native_factory_keeps_actual_store_private checkpoint_recovery_bootstrap_native_factory_cancellation_retains_physical_reads checkpoint_recovery_bootstrap_native_factory_waits_for_physical_retirement checkpoint_recovery_bootstrap_native_retains_exactly_one_store checkpoint_recovery_bootstrap_native_missing_factory_withdraws_store checkpoint_recovery_bootstrap_native_last_arc_drops_store_before_authority checkpoint_recovery_bootstrap_native_original_optin_survives; do
-            timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api "$test" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$test.log"
-            grep -q '1 passed; 0 failed' "$test.log"
-          done
-      - name: Missing final Ready remains a genuine counterexample
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready.log
+          grep -q '14 passed; 0 failed' ready.log
+      - name: Existing normal recovery and live Ready
         run: |
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_missing_ready -- --ignored --test-threads=1 --nocapture 2>&1 | tee missing-ready.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'normal recovered database bootstrap is not implemented' missing-ready.log
-          grep -q '0 passed; 1 failed' missing-ready.log
+          for filter in checkpoint_recovery_finalize_native_ checkpoint_recovery_reclaim_native_ shared_checkpoint_ready_native_; do
+            timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api "$filter" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$filter.log"
+          done
+      - name: Full core library
+        run: |
+          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee full-core.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' full-core.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --tests --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
