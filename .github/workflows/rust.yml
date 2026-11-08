@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 68621e374
+          ref: '68621e3747b1c29a52be772e84bcb6ed40fff434'
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
