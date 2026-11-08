@@ -9,6 +9,7 @@ enum Role {
     Wal,
     Manifest,
     Coordination,
+    Ids,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
@@ -236,6 +237,7 @@ impl crate::IO for ControlledIo {
                 Some("physical-wal") => Some(Role::Wal),
                 Some("manifest") => Some(Role::Manifest),
                 Some("physical-tshm") => Some(Role::Coordination),
+                Some("ids-selector" | "ids-a" | "ids-b") => Some(Role::Ids),
                 _ => None,
             }
         };
@@ -559,4 +561,174 @@ fn cases() -> impl Iterator<Item = (CrashPoint, usize)> {
     ]
     .into_iter()
     .flat_map(|point| [1, 2].into_iter().map(move |commits| (point, commits)))
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn intent_source_ids_io_native_every_read_error_keeps_files_and_fresh_retry() {
+    for commits in [1, 2] {
+        let control = Control::new();
+        let baseline = fixture(&control, CrashPoint::BeforeWalCommit, commits);
+        let mut inspection = source_inspection(&baseline);
+        control.arm(Fault::None);
+        let inspected = baseline.io.block(|| inspection.poll()).unwrap();
+        let events = control.events.lock().clone();
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, Event(Role::Ids, Operation::Read(_)))));
+        control.armed.store(false, Ordering::Release);
+        drop(inspected);
+        drop(inspection);
+        drop(baseline);
+        for (index, event) in events.iter().enumerate() {
+            eprintln!(
+                "SOURCE_ID_READ_ERROR parity={commits} read={} {event:?}",
+                index + 1
+            );
+            let control = Control::new();
+            let mut fixture = fixture(&control, CrashPoint::BeforeWalCommit, commits);
+            let mut inspection = source_inspection(&fixture);
+            let before = source_files(&fixture);
+            control.arm(Fault::Error(index + 1));
+            assert!(fixture.io.block(|| inspection.poll()).is_err());
+            control.armed.store(false, Ordering::Release);
+            assert_eq!(control.events.lock().get(index), Some(event));
+            drop(inspection);
+            assert_source_files(&before);
+            assert!(fixture.runtime.reserve_store().is_err());
+            reopen_source_runtime(&mut fixture);
+            let mut retry = source_inspection(&fixture);
+            let inspected = fixture.io.block(|| retry.poll()).unwrap();
+            assert!(fixture.runtime.replay.lock().is_none());
+            assert_source_files(&before);
+            drop(inspected);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn intent_source_ids_io_native_cancel_keeps_authority_through_backend_retirement() {
+    for commits in [1, 2] {
+        let control = Control::new();
+        let baseline = fixture(&control, CrashPoint::BeforeWalCommit, commits);
+        let mut inspection = source_inspection(&baseline);
+        control.arm(Fault::None);
+        let inspected = baseline.io.block(|| inspection.poll()).unwrap();
+        let events = control.events.lock().clone();
+        control.armed.store(false, Ordering::Release);
+        drop(inspected);
+        drop(inspection);
+        drop(baseline);
+        for (index, event) in events.iter().enumerate() {
+            for callback_first in [false, true] {
+                eprintln!("SOURCE_ID_READ_CANCEL parity={commits} read={} {event:?} callback={callback_first}", index + 1);
+                let control = Control::new();
+                let mut fixture = fixture(&control, CrashPoint::BeforeWalCommit, commits);
+                let mut inspection = source_inspection(&fixture);
+                let before = source_files(&fixture);
+                control.arm(Fault::Hold(index + 1));
+                let mut polls = 0;
+                let waiter = loop {
+                    polls += 1;
+                    assert!(
+                        polls < 1000,
+                        "source inspection did not reach withheld backend"
+                    );
+                    match inspection.poll().unwrap() {
+                        IOResult::IO(waiter) => {
+                            if control.held.lock().is_some() {
+                                break waiter;
+                            }
+                            waiter.wait(fixture.io.as_ref()).unwrap();
+                        }
+                        IOResult::Done(_) => panic!("source inspection bypassed withheld backend"),
+                    }
+                };
+                let held = control.held.lock().take().unwrap();
+                if callback_first {
+                    held.complete();
+                }
+                drop(waiter);
+                drop(inspection);
+                assert!(matches!(
+                    fixture.runtime.files.authority.try_acquire(),
+                    Err(LimboError::Busy)
+                ));
+                assert!(matches!(
+                    fixture.runtime.begin_open(),
+                    Err(LimboError::Busy)
+                ));
+                if !callback_first {
+                    held.complete();
+                }
+                assert!(held.completion.finished());
+                assert!(
+                    matches!(
+                        fixture.runtime.files.authority.try_acquire(),
+                        Err(LimboError::Busy)
+                    ),
+                    "source ID callback released authority before actual backend retirement"
+                );
+                assert!(fixture.runtime.replay.lock().is_none());
+                assert_source_files(&before);
+                drop(held);
+                control.armed.store(false, Ordering::Release);
+                assert!(fixture.runtime.reserve_store().is_err());
+                reopen_source_runtime(&mut fixture);
+                let mut retry = source_inspection(&fixture);
+                let inspected = fixture.io.block(|| retry.poll()).unwrap();
+                assert!(fixture.runtime.replay.lock().is_none());
+                assert_source_files(&before);
+                drop(inspected);
+            }
+        }
+    }
+}
+
+fn source_inspection(fixture: &IntentCrashFixture) -> SourceIdInspection {
+    let mut recovery = start(fixture);
+    let recovered = fixture.io.block(|| recovery.poll()).unwrap();
+    recovered
+        .begin_source_store()
+        .unwrap()
+        .begin_source_id_inspection()
+        .unwrap()
+}
+
+fn source_files(fixture: &IntentCrashFixture) -> Vec<(PathBuf, Vec<u8>)> {
+    fixture
+        .durable_before
+        .iter()
+        .map(|(path, _)| path.clone())
+        .chain([fixture.runtime.files.namespace.join("manifest")])
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn assert_source_files(before: &[(PathBuf, Vec<u8>)]) {
+    for (path, bytes) in before {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+fn reopen_source_runtime(fixture: &mut IntentCrashFixture) {
+    let path = fixture.path.canonicalize().unwrap();
+    let file = fixture
+        .io
+        .open_file(path.to_str().unwrap(), crate::OpenFlags::NoLock, false)
+        .unwrap();
+    fixture.runtime = SharedMvccRuntime::open_existing(
+        fixture.io.clone(),
+        file.clone(),
+        file.file_id().unwrap().unwrap(),
+        &path,
+        fixture.runtime.files.authority.configured_history_limit(),
+        false,
+    )
+    .unwrap();
 }
