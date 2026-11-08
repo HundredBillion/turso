@@ -972,7 +972,11 @@ fn checkpoint_recovery_reclaim_native_rejects_second_store() {
         for _ in 0..8 {
             let first = first.clone();
             let runtime = fixture.runtime.clone();
-            joins.push(scope.spawn(move || first.attach_shared_runtime(runtime)));
+            let barrier = barrier.clone();
+            joins.push(scope.spawn(move || {
+                barrier.wait();
+                first.attach_shared_runtime(runtime)
+            }));
         }
         for join in joins {
             join.join().unwrap().unwrap();
@@ -997,4 +1001,60 @@ fn checkpoint_recovery_reclaim_native_rejects_second_store() {
             .is_err(),
         "dropping the first Store reopened its runtime claim"
     );
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_finalized_suspension() {
+    let mut fixture = fresh_fixture(false);
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+    let (ids, guard) = finalized.finalized.suspend();
+    assert_eq!(ids.proof().target_identity(), fixture.target);
+    let ids = ids.rejoin(guard).unwrap();
+    assert_eq!(ids.guard().published().unwrap(), fixture.target.prefix);
+    assert!(matches!(
+        fixture.runtime.files.authority.try_acquire(),
+        Err(LimboError::Busy)
+    ));
+    let (ids, original_guard) = ids.suspend();
+    let foreign = fresh_fixture(false);
+    let guard = foreign.confirmed.unwrap().guard;
+    assert!(ids.rejoin(guard).is_err());
+    assert_eq!(original_guard.published().unwrap(), fixture.target.prefix);
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_reservation_is_linear() {
+    let fixture = fresh_fixture(false);
+    let store = MvStore::new(
+        crate::mvcc::clock::MvccClock::new(),
+        fixture.runtime.storage(),
+        false,
+    )
+    .unwrap();
+    let reservation = fixture.runtime.reserve_store().unwrap();
+    reservation.validate(&fixture.runtime).unwrap();
+    assert!(fixture.runtime.reserve_store().is_err());
+    assert!(matches!(
+        store.attach_shared_runtime(fixture.runtime.clone()),
+        Err(LimboError::Busy)
+    ));
+    drop(reservation);
+    let mismatch: Arc<dyn crate::mvcc::persistent_storage::DurableStorage> = Arc::new(
+        Storage::new(fixture.runtime.logical.clone(), fixture.io.clone(), None),
+    );
+    let wrong = MvStore::new(crate::mvcc::clock::MvccClock::new(), mismatch, false).unwrap();
+    assert!(wrong
+        .attach_shared_runtime(fixture.runtime.clone())
+        .is_err());
+    let reservation = fixture.runtime.reserve_store().unwrap();
+    let other = fresh_fixture(false);
+    assert!(reservation.validate(&other.runtime).is_err());
+    drop(reservation);
+    store
+        .attach_shared_runtime(fixture.runtime.clone())
+        .unwrap();
+    assert!(fixture.runtime.reserve_store().is_err());
 }

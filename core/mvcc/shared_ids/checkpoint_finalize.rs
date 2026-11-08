@@ -175,6 +175,61 @@ impl FinalizedIds {
     }
 }
 
+#[allow(dead_code)]
+pub(in crate::mvcc) struct SuspendedFinalizedIds {
+    ids: SuspendedIds,
+    proof: CompletedCheckpointProof,
+}
+
+#[allow(dead_code)]
+impl FinalizedIds {
+    pub(in crate::mvcc) fn suspend(self) -> (SuspendedFinalizedIds, AuthorityGuard) {
+        let (ids, guard) = self.loaded.suspend();
+        (
+            SuspendedFinalizedIds {
+                ids,
+                proof: self.proof,
+            },
+            guard,
+        )
+    }
+}
+
+#[allow(dead_code)]
+impl SuspendedFinalizedIds {
+    pub(in crate::mvcc) fn proof(&self) -> &CompletedCheckpointProof {
+        &self.proof
+    }
+
+    pub(in crate::mvcc) fn rejoin(self, guard: AuthorityGuard) -> Result<FinalizedIds> {
+        if !self.proof.matches_lease(&guard)
+            || self.ids.source_identity() != self.proof.target_identity()
+            || guard.published()? != self.proof.target_identity().prefix
+        {
+            return Err(invalid(
+                "finalized IDs lost their original target authority lease",
+            ));
+        }
+        guard.ensure_no_snapshot_locks()?;
+        if !guard.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        let loaded = self.ids.rejoin_source(guard)?;
+        if loaded.has_pending_checkpoint()
+            || loaded.identity() != self.proof.target_identity()
+            || loaded.state.logical_floor > self.proof.materialized_floor()
+        {
+            return Err(invalid(
+                "suspended finalized IDs no longer match their completed target",
+            ));
+        }
+        Ok(FinalizedIds {
+            loaded,
+            proof: self.proof,
+        })
+    }
+}
+
 impl IdCheckpointFinalize {
     pub(in crate::mvcc) fn poll(&mut self) -> Result<IOResult<FinalizedIds>> {
         use crate::io::{File, FileSyncType};
