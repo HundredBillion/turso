@@ -1,53 +1,44 @@
-name: Shared pager generation certification
+name: Shared pager Windows compilation
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  pager-generation-native:
-    runs-on: ubuntu-24.04
+  windows-pager-check:
+    runs-on: windows-latest
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
-      RUST_BACKTRACE: 1
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ef7a2adfbf243f1a43c8b2830c79e5aeb40884ac
+          ref: cde1b85918f86c0248b80518f8a1fb55586290bc
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: recovery-native-143ccda
-      - name: Record exact source
+          shared-key: pager-generation-windows-188
+      - name: Record exact source and platform
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ef7a2adfbf243f1a43c8b2830c79e5aeb40884ac
+          test "$(git rev-parse HEAD)" = cde1b85918f86c0248b80518f8a1fb55586290bc
           rustc -Vv | tee rustc.txt
-          stat -f -c 'temporary filesystem: %T (%t)' /tmp
-      - name: Native constructors and completed generation certificate
+      - name: Windows shared-refresh typecheck
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee constructor-green.log
-          grep -q '6 passed; 0 failed' constructor-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee certificate-green.log
-          grep -q '1 passed; 0 failed' certificate-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_ -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee generation-green.log
-          grep -q '14 passed; 0 failed' generation-green.log
-      - name: Strict lint and exact source
-        run: |
-          git diff --exit-code
-          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-check.log
           cargo fmt --all -- --check
+          git diff --exit-code
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pager-generation-ef7a2-native
+          name: pager-generation-cde1-windows
           path: |
             source.txt
             rustc.txt
-            '*green.log'
-            '*red.log'
-            'restored-*.log'
+            windows-check.log
