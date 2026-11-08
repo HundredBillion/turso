@@ -1,4 +1,4 @@
-name: Live sequence descriptor native validation
+name: Recovery physical inspection expected RED
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 630c7065e3f023468752fa7ae453fac000ddf6ad
+          ref: 26ebfc4cad628f0c21cbd0fd5654b4384f362d1a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,26 +25,25 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = "$(git rev-parse 630c7065e3f023468752fa7ae453fac000ddf6ad)"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse 26ebfc4cad628f0c21cbd0fd5654b4384f362d1a)"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
-      - name: Complete-frame descriptor regressions
+      - name: Verified recovery and physical-collector prerequisites
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ -- --test-threads=1 --nocapture 2>&1 | tee descriptor.log
-          grep -q '4 passed; 0 failed' descriptor.log
-      - name: Previously failing independent peer sequence preparation
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
+          grep -q '3 passed; 0 failed' entry.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_bootstrap::tests:: -- --test-threads=1 --nocapture 2>&1 | tee collector.log
+          grep -q '4 passed; 0 failed' collector.log
+      - name: Exact missing physical inspection
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native_peer_sequence_ddl -- --ignored --test-threads=1 --nocapture 2>&1 | tee peer-sequence.log
-          grep -q '1 passed; 0 failed' peer-sequence.log
-      - name: Shared ID opcode compatibility
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee id-opcodes.log
-          grep -q '6 passed; 0 failed' id-opcodes.log
-      - name: Complete MVCC database and strict library lint
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=2 2>&1 | tee mvcc.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' mvcc.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture > physical-red.log 2>&1
+          result=$?
+          set -e
+          cat physical-red.log
+          test "$result" -ne 0
+          grep -q 'checkpoint recovery physical inspection is not implemented' physical-red.log
+          grep -q '0 passed; 1 failed' physical-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
