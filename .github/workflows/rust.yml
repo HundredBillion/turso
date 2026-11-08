@@ -15,11 +15,11 @@ defaults:
 jobs:
   schema:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 16d66c6f0f81b46090878a0292f9a208a2866edc
+          ref: 64cdab386bd70e285a6f49c780971d485520e088
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 16d66c6f0f81b46090878a0292f9a208a2866edc
+          test "$(git rev-parse HEAD)" = 64cdab386bd70e285a6f49c780971d485520e088
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Native ordinary locks and exact downgrade regression
@@ -37,6 +37,12 @@ jobs:
           grep '^test result:' ordinary-locks.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker.log
           grep '^test result:' marker.log | tail -1 | grep -q '^test result: ok. 5 passed; 0 failed;'
+      - name: Broader ordinary core and SDK contracts
+        run: |
+          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api,bench -- --test-threads=2 2>&1 | tee core.log
+          grep '^test result:' core.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_sdk_kit --lib -- --test-threads=2 2>&1 | tee sdk.log
+          grep '^test result:' sdk.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
       - name: Actual io_uring lock ownership
         run: |
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,io_uring linux_ordinary_lock_native_uring_alias_cache_and_sigkill -- --ignored --test-threads=1 --nocapture 2>&1 | tee uring-locks.log
@@ -60,11 +66,11 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 16d66c6f0f81b46090878a0292f9a208a2866edc
+          ref: 64cdab386bd70e285a6f49c780971d485520e088
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
