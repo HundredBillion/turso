@@ -964,9 +964,7 @@ fn checkpoint_recovery_reclaim_native_rejects_second_store() {
         )
         .unwrap(),
     );
-    first
-        .attach_shared_runtime(fixture.runtime.clone())
-        .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
     std::thread::scope(|scope| {
         let mut joins = Vec::new();
         for _ in 0..8 {
