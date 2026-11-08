@@ -6,12 +6,16 @@ older workers before selecting an offline operation and acknowledge that fact
 with `--all-older-workers-stopped`. The protocol also checks current participants;
 a live transaction can return BUSY rather than being evicted or retried.
 
-An existing database must first be in ordinary MVCC mode:
+Existing ordinary SQLite DELETE/WAL and Turso MVCC databases use the same explicit operation:
 
 ```sh
-tursodb data.db 'PRAGMA journal_mode=mvcc;'
 tursodb data.db --shared-mvcc-offline upgrade-existing --all-older-workers-stopped
 ```
+
+An existing rollback journal, shared transition namespace, or foreign nonempty
+logical log is rejected before conversion. Recover a hot rollback journal with
+SQLite first. An acknowledged SQLite WAL is recovered under the retained native
+main-file exclusion; the operator does not replace it with an empty file.
 
 To initialize and publish a new database without replacing an existing file, use
 separate staging and destination paths:

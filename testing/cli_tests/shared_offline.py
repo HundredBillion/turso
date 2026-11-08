@@ -6,6 +6,7 @@ import json
 import os
 import select
 import sqlite3
+import sys
 import time
 from pathlib import Path
 import subprocess
@@ -66,6 +67,10 @@ def crash_cases(test_binary, directory, run):
         path, limit, namespace = Path(lines[0]), int(lines[1]), Path(lines[2])
         assert path.resolve().is_relative_to(case.resolve())
         assert namespace.parent == path.parent
+        if phase.startswith('cleanup-') and namespace.exists():
+            unchanged = snapshot(path.parent)
+            run(path, '--shared-mvcc-offline', 'upgrade-existing', '--all-older-workers-stopped', success=False)
+            assert snapshot(path.parent) == unchanged, 'wrong upgrade operation changed partial downgrade'
         operation = 'resume-downgrade-cleanup' if phase.startswith('cleanup-') else 'resume-downgrade-marker'
         before = path.read_bytes() if phase.startswith('cleanup-') else None
         run(path, '--shared-mvcc-offline', operation, '--all-older-workers-stopped',
@@ -81,7 +86,11 @@ def crash_cases(test_binary, directory, run):
     upgrade_child = selector('offline_marker_crash_child')
     for point in ['committed', 'checkpointed']:
         path = directory / f'upgrade-{point}.db'
-        run(path, sql="PRAGMA journal_mode=mvcc; CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO preserved VALUES(1,'before');")
+        with sqlite3.connect(path) as stock:
+            stock.executescript("CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO preserved VALUES(1,'before');")
+            if point == 'checkpointed':
+                stock.execute('PRAGMA journal_mode=WAL')
+        stock.close()
         env = dict(os.environ, TURSO_OFFLINE_MARKER_CRASH_PATH=str(path),
                    TURSO_OFFLINE_MARKER_CRASH_POINT=point)
         child = subprocess.run([str(test_binary), '--ignored', '--exact', upgrade_child, '--nocapture'],
@@ -99,7 +108,7 @@ def crash_cases(test_binary, directory, run):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True, type=Path)
-    parser.add_argument('--case', choices=['no-write', 'roundtrip', 'new', 'busy', 'crash', 'stock', 'stock-delete', 'stock-wal', 'close'], required=True)
+    parser.add_argument('--case', choices=['no-write', 'roundtrip', 'new', 'busy', 'crash', 'stock', 'stock-delete', 'stock-wal', 'stock-wal-crash', 'stock-refusals', 'close'], required=True)
     parser.add_argument('--test-binary', type=Path)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
@@ -128,6 +137,36 @@ def main():
         if args.case == 'crash':
             assert args.test_binary is not None, 'crash cases require the genuine native fixture executable'
             crash_cases(args.test_binary.resolve(strict=True), directory, run)
+        elif args.case == 'stock-refusals':
+            for kind in ('namespace', 'journal', 'tshm', 'foreign-log', 'wal-symlink', 'shm-hardlink'):
+                case_dir = directory / kind
+                case_dir.mkdir()
+                candidate = case_dir / 'ordinary.db'
+                with sqlite3.connect(candidate) as stock:
+                    stock.execute('CREATE TABLE preserved(value)')
+                    stock.execute("INSERT INTO preserved VALUES('unchanged')")
+                    stock.commit()
+                    stock.execute('PRAGMA journal_mode=WAL')
+                stock.close()
+                if kind == 'namespace':
+                    stat = candidate.stat()
+                    namespace = case_dir / f'.turso-mvcc-{stat.st_dev:016x}-{stat.st_ino:016x}'
+                    namespace.mkdir()
+                    (namespace / 'manifest').write_bytes(b'existing transition evidence')
+                elif kind == 'journal':
+                    Path(str(candidate) + '-journal').write_bytes(b'possibly hot rollback journal')
+                elif kind == 'tshm':
+                    Path(str(candidate) + '-tshm').write_bytes(b'other coordination')
+                elif kind == 'foreign-log':
+                    candidate.with_suffix('.db-log').write_bytes(b'foreign acknowledged log')
+                elif kind == 'wal-symlink':
+                    Path(str(candidate) + '-wal').symlink_to(candidate)
+                else:
+                    os.link(candidate, Path(str(candidate) + '-shm'))
+                before = snapshot(case_dir)
+                result = run(candidate, '--shared-mvcc-offline', 'upgrade-existing', '--all-older-workers-stopped', success=False)
+                assert snapshot(case_dir) == before, (kind, result.stderr)
+                assert candidate.read_bytes()[18:20] == bytes([2, 2]), kind
         elif args.case == 'no-write':
             for options in [
                 ['--shared-mvcc-offline', 'publish-new'],
@@ -150,7 +189,7 @@ def main():
                 assert not Path(str(stage) + '-wal').exists()
                 assert not stage.with_suffix('.db-log').exists()
             else:
-                if args.case in ('stock', 'stock-delete', 'stock-wal'):
+                if args.case in ('stock', 'stock-delete', 'stock-wal', 'stock-wal-crash'):
                     with sqlite3.connect(path) as stock:
                         stock.executescript("CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); CREATE UNIQUE INDEX preserved_value ON preserved(value); INSERT INTO preserved VALUES(1,'before'); CREATE TABLE typed(i INTEGER, r REAL, t TEXT, b BLOB, z); CREATE INDEX typed_text ON typed(t);")
                         stock.execute('INSERT INTO typed VALUES(?,?,?,?,?)', (-17, 1.25, 'héllo', b'\x00\xff', None))
@@ -159,13 +198,28 @@ def main():
                     stock.close()
                     if args.case == 'stock':
                         run(path, sql='PRAGMA journal_mode=mvcc;')
-                    elif args.case == 'stock-wal':
+                    elif args.case in ('stock-wal', 'stock-wal-crash'):
                         with sqlite3.connect(path) as stock:
                             assert stock.execute('PRAGMA journal_mode=WAL').fetchone() == ('wal',)
                         stock.close()
-                    assert path.read_bytes()[18:20] == bytes([255, 255] if args.case == 'stock' else [2, 2] if args.case == 'stock-wal' else [1, 1])
+                    assert path.read_bytes()[18:20] == bytes([255, 255] if args.case == 'stock' else [2, 2] if args.case in ('stock-wal', 'stock-wal-crash') else [1, 1])
                 else:
                     run(path, sql="PRAGMA journal_mode=mvcc; CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); CREATE UNIQUE INDEX preserved_value ON preserved(value); INSERT INTO preserved VALUES(1,'before');")
+                if args.case == 'stock-wal-crash':
+                    child = subprocess.Popen([sys.executable, '-u', '-c',
+                        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA synchronous=FULL'); c.execute('PRAGMA wal_autocheckpoint=0'); c.execute('CREATE TABLE acknowledged_wal(id INTEGER PRIMARY KEY, value TEXT)'); c.execute(\"INSERT INTO acknowledged_wal VALUES(42,'durable-before-death')\"); c.commit(); print('ACK42',flush=True); sys.stdin.read()",
+                        str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        ready, _, _ = select.select([child.stdout], [], [], 15)
+                        assert ready and child.stdout.readline() == b'ACK42\n', 'SQLite child failed to acknowledge commit'
+                        assert Path(str(path) + '-wal').stat().st_size > 32
+                        assert Path(str(path) + '-shm').is_file()
+                        child.kill()
+                        assert child.wait(timeout=5) == -9
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.wait(timeout=5)
                 inode = path.stat().st_ino
                 offline(path, 'upgrade-existing')
                 assert path.stat().st_ino == inode
@@ -178,6 +232,8 @@ def main():
             assert snapshot(directory) == before
             if args.case == 'new':
                 run(path, '--shared-mvcc', sql="CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO preserved VALUES(1,'before');")
+            if args.case == 'stock-wal-crash':
+                assert run(path, '--shared-mvcc', '--readonly', sql='SELECT id,value FROM acknowledged_wal').stdout.strip() == '42|durable-before-death'
             committed = run(path, '--shared-mvcc', sql="BEGIN CONCURRENT; UPDATE preserved SET value='after' WHERE id=1; INSERT INTO preserved VALUES(2,'peer'); COMMIT; SELECT 'COMMITTED_BEFORE_CLOSE';", success=None if args.case == 'close' else True)
             assert committed.stdout.strip() == 'COMMITTED_BEFORE_CLOSE', committed.stdout
             assert run(path, '--shared-mvcc', '--readonly', sql='SELECT id,value FROM preserved ORDER BY id').stdout.strip() == '1|after\n2|peer'
@@ -225,11 +281,13 @@ def main():
             assert not path.with_suffix('.db-log').exists()
             assert run(path, sql='SELECT id,value FROM preserved ORDER BY id').stdout.strip() == '1|after\n2|peer'
             assert run(path, sql='PRAGMA integrity_check').stdout.strip() == 'ok'
-            if args.case in ('stock', 'stock-delete', 'stock-wal'):
+            if args.case in ('stock', 'stock-delete', 'stock-wal', 'stock-wal-crash'):
                 with sqlite3.connect(path) as stock:
                     assert stock.execute('SELECT i,r,t,b,z FROM typed INDEXED BY typed_text').fetchall() == [(-17, 1.25, 'héllo', b'\x00\xff', None)]
                     assert stock.execute("SELECT name,sql FROM sqlite_schema WHERE name IN ('preserved','preserved_value','typed','typed_text') ORDER BY name").fetchall() == schema
                     assert stock.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+                    if args.case == 'stock-wal-crash':
+                        assert stock.execute('SELECT id,value FROM acknowledged_wal').fetchall() == [(42, 'durable-before-death')]
                 stock.close()
     print(json.dumps({'case': args.case, 'result': 'passed'}), flush=True)
 
