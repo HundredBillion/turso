@@ -4,6 +4,7 @@ on:
 permissions:
   contents: read
 env:
+  CC_x86_64_pc_windows_msvc: cl.exe
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
@@ -18,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fa22532749e2c20839ad12b678fc8985d9b83fa6
+          ref: 8f71b5525766e4a070f6397a09d24946794f8cd9
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -26,7 +27,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "fa22532749e2c20839ad12b678fc8985d9b83fa6"
+          test "$(git rev-parse HEAD)" = "8f71b5525766e4a070f6397a09d24946794f8cd9"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -103,6 +104,19 @@ jobs:
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade.log
           grep -q "7 passed; 0 failed" downgrade.log
+      - name: Actual shared database open and downgrade marker
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_ -- --ignored --test-threads=1 2>&1 | tee shared-open.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-open.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 2>&1 | tee marker.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' marker.log
+      - name: C bindings and SDK integration
+        run: |
+          cargo build --locked -p turso_sqlite3
+          LD_LIBRARY_PATH="$PWD/target/debug" cargo test --locked -p turso_sqlite3 --lib --test compat -- --test-threads=2 2>&1 | tee c-compat.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' c-compat.log
+          cargo test --locked -p turso_sdk_kit --lib 2>&1 | tee sdk.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' sdk.log
       - name: Full ordinary core and strict lint
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee core.log
@@ -121,10 +135,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fa22532749e2c20839ad12b678fc8985d9b83fa6
+          ref: 8f71b5525766e4a070f6397a09d24946794f8cd9
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
       - name: Check ordinary Windows compatibility
         run: cargo check --locked -p turso_core --lib --features conn_raw_api,bench
+      - name: Windows C binding compatibility
+        shell: pwsh
+        run: |
+          cargo build --locked -p turso_sqlite3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$pwd\target\debug;$env:PATH"
+          cargo test --locked -p turso_sqlite3 --lib --test compat -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
