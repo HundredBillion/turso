@@ -4,6 +4,16 @@ mod shared_pager_generation;
 #[path = "shared_checkpoint.rs"]
 mod shared_checkpoint;
 
+#[path = "shared_checkpoint_recovery.rs"]
+mod shared_checkpoint_recovery;
+
+#[path = "shared_checkpoint_recovery_physical.rs"]
+mod shared_checkpoint_recovery_physical;
+
+#[path = "shared_checkpoint_recovery_ids.rs"]
+mod shared_checkpoint_recovery_ids;
+pub(in crate::mvcc) use shared_checkpoint_recovery_ids::RecoveryCompletionEvidence;
+
 #[path = "shared_id_runtime.rs"]
 mod shared_id_runtime;
 pub(crate) use shared_id_runtime::{SharedIdRequest, SharedIdResult, SharedIdState};
@@ -28,6 +38,8 @@ use crate::sync::Weak;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct SharedMvccRuntime {
+    io: Arc<dyn crate::IO>,
+    path: PathBuf,
     files: SharedMvccFiles,
     gate: Arc<CheckpointAdmissionGate>,
     main: Arc<GuardedFile>,
@@ -136,9 +148,11 @@ impl SharedMvccRuntime {
             database_id,
             history_limit,
         )?;
-        let storage = Arc::new(Storage::new(logical.clone(), io, None));
+        let storage = Arc::new(Storage::new(logical.clone(), io.clone(), None));
         let wal_path = files.namespace.join("physical-wal");
         Ok(Arc::new(Self {
+            io,
+            path: canonical_path.to_path_buf(),
             files,
             gate,
             main,
@@ -1392,3 +1406,7 @@ mod shared_physical_native_tests;
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_connection_tests.rs"]
 mod shared_connection_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_checkpoint_recovery_io_tests.rs"]
+mod shared_checkpoint_recovery_io_tests;
