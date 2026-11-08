@@ -1,7 +1,7 @@
 #[path = "shared_checkpoint_recovery_bootstrap.rs"]
 mod shared_checkpoint_recovery_bootstrap;
 pub(crate) use shared_checkpoint_recovery_bootstrap::{
-    RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
 };
 
 use super::*;

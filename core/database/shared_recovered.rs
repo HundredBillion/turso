@@ -67,6 +67,146 @@ impl RecoveryOpenConfig {
     }
 }
 
+pub(crate) struct RecoveredDatabaseFactory {
+    connection: Option<Arc<Connection>>,
+    pager: Option<Arc<Pager>>,
+    database: Option<Arc<Database>>,
+    building: Option<Database>,
+    validation: HeaderValidationState,
+    permit: Arc<crate::mvcc::database::RecoveryConstructionPermit>,
+    config: Arc<RecoveryOpenConfig>,
+}
+impl RecoveredDatabaseFactory {
+    pub(crate) fn new(source: &crate::mvcc::database::RecoveryBootstrapEvidence) -> Result<Self> {
+        source.validate()?;
+        let config = source.config().clone();
+        let io = source.io();
+        let runtime = source.runtime();
+        let flags = if config.effective_readonly(source.original_readonly()) {
+            OpenFlags::NoLock | OpenFlags::ReadOnly
+        } else {
+            OpenFlags::NoLock
+        };
+        let mut database = Database::new(
+            config.options.db_opts,
+            flags,
+            source.path()?,
+            runtime.wal_path().to_str().ok_or_else(|| {
+                LimboError::InvalidArgument("shared WAL path must be UTF-8".into())
+            })?,
+            &io,
+            Arc::new(DatabaseFile::new(runtime.main_file())),
+            None,
+            config.options.allocators.clone(),
+            None,
+            config.options.dialect.clone(),
+            &config.options.native_extensions,
+        )?;
+        {
+            let shared =
+                Arc::get_mut(&mut database.shared).expect("new recovery Database state is unique");
+            shared.shared_mvcc_runtime = Some(runtime.clone());
+            shared.durable_storage = Some(runtime.storage());
+            shared.mv_store.store(Some(source.store().clone()));
+        }
+        let permit = source.make_permit(&database)?;
+        Arc::get_mut(&mut database.shared)
+            .expect("new recovery Database state is unique")
+            .recovery_construction = Some(permit.clone());
+        Ok(Self {
+            connection: None,
+            pager: None,
+            database: None,
+            building: Some(database),
+            validation: Default::default(),
+            permit,
+            config,
+        })
+    }
+    pub(crate) fn poll(
+        &mut self,
+        source: &mut crate::mvcc::database::RecoveryBootstrapEvidence,
+    ) -> IOResultOr<()> {
+        self.permit.validate_source(source)?;
+        if !Arc::ptr_eq(source.config(), &self.config) {
+            return Err(LimboError::InvalidArgument(
+                "recovery constructor resumed with another configuration".into(),
+            )
+            .into());
+        }
+        if self.database.is_none() {
+            let pager = return_if_io!(self.building.as_mut().unwrap().header_validation(
+                &mut self.validation,
+                None,
+                None
+            ));
+            self.pager = Some(pager);
+            self.database = Some(Arc::new(self.building.take().unwrap()));
+        }
+        let database = self.database.as_ref().unwrap();
+        self.permit.validate_database(database)?;
+        let pager = self.pager.as_ref().unwrap();
+        let header = return_if_io!(pager.with_header(|header| *header));
+        source.validate_header(&header)?;
+        if let Some(waiter) = source.physical_retirement() {
+            return Ok(IOResult::IO(crate::types::IOCompletions(waiter)));
+        }
+        if self.connection.is_none() {
+            self.connection = Some(database.new_connection(
+                false,
+                pager.clone(),
+                None,
+                header.default_page_cache_size.get(),
+                ConnectionContext::default(),
+                database.is_readonly(),
+            )?);
+        }
+        Ok(IOResult::Done(()))
+    }
+    pub(crate) fn finish(
+        &mut self,
+        source: &mut crate::mvcc::database::RecoveryBootstrapEvidence,
+    ) -> Result<crate::mvcc::database::RecoveredDatabaseReady> {
+        self.permit.validate_source(source)?;
+        let database = self.database.as_ref().ok_or(LimboError::Busy)?;
+        let connection = self.connection.as_ref().ok_or(LimboError::Busy)?;
+        self.permit.validate_database(database)?;
+        source.install(connection)?;
+        self.permit.validate_database(database)?;
+        source.finish_ready(database.clone(), connection.clone())
+    }
+
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(crate) fn test_connections(&self) -> Result<(Arc<Connection>, Arc<Connection>)> {
+        let original = self.connection.as_ref().ok_or(LimboError::Busy)?.clone();
+        let database = self.database.as_ref().ok_or(LimboError::Busy)?;
+        let peer = database.new_connection(
+            false,
+            self.pager.as_ref().ok_or(LimboError::Busy)?.clone(),
+            None,
+            0,
+            ConnectionContext::default(),
+            database.is_readonly(),
+        )?;
+        Ok((original, peer))
+    }
+    fn abort(&mut self) {
+        if let HeaderValidationState::Start { init } = &mut self.validation {
+            init.cancel();
+        }
+        self.connection = None;
+        self.validation = Default::default();
+        self.pager = None;
+        self.database = None;
+        self.building = None;
+    }
+}
+impl Drop for RecoveredDatabaseFactory {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,118 +389,5 @@ mod tests {
         let options = OpenOptions::new(Arc::new(crate::EngineDialect))
             .storage(Arc::new(DatabaseFile::new(file)));
         assert!(RecoveryOpenConfig::capture(options).is_err());
-    }
-}
-
-pub(crate) struct RecoveredDatabaseFactory {
-    connection: Option<Arc<Connection>>,
-    pager: Option<Arc<Pager>>,
-    database: Option<Arc<Database>>,
-    building: Option<Database>,
-    validation: HeaderValidationState,
-    permit: Arc<crate::mvcc::database::RecoveryConstructionPermit>,
-    config: Arc<RecoveryOpenConfig>,
-}
-impl RecoveredDatabaseFactory {
-    pub(crate) fn new(source: &crate::mvcc::database::RecoveryBootstrapEvidence) -> Result<Self> {
-        source.validate()?;
-        let config = source.config().clone();
-        let io = source.io();
-        let runtime = source.runtime();
-        let flags = if config.effective_readonly(source.original_readonly()) {
-            OpenFlags::NoLock | OpenFlags::ReadOnly
-        } else {
-            OpenFlags::NoLock
-        };
-        let mut database = Database::new(
-            config.options.db_opts,
-            flags,
-            source.path()?,
-            runtime.wal_path().to_str().ok_or_else(|| {
-                LimboError::InvalidArgument("shared WAL path must be UTF-8".into())
-            })?,
-            &io,
-            Arc::new(DatabaseFile::new(runtime.main_file())),
-            None,
-            config.options.allocators.clone(),
-            None,
-            config.options.dialect.clone(),
-            &config.options.native_extensions,
-        )?;
-        {
-            let shared =
-                Arc::get_mut(&mut database.shared).expect("new recovery Database state is unique");
-            shared.shared_mvcc_runtime = Some(runtime.clone());
-            shared.durable_storage = Some(runtime.storage());
-            shared.mv_store.store(Some(source.store().clone()));
-        }
-        let permit = source.make_permit(&database)?;
-        Arc::get_mut(&mut database.shared)
-            .expect("new recovery Database state is unique")
-            .recovery_construction = Some(permit.clone());
-        Ok(Self {
-            connection: None,
-            pager: None,
-            database: None,
-            building: Some(database),
-            validation: Default::default(),
-            permit,
-            config,
-        })
-    }
-    pub(crate) fn poll(
-        &mut self,
-        source: &mut crate::mvcc::database::RecoveryBootstrapEvidence,
-    ) -> IOResultOr<()> {
-        self.permit.validate_source(source)?;
-        if !Arc::ptr_eq(source.config(), &self.config) {
-            return Err(LimboError::InvalidArgument(
-                "recovery constructor resumed with another configuration".into(),
-            )
-            .into());
-        }
-        if self.database.is_none() {
-            let pager = return_if_io!(self.building.as_mut().unwrap().header_validation(
-                &mut self.validation,
-                None,
-                None
-            ));
-            self.pager = Some(pager);
-            self.database = Some(Arc::new(self.building.take().unwrap()));
-        }
-        let database = self.database.as_ref().unwrap();
-        self.permit.validate_database(database)?;
-        let pager = self.pager.as_ref().unwrap();
-        let header = return_if_io!(pager.with_header(|header| *header));
-        source.validate_header(&header)?;
-        if let Some(waiter) = source.physical_retirement() {
-            return Ok(IOResult::IO(crate::types::IOCompletions(waiter)));
-        }
-        if self.connection.is_none() {
-            self.connection = Some(database.new_connection(
-                false,
-                pager.clone(),
-                None,
-                header.default_page_cache_size.get(),
-                ConnectionContext::default(),
-                database.is_readonly(),
-            )?);
-        }
-        Ok(IOResult::Done(()))
-    }
-    fn abort(&mut self) {
-        if let HeaderValidationState::Start { init } = &mut self.validation {
-            init.cancel();
-        }
-        self.connection = None;
-        self.validation = Default::default();
-        self.pager = None;
-        self.database = None;
-        self.building = None;
-    }
-}
-impl Drop for RecoveredDatabaseFactory {
-    fn drop(&mut self) {
-        self.abort();
     }
 }

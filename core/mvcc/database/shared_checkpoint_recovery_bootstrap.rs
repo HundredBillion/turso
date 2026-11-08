@@ -97,7 +97,105 @@ impl RecoveryConstructionPermit {
     }
 }
 
+impl RecoveredDatabaseReady {
+    pub(in crate::mvcc) fn into_parts(self) -> (Arc<crate::Database>, Arc<Connection>) {
+        (self.database, self.connection)
+    }
+}
+
 impl RecoveryBootstrapEvidence {
+    pub(crate) fn install(&mut self, connection: &Arc<Connection>) -> Result<()> {
+        self.validate()?;
+        connection.db.validate_shared_runtime(&self.runtime)?;
+        if !connection
+            .db
+            .get_mv_store()
+            .as_ref()
+            .is_some_and(|store| Arc::ptr_eq(store, &self.store))
+        {
+            return Err(LimboError::InvalidArgument(
+                "recovery installation changed its Store".into(),
+            ));
+        }
+        let parts = self.parts.take().ok_or_else(|| {
+            LimboError::InvalidArgument("recovery base was already installed".into())
+        })?;
+        let generation = connection.prepare_context_generation();
+        generation.checked_add(1).ok_or(LimboError::DatabaseFull)?;
+        self.prepared = Some(self.store.prepare_generation_reload(
+            parts.header,
+            &parts.schema,
+            parts.persistent_timestamp,
+        )?);
+        self.replay = Some(SharedReplayContext::new(
+            parts.into_context(&self.store),
+            self.record,
+            self.runtime.storage(),
+        ));
+        if !self
+            .replay
+            .as_ref()
+            .unwrap()
+            .matches_oracle_identity(self.proof().target_identity())
+        {
+            return Err(LimboError::Corrupt(
+                "recovered replay differs from the completed base".into(),
+            ));
+        }
+        self.original_connection = Some(Arc::downgrade(connection));
+        connection.get_pager().reset_shared_generation()?;
+        self.prepared
+            .take()
+            .unwrap()
+            .install(&self.store, self.proof(), self.guard())?;
+        *connection.db.schema.lock() = self.schema.clone();
+        *connection.schema.write() = self.schema.clone();
+        connection.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    pub(crate) fn finish_ready(
+        &mut self,
+        database: Arc<crate::Database>,
+        connection: Arc<Connection>,
+    ) -> Result<RecoveredDatabaseReady> {
+        self.validate()?;
+        let target = self.proof().target_identity();
+        if !self.original_connection.as_ref().is_some_and(|original| {
+            crate::sync::Weak::ptr_eq(original, &Arc::downgrade(&connection))
+        }) || !Arc::ptr_eq(&database, &connection.db)
+            || !Arc::ptr_eq(&self.schema, &database.schema.lock())
+            || !Arc::ptr_eq(&self.schema, &connection.schema.read())
+            || self.store.last_committed_tx_ts.load(Ordering::Acquire)
+                != target.prefix.committed_timestamp
+            || self.store.durable_txid_max.load(Ordering::Acquire)
+                != target.database.checkpoint_timestamp
+            || !self
+                .replay
+                .as_ref()
+                .is_some_and(|replay| replay.matches_oracle_identity(target))
+        {
+            return Err(LimboError::InvalidArgument(
+                "recovered Database is not ready for admission".into(),
+            ));
+        }
+        self.runtime
+            .certify_completed_pager(&connection, self.proof(), self.guard())?;
+        let (ids, _proof) = self.finalized.take().unwrap().into_parts();
+        let guard = ids.into_guard();
+        *self.runtime.replay.lock() = self.replay.take();
+        if let Err(error) = guard.finish() {
+            self.runtime.replay.lock().take();
+            return Err(error);
+        }
+        self.bindings.clear();
+        self.pause.take();
+        Ok(RecoveredDatabaseReady {
+            database,
+            connection,
+        })
+    }
+
     fn guard(&self) -> &AuthorityGuard {
         self.finalized.as_ref().unwrap().guard()
     }
@@ -312,10 +410,14 @@ impl RecoveryBootstrap {
                 .as_mut()
                 .unwrap()
                 .poll(self.evidence.as_mut().unwrap()));
-            Err(LimboError::InvalidArgument(
-                "normal recovered database bootstrap is not implemented".into(),
-            )
-            .into())
+            let ready = self
+                .factory
+                .as_mut()
+                .unwrap()
+                .finish(self.evidence.as_mut().unwrap())?;
+            self.factory = None;
+            self.evidence = None;
+            Ok(IOResult::Done(ready))
         })();
         if result.is_err() {
             self.abort();

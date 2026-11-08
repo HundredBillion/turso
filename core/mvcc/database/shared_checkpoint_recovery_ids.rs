@@ -2,7 +2,7 @@
 mod shared_checkpoint_recovery_confirmation;
 pub(in crate::mvcc) use shared_checkpoint_recovery_confirmation::RecoveryCompletionEvidence;
 pub(crate) use shared_checkpoint_recovery_confirmation::{
-    RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
 };
 
 use super::shared_checkpoint_recovery_physical::InspectedRecoveryBase;

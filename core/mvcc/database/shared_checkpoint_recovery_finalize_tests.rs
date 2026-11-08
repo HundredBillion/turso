@@ -1171,13 +1171,12 @@ fn checkpoint_recovery_bootstrap_native_original_optin_survives() {
     let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
     assert!(Arc::ptr_eq(reclaimed.config_for_test(), &original));
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
-    let error = match fixture.io.block(|| bootstrap.poll()) {
-        Ok(_) => panic!("missing factory produced readiness"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("normal recovered database bootstrap is not implemented"));
+    let ready = fixture.io.block(|| bootstrap.poll()).unwrap();
+    let (database, connection) = ready.into_parts();
+    assert_eq!(database.dialect().name(), "engine");
+    connection
+        .execute("UPDATE preserved SET value='original opt-in recovered' WHERE id=1")
+        .unwrap();
 }
 
 #[test]
@@ -1201,4 +1200,33 @@ fn checkpoint_recovery_bootstrap_native_rejects_changed_history() {
         [0, 2, 3].map(|index| std::fs::read(&fixture.paths[index]).unwrap()),
         before
     );
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_captured_readonly_view_stays_readonly() {
+    let options =
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).flags(crate::OpenFlags::ReadOnly);
+    let mut fixture = fresh_fixture_with_options(false, false, |io| io, options);
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| finalizing.poll()).unwrap();
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
+    let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+    let ready = fixture.io.block(|| bootstrap.poll()).unwrap();
+    let (database, connection) = ready.into_parts();
+    assert!(database.is_readonly());
+    let mut values = Vec::new();
+    connection
+        .prepare("SELECT value FROM preserved WHERE id=1")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, ["durable payload"]);
+    assert!(connection
+        .execute("UPDATE preserved SET value='forbidden' WHERE id=1")
+        .is_err());
 }

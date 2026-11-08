@@ -450,8 +450,12 @@ fn checkpoint_recovery_bootstrap_native_missing_ready() {
     let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
     assert_reclaimed(&fixture, &trace, &reclaimed);
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
-    let _ready = fixture.io.block(|| bootstrap.poll()).unwrap();
-    panic!("stub returned recovery readiness without a Database");
+    let ready = fixture.io.block(|| bootstrap.poll()).unwrap();
+    let (database, connection) = ready.into_parts();
+    assert!(Arc::ptr_eq(&database, &connection.db));
+    connection
+        .execute("UPDATE preserved SET value='reclaimed and ready' WHERE id=1")
+        .unwrap();
 }
 
 pub(in super::super) fn bootstrap_fixture() -> (

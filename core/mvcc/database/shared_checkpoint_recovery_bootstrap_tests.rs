@@ -90,23 +90,64 @@ fn checkpoint_recovery_bootstrap_native_failed_allocation_releases_unused_claim(
 
 #[test]
 #[ignore = "requires native shared MVCC files"]
-fn checkpoint_recovery_bootstrap_native_missing_factory_withdraws_store() {
+fn checkpoint_recovery_bootstrap_native_ready_reopens_admission_and_commits() {
     let (_directory, io, runtime, reclaimed) = bootstrap_fixture();
+    let target = reclaimed.proof().target_identity();
+    let path = runtime.path.clone();
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
     bootstrap.prepare_store().unwrap();
-    let weak = Arc::downgrade(&bootstrap.evidence.as_ref().unwrap().store);
-    let error = match io.block(|| bootstrap.poll()) {
-        Ok(_) => panic!("unimplemented recovery factory produced readiness"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("normal recovered database bootstrap is not implemented"));
+    let store = Arc::downgrade(&bootstrap.evidence.as_ref().unwrap().store);
+    let ready = io.block(|| bootstrap.poll()).unwrap();
+    let (database, connection) = ready.into_parts();
     assert!(bootstrap.evidence.is_none());
-    assert!(weak.upgrade().is_none());
-    assert!(runtime.replay.lock().is_none());
+    assert!(store.upgrade().is_some());
     assert!(runtime.reserve_store().is_err());
-    assert!(bootstrap.prepare_store().is_err());
+    assert_eq!(
+        runtime.replay.lock().as_ref().unwrap().identity().unwrap(),
+        target
+    );
+    assert!(runtime.gate.try_enter_admission().is_ok());
+    drop(runtime.files.authority.try_acquire().unwrap());
+    let mut before = Vec::new();
+    connection
+        .prepare("SELECT value FROM preserved WHERE id=1")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            before.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(before, ["durable payload"]);
+    connection.execute("UPDATE preserved SET value='normal recovery committed' WHERE id=1; INSERT INTO preserved VALUES(2,'new row')").unwrap();
+    assert!(
+        runtime
+            .replay
+            .lock()
+            .as_ref()
+            .unwrap()
+            .identity()
+            .unwrap()
+            .prefix
+            .end_offset
+            > 0
+    );
+    let fresh = crate::Database::open(
+        io,
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(database.dialect().clone())
+            .with_shared_mvcc_for_test(runtime.files.authority.configured_history_limit()),
+    )
+    .unwrap();
+    let peer = fresh.connect(crate::ConnectOpts::new()).unwrap();
+    let mut values = Vec::new();
+    peer.prepare("SELECT value FROM preserved ORDER BY id")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, ["normal recovery committed", "new row"]);
 }
 
 struct HeldRead {
@@ -134,11 +175,13 @@ struct ReadControl {
 #[derive(Default)]
 struct ReleaseObserver {
     read: Mutex<ReadControl>,
+    fail_finish: crate::sync::atomic::AtomicBool,
     store: Mutex<Option<crate::sync::Weak<crate::MvStore>>>,
     releases: crate::sync::atomic::AtomicUsize,
     live_store_at_release: crate::sync::atomic::AtomicBool,
 }
 struct ReleaseFile {
+    authority: bool,
     inner: Arc<dyn File>,
     observer: Arc<ReleaseObserver>,
 }
@@ -233,7 +276,14 @@ impl File for ReleaseFile {
                     .store(true, Ordering::Release);
             }
         }
-        self.inner.shared_wal_unlock_byte(offset, kind)
+        self.inner.shared_wal_unlock_byte(offset, kind)?;
+        if self.authority && offset == 1 && self.observer.fail_finish.swap(false, Ordering::AcqRel)
+        {
+            return Err(LimboError::InvalidArgument(
+                "injected recovered publication unlock failure".into(),
+            ));
+        }
+        Ok(())
     }
     fn shared_wal_set_len(&self, size: u64) -> Result<()> {
         self.inner.shared_wal_set_len(size)
@@ -267,6 +317,10 @@ impl crate::IO for ReleaseIo {
     ) -> Result<Arc<dyn File>> {
         let file = self.inner.open_file(path, flags, direct)?;
         Ok(Arc::new(ReleaseFile {
+            authority: std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("authority"),
             inner: file,
             observer: self.observer.clone(),
         }))
@@ -446,5 +500,79 @@ fn checkpoint_recovery_bootstrap_native_factory_waits_for_physical_retirement() 
         assert!(runtime.replay.lock().is_none());
         drop(factory);
         drop(bootstrap);
+    }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_late_failures_leave_no_ready_replay() {
+    use super::super::super::tests::reclaim_tests::bootstrap_fixture_with_io;
+    for boundary in 0..4 {
+        let observer = Arc::new(ReleaseObserver::default());
+        let wrapping = observer.clone();
+        let (_directory, io, runtime, reclaimed) = bootstrap_fixture_with_io(move |inner| {
+            Arc::new(ReleaseIo {
+                inner,
+                observer: wrapping,
+            })
+        });
+        let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+        bootstrap.prepare_store().unwrap();
+        let evidence = bootstrap.evidence.as_mut().unwrap();
+        let mut factory =
+            crate::database::shared_recovered::RecoveredDatabaseFactory::new(evidence).unwrap();
+        io.block(|| factory.poll(evidence)).unwrap();
+        let (original, _) = factory.test_connections().unwrap();
+        evidence.install(&original).unwrap();
+        let (_, foreign) = factory.test_connections().unwrap();
+        assert!(Arc::ptr_eq(&foreign.schema.read(), &original.schema.read()));
+        let pager = original.get_pager();
+        match boundary {
+            0 => {
+                evidence
+                    .store
+                    .last_committed_tx_ts
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            1 => pager.begin_read_tx().unwrap(),
+            2 => observer.fail_finish.store(true, Ordering::Release),
+            3 => {}
+            _ => unreachable!(),
+        }
+        let offered = if boundary == 3 {
+            foreign.clone()
+        } else {
+            original.clone()
+        };
+        let error = match evidence.finish_ready(original.db.clone(), offered) {
+            Ok(_) => panic!("recovered readiness ignored late fault {boundary}"),
+            Err(error) => error,
+        };
+        match boundary {
+            0 | 3 => assert!(
+                error.to_string().contains("not ready for admission"),
+                "{error}"
+            ),
+            1 => {
+                assert!(matches!(error, LimboError::Busy), "{error}");
+                pager.end_read_tx();
+            }
+            2 => assert!(
+                error
+                    .to_string()
+                    .contains("injected recovered publication unlock failure"),
+                "{error}"
+            ),
+            _ => unreachable!(),
+        }
+        assert!(runtime.replay.lock().is_none());
+        drop(pager);
+        drop(foreign);
+        drop(original);
+        drop(factory);
+        drop(bootstrap);
+        assert!(runtime.replay.lock().is_none());
+        assert!(runtime.gate.try_enter_admission().is_ok());
+        assert!(runtime.reserve_store().is_err());
     }
 }
