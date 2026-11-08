@@ -2106,8 +2106,8 @@ mod tests {
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn cached_sdk_join_preserves_existing_process_file_lock() {
-        let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
         use turso_core::IO;
+        let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
 
         const CHILD_PATH: &str = "TURSO_SDK_LOCK_PROBE_PATH";
         const CHILD_BLOCKED: &str = "TURSO_SDK_LOCK_PROBE_BLOCKED";
