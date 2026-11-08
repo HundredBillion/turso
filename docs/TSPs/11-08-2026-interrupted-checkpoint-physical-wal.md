@@ -56,15 +56,19 @@ impl GuardedFile {
 impl SharedWalRecoveryLocks {
     pub(crate) fn acquire(mapping: Arc<MappedSharedWalCoordination>) -> Result<Arc<Self>>;
     // No arbitrary caller-provided snapshot is accepted by these methods.
-    pub(crate) fn install_scanned(&self, evidence: &RecoveryWalEvidence) -> Result<()>;
     pub(crate) fn install_empty(&self, evidence: &RecoveredPhysicalWalEvidence) -> Result<()>;
-    pub(crate) fn begin_sync(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<Completion>;
+    pub(crate) fn begin_sync(
+        self: &Arc<Self>,
+        evidence: RecoveryWalSyncEvidence,
+    ) -> Result<Completion>;
 }
 ```
 
-The runtime constructs the physical lock owner only from its actual retained coordination Arc, and validates that association before binding either file. The evidence types have private constructors in the runtime recovery child. They bind the actual runtime, retained main/WAL/manifest/native coordination identities, original full intent, original authority lease, exact scanner output Arc and observed file lengths. Storage validates these associations before publishing derived coordination. `begin_sync` retains both native exclusion and an MVCC pin in the real backend sync completion.
+The runtime constructs the physical lock owner only from its actual retained coordination Arc, and validates that association before binding either file. The evidence types have private constructors in the runtime recovery child. They bind the actual runtime, retained main/WAL/manifest/native coordination identities, original full intent, original authority lease, exact scanner output Arc and observed file lengths. Storage accepts only the final actual synced-main/empty-WAL evidence for derived reconciliation. `RecoveryWalSyncEvidence` is an opaque crate-private owner constructed only by the runtime after those associations are checked; its fields retain physical exclusion before the MVCC pin in drop order. Storage captures the whole owner in the real backend sync completion. Neither `AuthorityGuard` nor `IoPin` needs broader visibility.
 
-`install_scanned` copies only the committed scan's header/checksums/index, sets `nbackfills=0`, clears obsolete backfill proof/index and repairs an interrupted derived seqlock under all native locks. It does not trust mapped max frame, salt, CRC, generation or positive backfill. Preserve/increment the local visibility counter only as invalidation metadata, never as durable-file proof. A final exact zero-frame snapshot comes from the actual locally checkpointed WAL plus empty actual file, not from a guessed timestamp or invented normal record.
+**Approved refinement:** No initial mapped reseed is performed. The private effective-image reader and copy pager use only an in-process WAL built from the actual committed disk scan. They must never call mapped snapshot, backfill, checksum or frame-index APIs, including through close, metadata or debug paths that could spin on an odd seqlock. Native physical ownership prevents other legitimate participants from consulting/replacing that state during copying.
+
+After main is actually synced, WAL is actually empty and fresh main-only inspection matches the prevalidated committed image, `install_empty` clears obsolete derived index/backfill state and repairs an interrupted mapped seqlock under all native locks. The exact zero-frame header comes from the actual locally checkpointed WAL, not a guessed timestamp or invented normal record. Preserve/increment visibility counters only as invalidation metadata, never as durable-file proof. The final actual mapping sync and backend retirement remain required before returning; later complete recovery/new-peer acceptance must prove usability. This refinement removes an unnecessary intermediate derived-state write and does not relax future admission.
 
 ## State and output
 
@@ -89,7 +93,7 @@ struct RecoveredIntentPhysicalBase {
 }
 ```
 
-The original intent owner stays nested throughout; its admission pause is released last. The driver progresses through native exclusion, guarded bindings, committed scan, effective-image inspection, fresh exact manifest reselection, derived mapping reconciliation, existing physical checkpoint, fresh main-only inspection, final mapping reconciliation/sync and retirement. Store/replay/IDs/global published prefix remain untouched.
+The original intent owner stays nested throughout; its admission pause is released last. The driver progresses through native exclusion, guarded bindings, committed scan, effective-image inspection, fresh exact manifest reselection, existing physical checkpoint, fresh main-only inspection, final mapping reconciliation/sync and retirement. Store/replay/IDs/global published prefix remain untouched.
 
 For effective-image inspection, build an **in-process** `WalFile` from the exact committed scan and attach it to a private read-only `SharedPhysicalConnection`. The actual native physical exclusion is owned externally, so the in-process checkpoint avoids trying to acquire the same native locks twice. Never construct ordinary `ShmWalCoordination` for this recovery operation. Clear the private page cache/schema header state after attaching WAL and before parsing. Reject custom storage, codecs and encryption as the existing physical reader does.
 
@@ -132,8 +136,8 @@ After successful checkpoint completion, wait for actual backend retirement, veri
 - [ ] Extend the actual SIGKILL fixture to preserve three physical states: before first main write, after exactly one successful changed main-page write while later changed pages are held, and after successful main FULL sync but before actual WAL truncate. Use multiple changed pages and assert old/partial/new main byte relationships; run both one/two acknowledged commits.
 - [ ] Add the explicit missing `begin_physical_wal_recovery` regression. Require all six genuine crash prerequisites pass first and the recovery test fail for the missing behavior rather than setup/timeout.
 - [ ] Implement scan/effective-reader validation, exact record reselection and typed evidence without modifying main/WAL; test invalid salt/checksum/commit boundary, replaced files/lease/runtime, intermediate timestamp and foreign/live readers. Valid committed prefixes with torn uncommitted tails retain only the last committed image.
-- [ ] Implement mapping force-from-scan under the retained owner, existing FULL/TRUNCATE checkpoint, fresh main inspection, final zero mapping/sync and backend retirement. Assert exact acknowledged rows/schema/indexes, unchanged intent/log/IDs, no replay/global recovery/Ready and owner-held admission exclusion.
-- [ ] Test stale mapped tail/checksum/index/backfill and an interrupted odd mapped seqlock. Recovery must use actual scan and finish within a bounded deadline. Remove the force-from-scan call as a causal control; require the stale-state regression fail.
+- [ ] Implement private in-process WAL copying from the exact scan under the retained owner, existing FULL/TRUNCATE checkpoint, fresh main inspection, final zero mapping/sync and backend retirement. Assert exact acknowledged rows/schema/indexes, unchanged intent/log/IDs, no replay/global recovery/Ready and owner-held admission exclusion.
+- [ ] Test stale mapped tail/checksum/index/backfill and an interrupted odd mapped seqlock. Recovery must use the actual scan without consulting the mapping and finish within a bounded deadline. Remove the final derived mapping repair as a causal control; require the stale/odd-state postcondition regression fail without an unbounded snapshot call.
 - [ ] Inject main write/sync and WAL truncate/sync failures; cancel before/after callbacks and before backend retirement. Reopen with fresh native selection and retry without losing the acknowledged logical prefix. A crash after durable main but before WAL truncate must be idempotent.
 - [ ] Commit the verified recovery driver. Keep ordinary replay/completed confirmation guards unchanged.
 
@@ -155,3 +159,11 @@ After successful checkpoint completion, wait for actual backend retirement, veri
 5. **Can the output close issue7 or make PR8 ready?** No. It is an internal verified stage. All required crash classes, typed logical/ID completion and public PHP acceptance still apply.
 
 The parent is the independent design hardening reviewer. Existing user protocol approvals authorize routine private recovery implementation after that review; no new user policy choice is introduced.
+
+
+## Execution refinements accepted by the parent
+
+- The recovery owner type and I/O transport compile on every `host_shared_wal` platform because `GuardedFile` also compiles there. Native acquisition rejects unsupported platforms before any lock; the runtime recovery path remains Linux64 only.
+- Independent review caught a normal writer/checkpoint ownership race in liveness probing. Recheck current local ownership for the requested byte under the same mutex as the OFD probe; a previously sampled boolean is insufficient. The deterministic regression samples false, acquires the actual local owner, then invokes the probe and checks independent-fd exclusion.
+- Distinct physical schema parses are compared by actual header/catalog root rows/custom-type definitions, not schema Arc identity. The existing `PhysicalBaseParts` already retains immutable catalog records suitable for a semantic comparison.
+- Keep a fresh runtime unclaimed while opening only private nonshared physical readers. If a later materialization phase attaches a real shared Store, retain/reuse it under the one-Store-per-Runtime reservation; never reset that claim or construct a second Store for the handoff.
