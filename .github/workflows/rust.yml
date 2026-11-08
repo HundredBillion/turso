@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: cd5e4ec61dcede8e7c158d75ef7d373b173980f8
+          ref: 16d66c6f0f81b46090878a0292f9a208a2866edc
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,28 +28,22 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = cd5e4ec61dcede8e7c158d75ef7d373b173980f8
+          test "$(git rev-parse HEAD)" = 16d66c6f0f81b46090878a0292f9a208a2866edc
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Cleanup, recovery and genuine extent acceptance
+      - name: Native ordinary locks and exact downgrade regression
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_partial_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee partial.log
-          grep '^test result:' partial.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_extent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent.log
-          grep '^test result:' extent.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
-          grep '^test result:' resume.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee cleanup.log
-          grep '^test result:' cleanup.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
-          grep '^test result:' creation.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
-          grep '^test result:' preparation.log | tail -1 | grep -q '^test result: ok. 7 passed; 0 failed;'
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --skip old_handle_close --test-threads=1 --nocapture 2>&1 | tee marker.log
-          grep '^test result:' marker.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ordinary-locks.log
+          grep '^test result:' ordinary-locks.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker.log
+          grep '^test result:' marker.log | tail -1 | grep -q '^test result: ok. 5 passed; 0 failed;'
+      - name: Actual io_uring lock ownership
+        run: |
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,io_uring linux_ordinary_lock_native_uring_alias_cache_and_sigkill -- --ignored --test-threads=1 --nocapture 2>&1 | tee uring-locks.log
+          grep '^test result:' uring-locks.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
       - name: Strict library lint and formatting
         run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          cargo clippy --locked -p turso_core --lib --tests --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee clippy.log
           cargo fmt --all --check
       - uses: actions/upload-artifact@v4
         if: always()
@@ -70,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: cd5e4ec61dcede8e7c158d75ef7d373b173980f8
+          ref: 16d66c6f0f81b46090878a0292f9a208a2866edc
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
