@@ -741,8 +741,16 @@ fn checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_ph
     );
     let mut state = inspected.begin_confirmation().unwrap();
     let confirmed = fixture.io.block(|| Ok(state.poll()?)).unwrap();
-    assert_eq!(confirmed.max_owner_epoch(), maximum);
-    assert_eq!(confirmed.proof().materialized_floor(), physical);
+    assert_eq!(
+        confirmed.max_owner_epoch(),
+        maximum,
+        "confirmation lost inspected owner epoch"
+    );
+    assert_eq!(
+        confirmed.proof().materialized_floor(),
+        physical,
+        "confirmation used permanent ID floor as physical evidence"
+    );
     assert_eq!(confirmed.proof().source_identity(), None);
     assert!(confirmed.guard().requires_recovery());
     assert_eq!(unchanged_files(&fixture), before);
