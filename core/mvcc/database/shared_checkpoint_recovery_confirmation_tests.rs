@@ -227,6 +227,9 @@ impl Control {
         };
         if self.enabled.load(Ordering::Acquire) {
             let step = self.step.fetch_add(1, Ordering::AcqRel);
+            if let Mutation::Sync(kind) = &pending.mutation {
+                assert!(matches!(kind, FileSyncType::FullFsync));
+            }
             if let Mutation::Write(offset, _) = &pending.mutation {
                 self.offsets.lock().push(*offset);
             }
