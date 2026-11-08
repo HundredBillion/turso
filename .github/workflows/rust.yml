@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2e01ac8cf41a8d89550dead1510c8c26769d7283
+          ref: 1d477a457e2b36dace9ad5517ea0279d292799b1
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 2e01ac8cf41a8d89550dead1510c8c26769d7283
+          test "$(git rev-parse HEAD)" = 1d477a457e2b36dace9ad5517ea0279d292799b1
           test "$(id -u)" -ne 0
           rustc -Vv
       - name: Actual SQLite dialect and native extension through C
