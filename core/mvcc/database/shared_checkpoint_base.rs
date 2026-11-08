@@ -1,4 +1,6 @@
 use super::*;
+#[path = "shared_checkpoint_install.rs"]
+mod shared_checkpoint_install;
 use crate::database::shared_physical::SharedPhysicalConnection;
 use crate::mvcc::database::shared_bootstrap::{PhysicalBaseParts, PhysicalBaseReadState};
 use crate::mvcc::read_pinned_file::ReadPinnedFile;
