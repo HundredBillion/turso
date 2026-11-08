@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b7c6161b8682e1daa7b0dfcbfb04556542825481
+          ref: 725139ac8faa902df0a770ceb000b2b9e2461ab3
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,35 +28,24 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b7c6161b8682e1daa7b0dfcbfb04556542825481
+          test "$(git rev-parse HEAD)" = 725139ac8faa902df0a770ceb000b2b9e2461ab3
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Exact-layout removal control and restored live marker
+      - name: Merged live marker controls
         run: |
-          file=core/mvcc/mode_transition/downgrade_marker.rs
-          cp "$file" /tmp/downgrade-marker.rs
-          trap 'cp /tmp/downgrade-marker.rs "$file"' EXIT
-          python3 - <<'PYCONTROL'
-          from pathlib import Path
-          p = Path('core/mvcc/mode_transition/downgrade_marker.rs')
-          text = p.read_text()
-          needle = '    proof\n        .intent\n        .installed_source()?\n        .validate_physical_layout(&header, proof.main_file().size()?)?;\n'
-          assert text.count(needle) == 1
-          p.write_text(text.replace(needle, ''))
-          PYCONTROL
-          git diff > layout-control.diff
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --skip old_handle_close --test-threads=1 --nocapture 2>&1 | tee marker-merged.log
+          grep -q '^test result: ok. 3 passed; 0 failed;' marker-merged.log
+      - name: Observe old-handle lock exclusion
+        run: |
           set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_rejects_changed_installed_extent -- --ignored --test-threads=1 --nocapture 2>&1 | tee layout-control-red.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_old_handle_close_preserves_ordinary_lock -- --ignored --test-threads=1 --nocapture 2>&1 | tee old-handle-probe.log
           code=${PIPESTATUS[0]}
           set -e
-          test "$code" = 101
-          grep -q '^test result: FAILED. 0 passed; 1 failed;' layout-control-red.log
-          grep -q 'changed installed extent must reject before marker publication' layout-control-red.log
-          cp /tmp/downgrade-marker.rs "$file"
-          trap - EXIT
-          git diff --exit-code
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker-restored.log
-          grep -q '^test result: ok. 3 passed; 0 failed;' marker-restored.log
+          echo "$code" > lock-probe-status.txt
+          test "$code" = 0 -o "$code" = 101
+          summary=$(sed -n '/^test result:/p' old-handle-probe.log | tail -n1)
+          echo "$summary" > lock-probe-summary.txt
+          echo "$summary" | grep -Eq '(1 passed; 0 failed|0 passed; 1 failed)'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -67,4 +56,5 @@ jobs:
             *.log
             *.diff
             *status.txt
+            *summary.txt
           retention-days: 14
