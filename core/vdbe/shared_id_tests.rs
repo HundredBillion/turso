@@ -930,3 +930,6 @@ fn shared_id_lifecycle_native_named_rollback_preserves_earlier_sequence_claim() 
         [2]
     );
 }
+
+#[path = "shared_id_lifecycle_io_tests.rs"]
+mod shared_id_lifecycle_io_tests;
