@@ -53,19 +53,69 @@ fn shared_checkpoint_entry_native_api_reclaims_and_preserves_idle_peer() {
     idle.execute("UPDATE preserved SET value='after checkpoint' WHERE id=1")
         .unwrap();
     assert_eq!(payload(&connection), ["after checkpoint"]);
+    for mode in [
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+        CheckpointMode::Full,
+        CheckpointMode::Restart,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    ] {
+        connection
+            .execute("UPDATE preserved SET value='each API mode' WHERE id=1")
+            .unwrap();
+        assert!(connection.checkpoint(mode).unwrap().everything_backfilled());
+        assert_eq!(payload(&idle), ["each API mode"]);
+    }
+    let before = std::fs::read(runtime.files.namespace.join("manifest")).unwrap();
+    let logical = std::fs::read(runtime.files.namespace.join("logical")).unwrap();
+    for mode in [
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        },
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: Some(1),
+        },
+    ] {
+        assert!(matches!(
+            connection.checkpoint(mode),
+            Err(LimboError::InvalidArgument(_))
+        ));
+    }
+    let reader = db
+        .connect(crate::ConnectOpts::new().with_readonly(true))
+        .unwrap();
+    assert!(matches!(
+        reader.checkpoint(CheckpointMode::Full),
+        Err(LimboError::ReadOnly)
+    ));
+    assert!(matches!(
+        reader.execute("PRAGMA wal_checkpoint"),
+        Err(LimboError::ReadOnly)
+    ));
+    assert_eq!(
+        std::fs::read(runtime.files.namespace.join("manifest")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(runtime.files.namespace.join("logical")).unwrap(),
+        logical
+    );
 }
 
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_checkpoint_entry_native_sql_repeats_after_commits() {
     let (_directory, _db, connection) = fixture();
-    for value in ["first", "second"] {
+    for value in ["PASSIVE", "FULL", "RESTART", "TRUNCATE"] {
         connection
             .execute(format!("UPDATE preserved SET value='{value}' WHERE id=1"))
             .unwrap();
         let mut rows = Vec::new();
         connection
-            .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+            .prepare(format!("PRAGMA wal_checkpoint({value})"))
             .unwrap()
             .run_with_row_callback(|row| {
                 rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?, row.get::<i64>(2)?));
