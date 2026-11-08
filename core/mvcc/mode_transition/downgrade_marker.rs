@@ -7,44 +7,82 @@ use std::path::Path;
 /// Retains the terminal intent, native main exclusion and admission pause through
 /// every raw-open/connection lifetime. Only genuine installed checkpoints qualify.
 pub(crate) struct PreparedDowngradeMarker {
-    intent: MirroredDowngradeIntent,
+    origin: MarkerOrigin,
+}
+enum MarkerOrigin {
+    Installed(Box<MirroredDowngradeIntent>),
+    Recovered(Box<super::downgrade_resume::RecoveredDowngradeSource>),
 }
 impl PreparedDowngradeMarker {
     fn from_intent(intent: MirroredDowngradeIntent) -> Result<Arc<Self>> {
         intent.installed_source()?.files().revalidate()?;
-        let proof = Arc::new(Self { intent });
+        let proof = Arc::new(Self {
+            origin: MarkerOrigin::Installed(Box::new(intent)),
+        });
         proof.revalidate()?;
         Ok(proof)
     }
     pub(crate) fn revalidate(&self) -> Result<()> {
-        self.intent
-            .installed_source()?
-            .validate_marker(self.intent.guard(), self.intent.record())
+        match &self.origin {
+            MarkerOrigin::Installed(intent) => intent
+                .installed_source()?
+                .validate_marker(intent.guard(), intent.record()),
+            MarkerOrigin::Recovered(source) => source.revalidate(),
+        }
+    }
+    fn files(&self) -> &super::downgrade_files::DowngradeFiles {
+        match &self.origin {
+            MarkerOrigin::Installed(intent) => intent.installed_source().unwrap().files(),
+            MarkerOrigin::Recovered(source) => &source.files,
+        }
+    }
+    fn record(&self) -> crate::mvcc::commit_manifest::ManifestRecord {
+        match &self.origin {
+            MarkerOrigin::Installed(intent) => intent.record(),
+            MarkerOrigin::Recovered(source) => source.record,
+        }
     }
     pub(crate) fn path(&self) -> &Path {
-        self.intent.installed_source().unwrap().files().path()
+        self.files().path()
     }
     pub(crate) fn database_id(&self) -> FileId {
-        self.intent.record().database_id()
+        self.record().database_id()
     }
     pub(crate) fn wal_id(&self) -> FileId {
-        self.intent
-            .record()
-            .downgrade_intent()
-            .unwrap()
-            .basename_wal_id
+        self.record().downgrade_intent().unwrap().basename_wal_id
     }
     pub(crate) fn main_file(&self) -> Arc<dyn File> {
-        self.intent.installed_source().unwrap().files().main_file()
+        self.files().main_file()
     }
     pub(crate) fn wal_file(&self) -> Arc<dyn File> {
-        self.intent.installed_source().unwrap().files().wal_file()
+        self.files().wal_file()
     }
     fn timestamp(&self) -> u64 {
-        self.intent.record().prefix().committed_timestamp
+        self.record().prefix().committed_timestamp
     }
     fn physical_floor(&self) -> i64 {
-        self.intent.installed_source().unwrap().physical_floor()
+        match &self.origin {
+            MarkerOrigin::Installed(intent) => intent.installed_source().unwrap().physical_floor(),
+            MarkerOrigin::Recovered(source) => source.logical_floor,
+        }
+    }
+    fn validate_layout(
+        &self,
+        header: &crate::storage::sqlite3_ondisk::DatabaseHeader,
+        bytes: u64,
+    ) -> Result<()> {
+        match &self.origin {
+            MarkerOrigin::Installed(intent) => intent
+                .installed_source()?
+                .validate_physical_layout(header, bytes),
+            MarkerOrigin::Recovered(source) => source.validate_layout(header, bytes),
+        }
+    }
+    fn mirror(&self) -> Result<()> {
+        match &self.origin {
+            MarkerOrigin::Installed(intent) => self.files().require_mirrored(intent.record()),
+            MarkerOrigin::Recovered(source) => source.mirror(),
+        }
     }
 }
 
@@ -56,7 +94,16 @@ pub(in crate::mvcc) struct CompletedDowngradeMarker {
 pub(in crate::mvcc) fn commit_marker(
     intent: MirroredDowngradeIntent,
 ) -> Result<CompletedDowngradeMarker> {
-    let proof = PreparedDowngradeMarker::from_intent(intent)?;
+    commit_prepared(PreparedDowngradeMarker::from_intent(intent)?)
+}
+pub(super) fn commit_recovered(
+    source: super::downgrade_resume::RecoveredDowngradeSource,
+) -> Result<CompletedDowngradeMarker> {
+    commit_prepared(Arc::new(PreparedDowngradeMarker {
+        origin: MarkerOrigin::Recovered(Box::new(source)),
+    }))
+}
+fn commit_prepared(proof: Arc<PreparedDowngradeMarker>) -> Result<CompletedDowngradeMarker> {
     let db = crate::Database::open_offline_downgrade(proof.clone())?;
     if db.get_mv_store().is_some()
         || db
@@ -76,16 +123,15 @@ pub(in crate::mvcc) fn commit_marker(
     connection.execute("PRAGMA synchronous=FULL")?;
     let pager = connection.get_pager();
     let header = pager.io.block(|| pager.with_header(|header| *header))?;
-    proof
-        .intent
-        .installed_source()?
-        .validate_physical_layout(&header, proof.main_file().size()?)?;
+    proof.validate_layout(&header, proof.main_file().size()?)?;
     let (read, write, pages) = (
         header.read_version.0,
         header.write_version.0,
         header.database_size.get(),
     );
-    if (read, write) != (254, 254) || proof.physical_floor() > -i64::from(pages.max(1)) {
+    if !matches!((read, write), (254, 254) | (2, 2))
+        || proof.physical_floor() > -i64::from(pages.max(1))
+    {
         return Err(invalid(
             "downgrade marker differs from materialized physical layout",
         ));
@@ -106,14 +152,17 @@ pub(in crate::mvcc) fn commit_marker(
         ));
     }
     proof.revalidate()?;
-    connection.execute("BEGIN IMMEDIATE")?;
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.read_version = crate::storage::sqlite3_ondisk::RawVersion(2);
-            header.write_version = crate::storage::sqlite3_ondisk::RawVersion(2);
-        })
-    })?;
-    connection.execute("COMMIT")?;
+    proof.mirror()?;
+    if read == 254 {
+        connection.execute("BEGIN IMMEDIATE")?;
+        pager.io.block(|| {
+            pager.with_header_mut(|header| {
+                header.read_version = crate::storage::sqlite3_ondisk::RawVersion(2);
+                header.write_version = crate::storage::sqlite3_ondisk::RawVersion(2);
+            })
+        })?;
+        connection.execute("COMMIT")?;
+    }
     connection.checkpoint(crate::CheckpointMode::Truncate {
         upper_bound_inclusive: None,
     })?;

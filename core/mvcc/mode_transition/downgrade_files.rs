@@ -9,10 +9,10 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-struct RetainedFile {
-    path: PathBuf,
-    file: File,
-    id: FileId,
+pub(super) struct RetainedFile {
+    pub(super) path: PathBuf,
+    pub(super) file: File,
+    pub(super) id: FileId,
 }
 impl RetainedFile {
     fn open(path: PathBuf) -> Result<Self> {
@@ -40,9 +40,9 @@ impl RetainedFile {
 /// Native aliases used only while the caller retains completed-checkpoint ownership.
 /// A missing basename WAL is exclusively created and synced before intent publication.
 pub(in crate::mvcc) struct DowngradeFiles {
-    main: RetainedFile,
+    pub(super) main: RetainedFile,
     wal: RetainedFile,
-    files: Vec<RetainedFile>,
+    pub(super) files: Vec<RetainedFile>,
     namespace: PathBuf,
     namespace_file: File,
     log_path: PathBuf,
@@ -53,21 +53,33 @@ pub(in crate::mvcc) struct DowngradeFiles {
 }
 impl DowngradeFiles {
     pub(in crate::mvcc) fn open(path: &Path, expected: &SharedMvccFiles) -> Result<Self> {
+        Self::open_inner(path, Some(expected))
+    }
+    pub(super) fn open_terminal(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+    fn open_inner(path: &Path, expected: Option<&SharedMvccFiles>) -> Result<Self> {
         super::require_linux_platform()?;
         let main = RetainedFile::open(path.to_path_buf())?;
         lock_exclusive(&main.file)?;
         let canonical = path.canonicalize().map_err(fs_error)?;
         let namespace = namespace_for(&canonical, main.id)?;
-        if expected.main.file_id()? != Some(main.id)
-            || namespace != expected.namespace.canonicalize().map_err(fs_error)?
-        {
-            return Err(invalid("downgrade requires the installed native database"));
+        if let Some(expected) = expected {
+            if expected.main.file_id()? != Some(main.id)
+                || namespace != expected.namespace.canonicalize().map_err(fs_error)?
+            {
+                return Err(invalid("downgrade requires the installed native database"));
+            }
         }
         let main = RetainedFile {
             path: canonical,
             ..main
         };
-        require_marker(&main.file, SHARED_MVCC_VERSION)?;
+        let marker = super::read_marker(&main.file)?;
+        if marker != SHARED_MVCC_VERSION && (expected.is_some() || marker != 2) {
+            return Err(invalid("downgrade requires shared or terminal WAL mode"));
+        }
+        require_marker(&main.file, marker)?;
         let namespace_file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
@@ -90,20 +102,34 @@ impl DowngradeFiles {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(fs_error(error)),
         };
-        let identities = [
-            ("manifest", expected.manifest.file_id()?),
-            ("logical", expected.logical.file_id()?),
-            ("physical-wal", expected.physical_wal.file_id()?),
-            ("physical-tshm", expected.physical_coordination.file_id()?),
-            ("authority", expected.authority.file_id()?),
-            ("ids-a", expected.id_banks[0].file_id()?),
-            ("ids-b", expected.id_banks[1].file_id()?),
-            ("ids-selector", expected.id_selector.file_id()?),
+        let names = [
+            "manifest",
+            "logical",
+            "physical-wal",
+            "physical-tshm",
+            "authority",
+            "ids-a",
+            "ids-b",
+            "ids-selector",
         ];
+        let expected_ids = expected
+            .map(|expected| -> Result<_> {
+                Ok([
+                    expected.manifest.file_id()?,
+                    expected.logical.file_id()?,
+                    expected.physical_wal.file_id()?,
+                    expected.physical_coordination.file_id()?,
+                    expected.authority.file_id()?,
+                    expected.id_banks[0].file_id()?,
+                    expected.id_banks[1].file_id()?,
+                    expected.id_selector.file_id()?,
+                ])
+            })
+            .transpose()?;
         let mut files = Vec::new();
-        for (name, expected_id) in identities {
+        for (index, name) in names.into_iter().enumerate() {
             let file = RetainedFile::open(namespace.join(name))?;
-            if Some(file.id) != expected_id {
+            if expected_ids.is_some_and(|ids| ids[index] != Some(file.id)) {
                 return Err(invalid("downgrade namespace identity changed"));
             }
             files.push(file);
@@ -123,7 +149,7 @@ impl DowngradeFiles {
             .map(|wal| wal.file.metadata().map(|m| m.len()))
             .transpose()
             .map_err(fs_error)?;
-        if wal_length.is_some_and(|length| length != 0)
+        if (expected.is_some() && wal_length.is_some_and(|length| length != 0))
             || files[1].file.metadata().map_err(fs_error)?.len() != 0
             || files[2].file.metadata().map_err(fs_error)?.len() != 0
         {
@@ -135,6 +161,9 @@ impl DowngradeFiles {
         let wal = match wal {
             Some(wal) => wal,
             None => {
+                if expected.is_none() {
+                    return Err(invalid("terminal downgrade WAL is missing"));
+                }
                 let parent = main
                     .path
                     .parent()
@@ -207,7 +236,11 @@ impl DowngradeFiles {
             main_io,
             wal_io,
         };
-        retained.revalidate()?;
+        if expected.is_some() {
+            retained.revalidate()?;
+        } else {
+            retained.revalidate_marker()?;
+        }
         Ok(retained)
     }
     pub(in crate::mvcc) fn revalidate(&self) -> Result<()> {
@@ -267,6 +300,22 @@ impl DowngradeFiles {
     }
     pub(in crate::mvcc) fn wal_file(&self) -> Arc<dyn IoFile> {
         self.wal_io.clone()
+    }
+    pub(super) fn selected_manifest(&self) -> Result<crate::mvcc::commit_manifest::ManifestRecord> {
+        use crate::mvcc::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+        if self.files[0].file.metadata().map_err(fs_error)?.len() != (2 * SLOT_SIZE) as u64 {
+            return Err(invalid("downgrade manifest length changed"));
+        }
+        let mut records = [None; 2];
+        for (index, record) in records.iter_mut().enumerate() {
+            let mut bytes = [0; RECORD_SIZE];
+            self.files[0]
+                .file
+                .read_exact_at(&mut bytes, (index * SLOT_SIZE) as u64)
+                .map_err(fs_error)?;
+            *record = ManifestRecord::decode(&bytes)?;
+        }
+        Ok(select_latest(records, self.main.id)?.1)
     }
     pub(in crate::mvcc) fn require_mirrored(
         &self,

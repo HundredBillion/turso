@@ -31,6 +31,10 @@ impl UnrecoveredIds {
         self.loaded.pending_checkpoint_source()
     }
 
+    pub(in crate::mvcc) fn has_pending_checkpoint(&self) -> bool {
+        self.loaded.has_pending_checkpoint()
+    }
+
     pub(in crate::mvcc) fn max_owner_epoch(&self) -> Option<u64> {
         self.max_owner_epoch
     }

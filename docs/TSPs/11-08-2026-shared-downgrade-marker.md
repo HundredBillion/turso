@@ -228,3 +228,29 @@ recreate IDs. Missing-WAL creation remains genuine-Live-only and durable before
 intent. A bounded real child-lock probe runs before any policy choice for old
 same-process descriptors. Dependencyfa225 was merged without production conflicts;
 review11554 transferred the narrow pending-selector accessor hunk to this task.
+
+## Continuation evidence
+
+Missing-WAL creation source `f267be5c9` passed Linux native creation2,
+preparation7 and marker3 plus strict library lint/formatting in
+[run42503599577](https://github.com/HundredBillion/turso/actions/runs/42503599577).
+The genuine desired operation first failed at the explicit missing-WAL restriction
+(0 passed/1 failed) in run42502871275. Invalid ordinary log/coordination files are
+rejected before creation. A WAL missing after terminal publication still fails
+without recreation. Process-death coverage of creation is still pending.
+
+The actual old-handle lifecycle probe passed in
+[run42503446343](https://github.com/HundredBillion/turso/actions/runs/42503446343),
+source `36dfcb9ba`. Weak references prove the old shared Database, runtime and
+native main handle retired before the second independent child attempted its
+nonblocking ordinary RW lock; the child remained excluded. This bounded path did
+not reproduce the hypothesized close-any-inode lock loss, so it does not justify
+an additional operator lifetime policy. It is not evidence for arbitrary legacy
+handle interactions or multi-process permission enforcement.
+
+Fresh-terminal resume source `d47369981` has an intentional stub. Its genuine
+live checkpoint publishes terminal intent, drops the live source and then asks
+for fresh resume. Run42503731841 observed the intended missing-operation failure
+(0 passed/1 failed). The replacement implementation is under verification and
+must not be treated as a completed downgrade until recovery and cleanup fault
+controls pass.
