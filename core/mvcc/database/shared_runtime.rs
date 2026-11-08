@@ -26,6 +26,9 @@ pub(in crate::mvcc) use shared_checkpoint_recovery_intent::RecoveryIntentEvidenc
 #[path = "shared_checkpoint_intent_fixture.rs"]
 mod shared_checkpoint_intent_fixture;
 
+#[path = "shared_checkpoint_recovery_wal.rs"]
+mod shared_checkpoint_recovery_wal;
+
 #[path = "shared_checkpoint_recovery_physical.rs"]
 mod shared_checkpoint_recovery_physical;
 
