@@ -27,6 +27,8 @@ use crate::sync::Weak;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct SharedMvccRuntime {
+    io: Arc<dyn crate::IO>,
+    path: PathBuf,
     files: SharedMvccFiles,
     gate: Arc<CheckpointAdmissionGate>,
     main: Arc<GuardedFile>,
@@ -133,9 +135,11 @@ impl SharedMvccRuntime {
             database_id,
             history_limit,
         )?;
-        let storage = Arc::new(Storage::new(logical.clone(), io, None));
+        let storage = Arc::new(Storage::new(logical.clone(), io.clone(), None));
         let wal_path = files.namespace.join("physical-wal");
         Ok(Arc::new(Self {
+            io,
+            path: canonical_path.to_path_buf(),
             files,
             gate,
             main,
