@@ -655,6 +655,12 @@ pub fn op_checkpoint(
         };
         #[cfg(all(host_shared_wal, unix))]
         let result = if mv_store.is_shared() {
+            if *database != crate::MAIN_DB_ID {
+                return Err(LimboError::InvalidArgument(
+                    "shared checkpoint requires the main database".into(),
+                )
+                .into());
+            }
             crate::mvcc::database::checkpoint_shared(program.connection.clone(), *checkpoint_mode)
         } else {
             run_ordinary()
