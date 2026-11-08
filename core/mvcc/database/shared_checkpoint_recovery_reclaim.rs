@@ -54,6 +54,11 @@ pub(in crate::mvcc) struct RecoveryLogReclamation {
 #[allow(dead_code)]
 impl FinalizedRecoveredCheckpoint {
     pub(in crate::mvcc) fn begin_log_reclamation(self) -> Result<RecoveryLogReclamation> {
+        if self.runtime.original_readonly {
+            return Err(LimboError::InvalidArgument(
+                "shared checkpoint recovery requires a writable participant".into(),
+            ));
+        }
         validate_target(&self.runtime, &self.parts, self.proof(), self.guard())?;
         if !self.guard().io_retired() {
             return Err(LimboError::Busy);

@@ -186,11 +186,19 @@ fn log_fixture(
     callback_error: bool,
     delay: usize,
 ) -> (Fixture, Arc<LogTrace>, FinalizedRecoveredCheckpoint) {
+    log_fixture_with_io(fail, callback_error, delay, |io| io)
+}
+fn log_fixture_with_io(
+    fail: usize,
+    callback_error: bool,
+    delay: usize,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> (Fixture, Arc<LogTrace>, FinalizedRecoveredCheckpoint) {
     let trace = Arc::new(LogTrace::default());
     let wrapping = trace.clone();
     let mut fixture = fresh_fixture_with_io(false, move |inner| {
         Arc::new(LogIo {
-            inner,
+            inner: decorate(inner),
             trace: wrapping,
         })
     });
@@ -444,4 +452,27 @@ fn checkpoint_recovery_bootstrap_native_missing_ready() {
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
     let _ready = fixture.io.block(|| Ok(bootstrap.poll()?)).unwrap();
     panic!("stub returned recovery readiness without a Database");
+}
+
+pub(in super::super) fn bootstrap_fixture() -> (
+    tempfile::TempDir,
+    Arc<dyn crate::IO>,
+    Arc<SharedMvccRuntime>,
+    ReclaimedRecoveredCheckpoint,
+) {
+    bootstrap_fixture_with_io(|io| io)
+}
+pub(in super::super) fn bootstrap_fixture_with_io(
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn crate::IO>,
+    Arc<SharedMvccRuntime>,
+    ReclaimedRecoveredCheckpoint,
+) {
+    let (fixture, trace, finalized) = log_fixture_with_io(usize::MAX, false, usize::MAX, decorate);
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
+    assert_reclaimed(&fixture, &trace, &reclaimed);
+    (fixture._directory, fixture.io, fixture.runtime, reclaimed)
 }

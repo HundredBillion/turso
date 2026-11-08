@@ -331,6 +331,7 @@ struct Fixture {
     initial_epoch: u64,
     initial_next: u64,
     old_append: Option<AppendImage>,
+    options: crate::OpenOptions,
     _directory: tempfile::TempDir,
 }
 impl Fixture {
@@ -365,9 +366,7 @@ impl Fixture {
     fn reconfirm(&self) -> RecoveredCheckpointConfirmation {
         let mut opening = self.runtime.begin_checkpoint_recovery().unwrap();
         let selected = self.io.block(|| Ok(opening.poll()?)).unwrap();
-        let mut physical = selected
-            .begin_physical_read(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
-            .unwrap();
+        let mut physical = selected.begin_physical_read(self.options.clone()).unwrap();
         let physical = self.io.block(|| Ok(physical.poll()?)).unwrap();
         let mut loading = physical.begin_id_inspection().unwrap();
         let inspected = self.io.block(|| Ok(loading.poll()?)).unwrap();
@@ -381,6 +380,26 @@ fn fresh_fixture(target_only: bool) -> Fixture {
 fn fresh_fixture_with_io(
     target_only: bool,
     decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> Fixture {
+    fresh_fixture_with_access(target_only, false, decorate)
+}
+fn fresh_fixture_with_access(
+    target_only: bool,
+    readonly: bool,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> Fixture {
+    fresh_fixture_with_options(
+        target_only,
+        readonly,
+        decorate,
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+    )
+}
+fn fresh_fixture_with_options(
+    target_only: bool,
+    readonly: bool,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+    options: crate::OpenOptions,
 ) -> Fixture {
     let (_directory, path, namespace, earlier, old_maximum, target, old_append) = {
         let mut old = fault_fixture_with_seed(target_only, true);
@@ -440,8 +459,13 @@ fn fresh_fixture_with_io(
         trace: trace.clone(),
     }));
     let canonical = std::fs::canonicalize(&path).unwrap();
+    let flags = if readonly {
+        crate::OpenFlags::ReadOnly | crate::OpenFlags::NoLock
+    } else {
+        crate::OpenFlags::NoLock
+    };
     let main = io
-        .open_file(canonical.to_str().unwrap(), crate::OpenFlags::NoLock, false)
+        .open_file(canonical.to_str().unwrap(), flags, false)
         .unwrap();
     let id = main.file_id().unwrap().unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
@@ -452,9 +476,15 @@ fn fresh_fixture_with_io(
             ino: metadata.ino()
         }
     );
-    let runtime =
-        SharedMvccRuntime::open_existing(io.clone(), main, id, &canonical, 64 * 1024 * 1024, false)
-            .unwrap();
+    let runtime = SharedMvccRuntime::open_existing(
+        io.clone(),
+        main,
+        id,
+        &canonical,
+        64 * 1024 * 1024,
+        readonly,
+    )
+    .unwrap();
     let (epoch, ready, next_timestamp) = runtime.files.authority.recovery_state_for_test().unwrap();
     assert_eq!(
         epoch,
@@ -470,9 +500,7 @@ fn fresh_fixture_with_io(
     }
     let mut opening = runtime.begin_checkpoint_recovery().unwrap();
     let selected = io.block(|| Ok(opening.poll()?)).unwrap();
-    let mut physical = selected
-        .begin_physical_read(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
-        .unwrap();
+    let mut physical = selected.begin_physical_read(options.clone()).unwrap();
     let physical = io.block(|| Ok(physical.poll()?)).unwrap();
     let mut loading = physical.begin_id_inspection().unwrap();
     let inspected = io.block(|| Ok(loading.poll()?)).unwrap();
@@ -500,6 +528,7 @@ fn fresh_fixture_with_io(
         initial_epoch: epoch,
         initial_next: next_timestamp,
         old_append: Some(old_append),
+        options,
         _directory,
     }
 }
@@ -551,6 +580,7 @@ fn ready_fixture(target_only: bool) -> Fixture {
         initial_epoch,
         initial_next,
         old_append: None,
+        options: crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
         _directory: old._directory,
     }
 }
@@ -1106,4 +1136,71 @@ fn checkpoint_recovery_reclaim_native_rejects_preexisting_store_before_mutation(
 }
 
 #[path = "shared_checkpoint_recovery_reclaim_tests.rs"]
-mod reclaim_tests;
+pub(super) mod reclaim_tests;
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_readonly_requires_writable_recovery() {
+    let mut fixture = fresh_fixture_with_access(false, true, |io| io);
+    assert!(fixture.runtime.original_readonly);
+    let before = [0, 2, 3].map(|index| std::fs::read(&fixture.paths[index]).unwrap());
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| finalizing.poll()).unwrap();
+    let error = match finalized.begin_log_reclamation() {
+        Ok(_) => panic!("content-readonly runtime began log reclamation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires a writable participant"));
+    assert_eq!(
+        [0, 2, 3].map(|index| std::fs::read(&fixture.paths[index]).unwrap()),
+        before
+    );
+    assert!(fixture.runtime.replay.lock().is_none());
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_original_optin_survives() {
+    let options = crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+        .with_shared_mvcc_for_test(64 * 1024 * 1024);
+    let mut fixture = fresh_fixture_with_options(false, false, |io| io, options);
+    let original = fixture.confirmed.as_ref().unwrap().config.clone();
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| finalizing.poll()).unwrap();
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
+    assert!(Arc::ptr_eq(reclaimed.config_for_test(), &original));
+    let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+    let error = match bootstrap.poll() {
+        Ok(_) => panic!("missing factory produced readiness"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("normal recovered database bootstrap is not implemented"));
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_rejects_changed_history() {
+    let mut fixture = fresh_fixture(false);
+    let before = [0, 2, 3].map(|index| std::fs::read(&fixture.paths[index]).unwrap());
+    fixture.confirmed.take();
+    let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
+    let error = match selected.begin_physical_read(
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(1),
+    ) {
+        Ok(_) => panic!("physical recovery accepted a mismatched original history limit"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("validated shared history budget"));
+    assert_eq!(
+        [0, 2, 3].map(|index| std::fs::read(&fixture.paths[index]).unwrap()),
+        before
+    );
+}

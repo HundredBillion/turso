@@ -61,6 +61,7 @@ impl CheckpointRecoverySelection {
             LimboError::InvalidArgument("shared database path must be UTF-8".into())
         })?;
         let config = RecoveryOpenConfig::capture(options)?;
+        config.validate_history(runtime.files.authority.configured_history_limit())?;
         let opening = config.open_physical(runtime.io.clone(), path.to_owned(), file)?;
         Ok(RecoveryPhysicalRead {
             selection: Some(self),

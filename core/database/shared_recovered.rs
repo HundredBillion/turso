@@ -39,8 +39,26 @@ impl RecoveryOpenConfig {
         )
     }
 
+    pub(crate) fn validate_history(&self, actual_limit: u64) -> Result<()> {
+        if actual_limit == 0
+            || self
+                .options
+                .shared_mvcc_history_limit
+                .is_some_and(|requested| requested != actual_limit)
+        {
+            return Err(LimboError::InvalidArgument(
+                "recovery open options differ from the validated shared history budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn store_allocator(&self) -> crate::alloc::DynAllocator {
         self.options.allocators.mv_store.clone()
+    }
+
+    pub(crate) fn effective_readonly(&self, original_readonly: bool) -> bool {
+        original_readonly || self.options.flags.contains(OpenFlags::ReadOnly)
     }
 }
 
@@ -123,6 +141,36 @@ mod tests {
                 .deallocate(block.cast(), layout)
         };
         assert_eq!(fts_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn recovery_open_config_retains_and_validates_original_optin() {
+        let config = RecoveryOpenConfig::capture(
+            OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(64 * 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(
+            config.options.shared_mvcc_history_limit,
+            Some(64 * 1024 * 1024)
+        );
+        config.validate_history(64 * 1024 * 1024).unwrap();
+        assert!(config.validate_history(1).is_err());
+        assert!(config.validate_history(0).is_err());
+    }
+
+    #[test]
+    fn recovery_open_config_preserves_readonly_restrictions() {
+        let writable =
+            RecoveryOpenConfig::capture(OpenOptions::new(Arc::new(crate::EngineDialect))).unwrap();
+        assert!(!writable.effective_readonly(false));
+        assert!(writable.effective_readonly(true));
+        let readonly = RecoveryOpenConfig::capture(
+            OpenOptions::new(Arc::new(crate::EngineDialect)).flags(OpenFlags::ReadOnly),
+        )
+        .unwrap();
+        assert!(readonly.effective_readonly(false));
+        assert!(readonly.effective_readonly(true));
     }
 
     #[test]
