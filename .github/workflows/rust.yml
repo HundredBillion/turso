@@ -4,7 +4,7 @@ on:
 permissions:
   contents: read
 jobs:
-  shared-constructor-red:
+  shared-constructor-green:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 05b67c74dee07d53e4c8ca82f107bf2ed0412d4b
+          ref: b25efbacffb3ff8dd568651fdc64314b2f180d53
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,23 +24,18 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 05b67c74dee07d53e4c8ca82f107bf2ed0412d4b
+          test "$(git rev-parse HEAD)" = b25efbacffb3ff8dd568651fdc64314b2f180d53
           rustc -Vv | tee rustc.txt
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
-      - name: Current constructor must violate paused admission
+      - name: Guarded constructor honors paused admission
         run: |
-          set +e
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_pause_rejects_connection_before_header_io -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q '0 passed; 1 failed' pause-red.log
-          grep -q 'a paused checkpoint admitted a new shared connection' pause-red.log
+          grep -q '1 passed; 0 failed' pause-red.log
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-constructor-05b67-red
+          name: shared-constructor-b25-green
           path: |
             source.txt
             rustc.txt
