@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 07cff3dc54f351a60a57262b4144fbdad66e361e
+          ref: 63693f98db98fb9ee0f86bf4e9df46033d06dde0
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -26,7 +26,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "07cff3dc54f351a60a57262b4144fbdad66e361e"
+          test "$(git rev-parse HEAD)" = "63693f98db98fb9ee0f86bf4e9df46033d06dde0"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -99,6 +99,10 @@ jobs:
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_worker_native_ -- --ignored --test-threads=1 2>&1 | tee workers.log
           grep -q "5 passed; 0 failed" workers.log
+      - name: Offline downgrade intent preparation
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade.log
+          grep -q "7 passed; 0 failed" downgrade.log
       - name: Full ordinary core and strict lint
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee core.log
@@ -117,7 +121,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 07cff3dc54f351a60a57262b4144fbdad66e361e
+          ref: 63693f98db98fb9ee0f86bf4e9df46033d06dde0
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
