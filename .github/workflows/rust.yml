@@ -1,4 +1,4 @@
-name: Shared checkpoint physical staging native validation
+name: Shared synchronous prepare retirement validation
 on:
   workflow_dispatch:
 permissions:
@@ -10,107 +10,46 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "1"
 jobs:
-  physical-staging:
+  prepare-retirement:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c41249e5f39e0938c8f163666b04ceb33cae7b9e
+          ref: b21428dff093b0b9669464186d3b40545930eafd
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Record exact source and native environment
+      - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = c41249e5f39e0938c8f163666b04ceb33cae7b9e
+          test "$(git rev-parse HEAD)" = b21428dff093b0b9669464186d3b40545930eafd
           test "$(id -u)" -ne 0
-          stat -f -c 'workspace filesystem: %T (%t)' .
-          stat -f -c 'temporary filesystem: %T (%t)' /tmp
-          rustc -Vv | tee rustc.txt
-      - name: Store-independent physical facts and unchanged bootstrap
+          stat -f -c 'filesystem: %T (%t)' /tmp
+          rustc -Vv
+      - name: Checkpoint pause excludes idle root prepare
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database::shared_bootstrap -- --test-threads=1 --nocapture 2>&1 | tee facts-green.log
-          grep -q '4 passed; 0 failed' facts-green.log
-      - name: Existing completed publication coordinator
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_idle_root_respects_checkpoint_pause -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause.log
+          grep -q '1 passed; 0 failed' pause.log
+      - name: Missing logical read pins must fail actual retirement control
         run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_coordinator_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee coordinator-green.log
-          grep -q '3 passed; 0 failed' coordinator-green.log
-      - name: Live physical staging and delayed read retirement
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-staging-green.log
-          grep -q '3 passed; 0 failed' physical-staging-green.log
-      - name: Verified generation and pager components
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload -- --test-threads=1 2>&1 | tee generation-prep.log
-          grep -q '3 passed; 0 failed' generation-prep.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reset_ -- --test-threads=1 2>&1 | tee pager.log
-          grep -q '7 passed; 0 failed' pager.log
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee generation-native.log
-          grep -q '2 passed; 0 failed' generation-native.log
-      - name: Reclaim and install without admission release
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee local-install-green.log
-          grep -q '6 passed; 0 failed' local-install-green.log
-      - name: Certified ready handoff and late failures
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-green.log
-          grep -q '4 passed; 0 failed' ready-green.log
-      - name: Original connection equality causal control
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_install.rs'
-          s=open(p).read()
-          a=s.index('        if !crate::sync::Weak::ptr_eq')
-          b=s.index('        let store =',a)
-          s=s[:a]+s[b:]
-          open(p,'w').write(s)
-          PYCONTROL
           set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_rejects_foreign_connection_with_same_schema -- --ignored --test-threads=1 --nocapture 2>&1 | tee original-red.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_no_result_until_manifest_and_logical_backend_retire -- --ignored --test-threads=1 --nocapture 2>&1 | tee logical-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q '0 passed; 1 failed' original-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
-      - name: Finish failure withdrawal causal control
+          grep -q 'logical: prepare returned before physical retirement' logical-red.log
+          grep -q '0 passed; 1 failed' logical-red.log
+      - name: Source integrity
         run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_install.rs'
-          s=open(p).read()
-          old='        if result.is_err() {\n            runtime.replay.lock().take();\n        }\n'
-          assert s.count(old)==1
-          s=s.replace(old,'')
-          open(p,'w').write(s)
-          PYCONTROL
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_late_failures_leave_no_replay -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'failed readiness retained replay at 2' finish-red.log
-          grep -q '0 passed; 1 failed' finish-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
-      - name: Restored ready handoff and full MVCC
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-restored.log
-          grep -q '4 passed; 0 failed' ready-restored.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
-          grep -q '0 failed' mvcc.log
-      - name: Strict library lint and source integrity
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
           cargo fmt --all --check
           git diff --exit-code
-      - name: Preserve exact source and expected failure
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: checkpoint-physical-staging-validation
+          name: shared-prepare-retirement
           path: |
             source.txt
-            rustc.txt
             *.log
-          retention-days: 14
