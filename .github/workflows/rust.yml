@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a2638923b40721fcb97e251a406c8a1301c3ae29
+          ref: 51281e58f3a060e4a261a5f31a6a9dc7b1dc9714
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = a2638923b40721fcb97e251a406c8a1301c3ae29
+          test "$(git rev-parse HEAD)" = 51281e58f3a060e4a261a5f31a6a9dc7b1dc9714
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -37,15 +37,19 @@ jobs:
           grep -q '1 passed; 0 failed' physical.log
           timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ids_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids.log
           grep -q '1 passed; 0 failed' ids.log
-      - name: Missing recovered confirmation must fail
+      - name: Recovered confirmation and actual-file rejection
         run: |
-          set +e
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'recovered checkpoint confirmation is not implemented' confirmation-red.log
-          grep -q '0 passed; 1 failed' confirmation-red.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-green.log
+          grep -q '2 passed; 0 failed' confirmation-green.log
+      - name: Manifest and ID protocol siblings
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee ids-protocol.log
+          grep -q '0 failed' ids-protocol.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::commit_manifest:: -- --test-threads=1 2>&1 | tee manifest.log
+          grep -q '0 failed' manifest.log
+      - name: Strict library lint
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Source integrity
         run: |
           cargo fmt --all --check
