@@ -1,4 +1,4 @@
-name: Shared synchronous prepare retirement validation
+name: Recovered completed checkpoint confirmation validation
 on:
   workflow_dispatch:
 permissions:
@@ -10,13 +10,13 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "1"
 jobs:
-  prepare-retirement:
+  recovered-confirmation:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6a3e9f78d0bd1debef6b467775450e61a6af9463
+          ref: a2638923b40721fcb97e251a406c8a1301c3ae29
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,37 +25,27 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 6a3e9f78d0bd1debef6b467775450e61a6af9463
+          test "$(git rev-parse HEAD)" = a2638923b40721fcb97e251a406c8a1301c3ae29
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
-      - name: Checkpoint pause excludes idle root prepare
+      - name: Existing sealed recovery entry and physical inspection
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_idle_root_respects_checkpoint_pause -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause.log
-          grep -q '1 passed; 0 failed' pause.log
-      - name: Manifest and logical physical retirement
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
+          grep -q '3 passed; 0 failed' entry.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical.log
+          grep -q '1 passed; 0 failed' physical.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ids_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids.log
+          grep -q '1 passed; 0 failed' ids.log
+      - name: Missing recovered confirmation must fail
         run: |
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_no_result_until_manifest_and_logical_backend_retire -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-green.log
-          grep -q '1 passed; 0 failed' retirement-green.log
-      - name: Immediate peer schema import
-        run: |
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee prepare-green.log
-          grep -q '3 passed; 0 failed' prepare-green.log
-      - name: Central replay cancellation and read pins
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh -- --test-threads=1 2>&1 | tee refresh.log
-          grep -q '6 passed; 0 failed' refresh.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::read_pinned_file -- --test-threads=1 2>&1 | tee pins.log
-          grep -q '2 passed; 0 failed' pins.log
-      - name: Watermark cancellation sibling and shared metadata
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_io_native_reset_drop_resume_retains_physical_reads -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark-io.log
-          grep -q '1 passed; 0 failed' watermark-io.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
-          grep -q '0 failed' mvcc.log
-      - name: Strict library lint
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          set +e
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'recovered checkpoint confirmation is not implemented' confirmation-red.log
+          grep -q '0 passed; 1 failed' confirmation-red.log
       - name: Source integrity
         run: |
           cargo fmt --all --check
@@ -63,7 +53,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-prepare-retirement
+          name: recovered-completed-confirmation
           path: |
             source.txt
             *.log
