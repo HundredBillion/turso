@@ -270,81 +270,103 @@ impl Drop for ProcessWorker {
 
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
-fn shared_worker_native_row_delete_and_unique_conflicts() {
-    for conflict in ["update", "delete", "unique"] {
-        for winner in [0, 1] {
-            eprintln!("worker conflict={conflict}, winner={winner}");
-            let directory = tempfile::tempdir().unwrap();
-            let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
-            let mut setup = Worker::open(&path, limit, true);
-            assert_eq!(setup.execute("CREATE TABLE worker_rows(id INTEGER PRIMARY KEY, value INTEGER, tag TEXT); CREATE UNIQUE INDEX worker_tag ON worker_rows(tag); INSERT INTO worker_rows VALUES(1,100,'original')"), "OK");
-            drop(setup);
-            let mut workers = [
-                Worker::open(&path, limit, true),
-                Worker::open(&path, limit, true),
-            ];
-            for worker in &mut workers {
-                assert_eq!(worker.execute("BEGIN CONCURRENT"), "OK");
-                assert_eq!(
-                    worker.query("SELECT value FROM worker_rows WHERE id=1"),
-                    "[100]"
-                );
-            }
-            let sql = match conflict {
-                "update" => [
-                    "UPDATE worker_rows SET value=10 WHERE id=1",
-                    "UPDATE worker_rows SET value=20 WHERE id=1",
-                ],
-                "delete" => [
-                    "DELETE FROM worker_rows WHERE id=1",
-                    "UPDATE worker_rows SET value=20 WHERE id=1",
-                ],
-                "unique" => [
-                    "INSERT INTO worker_rows VALUES(10,10,'duplicate')",
-                    "INSERT INTO worker_rows VALUES(20,20,'duplicate')",
-                ],
-                _ => unreachable!(),
-            };
-            for index in 0..2 {
-                assert_eq!(
-                    workers[index].execute(sql[index]),
-                    "OK",
-                    "both conflicting writes must be staged before commit"
-                );
-            }
-            assert_eq!(workers[winner].execute("COMMIT"), "OK");
-            let loser = 1 - winner;
-            let error = workers[loser].execute("COMMIT");
-            eprintln!("conflict result: {error}");
-            assert!(
-                ["ERR WriteWriteConflict", "ERR Busy", "ERR Constraint"]
-                    .iter()
-                    .any(|prefix| error.starts_with(prefix)),
-                "second conflicting commit was not rejected: {error}"
+fn shared_worker_native_update_conflicts() {
+    worker_conflicts("update");
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_worker_native_delete_conflicts() {
+    worker_conflicts("delete");
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_worker_native_unique_conflicts() {
+    worker_conflicts("unique");
+}
+
+fn worker_conflicts(conflict: &str) {
+    for winner in [0, 1] {
+        eprintln!("worker conflict={conflict}, winner={winner}");
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+        let mut setup = Worker::open(&path, limit, true);
+        assert_eq!(setup.execute("CREATE TABLE worker_rows(id INTEGER PRIMARY KEY, value INTEGER, tag TEXT); CREATE UNIQUE INDEX worker_tag ON worker_rows(tag); INSERT INTO worker_rows VALUES(1,100,'original')"), "OK");
+        drop(setup);
+        let mut workers = [
+            Worker::open(&path, limit, true),
+            Worker::open(&path, limit, true),
+        ];
+        for worker in &mut workers {
+            assert_eq!(worker.execute("BEGIN CONCURRENT"), "OK");
+            assert_eq!(
+                worker.query("SELECT value FROM worker_rows WHERE id=1"),
+                "[100]"
             );
-            workers[loser].execute("ROLLBACK");
-            drop(workers);
-            let mut fresh = Worker::open(&path, limit, true);
-            match conflict {
-                "unique" => {
-                    assert_eq!(
-                        fresh.query("SELECT count(*) FROM worker_rows WHERE tag='duplicate'"),
-                        "[1]"
-                    );
-                    assert_eq!(
-                        fresh.query("SELECT id FROM worker_rows WHERE tag='duplicate'"),
-                        format!("[{}]", (winner + 1) * 10)
-                    );
-                    assert_eq!(fresh.query("SELECT count(*) FROM worker_rows"), "[2]");
-                }
-                "delete" if winner == 0 => {
-                    assert_eq!(fresh.query("SELECT count(*) FROM worker_rows"), "[0]")
-                }
-                _ => assert_eq!(
-                    fresh.query("SELECT value FROM worker_rows WHERE id=1"),
+        }
+        let sql = match conflict {
+            "update" => [
+                "UPDATE worker_rows SET value=10 WHERE id=1",
+                "UPDATE worker_rows SET value=20 WHERE id=1",
+            ],
+            "delete" => [
+                "DELETE FROM worker_rows WHERE id=1",
+                "UPDATE worker_rows SET value=20 WHERE id=1",
+            ],
+            "unique" => [
+                "INSERT INTO worker_rows VALUES(10,10,'duplicate')",
+                "INSERT INTO worker_rows VALUES(20,20,'duplicate')",
+            ],
+            _ => unreachable!(),
+        };
+        let loser = 1 - winner;
+        let first = workers[winner].execute(sql[winner]);
+        eprintln!("staging winner={winner}: {first}");
+        assert_eq!(first, "OK", "first conflicting write was rejected");
+        let second = workers[loser].execute(sql[loser]);
+        eprintln!("staging loser={loser}: {second}");
+        if conflict == "unique" {
+            assert_eq!(
+                second, "OK",
+                "distinct-primary-key inserts must reach unique-index validation"
+            );
+        }
+        assert_eq!(workers[winner].execute("COMMIT"), "OK");
+        let error = if second == "OK" {
+            workers[loser].execute("COMMIT")
+        } else {
+            second
+        };
+        eprintln!("conflict result: {error}");
+        assert!(
+            ["ERR WriteWriteConflict", "ERR Busy", "ERR Constraint"]
+                .iter()
+                .any(|prefix| error.starts_with(prefix)),
+            "conflicting write was not rejected: {error}"
+        );
+        workers[loser].execute("ROLLBACK");
+        drop(workers);
+        let mut fresh = Worker::open(&path, limit, true);
+        match conflict {
+            "unique" => {
+                assert_eq!(
+                    fresh.query("SELECT count(*) FROM worker_rows WHERE tag='duplicate'"),
+                    "[1]"
+                );
+                assert_eq!(
+                    fresh.query("SELECT id FROM worker_rows WHERE tag='duplicate'"),
                     format!("[{}]", (winner + 1) * 10)
-                ),
+                );
+                assert_eq!(fresh.query("SELECT count(*) FROM worker_rows"), "[2]");
             }
+            "delete" if winner == 0 => {
+                assert_eq!(fresh.query("SELECT count(*) FROM worker_rows"), "[0]")
+            }
+            _ => assert_eq!(
+                fresh.query("SELECT value FROM worker_rows WHERE id=1"),
+                format!("[{}]", (winner + 1) * 10)
+            ),
         }
     }
 }
