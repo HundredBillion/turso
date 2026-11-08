@@ -4264,7 +4264,7 @@ mod tests {
                 &mut self,
                 _: &Arc<turso_core::Connection>,
                 _: &[turso_core::Register],
-            ) -> turso_core::IOResultOr<i64> {
+            ) -> turso_core::types::IOResultOr<i64> {
                 Ok(turso_core::IOResult::Done(73))
             }
         }
