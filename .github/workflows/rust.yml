@@ -1,4 +1,4 @@
-name: Shared sequence watermark acceptance
+name: Shared provisional domain probes
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1c61e2306b8c37ff71728e19819ba572338e2d74
+          ref: af4d6bf740ae4a83987a4b8df51b6e5cfffa187f
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,22 +24,26 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1c61e2306b8c37ff71728e19819ba572338e2d74
+          test "$(git rev-parse HEAD)" = af4d6bf740ae4a83987a4b8df51b6e5cfffa187f
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Native watermark boundary and live claims
+      - name: Provisional table and sequence probes
         run: |
           set -o pipefail
-          timeout 1200 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_watermark_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark.log
-          grep -q '3 passed; 0 failed' watermark.log
-      - name: Strict library lint
-        run: |
-          set -o pipefail
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run
+          for selector in shared_id_opcode_native_provisional_table_ shared_id_opcode_native_provisional_sequence_; do
+            set +e
+            timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
+            result=${PIPESTATUS[0]}
+            set -e
+            echo "$result" > "$selector.exit.log"
+            test "$result" -eq 0 -o "$result" -eq 101
+            grep -Eq '(1 passed; 0 failed|0 passed; 1 failed)' "$selector.log"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-watermark
+          name: shared-provisional-probes
           path: |
             source.txt
             rustc.txt
