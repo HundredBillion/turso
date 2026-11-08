@@ -236,6 +236,10 @@ fn validate_parts(
 }
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_checkpoint_base_retirement_tests.rs"]
+mod retirement_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 mod tests {
     use super::*;
 
