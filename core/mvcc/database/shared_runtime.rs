@@ -16,6 +16,7 @@ mod shared_checkpoint_recovery;
 
 #[path = "shared_checkpoint_recovery_intent.rs"]
 mod shared_checkpoint_recovery_intent;
+pub(in crate::mvcc) use shared_checkpoint_recovery_intent::RecoveryIntentEvidence;
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_checkpoint_intent_fixture.rs"]
