@@ -618,3 +618,363 @@ mod shared_watermark_io_tests;
 
 #[path = "shared_watermark_process_tests.rs"]
 mod shared_watermark_process_tests;
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_rollback_to_releases_only_scoped_claims() {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let snapshot = store.read_snapshot_ts(outer);
+    first.execute("SAVEPOINT scope").unwrap();
+    first
+        .execute("UPDATE preserved SET id=66,value='changed' WHERE id=66")
+        .unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'scoped')")
+        .unwrap();
+    first.execute("SAVEPOINT nested").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(88,'nested')")
+        .unwrap();
+    first.execute("RELEASE nested").unwrap();
+    first.execute("ROLLBACK TO scope").unwrap();
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'reclaimed')")
+        .unwrap();
+    first.execute("ROLLBACK TO scope").unwrap();
+    let error = second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::LimboError::Busy),
+        "prior claim lost: {error:?}"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer'),(88,'peer')")
+        .expect("ROLLBACK TO acknowledged but retained scoped ID claims");
+    // The named frame remains usable, and its earlier outer claim is still live.
+    first.execute("ROLLBACK TO scope").unwrap();
+    first.execute("RELEASE scope").unwrap();
+    first.execute("ROLLBACK").unwrap();
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_failed_statement_releases_only_scoped_claims() {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let snapshot = store.read_snapshot_ts(outer);
+    let error = first
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'scoped'),(1,'duplicate')")
+        .unwrap_err();
+    assert!(
+        !matches!(error, crate::LimboError::Busy),
+        "expected the existing row constraint: {error:?}"
+    );
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    let error = second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::LimboError::Busy),
+        "prior claim lost: {error:?}"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .expect("failed statement rolled back but retained scoped ID claim");
+    first.execute("ROLLBACK").unwrap();
+}
+
+fn abandoned_claim_releases_scope(reset: bool) {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let snapshot = store.read_snapshot_ts(outer);
+    first.set_yield_injector(Some(Arc::new(AfterClaimYield(
+        std::sync::atomic::AtomicBool::new(true),
+    ))));
+    let mut statement = first
+        .prepare("INSERT INTO preserved(id,value) VALUES(77,'abandoned')")
+        .unwrap();
+    let mut parked = false;
+    for _ in 0..10000 {
+        match statement.step().unwrap() {
+            crate::StepResult::Yield => {
+                parked = true;
+                break;
+            }
+            crate::StepResult::IO => statement.get_pager().io.step().unwrap(),
+            other => panic!("expected durable claim boundary, got {other:?}"),
+        }
+    }
+    assert!(parked);
+    first.set_yield_injector(None);
+    if reset {
+        statement.reset().unwrap();
+    }
+    drop(statement);
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    let error = second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::LimboError::Busy),
+        "prior claim lost: {error:?}"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .expect("abandoned statement retained its scoped ID claim");
+    first
+        .execute("COMMIT")
+        .expect("abandoned statement poisoned the earlier transaction");
+    assert_eq!(
+        integers(&second, "SELECT id FROM preserved WHERE id>=66"),
+        [66, 77]
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_reset_releases_only_scoped_claims() {
+    abandoned_claim_releases_scope(true);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_drop_releases_only_scoped_claims() {
+    abandoned_claim_releases_scope(false);
+}
+
+#[derive(Debug)]
+struct AfterScopeReleaseYield(std::sync::atomic::AtomicBool);
+impl crate::mvcc::yield_points::YieldInjector for AfterScopeReleaseYield {
+    fn should_yield(&self, _: u64, _: u64, point: crate::mvcc::yield_points::YieldPoint) -> bool {
+        use crate::mvcc::yield_hooks::YieldPointMarker;
+        point == super::execute::TransactionYieldPoint::AfterSharedScopeRelease.point()
+            && self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_cancel_after_release_requires_local_undo() {
+    for reset in [true, false] {
+        let (_directory, first, second) = pair();
+        first.execute("BEGIN CONCURRENT").unwrap();
+        first
+            .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+            .unwrap();
+        first.execute("SAVEPOINT scope").unwrap();
+        first
+            .execute("INSERT INTO preserved(id,value) VALUES(77,'scoped')")
+            .unwrap();
+        let outer = first.get_mv_tx_id_for_db(0).unwrap();
+        let snapshot = first.mv_store().as_ref().unwrap().read_snapshot_ts(outer);
+        let mut reader = first
+            .prepare("SELECT id FROM preserved ORDER BY id")
+            .unwrap();
+        assert!(matches!(reader.step().unwrap(), crate::StepResult::Row));
+        first.set_yield_injector(Some(Arc::new(AfterScopeReleaseYield(
+            std::sync::atomic::AtomicBool::new(true),
+        ))));
+        let mut statement = first.prepare("ROLLBACK TO scope").unwrap();
+        let mut parked = false;
+        for _ in 0..10000 {
+            match statement.step().unwrap() {
+                crate::StepResult::Yield => {
+                    parked = true;
+                    break;
+                }
+                crate::StepResult::IO => statement.get_pager().io.step().unwrap(),
+                other => panic!("expected scope release boundary, got {other:?}"),
+            }
+        }
+        assert!(parked);
+        first.set_yield_injector(None);
+        assert!(
+            matches!(reader.step(), Err(crate::LimboError::Busy)),
+            "resumed reader bypassed pending rollback"
+        );
+        drop(reader);
+        assert!(
+            matches!(first.execute("COMMIT"), Err(crate::LimboError::Busy)),
+            "commit bypassed pending rollback"
+        );
+        assert!(
+            matches!(
+                second.execute("INSERT INTO preserved(id,value) VALUES(77,'peer')"),
+                Err(crate::LimboError::Busy)
+            ),
+            "publication authority retired before local undo"
+        );
+        if reset {
+            statement.reset().unwrap();
+        }
+        drop(statement);
+        second
+            .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+            .unwrap();
+
+        assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+        assert_eq!(
+            first.mv_store().as_ref().unwrap().read_snapshot_ts(outer),
+            snapshot
+        );
+        assert_eq!(
+            integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+            [66]
+        );
+        first.execute("RELEASE scope").unwrap();
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            integers(&second, "SELECT id FROM preserved WHERE id>=66"),
+            [66, 77]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_failed_sequence_statement_preserves_autonomous_value() {
+    let (_directory, first, second) = pair_with_setup(Some("CREATE SEQUENCE cleanup_sequence"));
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let snapshot = first.mv_store().as_ref().unwrap().read_snapshot_ts(outer);
+    first.execute("INSERT INTO preserved(id,value) VALUES(77,nextval('cleanup_sequence')),(1,nextval('cleanup_sequence'))")
+        .expect_err("existing key must abort the outer statement");
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(
+        first.mv_store().as_ref().unwrap().read_snapshot_ts(outer),
+        snapshot
+    );
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('cleanup_sequence')"
+        ),
+        [3],
+        "aborted statement retained sequence claims or rewound autonomous durable state"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    assert_eq!(integers(&second, "SELECT nextval('cleanup_sequence')"), [3]);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_named_rollback_preserves_earlier_sequence_claim() {
+    let (_directory, first, second) = pair_with_setup(Some(
+        "CREATE SEQUENCE prior_sequence; CREATE SEQUENCE scoped_sequence",
+    ));
+    first.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(integers(&first, "SELECT nextval('prior_sequence')"), [1]);
+    first.execute("SAVEPOINT scope").unwrap();
+    assert_eq!(integers(&first, "SELECT nextval('scoped_sequence')"), [1]);
+    first.execute("ROLLBACK TO scope").unwrap();
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('prior_sequence')"
+        ),
+        [1]
+    );
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('scoped_sequence')"
+        ),
+        [2]
+    );
+    first.execute("RELEASE scope").unwrap();
+    first.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        integers(
+            &second,
+            "SELECT sequence_watermark_experimental('prior_sequence')"
+        ),
+        [2]
+    );
+}
+
+#[path = "shared_id_lifecycle_io_tests.rs"]
+mod shared_id_lifecycle_io_tests;
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_empty_scopes_do_not_create_journal_owners() {
+    let (directory, first, second) = pair();
+    let namespace = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".turso-mvcc-")
+        })
+        .expect("shared namespace");
+    let capture = || {
+        ["ids-a", "ids-b", "ids-selector"].map(|name| std::fs::read(namespace.join(name)).unwrap())
+    };
+    let before = capture();
+    first.execute("SAVEPOINT empty").unwrap();
+    first.execute("SAVEPOINT nested").unwrap();
+    first.execute("ROLLBACK TO nested").unwrap();
+    first.execute("RELEASE nested").unwrap();
+    first.execute("ROLLBACK TO empty").unwrap();
+    first.execute("RELEASE empty").unwrap();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first.execute("SAVEPOINT empty").unwrap();
+    first.execute("ROLLBACK TO empty").unwrap();
+    first.execute("RELEASE empty").unwrap();
+    first.execute("COMMIT").unwrap();
+    assert_eq!(capture(), before, "empty scopes appended ID metadata");
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .unwrap();
+    assert_eq!(integers(&first, "SELECT count(*) FROM preserved"), [2]);
+}

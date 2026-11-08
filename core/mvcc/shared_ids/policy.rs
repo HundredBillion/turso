@@ -119,11 +119,13 @@ impl SharedIds {
             io,
             action,
             identity,
+            scope_boundary: None,
         })
     }
 }
 
 pub(in crate::mvcc) struct IdOperation {
+    scope_boundary: Option<SavepointMark>,
     stage: Stage,
     oracle: Box<dyn CommittedIdOracle>,
     io: Arc<dyn IO>,
@@ -161,6 +163,9 @@ enum Decision {
     Append(Change, IdResult),
 }
 impl IdOperation {
+    pub(in crate::mvcc) fn scope_boundary(&self) -> Option<SavepointMark> {
+        self.scope_boundary
+    }
     pub(in crate::mvcc) fn poll(&mut self) -> Result<IOResult<IdOutcome>> {
         loop {
             match std::mem::replace(&mut self.stage, Stage::Finished) {
@@ -173,6 +178,22 @@ impl IdOperation {
                 },
                 Stage::Evaluating(loaded) => {
                     self.check_identity(&loaded)?;
+                    if self.scope_boundary.is_none()
+                        && matches!(
+                            self.action,
+                            IdAction::ReserveRow { .. }
+                                | IdAction::ClaimExplicitRow { .. }
+                                | IdAction::ClaimSequence { .. }
+                                | IdAction::ReserveLogicalTable { .. }
+                        )
+                    {
+                        if let Some(owner) = action_owner(self.action) {
+                            self.scope_boundary = Some(SavepointMark {
+                                owner,
+                                next_ordinal: loaded.state.next_ordinal(owner)?,
+                            });
+                        }
+                    }
                     let live = loaded.guard.live_registrations()?;
                     if let Some(owner) = action_owner(self.action) {
                         if !matches!(self.action, IdAction::ReleaseOwner { .. })
