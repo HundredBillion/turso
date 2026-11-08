@@ -140,3 +140,19 @@ test with an intervening SELECT passes on the same source. The new implementatio
 must additionally preserve active snapshots, avoid recursive internal preparation,
 reject preparation while a checkpoint pauses admission, and retain authority over
 delayed physical reads.
+
+Logical reader lifetime is shared by prepare, transaction admission, bootstrap,
+commit refresh and checkpoint refresh. A normal selected manifest authorizes the
+read transport even while mapped publication still requires replay recovery.
+`ReadPinnedFile::for_manifest_replay` accepts that sealed manifest and retains its
+lease in every physical read callback. It supplies no readiness or checkpoint
+proof. `SharedRefresh` already waits for physical retirement before adopting
+storage state or returning authority. Central wrapping in `reset_reader` applies
+the same lifetime rule to every caller.
+
+Native source `b21428dff` (run `42479654326`) passed checkpoint-pause protection
+and the manifest read case, then failed the logical read case after callback
+completion while the backend still retained its completion. A portable cancelled
+refresh test also fails when central wrapping is removed: authority becomes
+available before the physical read callback. Both regressions must pass with the
+wrapper restored.
