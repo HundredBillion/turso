@@ -41,10 +41,10 @@
 
 **Interfaces:** Pager tag stores physical database identity and durable generation/checkpoint base together. It starts unknown; aliases observe one tag. Runtime certification validates the selected normal record against the certified replay physical base before setting a constructor tag. Do not derive checkpoint base from a later committed prefix.
 
-- [ ] Add an old-generation idle-pager regression using genuine completed checkpoint publication.
-- [ ] Add private reset-and-tag operations that preserve SharedPagerState and reject active/dirty aliases without changing their transaction state.
-- [ ] Test a helper sharing an active Arc<Pager>: return Busy without reset or outer-transaction loss.
-- [ ] Verify tag assignment follows captured authority and cannot label an old in-flight constructor as a later generation.
+- [x] Add an old-generation idle-pager regression using genuine completed checkpoint publication.
+- [x] Add private reset-and-tag operations that preserve SharedPagerState and reject active/dirty aliases without changing their transaction state.
+- [x] Test a helper sharing an active Arc<Pager>: return Busy without reset or outer-transaction loss.
+- [x] Verify tag assignment follows captured authority and cannot label an old in-flight constructor as a later generation.
 
 ### Task 3: Admission and checkpoint-tail certification
 
@@ -54,16 +54,27 @@
 
 **Interfaces:** SharedRefresh::poll_begin checks the actual pager tag after refreshed selection and before snapshot registration. Bootstrap certification occurs only after real base/replay/ID validation. `SharedMvccRuntime::certify_completed_pager(connection, proof, guard) -> Result<()>` works while replay is None, validates the original completed target authority and source pager ownership, resets idle private state, and sets the target tag. It publishes no replay state and releases no authority or admission pause.
 
-- [ ] Wire the pre-snapshot pager check; retain existing schema-generation/reprepare guards.
-- [ ] Certify initial bootstrap under its validated ownership before promotion/post-bootstrap queries.
-- [ ] Expose the completed-proof certification seam to the independently owned tail; late failure remains fail-closed.
-- [ ] Verify cancellation, retry, foreign source/authority and active-pager rejection without constructing opaque proof values in tests.
+- [x] Wire the pre-snapshot pager check; retain existing schema-generation/reprepare guards.
+- [x] Certify initial bootstrap under its validated ownership before promotion/post-bootstrap queries.
+- [x] Expose the completed-proof certification seam to the independently owned tail; late failure remains fail-closed.
+- [x] Verify cancellation, retry, foreign source/authority and active-pager rejection without constructing opaque proof values in tests.
 
 ### Task 4: Combined validation and independent review
 
 **Blocked by:** Tasks 1-3
 
-- [ ] Run focused portable pager/generation/constructor tests and ordinary connection regressions on pinned Rust1.88.
-- [ ] Run genuine native initial-open/constructor/idle-generation tests with exact counts and causal controls.
-- [ ] Run shared runtime/admission suites and strict library Clippy with bench,conn_raw_api; format and inspect diff.
+- [x] Run focused portable pager/generation/constructor tests and ordinary connection regressions on pinned Rust1.88.
+- [x] Run genuine native initial-open/constructor/idle-generation tests with exact counts and causal controls.
+- [x] Run shared runtime/admission suites and strict library Clippy with bench,conn_raw_api; format and inspect diff.
 - [ ] Obtain independent whole-component review; integrate only tested source commits. Never merge validation workflows or activate public shared mode.
+
+
+## Verified scope and evidence
+
+Implementation source ef7a2adfbf243f1a43c8b2830c79e5aeb40884ac passed native Linux run 42434445275: six constructor/admission/cancellation tests, one genuine completed-proof pager certification test, fourteen generation tests, strict Rust1.88 library Clippy with bench,conn_raw_api, and formatting. Production-identical 97283c368 passed native run 42434201098 with two causal controls: removing generation reset failed both stale-cache and active-alias tests; omitting the completed target tag failed the genuine proof test. Restored exact source passed again. Local full core library validation passed 2816 tests, with 40 ignored.
+
+Initial-open and cached-constructor physical-header cancellation tests retain actual backend completions before callback and after callback. Both native ownership exclusion and direct retry after release are checked. Removing read ownership and removing InitState read-lock cleanup each produced the intended native failure before exact-source restoration passed. Constructor tests also distinguish the physical checkpoint timestamp from a later same-generation logical commit timestamp.
+
+The completed certifier checks incarnation readiness; the checkpoint tail separately supplies finalized ID-selector ownership through FinalizedIds. A cert-only test may retain prepared IDs because it publishes no replay or admission readiness.
+
+This component checks private pager state after a local Store/replay installation. Reloading an idle process whose Store/replay still belongs to an earlier generation remains a separate integration gate, including when later commits have overwritten the empty completed record. Generation mismatch remains closed to admission; this component manufactures no completed proof and rewinds no published prefix. Public shared mode remains disabled.
