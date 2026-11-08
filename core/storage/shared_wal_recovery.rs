@@ -128,6 +128,26 @@ mod tests {
         assert!(mapping.register_db_file_reader(owner).is_none());
         assert!(!mapping.try_acquire_writer(owner));
         assert!(!mapping.try_acquire_checkpoint(owner));
+        assert!(mapping.writer_or_checkpoint_lock_active());
+        assert!(mapping.checkpoint_lock_active());
+        assert!(mapping.has_active_db_file_reader());
+        assert_eq!(mapping.min_active_reader_frame(), Some(0));
+        let foreign_io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let foreign = foreign_io
+            .open_file(
+                directory.path().join("tshm").to_str().unwrap(),
+                OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        for offset in 1..67 {
+            assert!(
+                !foreign
+                    .shared_wal_try_lock_byte(offset, true, mapping.lock_kind())
+                    .unwrap(),
+                "native recovery byte {offset} escaped exclusion"
+            );
+        }
         assert!(matches!(
             SharedWalRecoveryLocks::acquire(mapping.clone()),
             Err(LimboError::Busy)

@@ -1844,7 +1844,8 @@ impl MappedSharedWalCoordination {
     /// writer/checkpoint/reader ownership. Shared owner fields are metadata and
     /// may legitimately lag behind crash recovery or repair paths.
     fn byte_lock_is_held(&self, offset: u64, local_held: bool) -> bool {
-        if local_held {
+        let local = self.local_lock_state.lock();
+        if local_held || local.recovery_held || local.recovery_poisoned {
             return true;
         }
         match self
@@ -2338,6 +2339,9 @@ impl MappedSharedWalCoordination {
                     return None;
                 }
                 let local = self.local_lock_state.lock();
+                if local.recovery_held || local.recovery_poisoned {
+                    return Some(DB_FILE_READER_FRAME);
+                }
                 let frame = frame.load(Ordering::Acquire);
                 if frame == UNUSED_READER_FRAME {
                     return None;
