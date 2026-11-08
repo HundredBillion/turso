@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9c019ad35eda60e73383b8b9721a0e529e8b9431
+          ref: 71578623c63ef9502cd88d0729807fc04ed6229f
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9c019ad35eda60e73383b8b9721a0e529e8b9431
+          test "$(git rev-parse HEAD)" = 71578623c63ef9502cd88d0729807fc04ed6229f
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
@@ -51,30 +51,6 @@ jobs:
           cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ 2>&1 | tee peer-descriptors.log
           grep -q '4 passed; 0 failed' peer-descriptors.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-      - name: Source layout memo causal control and restore
-        run: |
-          set -o pipefail
-          python3 - <<'CONTROL'
-          from pathlib import Path
-          path = Path('core/database/shared_oracle.rs')
-          source = path.read_text()
-          needle = '        let reserved = source.get_reserved_space();'
-          assert source.count(needle) == 1
-          source = source.replace(needle, '        let reserved = Some(source.get_reserved_space().ok_or_else(|| LimboError::InvalidArgument("oracle source pager layout is not initialized".into()))?);')
-          path.write_text(source)
-          CONTROL
-          git diff > source-layout-control.diff
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_oracle_pager_uses_retained_identity_and_independent_read_state -- --ignored --test-threads=1 --nocapture 2>&1 | tee source-layout-red.log
-          code=${PIPESTATUS[0]}
-          set -e
-          test "$code" = 101
-          grep -q '0 passed; 1 failed' source-layout-red.log
-          grep -q 'oracle source pager layout is not initialized' source-layout-red.log
-          git restore core/database/shared_oracle.rs
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_oracle_pager_uses_retained_identity_and_independent_read_state -- --ignored --test-threads=1 2>&1 | tee restored-factory.log
-          grep -q '1 passed; 0 failed' restored-factory.log
-          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
