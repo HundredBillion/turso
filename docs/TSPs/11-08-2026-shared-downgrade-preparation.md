@@ -1,6 +1,6 @@
 # Private downgrade-intent preparation from installed checkpoint
 
-Status: proposed bounded slice for root review. This implements the approved
+Status: bounded design approved by root; implementation under validation. This implements the approved
 mirrored downgrade-fence scheme; it does not implement marker2 publication,
 namespace removal, public operation dispatch or C/PDO activation.
 
@@ -19,7 +19,7 @@ helper shared by that method and downgrade preparation; preserve ready behavior.
 The new entry is conceptually:
 
 `InstalledLocalCheckpoint::begin_downgrade(connection, OfflinePrerequisite)`
-`  -> SharedDowngradePreparation::poll() -> PreparedSharedDowngrade`
+`  -> SharedDowngradePreparation::poll() -> MirroredDowngradeIntent`
 
 It consumes the installed token and never calls `publish_ready`. Its opaque
 source proof retains the real completed proof, original connection/schema/replay
@@ -40,7 +40,8 @@ WAL emptiness before publication. No file is created, truncated or replaced.
 
 As with the existing private offline recovery opener, use a forced SyscallIO
 manifest handle whose native identity equals the runtime's retained manifest.
-No custom/asynchronous backend is accepted for this offline slice. Physical I/O
+The installed runtime may use its existing supported backend; prior I/O must be
+retired. Transition I/O always uses the owned synchronous alias. Physical I/O
 therefore completes before each syscall returns; this avoids adding a new generic
 resource-retention policy merely to preserve the native main lock across abandoned
 asynchronous work. Existing manifest authority pins remain unchanged.
@@ -50,7 +51,8 @@ installed source proof and loaded manifest, while retaining its synthetic fixtur
 constructor under cfg(test). The source proof remains owned by publication and
 then by its returned mirrored token, including main/WAL handles and admission
 pause. It authorizes only normal empty completed target -> existing terminal v3
-intent with actual basename WAL FileId. Do not require or publish runtime Ready.
+intent with actual basename WAL FileId. Preserve the mapped incarnation-ready
+metadata check, but never publish Database/runtime Ready or the replay context.
 Both slots must be FULL-synced and existing completion retirement satisfied before
 return. On error/drop, replay stays absent and authority requires recovery; no
 marker operation is possible. A partially published valid terminal intent remains
@@ -74,4 +76,12 @@ an admission fence under the existing selector rules.
    cancellation coverage from synthetic publication fixtures.
 
 Marker transaction/checkpoint, interrupted-downgrade resumption and safe namespace
-cleanup remain mandatory later stages. No ordinary-mode behavior is changed.
+cleanup remain mandatory later stages. An absent basename WAL is an explicit
+error without creation in this slice; safe creation and interrupted-resume handling
+remain required for the complete operator. No ordinary-mode behavior is changed.
+
+## Initial causal evidence
+
+Native run 42487138081, source d82be999aa783d88e6856ed6cb523981d1c3f6b4,
+reached the genuine installed-checkpoint constructor and failed exactly its
+not-implemented stub (0 passed, 1 failed). No proof fields were fabricated.

@@ -1,24 +1,43 @@
 use super::*;
+use crate::mvcc::database::InstalledDowngradeSource;
 
 /// Mirrors an intent; it does not certify physical materialization or quiescence.
-/// Production construction stays unavailable until the coordinator owns that proof.
+/// The production constructor consumes the installed, quiescent checkpoint capability.
 pub(in crate::mvcc) struct DowngradeIntentPublication {
     file: Arc<dyn File>,
     publication: ManifestPublication,
     mirrored: bool,
     durable: Option<DurableManifest>,
     terminated: bool,
+    source: Option<InstalledDowngradeSource>,
 }
 
 pub(in crate::mvcc) struct MirroredDowngradeIntent {
     _file: Arc<dyn File>,
     record: ManifestRecord,
     guard: AuthorityGuard,
+    _source: Option<InstalledDowngradeSource>,
 }
 
 impl DowngradeIntentPublication {
-    // The real constructor must consume the coordinator's final owned quiescent
-    // token. Synthetic fixtures certify publication ordering only.
+    pub(in crate::mvcc) fn from_installed(
+        loaded: LoadedManifest,
+        source: InstalledDowngradeSource,
+    ) -> Result<Self> {
+        source.validate(&loaded)?;
+        let intent = loaded.record.begin_downgrade(source.wal_id())?;
+        let file = loaded.file.clone();
+        Ok(Self {
+            file,
+            publication: loaded.publish_record(intent)?,
+            mirrored: false,
+            durable: None,
+            terminated: false,
+            source: Some(source),
+        })
+    }
+
+    // Synthetic fixtures certify publication ordering only.
     #[cfg(test)]
     pub(super) fn synthetic(loaded: LoadedManifest, basename_wal_id: FileId) -> Result<Self> {
         let guard = loaded.guard()?;
@@ -38,6 +57,7 @@ impl DowngradeIntentPublication {
             mirrored: false,
             durable: None,
             terminated: false,
+            source: None,
         })
     }
 }
@@ -64,6 +84,7 @@ impl DowngradeIntentPublication {
                     _file: self.file.clone(),
                     record: durable.record,
                     guard: durable.guard.take().unwrap(),
+                    _source: self.source.take(),
                 }));
             }
             let mut durable = match self.publication.poll()? {

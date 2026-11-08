@@ -1,5 +1,6 @@
 #[path = "shared_downgrade_preparation.rs"]
 mod shared_downgrade_preparation;
+pub(in crate::mvcc) use shared_downgrade_preparation::InstalledDowngradeSource;
 
 use super::*;
 use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
@@ -16,8 +17,8 @@ pub(in crate::mvcc) struct InstalledLocalCheckpoint {
 }
 
 impl InstalledLocalCheckpoint {
-    pub(in crate::mvcc) fn publish_ready(self, connection: Arc<Connection>) -> Result<()> {
-        if !crate::sync::Weak::ptr_eq(&self.original_connection, &Arc::downgrade(&connection)) {
+    fn validate_handoff(&self, connection: &Arc<Connection>) -> Result<Arc<SharedMvccRuntime>> {
+        if !crate::sync::Weak::ptr_eq(&self.original_connection, &Arc::downgrade(connection)) {
             return Err(LimboError::InvalidArgument(
                 "checkpoint handoff requires its original connection".into(),
             ));
@@ -59,6 +60,11 @@ impl InstalledLocalCheckpoint {
                 "checkpoint handoff has nonempty append state".into(),
             ));
         }
+        Ok(runtime.clone())
+    }
+
+    pub(in crate::mvcc) fn publish_ready(self, connection: Arc<Connection>) -> Result<()> {
+        let runtime = self.validate_handoff(&connection)?;
         runtime.certify_completed_pager(&connection, &self.proof, &self.guard)?;
         *runtime.replay.lock() = Some(self.replay);
         let result = self.guard.finish();
