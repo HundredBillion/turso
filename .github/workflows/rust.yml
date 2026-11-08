@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 7717dcc35203fa51760bbad26451c13937eac782
+          ref: 4532b92040e8a5c7565d718d26da93e12e32f79d
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 7717dcc35203fa51760bbad26451c13937eac782
+          test "$(git rev-parse HEAD)" = 4532b92040e8a5c7565d718d26da93e12e32f79d
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
