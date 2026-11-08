@@ -62,8 +62,6 @@ pub use memory::MemoryIO;
 pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
-#[cfg(feature = "fs")]
-pub(crate) use common::ENV_DISABLE_FILE_LOCK;
 mod completions;
 pub use clock::Clock;
 pub use completions::*;

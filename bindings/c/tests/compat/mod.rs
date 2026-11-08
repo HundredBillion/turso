@@ -5836,7 +5836,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "sqlite3"))]
-    fn test_uri_legacy_reader_defers_writer_activation_until_first_write() {
+    fn test_uri_legacy_reader_requires_reopen_before_writable_open() {
         unsafe {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("legacy.db");
@@ -5875,52 +5875,31 @@ mod tests {
                 ),
                 SQLITE_OK
             );
+            let before = std::fs::read(&path).unwrap();
             let mut writer = ptr::null_mut();
-            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_CANTOPEN);
             assert!(!writer.is_null());
-            assert_eq!(
-                sqlite3_exec(
-                    writer,
-                    c"INSERT INTO t VALUES(2)".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_BUSY
+            let error = std::ffi::CStr::from_ptr(sqlite3_errmsg(writer)).to_string_lossy();
+            assert!(
+                error.contains("read-only") && error.contains("reopen"),
+                "{error}"
             );
-            assert_eq!(sqlite3_errcode(writer), SQLITE_BUSY);
-            assert_eq!(
-                sqlite3_exec(
-                    reader,
-                    c"COMMIT".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-            assert_eq!(
-                sqlite3_exec(
-                    writer,
-                    c"INSERT INTO t VALUES(2)".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-            assert_eq!(
-                sqlite3_exec(
-                    reader,
-                    c"SELECT * FROM t".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
             assert_eq!(sqlite3_close(writer), SQLITE_OK);
+            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+            let mut reopened = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut reopened), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    reopened,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(reopened), SQLITE_OK);
         }
     }
 

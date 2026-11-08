@@ -23,9 +23,6 @@ impl SharedConnectState {
             .shared_mvcc_runtime
             .as_ref()
             .ok_or(LimboError::Busy)?;
-        if !opts.readonly.unwrap_or(database.readonly_bootstrap) {
-            database.ensure_writable_open()?;
-        }
         if database.page_codec_id.is_some() || opts.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "shared connections require unencoded pages".into(),
@@ -73,7 +70,7 @@ impl SharedConnectState {
                 self.opts.encryption_key.clone(),
                 cache_size,
                 self.context.take().unwrap(),
-                self.opts.readonly.unwrap_or(database.readonly_bootstrap),
+                self.opts.readonly || database.is_readonly(),
             )?);
         }
         return_if_io!(self.open.finish_connection(
