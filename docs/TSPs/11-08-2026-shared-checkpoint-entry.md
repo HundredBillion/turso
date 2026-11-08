@@ -24,9 +24,13 @@
 
 **Interfaces:** Consume `SharedCheckpointPublication::new(store, connection)`, `PublishedSharedCheckpoint::begin_physical_read`, `VerifiedPhysicalBase::begin_local_install`, and `InstalledLocalCheckpoint::publish_ready`. Produce `pub(crate) fn checkpoint_shared(connection: Arc<Connection>, mode: CheckpointMode) -> Result<CheckpointResult>`.
 
-- [ ] Add actual public API, SQL PRAGMA, and live-reader checkpoint regressions using `shared_runtime_fixture`; assert persisted payload, reclaimed logical file, repeated commits/checkpoints, and reader preservation.
-- [ ] Run the three tests on native Linux against unchanged production code; retain actual failure output and positive selected-test counts.
-- [ ] Retain materialization result in the coordinator and call `release_guard()` immediately on Done. Drive publication, physical read, installation and Ready in the adapter with `io.block`.
-- [ ] Route shared stores in Core checkpoint and the SQL opcode to the adapter after existing explicit guards; leave ordinary branches intact.
-- [ ] Run native regressions, existing checkpoint ownership/install/readiness suites, Rust formatting and strict core all-target lint. Document shared-mode quiescence and correct the contradictory read-only paragraph.
-- [ ] Commit, push to fork, record evidence, and obtain peer review before integration.
+- [x] Add actual public API, SQL PRAGMA, and live-reader checkpoint regressions using `shared_runtime_fixture`; assert persisted payload, reclaimed logical file, repeated commits/checkpoints, and reader preservation.
+- [x] Run the three tests on native Linux against unchanged production code; retain actual failure output and positive selected-test counts.
+- [x] Retain materialization result in the coordinator and call `release_guard()` immediately on Done. Drive publication, physical read, installation and Ready in the adapter with `io.block`.
+- [x] Route shared stores in Core checkpoint and the SQL opcode to the adapter after existing explicit guards; leave ordinary branches intact.
+- [x] Run native regressions, existing checkpoint ownership/install/readiness suites, Rust formatting and strict core all-target lint. Document shared-mode quiescence and correct the contradictory read-only paragraph.
+- [x] Commit, push to fork, record evidence, and obtain peer review before integration.
+
+## Acceptance evidence
+
+Exact runtime7a8717eee3c664433230789fe00f0ffc507f82ba passed native Linux run42520469060: allfourAPI/SQLmodes and bounded/readonly/reader refusal controls3, existingReady4 andinstallation6; strict productionlib andalltargetsClippy withconn_raw_api,bench,io_uring, andfmt. Baselinebff42519852274 selected3andfailed3 for missingmirroredintent; expandedc2 baseline42520262278 selected3andfailedonlySQLPASSIVE attranslation. Independentperformancepeerreviewaccepted thetypedlifetime/resultlockchain andthe7-linefollowup. Ordinary C/PDOactivationremainsdisabled.
