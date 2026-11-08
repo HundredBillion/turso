@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d47369981ca18a03fecf8abc51c1d2f2911e88c8
+          ref: b6fb3409f18d4a1822da8f10b430489b42df97fd
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,18 +28,23 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = d47369981ca18a03fecf8abc51c1d2f2911e88c8
+          test "$(git rev-parse HEAD)" = b6fb3409f18d4a1822da8f10b430489b42df97fd
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Fresh terminal resume expected RED
+      - name: Fresh terminal recovery and prior native controls
         run: |
-          set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume-red.log
-          code=${PIPESTATUS[0]}
-          set -e
-          test "$code" = 101
-          grep -q '^test result: FAILED. 0 passed; 1 failed;' resume-red.log
-          grep -q 'fresh terminal downgrade must resume without a live installed source' resume-red.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
+          grep -q '^test result: ok. 1 passed; 0 failed;' resume.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
+          grep -q '^test result: ok. 2 passed; 0 failed;' creation.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
+          grep -q '^test result: ok. 7 passed; 0 failed;' preparation.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker.log
+          grep -q '^test result: ok. 4 passed; 0 failed;' marker.log
+      - name: Strict library lint and formatting
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -52,3 +57,17 @@ jobs:
             *status.txt
             *summary.txt
           retention-days: 14
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b6fb3409f18d4a1822da8f10b430489b42df97fd
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-windows
+          cache-on-failure: true
+      - run: cargo check --locked -p turso_core --lib --features conn_raw_api
