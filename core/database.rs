@@ -2248,7 +2248,6 @@ impl Database {
                     if state.mvcc_convert_stmt.is_some()
                         || (db.opts.enable_mvcc
                             && db.get_mv_store().is_none()
-                            && !db.open_flags.contains(OpenFlags::ReadOnly)
                             && !db.open_flags.contains(OpenFlags::ReadOnly))
                     {
                         if state.mvcc_convert_stmt.is_none() {
