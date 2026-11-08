@@ -25,9 +25,9 @@ and crash controls use SIGKILL.
   scenarios below require successful execution of
   two disjoint write transactions before either commits. Every opened participant
   must report `PRAGMA turso_mvcc_mode` as exactly `shared`. A missing capability
-  produces exit 78 before durability configuration or data-changing SQL.
+  produces exit 78 before that shared participant issues data-changing SQL.
 
-The proposed URI contract, coordinated with the protocol owner, is
+The explicit URI contract is
 `file:/absolute/path?turso_mvcc=shared&turso_mvcc_history_limit=67108864`, plus
 `mode=ro` for read-only participants. Ordinary existing databases must not upgrade
 implicitly: a separate fixture checks refusal and unchanged files. The principal
@@ -59,7 +59,7 @@ For a freshly built Turso C library, arrange the loader exactly as the existing
 PHP storage validation does. Keep the symlink directory dedicated to the test:
 
 ```
-cargo build -p turso_sqlite3
+cargo build -p turso_sqlite3 -p turso_cli
 mkdir /new/turso-loader
 ln -s "$PWD/target/debug/libturso_sqlite3.so" /new/turso-loader/libsqlite3.so.0
 LD_LIBRARY_PATH="/new/turso-loader:$PWD/target/debug" python3 bindings/c/tests/php_workers/run.py \
@@ -67,6 +67,7 @@ LD_LIBRARY_PATH="/new/turso-loader:$PWD/target/debug" python3 bindings/c/tests/p
   --library "$PWD/target/debug/libturso_sqlite3.so" --output /new/turso-control
 LD_LIBRARY_PATH="/new/turso-loader:$PWD/target/debug" python3 bindings/c/tests/php_workers/run.py \
   --profile shared-acceptance --api pdo \
+  --shared-admin-cli "$PWD/target/debug/tursodb" \
   --library "$PWD/target/debug/libturso_sqlite3.so" --output /new/shared-acceptance
 ```
 
@@ -168,5 +169,14 @@ no production interface and never treats stock SQLite's ignored bit as support.
 
 The identity-directory regression controls were observed RED when those files
 and hidden directory creation were omitted, then GREEN with the complete
-snapshots. These are oracle checks; actual new-mode behavior remains unimplemented
-and cannot be certified by constructing synthetic sidecar files.
+snapshots. Full acceptance also requires real protocol files and actual engine
+behavior under independent shared workers.
+
+### Shared fixture initialization
+
+The `shared-acceptance` profile requires `--shared-admin-cli /path/to/tursodb`
+from the tested build. Before shared workers start, the supervisor creates an
+ordinary fixture, closes and reaps its only worker, and invokes the explicit
+offline upgrade with `--all-older-workers-stopped`. It records the initializer's
+hash, command and result. Shared URI opens must not implicitly upgrade existing
+databases. Stock SQLite negative controls do not run this initializer.

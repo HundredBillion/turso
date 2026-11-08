@@ -166,6 +166,8 @@ class Suite:
         self.record("ledger_synced", **record)
 
     def bootstrap(self):
+        if self.mode == "shared" and self.args.engine == "turso":
+            self.initialize_shared_database()
         worker = Worker(self, "bootstrap")
         if self.mode == "wal":
             worker.rows("PRAGMA journal_mode=WAL", [["wal"]])
@@ -173,6 +175,34 @@ class Suite:
         worker.sql("CREATE TABLE pairs(txn TEXT, slot INTEGER, payload TEXT, PRIMARY KEY(txn,slot))")
         worker.sql("INSERT INTO items(id,label,value) VALUES(1,'one',10),(2,'two',20),(3,'three',30)")
         worker.close()
+
+    def initialize_shared_database(self):
+        initializer = Worker(self, "offline-fixture", mode="wal")
+        initializer.rows("PRAGMA journal_mode=WAL", [["wal"]])
+        initializer.sql("PRAGMA user_version=0")
+        initializer.close()
+        assert all(worker.process.poll() is not None for worker in self.workers), "older fixture worker is alive"
+        executable = Path(self.args.shared_admin_cli).resolve(strict=True)
+        command = [
+            str(executable),
+            str(self.database),
+            "--shared-mvcc-offline",
+            "upgrade-existing",
+            "--all-older-workers-stopped",
+            "--shared-mvcc-history-limit",
+            "67108864",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=self.args.deadline)
+        self.record(
+            "offline_initialization",
+            command=command,
+            cli_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+            older_workers_stopped=True,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+        assert result.returncode == 0, result.stderr
 
     def protocol(self):
         first = Worker(self, "protocol-a")
@@ -541,6 +571,9 @@ def main():
     parser.add_argument("--api", choices=["pdo", "sqlite3"], default="pdo")
     parser.add_argument("--php", default="php")
     parser.add_argument("--library", default="")
+    parser.add_argument(
+        "--shared-admin-cli", default="", help="tested tursodb binary for explicit fixture initialization"
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--busy-ms", type=int, default=100)
     parser.add_argument("--deadline", type=float, default=5)
@@ -561,6 +594,8 @@ def main():
         parser.error("vendor flag must fit positive C int and not change access flags")
     if args.profile == "shared-acceptance" and (args.api != "pdo" or args.shared_open_flag):
         parser.error("initial shared-mode acceptance is PDO URI only; SQLite3 flags are diagnostic, unsupported API")
+    if args.profile == "shared-acceptance" and not args.shared_admin_cli:
+        parser.error("shared acceptance requires --shared-admin-cli for explicit offline initialization")
     suite = Suite(args)
     try:
         suite.run()

@@ -45,3 +45,7 @@
 - [ ] Run supervisor unit tests and Ruff, then actual mapped-library PDO acceptance with independent PIDs, simultaneous transactions, stable readers, conflicts, IDs, rollback/savepoints, readonly/temp/attach checks, fsynced acknowledgements and killed-process recovery.
 - [ ] Run stock SQLite negative control and ordinary Turso controls on the same host, inspect exact final summaries and retain artifacts.
 - [ ] Obtain independent source review and combined Linux/Windows/PDO checks before integrating or removing the PR draft status.
+
+## Provisional preflight
+
+Focused C URI and capability tests may run before the recovery integrations are complete to expose ABI and worker-harness defects early. Such runs do not satisfy the release gate. The complete shared profile and combined recovery checks must pass together before public activation is integrated or the PR is marked ready.
