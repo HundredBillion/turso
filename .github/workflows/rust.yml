@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 097256765512384e519412b923ce5eddc8b33f10
+          ref: a343a8df1c5dc8ed0e155b135a38c682daa48a22
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,25 +27,19 @@ jobs:
           cache-on-failure: true
       - name: Actual baseline source
         run: |
-          test "$(git rev-parse HEAD)" = 097256765512384e519412b923ce5eddc8b33f10
+          test "$(git rev-parse HEAD)" = a343a8df1c5dc8ed0e155b135a38c682daa48a22
           test "$(id -u)" -ne 0
           rustc -Vv
-      - name: Healthy live readers and unacknowledged tails
+      - name: Public shared open recovery and real handoff races
         run: |
-          for filter in shared_open_recovery_native_healthy_open_keeps_live_reader shared_open_recovery_native_empty_prefix_ignores_unacknowledged_tail; do
-            timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api "$filter" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$filter.log"
-            grep -q '1 passed; 0 failed' "$filter.log"
-          done
+          timeout 360 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee public-open.log
+          grep -q '6 passed; 0 failed' public-open.log
       - name: Selector probe and existing transport lifetime
         run: |
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_selector_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee selector.log
           grep -q '3 passed; 0 failed' selector.log
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee existing-io.log
           grep -q '2 passed; 0 failed' existing-io.log
-      - name: Normal pending checkpoint public open now works
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_recovery_native_completed_pending_ids_opens -- --ignored --test-threads=1 --nocapture 2>&1 | tee pending-ids.log
-          grep -q '1 passed; 0 failed' pending-ids.log
       - name: Fresh selection dependency and existing Ready
         run: |
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fresh-entry.log
