@@ -1119,15 +1119,18 @@ mod tests {
     #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
     fn shared_downgrade_resume_native_sigkill_marker_phases_preserve_data() {
         for phase in ["intent", "commit", "checkpoint"] {
-            let (_directory, path, limit, _namespace) = killed_downgrade(phase);
-            let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
-                &path,
-                limit,
+            let (_directory, path, limit, namespace) = killed_downgrade(phase);
+            crate::mvcc::mode_transition::operation::execute_offline(
+                crate::mvcc::mode_transition::operation::OfflineOperation::ResumeDowngradeMarker {
+                    path: &path,
+                },
                 OfflinePrerequisite::AllOlderWorkersStopped,
+                limit,
             )
             .unwrap_or_else(|error| panic!("resume after {phase}: {error}"));
             assert_eq!(&std::fs::read(&path).unwrap()[18..20], &[2, 2]);
-            drop(completed);
+            assert!(!namespace.exists());
+            assert!(!path.with_extension("db-log").exists());
             let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
             let db = Database::open(
                 io,
@@ -1314,12 +1317,15 @@ mod tests {
             "cleanup-ids-selector",
             "cleanup-manifest",
         ] {
-            let (_directory, path, _limit, namespace) = killed_downgrade(phase);
+            let (_directory, path, limit, namespace) = killed_downgrade(phase);
             let main = std::fs::read(&path).unwrap();
             assert_eq!(&main[18..20], &[2, 2]);
-            crate::mvcc::mode_transition::downgrade_cleanup::resume_cleanup(
-                &path,
+            crate::mvcc::mode_transition::operation::execute_offline(
+                crate::mvcc::mode_transition::operation::OfflineOperation::ResumeDowngradeCleanup {
+                    path: &path,
+                },
                 OfflinePrerequisite::AllOlderWorkersStopped,
+                limit,
             )
             .expect(
                 "marker2 partial cleanup must resume without recreating missing namespace files",
