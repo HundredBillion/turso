@@ -553,3 +553,30 @@ fn shared_id_opcode_native_provisional_sequence_watermark_before_commit() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_watermark_identity_native_rejects_mismatched_backing_root() {
+    use crate::IOExt;
+    let (_directory, first, _) = pair_with_setup(Some("CREATE SEQUENCE expected_sequence START 3"));
+    first
+        .execute("CREATE SEQUENCE other_sequence START 99")
+        .unwrap();
+    let (_, expected) = first.find_sequence("expected_sequence").unwrap();
+    let backing = crate::translate::sequence::sequence_backing_table_name("other_sequence");
+    let root = first.with_schema(0, |schema| {
+        schema
+            .get_btree_table(crate::namespace::NamespaceId::ROOT, &backing)
+            .unwrap()
+            .root_page
+    });
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let mut state = crate::mvcc::database::SharedSequenceWatermarkState::default();
+    let result = first.get_pager().io.block(|| {
+        store.shared_sequence_watermark_nonblock(&first, 0, root, expected.clone(), &mut state)
+    });
+    assert!(
+        matches!(result, Err(crate::LimboError::SchemaUpdated)),
+        "accepted a backing root for another sequence: {result:?}"
+    );
+}
