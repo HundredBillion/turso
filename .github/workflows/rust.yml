@@ -1,4 +1,4 @@
-name: macOS sync stack counterexample
+name: macOS sync stack phase diagnosis
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+          ref: fd98deec6f1fdd5e91043c3b03ea6adfc86d01f3
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
@@ -33,7 +33,6 @@ jobs:
       - name: Matching workspace build
         run: |
           git rev-parse HEAD HEAD^{tree} | tee source.txt
-          test "$(git rev-parse HEAD^{tree})" = 9eac9697b47bff664d84af86687fbe236fa4bb51
           rustc -Vv | tee rustc.txt
           cargo build --verbose --locked --all-features 2>&1 | tee build.log
       - name: Exact nextest counterexample
@@ -43,22 +42,41 @@ jobs:
           RUST_LOG: ''
         run: |
           set +e
-          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'test(=database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base)' --no-tests=fail --failure-output=final 2>&1 | tee baseline.log
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'test(=database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base)' --no-tests=fail --failure-output=immediate --success-output=immediate 2>&1 | tee baseline.log
           status=${PIPESTATUS[0]}
           set -e
           echo "$status" > status.txt
-          test "$status" -eq 100
+          test "$status" -eq 100 -o "$status" -eq 0
           python3 - <<'PYCODE'
           import re
           from pathlib import Path
           Path('baseline-plain.log').write_text(re.sub(r'\x1b\[[0-9;]*m', '', Path('baseline.log').read_text()))
           PYCODE
-          grep -q 'has overflowed its stack' baseline-plain.log
-          grep -Eq '1 tests? run:.*0 passed.*1 failed' baseline-plain.log
+          grep -Eq '1 tests? run:' baseline-plain.log
+      - name: Native stack trace without changing stack limits
+        if: always()
+        run: |
+          cargo test --workspace --all-features --locked --exclude memory-benchmark --no-run --message-format=json > test-metadata.json 2> test-metadata.log
+          python3 - <<'PYCODE'
+          import json, subprocess
+          from pathlib import Path
+          rows=[json.loads(line) for line in Path('test-metadata.json').read_text().splitlines()]
+          binaries=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r.get('target',{}).get('name')=='turso_sync_engine' and r.get('profile',{}).get('test') and r.get('executable')]
+          assert len(binaries)==1,binaries
+          Path('test-binary.txt').write_text(binaries[0])
+          cmd=['lldb','--batch','-o','run','-o','thread backtrace all -c 40','--',binaries[0],'--exact','database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base','--nocapture']
+          try:
+              result=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
+              Path('lldb.log').write_text(result.stdout+'\n'+result.stderr)
+              Path('lldb-status.txt').write_text(str(result.returncode))
+          except subprocess.TimeoutExpired as error:
+              Path('lldb.log').write_bytes((error.stdout or b'')+(error.stderr or b'')+b'\nLLDB timed out')
+              raise
+          PYCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: macos-sync-stack-baseline
+          name: macos-sync-stack-phases
           path: |
             *.log
             *.txt
