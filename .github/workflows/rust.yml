@@ -35,6 +35,10 @@ jobs:
           test "$(git rev-parse HEAD)" = "$ENGINE"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
+      - name: Shared prepare busy handling
+        run: |
+          cargo test --locked -p turso_core --lib shared_prepare_busy_native_ -- --ignored --test-threads=1 2>&1 | tee prepare-busy.log
+          grep -q '2 passed; 0 failed' prepare-busy.log
       - name: Actual ordinary mode capability
         run: |
           cargo test --locked -p turso_core --lib turso_mvcc_mode_reports_actual_private_mode -- --test-threads=1 2>&1 | tee mode.log
