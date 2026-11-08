@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 67167aebee71e7139ce95be61279946af866749f
+          ref: 5739a896f3e53b814aad72b01977e2c91ad680aa
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 67167aebee71e7139ce95be61279946af866749f
+          test "$(git rev-parse HEAD)" = 5739a896f3e53b814aad72b01977e2c91ad680aa
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -41,15 +41,19 @@ jobs:
         run: |
           timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-green.log
           grep -q '8 passed; 0 failed' confirmation-green.log
-      - name: Missing proof-gated recovered ID finalization must fail
+      - name: Fresh recovered ID finalization keeps admission paused
         run: |
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'recovered checkpoint ID finalization is not implemented' finalization-red.log
-          grep -q '0 passed; 1 failed' finalization-red.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-green.log
+          grep -q '1 passed; 0 failed' finalization-green.log
+      - name: ID protocol and authority siblings
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee ids-protocol.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' ids-protocol.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority::tests:: -- --test-threads=1 2>&1 | tee authority.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' authority.log
+      - name: Strict library lint
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Source integrity
         run: |
           cargo fmt --all --check
