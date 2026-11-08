@@ -1,4 +1,4 @@
-name: macOS sync frame sizes
+name: macOS lazy shared-state boxing control
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fd98deec6f1fdd5e91043c3b03ea6adfc86d01f3
+          ref: 68621e374
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
@@ -30,11 +30,32 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
-      - name: Native stack trace without changing stack limits
-        if: always()
+      - name: Matching workspace build
         run: |
           git rev-parse HEAD HEAD^{tree} | tee source.txt
           rustc -Vv | tee rustc.txt
+          cargo build --verbose --locked --all-features 2>&1 | tee build.log
+      - name: Exact nextest counterexample
+        env:
+          NEXTEST_PROFILE: ci
+          LOCAL_SYNC_SERVER: ../../target/debug/tursodb
+          RUST_LOG: ''
+        run: |
+          set +e
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'test(=database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base)' --no-tests=fail --failure-output=immediate --success-output=immediate 2>&1 | tee baseline.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "$status" > status.txt
+          test "$status" -eq 100 -o "$status" -eq 0
+          python3 - <<'PYCODE'
+          import re
+          from pathlib import Path
+          Path('baseline-plain.log').write_text(re.sub(r'\x1b\[[0-9;]*m', '', Path('baseline.log').read_text()))
+          PYCODE
+          grep -Eq '1 tests? run:' baseline-plain.log
+      - name: Native stack trace without changing stack limits
+        if: always()
+        run: |
           cargo test --workspace --all-features --locked --exclude memory-benchmark --no-run --message-format=json > test-metadata.json 2> test-metadata.log
           python3 - <<'PYCODE'
           import json, subprocess
