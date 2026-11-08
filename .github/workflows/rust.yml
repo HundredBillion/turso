@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9264a7717
+          ref: 9264a7717df31252f83d1ad4254758a5fc7409ad
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse --short=9 HEAD)" = 9264a7717
+          test "$(git rev-parse HEAD)" = 9264a7717df31252f83d1ad4254758a5fc7409ad
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Manifest alias provenance expected RED
@@ -57,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9264a7717
+          ref: 9264a7717df31252f83d1ad4254758a5fc7409ad
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
