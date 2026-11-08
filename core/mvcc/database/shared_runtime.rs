@@ -326,14 +326,24 @@ impl SharedOpenState {
                 guard.retirement_completion(),
             )));
         }
-        let result = self.loaded.take().unwrap().into_guard()?.finish();
+        self.finish_current_prefix()?;
+        Ok(IOResult::Done(()))
+    }
+
+    fn finish_current_prefix(&mut self) -> Result<()> {
+        let result = self
+            .loaded
+            .take()
+            .ok_or(LimboError::Busy)?
+            .into_guard()?
+            .finish();
         if result.is_err() && self.current.installed {
             self.runtime.replay.lock().take();
         }
         result?;
         self.bindings.clear();
         self.admission = None;
-        Ok(IOResult::Done(()))
+        Ok(())
     }
 
     fn abort(&mut self) {
@@ -362,8 +372,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
         }
         io.block(|| open.poll_manifest())?;
         io.block(|| open.poll_current_prefix(self, connection, MAIN_DB_ID, None))?;
-        let loaded = open.loaded.take().unwrap();
-        loaded.into_guard()?.finish()?;
+        open.finish_current_prefix()?;
         Ok(())
     }
 
@@ -433,7 +442,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
             let open = state.open.as_mut().unwrap();
             return_if_io!(open.poll_manifest());
             return_if_io!(open.poll_current_prefix(self, connection, database_id, None));
-            SharedRefresh::begin_loaded(
+            let result = SharedRefresh::begin_loaded(
                 open.loaded.take().unwrap(),
                 self,
                 connection,
@@ -444,7 +453,11 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                     database_id,
                     exclusive,
                 },
-            )
+            );
+            if result.is_err() && open.current.installed {
+                runtime.replay.lock().take();
+            }
+            result
         })();
         if !matches!(&result, Ok(IOResult::IO(_))) {
             state.reset();

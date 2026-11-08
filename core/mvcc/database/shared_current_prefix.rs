@@ -173,3 +173,67 @@ impl SharedOpenState {
         Ok(IOResult::Done(()))
     }
 }
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_current_prefix_native_finish_failure_withdraws_local_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let (io, control) =
+            super::super::shared_connection_tests::delaying_native_read(path.clone());
+        let database = crate::Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        connection
+            .execute("UPDATE preserved SET value='logical only' WHERE id=1")
+            .unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap().clone();
+        runtime.replay.lock().take();
+        let mut open = runtime.begin_read_pinned_open().unwrap();
+        io.block(|| open.poll_current_prefix(&store, &connection, MAIN_DB_ID, None))
+            .unwrap();
+        assert!(runtime.replay.lock().is_some());
+        control.delay_after_reads(1);
+        let pending = runtime
+            .main
+            .pread(
+                0,
+                Completion::new_read(Arc::new(crate::Buffer::new_temporary(512)), |_| None),
+            )
+            .unwrap();
+        let held = control.take_pending();
+        assert!(matches!(
+            open.finish_current_prefix(),
+            Err(LimboError::Busy)
+        ));
+        assert!(
+            runtime.replay.lock().is_none(),
+            "failed authority release retained local readiness"
+        );
+        drop(pending);
+        drop(open);
+        assert!(matches!(
+            runtime.files.authority.try_acquire(),
+            Err(LimboError::Busy)
+        ));
+        held.complete();
+        assert!(matches!(
+            runtime.files.authority.try_acquire(),
+            Err(LimboError::Busy)
+        ));
+        drop(held);
+        let fresh = database.connect(crate::ConnectOpts::new()).unwrap();
+        fresh.execute("SELECT value FROM preserved").unwrap();
+        assert!(runtime.replay.lock().is_some());
+    }
+}
