@@ -362,3 +362,118 @@ fn shared_id_opcode_native_replace_retains_key_claim_until_rollback() {
         .unwrap();
     assert_eq!(integers(&second, "SELECT count(*) FROM preserved"), [2]);
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_watermark_readonly_boundaries_do_not_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+    let open = |readonly| {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let options = OpenOptions::new(Arc::new(EngineDialect))
+            .flags(if readonly {
+                crate::OpenFlags::ReadOnly
+            } else {
+                crate::OpenFlags::default()
+            })
+            .with_shared_mvcc_for_test(limit);
+        Database::open(io, path.to_str().unwrap(), options)
+            .unwrap()
+            .connect(ConnectOpts::new())
+            .unwrap()
+    };
+    let writer = open(false);
+    for ddl in [
+        "CREATE SEQUENCE asc_seq START 7 INCREMENT 3",
+        "CREATE SEQUENCE desc_seq START 10 INCREMENT -2 MINVALUE 0 MAXVALUE 10",
+        "CREATE SEQUENCE cycle_seq START 2 INCREMENT 1 MINVALUE 1 MAXVALUE 2 CYCLE",
+        "CREATE SEQUENCE edge_seq START 9223372036854775807",
+    ] {
+        writer.execute(ddl).unwrap();
+    }
+    assert_eq!(integers(&writer, "SELECT nextval('asc_seq')"), [7]);
+    assert_eq!(integers(&writer, "SELECT nextval('desc_seq')"), [10]);
+    assert_eq!(integers(&writer, "SELECT nextval('desc_seq')"), [8]);
+    assert_eq!(integers(&writer, "SELECT nextval('cycle_seq')"), [2]);
+    assert_eq!(integers(&writer, "SELECT nextval('cycle_seq')"), [1]);
+    assert_eq!(integers(&writer, "SELECT nextval('edge_seq')"), [i64::MAX]);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("INSERT INTO preserved(id,value) VALUES(88,'outer')")
+        .unwrap();
+    assert_eq!(integers(&writer, "SELECT nextval('asc_seq')"), [10]);
+    let before = watermark_durable_files(directory.path());
+    let reader = open(true);
+    assert!(reader.is_readonly(0));
+    assert_eq!(reader.get_mv_tx_id_for_db(0), None);
+    for _ in 0..2 {
+        for (name, expected) in [
+            ("asc_seq", 10),
+            ("desc_seq", 8),
+            ("cycle_seq", 1),
+            ("edge_seq", i64::MAX),
+        ] {
+            assert_eq!(
+                integers(
+                    &reader,
+                    &format!("SELECT sequence_watermark_experimental('{name}')")
+                ),
+                [expected]
+            );
+        }
+        let mut statement = reader
+            .prepare("SELECT sequence_watermark_experimental(NULL), 7")
+            .unwrap();
+        let mut rows = 0;
+        statement
+            .run_with_row_callback(|row| {
+                let mut values = row.get_values();
+                assert!(matches!(values.next(), Some(crate::Value::Null)));
+                assert_eq!(values.next().unwrap().as_int(), Some(7));
+                rows += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(reader
+            .execute("SELECT sequence_watermark_experimental('missing_sequence')")
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+    }
+    assert_eq!(reader.get_mv_tx_id_for_db(0), None);
+    assert_eq!(watermark_durable_files(directory.path()), before);
+    writer.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        integers(&reader, "SELECT sequence_watermark_experimental('asc_seq')"),
+        [13]
+    );
+}
+
+fn watermark_durable_files(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else if !matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("authority" | "physical-tshm")
+            ) {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    std::fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}

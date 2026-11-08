@@ -62,7 +62,12 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     .is_some_and(|saved| Arc::ptr_eq(&saved, connection))
                     || !Arc::ptr_eq(&pending.runtime, runtime)
                     || pending.root != root
-                    || !Arc::ptr_eq(&pending.sequence, &sequence)
+                    || pending.sequence.name != sequence.name
+                    || pending.sequence.start_value != sequence.start_value
+                    || pending.sequence.increment_by != sequence.increment_by
+                    || pending.sequence.min_value != sequence.min_value
+                    || pending.sequence.max_value != sequence.max_value
+                    || pending.sequence.cycle != sequence.cycle
                 {
                     return Err(LimboError::InvalidArgument(
                         "watermark request changed across I/O".into(),
