@@ -43,6 +43,10 @@ jobs:
         run: |
           cargo test --locked -p turso_core --lib turso_mvcc_mode_reports_actual_private_mode -- --test-threads=1 2>&1 | tee mode.log
           grep -q '1 passed; 0 failed' mode.log
+      - name: Busy callback handle observation
+        run: |
+          cargo test --locked -p turso_sqlite3 --lib shared_prepare_busy_native_callback_observes_handle -- --ignored --test-threads=1 2>&1 | tee callback-observation.log
+          grep -q '1 passed; 0 failed' callback-observation.log
       - name: Actual C URI entry
         run: |
           cargo test --locked -p turso_sqlite3 --lib shared_mvcc_uri_native_ -- --ignored --test-threads=1 2>&1 | tee shared-uri.log
