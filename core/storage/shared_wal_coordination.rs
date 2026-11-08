@@ -23,6 +23,12 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
+#[cfg(unix)]
+#[path = "shared_wal_recovery.rs"]
+mod recovery;
+#[cfg(unix)]
+pub(crate) use recovery::SharedWalRecoveryLocks;
+
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
