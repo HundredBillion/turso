@@ -3,12 +3,14 @@ use crate::mvcc::checkpoint_gate::CheckpointPause;
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct CheckpointRecoverySelection {
+    pub runtime: Arc<SharedMvccRuntime>,
     pub manifest: LoadedManifest,
     pub pause: CheckpointPause,
 }
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct CheckpointRecoveryOpen {
+    runtime: Arc<SharedMvccRuntime>,
     load: Option<ManifestLoad>,
     pause: Option<CheckpointPause>,
 }
@@ -18,19 +20,47 @@ impl SharedMvccRuntime {
     pub(in crate::mvcc) fn begin_checkpoint_recovery(
         self: &Arc<Self>,
     ) -> Result<CheckpointRecoveryOpen> {
-        Err(LimboError::InvalidArgument(
-            "checkpoint recovery selection is not implemented".into(),
-        ))
+        let pause = self.gate.try_pause_admission()?;
+        let guard = self.files.authority.try_acquire()?;
+        guard.ensure_no_snapshot_locks()?;
+        let load = ManifestLoad::new(self.files.manifest.clone(), guard, self.database_id)?;
+        Ok(CheckpointRecoveryOpen {
+            runtime: self.clone(),
+            load: Some(load),
+            pause: Some(pause),
+        })
     }
 }
 
 #[allow(dead_code)]
 impl CheckpointRecoveryOpen {
     pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<CheckpointRecoverySelection> {
-        Err(
-            LimboError::InvalidArgument("checkpoint recovery selection is not implemented".into())
-                .into(),
-        )
+        let result = self.poll_inner();
+        if result.is_err() {
+            self.load = None;
+            self.pause = None;
+        }
+        result
+    }
+
+    fn poll_inner(&mut self) -> IOResultOr<CheckpointRecoverySelection> {
+        let load = self.load.as_mut().ok_or_else(|| {
+            LimboError::InvalidArgument("checkpoint recovery selection has ended".into())
+        })?;
+        let manifest = return_if_io!(load.poll());
+        self.load = None;
+        if manifest.record().downgrade_intent().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint recovery cannot resume a downgrade".into(),
+            )
+            .into());
+        }
+        manifest.guard()?.ensure_no_snapshot_locks()?;
+        Ok(IOResult::Done(CheckpointRecoverySelection {
+            runtime: self.runtime.clone(),
+            manifest,
+            pause: self.pause.take().unwrap(),
+        }))
     }
 }
 
@@ -66,13 +96,13 @@ mod tests {
             let mut recovery = runtime.begin_checkpoint_recovery().unwrap();
             let selection = fixture.io.block(|| recovery.poll()).unwrap();
             assert!(selection.manifest.record().checkpoint_intent().is_some());
-            assert!(selection
+            selection
                 .manifest
                 .guard()
                 .unwrap()
-                .live_registrations()
-                .unwrap()
-                .is_empty());
+                .ensure_no_snapshot_locks()
+                .unwrap();
+            assert!(selection.manifest.guard().unwrap().requires_recovery());
             assert!(matches!(
                 runtime.files.authority.try_acquire(),
                 Err(LimboError::Busy)
@@ -88,13 +118,7 @@ mod tests {
             );
             drop(selection);
             assert!(runtime.gate.try_enter_admission().is_ok());
-            runtime
-                .files
-                .authority
-                .try_acquire()
-                .unwrap()
-                .finish()
-                .unwrap();
+            drop(runtime.files.authority.try_acquire().unwrap());
         }
     }
 }

@@ -548,6 +548,36 @@ impl AuthorityGuard {
         Ok(oldest)
     }
 
+    /// Recovery checks native ownership before mapped snapshot timestamps can be trusted.
+    pub(super) fn ensure_no_snapshot_locks(&self) -> Result<()> {
+        if self.authority.poisoned.load(Ordering::Acquire) {
+            return Err(LimboError::InvalidArgument(
+                "shared MVCC authority lost lock ownership".into(),
+            ));
+        }
+        let slots = self.authority.local_slots.lock();
+        for (slot, locally_owned) in slots.iter().enumerate() {
+            if *locally_owned
+                || !self.authority.file.shared_wal_try_lock_byte(
+                    SLOT_LOCK_START + slot as u64,
+                    true,
+                    LOCK_KIND,
+                )?
+            {
+                return Err(LimboError::Busy);
+            }
+            if let Err(error) = self
+                .authority
+                .file
+                .shared_wal_unlock_byte(SLOT_LOCK_START + slot as u64, LOCK_KIND)
+            {
+                self.authority.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn visit_live_registrations(&self, mut visit: impl FnMut(u64, u64)) -> Result<()> {
         self.require_recovered()?;
         let slots = self.authority.local_slots.lock();
