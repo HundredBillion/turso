@@ -1,10 +1,10 @@
-name: Shared constructor checkpoint pause regression
+name: Shared pager generation certification
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  shared-constructor-green:
+  pager-generation-native:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5b799477a477309e63356cd63cc894a6d273d979
+          ref: 97283c368d97750926155b3066fffe4da65eb2fd
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,24 +24,59 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5b799477a477309e63356cd63cc894a6d273d979
+          test "$(git rev-parse HEAD)" = 97283c368d97750926155b3066fffe4da65eb2fd
           rustc -Vv | tee rustc.txt
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
-      - name: Initial open must expose missing backend-retirement wait
+      - name: Native constructors and completed generation certificate
         run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee constructor-green.log
+          grep -q '5 passed; 0 failed' constructor-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee certificate-green.log
+          grep -q '1 passed; 0 failed' certificate-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_ -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee generation-green.log
+          grep -q '14 passed; 0 failed' generation-green.log
+      - name: Removing physical identity reset must retain stale cache and admit an active alias
+        run: |
+          trap 'git restore core/storage/pager.rs' EXIT
+          python3 -c 'from pathlib import Path; p=Path("core/storage/pager.rs"); s=p.read_text(); a=s.index("pub(crate) fn ensure_shared_generation("); b=s.index("pub(crate) fn reset_shared_generation(",a); part=s[a:b]; assert part.count("self.reset_shared_generation()?;")==1; p.write_text(s[:a]+part.replace("self.reset_shared_generation()?;", "")+s[b:])'
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_initial_open_waits_for_completed_header_backend_release -- --ignored --test-threads=1 --nocapture 2>&1 | tee bootstrap-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_tag_ -- --test-threads=1 --nocapture 2>&1 | tee pager-tag-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q '0 passed; 1 failed' bootstrap-red.log
-          grep -q 'initial open did not wait for completed header backend release' bootstrap-red.log
+          grep -q '0 passed; 2 failed' pager-tag-red.log
+          grep -q 'changed physical identity retained cached page' pager-tag-red.log
+          grep -q 'generation change reset a pager with an active outer reader' pager-tag-red.log
+          git restore core/storage/pager.rs
+      - name: Removing completed certification tag must leave the old generation
+        run: |
+          trap 'git restore core/mvcc/database/shared_pager_generation.rs' EXIT
+          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_pager_generation.rs"); s=p.read_text(); a=s.index("        pager.ensure_shared_generation(SharedPagerGeneration {",s.index("fn certify_completed_pager(")); b=s.index("\n    }\n}",a); p.write_text(s[:a]+"        Ok(())"+s[b:])'
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee certificate-tag-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' certificate-tag-red.log
+          grep -q 'completed certification did not install the target pager tag' certificate-tag-red.log
+          git restore core/mvcc/database/shared_pager_generation.rs
+      - name: Restore source and verify exact candidate
+        run: |
+          git diff --exit-code
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored-constructors.log
+          grep -q '5 passed; 0 failed' restored-constructors.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored-certificate.log
+          grep -q '1 passed; 0 failed' restored-certificate.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo fmt --all -- --check
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-bootstrap-5b799-red
+          name: pager-generation-97283-native
           path: |
             source.txt
             rustc.txt
-            bootstrap-red.log
+            '*green.log'
+            '*red.log'
+            'restored-*.log'
