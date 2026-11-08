@@ -444,3 +444,7 @@ fn shared_checkpoint_coordinator_native_empty_prefix_and_readonly_refusal() {
         source.prefix
     );
 }
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_checkpoint_entry_tests.rs"]
+mod shared_checkpoint_entry_tests;
