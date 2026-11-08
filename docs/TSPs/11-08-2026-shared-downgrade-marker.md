@@ -1,6 +1,7 @@
 # Offline shared-to-WAL marker transition and recovery
 
-Status: root approved the seam; genuine live marker regression is the first implementation gate.
+Status: live marker slice verified; missing-WAL creation, interrupted resume and
+cleanup remain unimplemented. Root approved the staged seam.
 Base: verified preparation6640d5b8642625b9f63a2d56a24e0cc910d353bf,
 whose runtime16fd0d695 passed native/Windows42488827632.
 
@@ -166,3 +167,48 @@ identity mismatch; never restore the shared marker or rebuild its namespace.
 
 Root approved the concrete seam, beginning with the live marker transaction
 before broader resume and cleanup implementation. No public operation/API or executable downgrade acceptance is claimed yet.
+
+## Verified live-marker milestone
+
+Runtime `b7c6161b8682e1daa7b0dfcbfb04556542825481` implements only the live,
+254-to2 marker step from the genuine installed/mirrored capability. It does not
+accept a freshly recovered2 marker or perform namespace/ordinary-log cleanup.
+The returned token retains the original authority/admission pause and native
+main exclusion. No public dispatcher/URI was enabled.
+
+[Native and Windows run42492367153](https://github.com/HundredBillion/turso/actions/runs/42492367153)
+pinned that source and passed: new live marker3; previous preparation7, ready4,
+installer6; ordinary transition/recovery36 with3 ignored helpers; manifest32 with4
+ignored; separately executed terminal fence1; strict Linux library Clippy and
+formatting; Windows core library compilation. The positive uses a real pager WAL
+transaction and truncate checkpoint, checks unchanged main inode and terminal
+namespace, then reopens ordinary WAL and verifies acknowledged payload and
+integrity after dropping the returned token. It is not a crash/recovery test.
+
+The genuine stub failed first at the intended missing marker operation:
+[run42491635402](https://github.com/HundredBillion/turso/actions/runs/42491635402),
+source `b5257eec5a461586f9366bef3496cc84cb76abc0`, 0 passed/1 failed. No completed
+checkpoint fields were manufactured for this fixture.
+
+The installer now retains the already validated physical header page size,
+reserved-space and declared page count, plus main byte length, into the opaque
+installed source. Before BEGIN the raw opener's actual header and current byte
+length must match. The prior negative logical-floor bound alone does not establish
+exact extent. Native controls change the declared count or append a physical page
+after genuine intent; both reject without marker/WAL/namespace mutation. Missing
+or replaced recorded WAL likewise rejects without recreation.
+
+[Single-check removal control42492820507](https://github.com/HundredBillion/turso/actions/runs/42492820507)
+removed only the exact-layout validation call from that same source. The appended
+page was then wrongly accepted and the rejection assertion failed (0 passed,
+1 failed). Restoring the exact file and checking a clean diff reran all3 marker
+parents successfully. This control does not disable the floor/metadata/provenance
+validators and does not infer causality from an unrelated failure.
+
+Remaining gates are the stages above: actual interrupted-process recovery, safe
+missing-WAL creation before intent, header-only ordinary-log cleanup and reopen,
+manifest-last partial-cleanup recovery, and the operator lifecycle. In particular,
+old same-process main descriptors can remain owned by external runtime Arcs after
+the capability drops; their later closure and ordinary POSIX-lock exclusion need
+an explicit lifecycle test before operator exposure. This is an unverified source
+concern, not a new policy requirement or a claim that the tested marker failed.
