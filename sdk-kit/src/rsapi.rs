@@ -2244,6 +2244,101 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codec_reopen_observes_inherited_ofd_until_child_exec() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+
+        unsafe extern "C" {
+            fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
+            fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+            fn close(fd: i32) -> i32;
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 1,
+        });
+        let db = open_database_with_page_codec(path, codec.clone());
+        let conn = db.connect().unwrap();
+        execute_sql(&conn, "CREATE TABLE inherited(value)");
+        execute_sql(&conn, "INSERT INTO inherited VALUES(42)");
+        execute_sql(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        let owners = (
+            Arc::downgrade(db.db.lock().unwrap().as_ref().unwrap()),
+            Arc::downgrade(&conn.connection),
+            Arc::downgrade(&conn.connection.get_pager()),
+            Arc::downgrade(&conn.connection.get_pager().db_file),
+        );
+        let config = db.config.clone();
+        let (mut ready, signal) = UnixStream::pair().unwrap();
+        let (mut release, wait) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let parent_release = release.as_raw_fd();
+        let parent_ready = ready.as_raw_fd();
+        let spawning = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("/bin/true");
+            // Only async-signal-safe system calls run between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    close(parent_release);
+                    close(parent_ready);
+                    let mut byte = 1u8;
+                    if write(signal.as_raw_fd(), &byte, 1) != 1
+                        || read(wait.as_raw_fd(), &mut byte, 1) != 1
+                    {
+                        return Err(std::io::Error::from_raw_os_error(5));
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn()
+        });
+        let mut byte = [0];
+        ready.read_exact(&mut byte).unwrap();
+        drop(conn);
+        drop(db);
+        assert_eq!(
+            (
+                owners.0.strong_count(),
+                owners.1.strong_count(),
+                owners.2.strong_count(),
+                owners.3.strong_count()
+            ),
+            (0, 0, 0, 0),
+        );
+        let attempt = TursoDatabase::new(config);
+        let error = attempt.open().unwrap_err();
+        assert!(error.to_string().contains("Locking error"), "{error}");
+        drop(attempt);
+        release.write_all(&[1]).unwrap();
+        let mut child = spawning.join().unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("inherited descriptor child exceeded its deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let reopened = open_database_with_page_codec(path, codec);
+        let conn = reopened.connect().unwrap();
+        let mut query = conn.prepare_single("SELECT value FROM inherited").unwrap();
+        assert_eq!(query.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(query.row_value(0).unwrap().as_int(), Some(42));
+    }
+
     #[test]
     pub fn page_codec_is_applied_to_sdk_connections() {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
