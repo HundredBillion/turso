@@ -29,6 +29,7 @@ mod shared_checkpoint_intent_fixture;
 #[path = "shared_checkpoint_recovery_wal.rs"]
 mod shared_checkpoint_recovery_wal;
 pub(in crate::mvcc) use shared_checkpoint_recovery_wal::RecoveryWalEvidence;
+pub(super) use shared_checkpoint_recovery_wal::SourceStoreLifetime;
 pub(crate) use shared_checkpoint_recovery_wal::{
     RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence,
 };

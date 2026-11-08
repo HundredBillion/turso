@@ -4880,6 +4880,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// checkpoint's full sweep.
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
+    // Private recovery connections may outlive their driver. Keep native authority
+    // until the actual Store data, including retained clones, has been destroyed.
+    #[cfg(all(host_shared_wal, unix))]
+    source_recovery_lifetime: Option<shared_runtime::SourceStoreLifetime>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -5023,6 +5027,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_in_progress: AtomicBool::new(false),
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
+            #[cfg(all(host_shared_wal, unix))]
+            source_recovery_lifetime: None,
         })
     }
 

@@ -694,3 +694,4 @@ mod io_tests;
 
 #[path = "shared_checkpoint_intent_store.rs"]
 mod shared_checkpoint_intent_store;
+pub(in crate::mvcc::database) use shared_checkpoint_intent_store::SourceStoreLifetime;

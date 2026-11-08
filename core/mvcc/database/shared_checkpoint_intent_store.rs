@@ -1,5 +1,23 @@
 use super::*;
 
+pub(in crate::mvcc::database) struct SourceStoreLifetime {
+    lease: Arc<PublicationLease>,
+}
+
+impl std::fmt::Debug for SourceStoreLifetime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceStoreLifetime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourceStoreLifetime {
+    fn matches_lease(&self, lease: &Weak<PublicationLease>) -> bool {
+        Weak::ptr_eq(&Arc::downgrade(&self.lease), lease)
+    }
+}
+
 pub(in crate::mvcc) struct IntentRecoveryStore {
     store: Arc<crate::MvStore>,
     runtime: Arc<SharedMvccRuntime>,
@@ -14,9 +32,6 @@ pub(in crate::mvcc) struct IntentRecoveryStore {
     header: crate::storage::sqlite3_ondisk::DatabaseHeader,
     schema: Arc<Schema>,
     source_ids_seeded: bool,
-    // Callee errors can destroy the guard first. Keep the native publication lock
-    // through Store destruction without counting the owner as pending I/O.
-    authority_owner: Arc<PublicationLease>,
 }
 
 pub(in crate::mvcc) struct SourceIntentStore {
@@ -44,9 +59,14 @@ impl RecoveredIntentPhysicalBase {
                 LimboError::InvalidArgument("source Store requires native coordination".into())
             })?;
         let main_bytes = runtime.files.main.size()?;
-        let store = runtime
+        let mut store = runtime
             .reserve_store()?
             .construct_store(self.config.store_allocator())?;
+        Arc::get_mut(&mut store)
+            .expect("fresh source Store has a single owner")
+            .source_recovery_lifetime = Some(SourceStoreLifetime {
+            lease: authority_owner,
+        });
         let owner = IntentRecoveryStore {
             store,
             runtime,
@@ -61,7 +81,6 @@ impl RecoveredIntentPhysicalBase {
             header: self.parts.header,
             schema: self.parts.schema.clone(),
             source_ids_seeded: false,
-            authority_owner,
         };
         owner.validate_source(&self)?;
         Ok(SourceIntentStore {
@@ -78,10 +97,11 @@ impl IntentRecoveryStore {
             || !Arc::ptr_eq(&self.config, &physical.config)
             || !Arc::ptr_eq(&self.schema, &physical.parts.schema)
             || !Weak::ptr_eq(&self.lease, &physical.guard().io_lease())
-            || !Arc::ptr_eq(
-                &self.authority_owner,
-                &self.lease.upgrade().ok_or(LimboError::Busy)?,
-            )
+            || self
+                .store
+                .source_recovery_lifetime
+                .as_ref()
+                .is_none_or(|lifetime| !lifetime.matches_lease(&self.lease))
             || self.record != physical.record()
             || bytemuck::bytes_of(&self.header) != bytemuck::bytes_of(&physical.parts.header)
             || require_native_id(&self.runtime.files.main)? != self.main_id
