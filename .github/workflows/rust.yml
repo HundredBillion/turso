@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1fd03b01e4a45d51776a3a155dd4f877f16cbda4
+          ref: b5205e5f49278204dc522d60298e213ff1b246f2
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1fd03b01e4a45d51776a3a155dd4f877f16cbda4
+          test "$(git rev-parse HEAD)" = b5205e5f49278204dc522d60298e213ff1b246f2
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -38,15 +38,16 @@ jobs:
         run: |
           timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_coordinator_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee coordinator-green.log
           grep -q '3 passed; 0 failed' coordinator-green.log
-      - name: Missing live physical staging must fail
+      - name: Live completed checkpoint physical staging
         run: |
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_stages_target_without_mutating_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-staging-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'completed checkpoint physical staging is not implemented' physical-staging-red.log
-          grep -q '0 passed; 1 failed' physical-staging-red.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_stages_target_without_mutating_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-staging-green.log
+          grep -q '1 passed; 0 failed' physical-staging-green.log
+      - name: Physical read pins and MVCC regressions
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api read_pinned_file -- --test-threads=1 --nocapture 2>&1 | tee pins.log
+          grep -q '2 passed; 0 failed' pins.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database -- --test-threads=1 2>&1 | tee database.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' database.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
