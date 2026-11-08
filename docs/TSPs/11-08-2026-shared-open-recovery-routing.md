@@ -1,10 +1,10 @@
 # Recover completed checkpoints before shared open allocates a Store
 
-Status: proposed implementation seam for parent review. Core Ready is independently accepted at222 and the complete C/helper release at774d17d835cc9ad9d656f30f61a67d604f26c2bb (runtime90, native42516139888 and42517774139). This branch preserves that release. Merge the parent's verified integration endpoint before production if it changes these seams; do not import unaccepted experiments.
+Status: proposed implementation seam for parent review. Core Ready is independently accepted at222 and the complete C/helper release at774d17d835cc9ad9d656f30f61a67d604f26c2bb (runtime90, native42516139888 and42517774139). This branch preserves that release. The next verified parent union is f4c3aa8604f87e33cccf9d650cdb0e1fc095654c (e35/Core/C plus accepted OFD); merge it before production and record the actual merged SHA. Do not import unaccepted experiments.
 
 ## Outcome
 
-A normal shared Core open that encounters a genuinely completed checkpoint with unfinished IDs or obsolete retained logical bytes must drive the existing real recovery/Ready chain before constructing any Store. The returned Database must work through its normal subsequent connect call. A healthy shared open with live readers continues through ordinary admission and existing bootstrap without requiring global quiescence. Public C/PDO URI activation is unchanged and remains disabled until the full intent/crash integration is accepted.
+A normal shared Core open that encounters a genuinely completed checkpoint with actual matching unfinished target IDs must drive the existing real recovery/Ready chain before constructing any Store. The returned Database must work through its normal subsequent connect call. A healthy shared open with live readers continues through ordinary admission and existing bootstrap without requiring global quiescence. Public C/PDO URI activation is unchanged and remains disabled until the full intent/crash integration is accepted.
 
 ## Current source and failure
 
@@ -23,11 +23,11 @@ The constructor accepts the actual retained SharedIds and actual LoadedManifest;
 For a Normal record:
 
 - Healthy: finalized active selector matches the selected generation, has no prepared bank, and its actual checkpoint timestamp is bounded by the committed prefix. At an empty prefix require the timestamp to match that target. A nonzero prefix with ordinary ID journal changes is healthy; differing selector slots alone are not a checkpoint-recovery signal.
-- Completed recovery candidate: the actual empty Normal target has a matching prepared target bank; or its active target is finalized but the actual retained logical file is nonempty and must be reclaimed. Determine the prepared target from real encoded fields, never target-minus-one or a timestamp-only proof.
+- Completed recovery candidate: the actual empty Normal target has a matching prepared target bank. Determine the prepared target from real encoded fields, never target-minus-one or a timestamp-only proof.
 - Unrelated/mismatched prepared identity or inconsistent selector/manifest fields fail closed before Store construction. Do not reinterpret malformed metadata as a recovery request.
 - Manifest INTENT is a distinct typed decision reserved for the intent successor. Terminal downgrade remains a separate explicit route/error. No error-message parsing.
 
-Normal mapped recovery-required/incarnation flags alone do not force global checkpoint recovery: ordinary bounded bootstrap can recover healthy state while other live readers remain valid. Initial/healthy empty-prefix namespaces with finalized IDs and an empty logical file stay ordinary.
+Tail bytes alone also never trigger recovery: an acknowledged prefix of zero ignores complete, corrupt or torn unacknowledged bytes, including healthy read-only opens. Do not truncate that tail or classify from its size. Normal mapped recovery-required/incarnation flags alone do not force global checkpoint recovery: ordinary bounded bootstrap can recover healthy state while other live readers remain valid. Initial/healthy empty-prefix namespaces with finalized IDs stay ordinary regardless of bytes beyond the acknowledged endpoint.
 
 ## Ordinary versus paused ownership
 
@@ -64,15 +64,15 @@ INTENT later enters the same fresh paused-selection decision as a typed successo
 
 ## Task 1: genuine public-open counterexample and routing probe
 
-- [ ] Add an actual completed-checkpoint fixture retaining pending IDs/obsolete logical bytes, then discard every old Store/Database/Runtime/proof/guard/pause before calling Database::open with shared options. First SQL uses a new normal connect call and must see the acknowledged completed row and commit another update. Observe the current exact missing-public-recovery failure natively before production.
-- [ ] Add healthy empty/nonzero-prefix public-open cases with another live reader (same process and real peer process where existing harness fits). They must open/connect without checkpoint pause or forcing the reader out. Test typed mismatched selector/manifest rejection.
+- [ ] Add an actual completed-checkpoint fixture retaining actual pending IDs, then discard every old Store/Database/Runtime/proof/guard/pause before calling Database::open with shared options. First SQL uses a new normal connect call and must see the acknowledged completed row and commit another update. Observe the current exact missing-public-recovery failure natively before production.
+- [ ] Add healthy empty/nonzero-prefix public-open cases with another live reader (same process and real peer process where existing harness fits). They must open/connect without checkpoint pause or forcing the reader out. Also verify complete/corrupt/torn unacknowledged tails under an empty prefix are ignored without content changes by read-only opens, including another live reader. Test typed mismatched selector/manifest rejection.
 - [ ] Implement the bounded actual two-slot read-only selector probe with original guard/native file identity and callback/retirement ownership; no LoadedIds escape or global quiescence. Obtain parent source review.
 
 ## Task 2: pre-Store shared-open driver and full normal recovery
 
 - [ ] Implement ordinary healthy transfer and paused fresh reclassification, bounded healthy restart, original-readonly refusal, and explicit normal/intent/downgrade decisions before Store construction. Do not route by mapped recovery flags or error strings.
 - [ ] Drive the accepted actual normal chain to Ready, drop the unused private connection safely, return actual Database through open_shared_async and verify normal connect/post-open SELECT/UPDATE/INSERT/commit plus independent peer observation.
-- [ ] Test matching prepared IDs and already-finalized IDs with obsolete logical bytes, both selector slot parities, captured caller options/native extension/readonly behavior, and no second Store claim. The normal public C URI remains disabled in this slice.
+- [ ] Test matching prepared IDs and healthy finalized IDs with ignored unacknowledged tail bytes, both selector slot parities, captured caller options/native extension/readonly behavior, and no second Store claim. The normal public C URI remains disabled in this slice.
 
 ## Task 3: races, cancellation and integration
 
@@ -80,3 +80,6 @@ INTENT later enters the same fresh paused-selection decision as a typed successo
 - [ ] Inject selector/manifest callback/submission errors and cancellation before callback and after callback before backend retirement. No Store/replay/commit may escape early; native authority remains BUSY until actual retirement. Exercise cancellation during actual subsequent recovery with the already accepted transport fixtures.
 - [ ] Causal controls: bypass candidate routing (genuine public counterexample fails), force healthy into quiescent recovery (live-reader case fails), omit read-retirement/actual reselection (the corresponding real race/ownership test fails). Restore exact source before positive/lint runs.
 - [ ] Run targeted native public-open/probe/normal-recovery/constructor/ID/watermark cohorts, selected Core/C/SDK/Windows checks appropriate to the final parent union, strict lint/fmt and independent whole-source review. Preserve the accepted Ready/C release and integrate on a separate branch. Public PDO/URI activation and the SOURCE/ACK intent successor require their separate final acceptance, not a test-helper-only success claim.
+
+
+Parent correction: neither nonempty logical-file length nor invalid bytes after acknowledged end is durable checkpoint evidence. The first draft proposed tail-only recovery; that is rejected and removed before production. Matching prepared target IDs are the initial Normal signal; INTENT is a later separate typed authoritative branch. Tests explicitly preserve readonly/live-reader opens with complete, corrupt and torn tails at endpoint zero.

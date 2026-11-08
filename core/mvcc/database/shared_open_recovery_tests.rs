@@ -19,6 +19,8 @@ fn completed_files(finalize_ids: bool) -> (tempfile::TempDir, PathBuf, PathBuf, 
     } = fixture;
     let logical = namespace.join("logical");
     assert!(std::fs::metadata(&logical).unwrap().len() > 0);
+    drop(connection);
+    drop(database);
     if finalize_ids {
         let mut finalizing = ids.finalize(guard, proof).unwrap();
         let finalized = io.block(|| Ok(finalizing.poll()?)).unwrap();
@@ -29,8 +31,6 @@ fn completed_files(finalize_ids: bool) -> (tempfile::TempDir, PathBuf, PathBuf, 
         drop(proof);
         drop(guard);
     }
-    drop(connection);
-    drop(database);
     drop(pause);
     drop(io);
     (directory, path, logical, limit)
@@ -89,24 +89,51 @@ fn shared_open_recovery_native_completed_pending_ids_opens() {
 
 #[test]
 #[ignore = "requires native shared MVCC files"]
-fn shared_open_recovery_native_finalized_ids_reclaims_old_log() {
-    let (_directory, path, logical, limit) = completed_files(true);
-    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
-    let database = crate::Database::open(
-        io,
-        path.to_str().unwrap(),
-        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
-    )
-    .unwrap();
-    assert_eq!(
-        std::fs::metadata(logical).unwrap().len(),
-        0,
-        "normal shared open retained obsolete checkpoint log bytes"
-    );
-    let connection = database.connect(crate::ConnectOpts::new()).unwrap();
-    connection
-        .execute("UPDATE preserved SET value='finalized IDs recovered' WHERE id=1")
-        .unwrap();
+fn shared_open_recovery_native_empty_prefix_ignores_unacknowledged_tail() {
+    for kind in ["complete", "corrupt", "torn"] {
+        let (_directory, path, logical, limit) = completed_files(true);
+        let mut tail = std::fs::read(&logical).unwrap();
+        match kind {
+            "complete" => {}
+            "corrupt" => {
+                *tail.last_mut().unwrap() ^= 0x80;
+            }
+            "torn" => tail.truncate(17),
+            _ => unreachable!(),
+        }
+        std::fs::write(&logical, &tail).unwrap();
+        std::fs::File::open(&logical).unwrap().sync_all().unwrap();
+        let physical_wal = logical.parent().unwrap().join("physical-wal");
+        let before = [&path, &logical, &physical_wal].map(|path| std::fs::read(path).unwrap());
+        let options = crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+            .with_shared_mvcc_for_test(limit)
+            .flags(crate::OpenFlags::ReadOnly);
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let database = crate::Database::open(io, path.to_str().unwrap(), options.clone()).unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        connection
+            .execute("BEGIN; SELECT value FROM preserved WHERE id=1")
+            .unwrap();
+        let peer_io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let peer = crate::Database::open(peer_io, path.to_str().unwrap(), options).unwrap();
+        let reader = peer.connect(crate::ConnectOpts::new()).unwrap();
+        let mut values = Vec::new();
+        reader
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                values.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(values, ["materialized shared row"]);
+        assert_eq!(
+            [&path, &logical, &physical_wal].map(|path| std::fs::read(path).unwrap()),
+            before,
+            "healthy readonly empty-prefix open changed content for {kind} tail"
+        );
+        connection.execute("ROLLBACK").unwrap();
+    }
 }
 
 #[test]
