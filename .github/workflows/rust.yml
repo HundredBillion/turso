@@ -1,4 +1,4 @@
-name: Current generation native integration cohort
+name: Current generation reload causal control
 on:
   workflow_dispatch:
 permissions:
@@ -7,7 +7,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  native-current-generation:
+  current-generation-causal:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -28,29 +28,29 @@ jobs:
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
           test "$(git rev-parse HEAD)" = 3942c92fc97654b389541f49821cb7623fcf4a27
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_opcode_native.log
-          grep -q '13 passed; 0 failed' shared_id_opcode_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_watermark_io_native.log
-          grep -q '1 passed; 0 failed' shared_watermark_io_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_lifecycle_native.log
-          grep -q '8 passed; 0 failed' shared_id_lifecycle_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_lifecycle_io_native.log
-          grep -q '2 passed; 0 failed' shared_id_lifecycle_io_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_prepare_native.log
-          grep -q '3 passed; 0 failed' shared_prepare_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_prepare_io_native.log
-          grep -q '1 passed; 0 failed' shared_prepare_io_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_stale_prepare_native.log
-          grep -q '1 passed; 0 failed' shared_id_stale_prepare_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_identity_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_watermark_identity_native.log
-          grep -q '1 passed; 0 failed' shared_watermark_identity_native.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_schema_publication_native.log
-          grep -q '3 passed; 0 failed' shared_schema_publication_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee current-path-green.log
+          grep -q '1 passed; 0 failed' current-path-green.log
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_current_prefix.rs'
+          s=open(p).read(); start=s.index('    pub(super) fn poll_current_base'); at=s.index('            if !database',start)
+          s=s[:at]+'            if identity.is_some_and(|identity| identity.database.generation != record.log_generation()) {\n                return Err(LimboError::Busy.into());\n            }\n'+s[at:]
+          open(p,'w').write(s)
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture > current-path-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_current_prefix.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' current-path-control-red.log
+          cat current-path-control-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee current-path-restored-green.log
+          grep -q '1 passed; 0 failed' current-path-restored-green.log
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: idle-generation-native-cohort-3942
+          name: idle-generation-path-control-3942
           path: |
             source.txt
             *.log
