@@ -264,3 +264,52 @@ fn shared_id_opcode_native_autoincrement_uses_durable_sequence() {
         )[0] > b
     );
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_updated_key_claim_blocks_peer_until_rollback() {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("UPDATE preserved SET id=99 WHERE id=1")
+        .unwrap();
+    assert!(matches!(
+        second.execute("INSERT INTO preserved(id,value) VALUES(99,'peer')"),
+        Err(crate::LimboError::Busy)
+    ));
+    assert_eq!(integers(&first, "SELECT id FROM preserved"), [99]);
+    first.execute("ROLLBACK").unwrap();
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(99,'peer')")
+        .unwrap();
+    assert_eq!(integers(&second, "SELECT count(*) FROM preserved"), [2]);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_opcode_native_replace_retains_key_claim_until_rollback() {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(99,'initial')")
+        .unwrap();
+    first
+        .execute("INSERT OR REPLACE INTO preserved(id,value) VALUES(99,'replacement')")
+        .unwrap();
+    assert_eq!(
+        integers(
+            &first,
+            "SELECT count(*) FROM preserved WHERE id=99 AND value='replacement'"
+        ),
+        [1]
+    );
+    assert!(matches!(
+        second.execute("INSERT INTO preserved(id,value) VALUES(99,'peer')"),
+        Err(crate::LimboError::Busy)
+    ));
+    first.execute("ROLLBACK").unwrap();
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(99,'peer')")
+        .unwrap();
+    assert_eq!(integers(&second, "SELECT count(*) FROM preserved"), [2]);
+}
