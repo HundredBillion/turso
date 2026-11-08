@@ -62,6 +62,7 @@ use tracing::Level;
 
 pub mod checkpoint_state_machine;
 mod persistent_metadata;
+mod sequence_replay;
 #[cfg(not(nightly))]
 mod version_chain;
 pub use checkpoint_state_machine::{
@@ -96,7 +97,7 @@ pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
     SharedBeginState, SharedBootstrapState, SharedIdRequest, SharedIdResult, SharedIdState,
-    SharedMvccRuntime, SharedOpenState,
+    SharedMvccRuntime, SharedOpenState, SharedSequenceWatermarkState,
 };
 
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
@@ -11150,6 +11151,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|schema| -> Result<_> {
                 let mut schema = crate::alloc::TryClone::try_clone(schema.as_ref())?;
                 schema.dropped_root_pages.clone_from(&dropped_roots);
+                self.prepare_peer_sequence_schema(&mut schema, &ctx.current_schema, frame)?;
                 Ok(Arc::new(schema))
             })
             .transpose()?;

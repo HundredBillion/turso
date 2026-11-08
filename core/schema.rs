@@ -4139,6 +4139,19 @@ impl Schema {
         })
     }
 
+    pub(crate) fn install_sequence_descriptor_from_record(
+        &mut self,
+        sequence_name: &str,
+        record: &ImmutableRecord,
+    ) -> crate::Result<()> {
+        let metadata = Self::read_sequence_metadata(record).ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table for \"{sequence_name}\" has invalid persisted metadata"
+            ))
+        })?;
+        self.install_sequence_descriptor(sequence_name, metadata)
+    }
+
     fn install_sequence_descriptor(
         &mut self,
         sequence_name: &str,

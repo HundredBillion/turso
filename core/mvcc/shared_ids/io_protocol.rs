@@ -1115,6 +1115,7 @@ mod tests {
                 },
                 IdQuery::RowExists { value, .. } => IdFact::RowExists(self.maximum == Some(*value)),
                 IdQuery::LogicalFloor => IdFact::LogicalFloor(-1),
+                IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
             }))
         }
     }
@@ -1407,6 +1408,106 @@ mod tests {
     }
 
     #[test]
+    fn id_policy_provisional_watermark_requires_live_exact_logical_owner() {
+        use super::super::policy::{IdAction, IdResult, SequenceDurability};
+        for invalid_case in [
+            "unreserved",
+            "foreign",
+            "released",
+            "dead",
+            "stale",
+            "generation",
+        ] {
+            let f = writable_fixture();
+            let mut registration_a = Some(registration(&f));
+            let registration_b = registration(&f);
+            let owner_a = owner(registration_a.as_ref().unwrap());
+            let (_, table) = reserved(policy(
+                &f,
+                IdAction::ReserveLogicalTable { owner: owner_a },
+                None,
+            ));
+            let mut domain = journal::Domain {
+                generation: 1,
+                table,
+                sequence: true,
+            };
+            assert_eq!(
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: Some(owner_a)
+                    },
+                    None
+                ),
+                IdResult::LowestClaim(None)
+            );
+            policy(
+                &f,
+                IdAction::ClaimSequence {
+                    owner: owner_a,
+                    domain,
+                    value: 5,
+                    durability: SequenceDurability::OuterTransaction,
+                },
+                None,
+            );
+            assert_eq!(
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: Some(owner_a)
+                    },
+                    None
+                ),
+                IdResult::LowestClaim(Some(5))
+            );
+            let mut supplied = owner_a;
+            match invalid_case {
+                "unreserved" => domain.table -= 1,
+                "foreign" => supplied = owner(&registration_b),
+                "released" => {
+                    policy(&f, IdAction::ReleaseOwner { owner: owner_a }, None);
+                }
+                "dead" => {
+                    drop(registration_a.take());
+                }
+                "stale" => supplied.epoch += 1,
+                "generation" => domain.generation += 1,
+                _ => unreachable!(),
+            }
+            let bank = f.bank.bytes.lock().clone();
+            let selector = f.selector.bytes.lock().clone();
+            let operation = f.files.start(
+                f.authority.try_acquire().unwrap(),
+                f.identity,
+                Box::new(Oracle {
+                    identity: f.identity,
+                    maximum: None,
+                }),
+                Arc::new(crate::MemoryIO::new()),
+                IdAction::LowestLiveSequenceClaim {
+                    domain,
+                    provisional_owner: Some(supplied),
+                },
+            );
+            let result = operation.and_then(|mut operation| operation.poll());
+            assert!(
+                result.is_err(),
+                "accepted {invalid_case} provisional ownership"
+            );
+            assert_eq!(*f.bank.bytes.lock(), bank, "{invalid_case} wrote bank");
+            assert_eq!(
+                *f.selector.bytes.lock(),
+                selector,
+                "{invalid_case} wrote selector"
+            );
+        }
+    }
+
+    #[test]
     fn id_policy_sequence_claims_preserve_supplied_cycle_descending_and_boundary_values() {
         use super::super::policy::{IdAction, IdResult, SequenceDurability};
         for durability in [
@@ -1434,13 +1535,27 @@ mod tests {
                 assert_eq!(recorded, value);
             }
             assert_eq!(
-                policy(&f, IdAction::LowestLiveSequenceClaim { domain }, None),
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: None
+                    },
+                    None
+                ),
                 IdResult::LowestClaim(Some(i64::MIN))
             );
             let mutations = f.bank.mutations.load(Ordering::Acquire);
             drop(a);
             assert_eq!(
-                policy(&f, IdAction::LowestLiveSequenceClaim { domain }, None),
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: None
+                    },
+                    None
+                ),
                 IdResult::LowestClaim(None)
             );
             assert_eq!(
@@ -1544,6 +1659,7 @@ mod tests {
                     autoincrement_floor: 100,
                 },
                 IdQuery::LogicalFloor => IdFact::LogicalFloor(-1000),
+                IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
                 IdQuery::RowExists { .. } => panic!("no random fallback below exhaustion"),
             }))
         }

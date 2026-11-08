@@ -809,3 +809,83 @@ The runtime owner reviewed this factor without a blocker. It compiled during the
 71-test portable ID run and passed library lint, but the recovered-proof positive
 and crash-reopen tests still require the physical evidence constructor. This entry
 is committed to unblock that integration; it is not native recovery acceptance.
+
+## Shared watermark reader continuation (2026-11-07)
+
+The scalar reader uses a separate yielding read state, because a standalone SELECT
+need not own a user transaction and a read-only participant must not allocate a
+claim. It retains one publication authority across committed-prefix refresh, a
+checked oracle read of the sequence backing row, and the journal's existing
+`LowestLiveSequenceClaim` query. Neither journal cleanup nor tail repair is part
+of this operation. Existing outer transactions keep their identity, snapshot, and
+uncommitted rows. No writer reacquires the checkpoint admission gate.
+
+The committed boundary uses `first_unsafe_sequence_watermark`: an uncalled row
+returns its value; called ascending non-CYCLE returns checked value + increment
+(with overflow retaining value); called descending/CYCLE retains value. The
+result is the numeric minimum of that boundary and live claims, matching the
+existing conservative local rule without promising descending/CYCLE scan order.
+
+Acceptance starts with an outer owner retaining allocation 1 while a peer commits
+allocation 2: both readers return 1; after outer rollback both return 3, including
+from an older local store. Further checks cover standalone/read-only reads,
+unchanged durable files, uncalled/non-unit/descending/CYCLE boundaries, invalid
+names/NULL, and suspended-read reset and backend retirement. Main-only oracle
+support remains explicit; attached shared readers are not silently redirected.
+
+The shared initial boundary is the committed uncalled backing value (for example,
+1). Ordinary mode still returns NULL before its local watermark map is populated;
+this path is unchanged. The shared value is an exclusive safe-scan boundary, not
+an allocation. An absent committed backing domain is accepted only when the
+current Active transaction records that exact created table ID and the selected
+journal proves the same live owner's logical-table reservation. Its boundary is
+NULL before any allocation and the live claim minimum afterward; no committed
+row is invented. Unreserved, foreign, released, dead, stale, and wrong-generation
+proofs fail without journal writes. Native CREATE/INSERT and provisional
+CREATE SEQUENCE/nextval/watermark schedules cover commit and rollback.
+
+For committed sequences the oracle checks the backing name and descriptor fields
+under authority. A root resolved before authority acquisition cannot silently
+supply another sequence's boundary after remapping. Delayed main, manifest, and
+selector reads must retain physical authority through statement reset/drop and
+backend completion retirement; a callback alone is not retirement.
+
+### Reader validation, 2026-11-07
+
+[Linux run 42433119912](https://github.com/HundredBillion/turso/actions/runs/42433119912)
+validated exact source `ba3c6d0bf659497f2c4625c8c967ea9638c09506` with Rust1.88:
+
+| Gate | Result |
+| --- | --- |
+| Native ID opcode cases, including provisional create/insert/sequence | 13 passed |
+| Wrong backing name/root and descriptor, followed by valid retry | 1 passed |
+| Main/manifest/selector delayed reads: reset/drop before and after callback, resume | 15 cases in 1 passing test |
+| Separate process live claim, rollback, SIGKILL; physical read-only observer | 1 passed |
+| Journal policy, including invalid provisional ownership | 12 passed |
+| Sequence regression filter | 29 passed, 5 ignored |
+| Strict core library lint (`conn_raw_api,bench`) | passed |
+
+The subprocess case retains an actual outer insert and sequence claim while the
+parent commits a later allocation. The observer returns the lower live claim,
+then advances after rollback and actual process death. Durable-file comparisons
+exclude only the writable authority and physical coordination mapping. This is
+native subprocess evidence; public PHP activation is a separate acceptance gate.
+
+Validation-only removal of the watermark reset hook failed with retained
+publication ownership after backend retirement. Restoring the exact source made
+all delayed-read cases pass again. The earlier exact logical-owner-check bypass
+also failed its unreserved-domain test. Neither negative-control mutation is part
+of the product branch. The first delayed-read fixture timed out because it did
+not drive reads during synchronous statement reset; its corrected `IO::step`
+performs the real read while retaining the backend completion, preserving the
+physical-retirement assertion.
+
+Reproduction selectors are `shared_id_opcode_native_`,
+`shared_watermark_identity_native_`, `shared_watermark_io_native_`, and
+`shared_watermark_process_native_`, each using `--ignored --test-threads=1`
+with `cargo test -p turso_core --lib --features conn_raw_api`. The child helper is
+invoked only by its parent test. Main-only oracle support remains explicit;
+shared ATTACH, transaction-wide savepoint claim release, checkpoint/recovery
+integration, and public PHP process acceptance are not established by this reader
+milestone. The separate peer-schema descriptor fix must still be integrated and
+validated with this branch.

@@ -40,6 +40,9 @@ pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
 mod statement_lifecycle_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+mod shared_id_tests;
 pub mod vacuum;
 pub mod value;
 #[allow(unused_imports)] // for benchmarks
@@ -1122,6 +1125,10 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     #[cfg(all(host_shared_wal, unix))]
     pub(crate) shared_begin: crate::mvcc::database::SharedBeginState,
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) shared_id: crate::mvcc::database::SharedIdState,
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) shared_watermark: crate::mvcc::database::SharedSequenceWatermarkState,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -1307,6 +1314,10 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_begin: Default::default(),
+            #[cfg(all(host_shared_wal, unix))]
+            shared_id: Default::default(),
+            #[cfg(all(host_shared_wal, unix))]
+            shared_watermark: Default::default(),
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1404,6 +1415,14 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
+    pub(crate) fn reset_shared_id(&mut self) {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.shared_id.reset();
+            self.shared_watermark.reset();
+        }
+    }
+
     pub(crate) fn reset_shared_begin(&mut self) {
         #[cfg(all(host_shared_wal, unix))]
         self.shared_begin.reset();
@@ -1422,6 +1441,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.reset_shared_begin();
+        self.reset_shared_id();
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -3587,6 +3607,7 @@ impl Program {
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         state.reset_shared_begin();
+        state.reset_shared_id();
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.

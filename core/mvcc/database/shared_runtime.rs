@@ -8,6 +8,10 @@ mod shared_checkpoint;
 mod shared_id_runtime;
 pub(crate) use shared_id_runtime::{SharedIdRequest, SharedIdResult, SharedIdState};
 
+#[path = "shared_sequence_watermark.rs"]
+mod shared_sequence_watermark;
+pub(crate) use shared_sequence_watermark::SharedSequenceWatermarkState;
+
 use super::shared_refresh::{SharedBeginOptions, SharedRefresh, SharedReplayContext};
 use super::*;
 use crate::io::FileId;
