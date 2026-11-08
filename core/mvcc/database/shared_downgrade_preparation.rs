@@ -676,10 +676,11 @@ mod tests {
         let path = std::env::var("TURSO_DOWNGRADE_LOCK_PATH").unwrap();
         let io = crate::io::SyscallIO::new().unwrap();
         let result = crate::IO::open_file(&io, &path, crate::OpenFlags::None, false);
-        assert!(
-            matches!(result, Err(LimboError::LockingError(_))),
-            "ordinary owner must still exclude the child after old descriptors close"
-        );
+        match result {
+            Err(LimboError::LockingError(_)) => (),
+            Err(error) => panic!("unexpected child open error: {error}"),
+            Ok(_) => panic!("child acquired ordinary main lock despite parent owner"),
+        }
     }
     fn assert_child_excluded(path: &std::path::Path) {
         require_lock_child_success(run_lock_child(path, false));
@@ -723,8 +724,9 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout)
                 .contains("test result: ok. 1 passed; 0 failed;"),
-            "lock child must execute exactly one test: {}",
-            String::from_utf8_lossy(&output.stdout)
+            "lock child must execute exactly one successful test: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(
             output.status.success(),
@@ -758,7 +760,9 @@ mod tests {
         .unwrap();
         let connection = db.connect(crate::ConnectOpts::new()).unwrap();
         connection.execute("SELECT value FROM preserved").unwrap();
+        eprintln!("checking ordinary exclusion BEFORE old handle retirement");
         assert_child_excluded(&fixture.path);
+        eprintln!("ordinary exclusion BEFORE old handle retirement passed");
         let old_main = Arc::downgrade(&fixture.runtime.files.main);
         let old_runtime = Arc::downgrade(&fixture.runtime);
         let old_database = Arc::downgrade(&fixture.connection.db);
@@ -776,7 +780,9 @@ mod tests {
             old_main.upgrade().is_none(),
             "old native main handle did not retire"
         );
+        eprintln!("checking ordinary exclusion AFTER actual old handle retirement");
         assert_child_excluded(&fixture.path);
+        eprintln!("ordinary exclusion AFTER actual old handle retirement passed");
         connection.execute("SELECT value FROM preserved").unwrap();
     }
     #[test]
