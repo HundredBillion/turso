@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6faf5d5a16c5c9059272da516f60f15357a65f63
+          ref: f448a526c9b7c367c272bc2870b43c34a4d59724
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,14 +24,42 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 6faf5d5a16c5c9059272da516f60f15357a65f63
+          test "$(git rev-parse HEAD)" = f448a526c9b7c367c272bc2870b43c34a4d59724
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Native overlapping schema commit audit
         run: |
           set -o pipefail
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee schema.log
-          grep -q '2 passed; 0 failed' schema.log
+          grep -q '3 passed; 0 failed' schema.log
+      - name: Isolate schema timestamp guard and restore
+        run: |
+          set -o pipefail
+          python3 - <<'CONTROL'
+          from pathlib import Path
+          p = Path('core/mvcc/database/mod.rs')
+          s = p.read_text()
+          needle = '                    if schema_updated {'
+          assert s.count(needle) == 1
+          p.write_text(s.replace(needle, '                    if false && schema_updated {'))
+          CONTROL
+          git diff > timestamp-control.diff
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_independent_stores -- --ignored --test-threads=1 --nocapture 2>&1 | tee timestamp-control.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "$code" > timestamp-control-status.txt
+          if test "$code" = 0; then
+            grep -q '1 passed; 0 failed' timestamp-control.log
+          else
+            test "$code" = 101
+            grep -q '0 passed; 1 failed' timestamp-control.log
+          fi
+          git restore core/mvcc/database/mod.rs
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored.log
+          grep -q '3 passed; 0 failed' restored.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -40,4 +68,6 @@ jobs:
             source.txt
             rustc.txt
             *.log
+            *.diff
+            *status.txt
           retention-days: 14
