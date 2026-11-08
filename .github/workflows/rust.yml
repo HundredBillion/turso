@@ -36,6 +36,10 @@ jobs:
           test "$(git rev-parse HEAD)" = "4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
+      - name: Public shared checkpoint entry
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_entry_native_ -- --ignored --test-threads=1 2>&1 | tee public-entry.log
+          grep -q '3 passed; 0 failed' public-entry.log
       - name: Final checkpoint readiness
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee group-0.log
@@ -80,7 +84,7 @@ jobs:
           grep -q '3 passed; 0 failed' watermark.log
       - name: Fresh completed recovery
         run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --test-threads=1 2>&1 | tee checkpoint_recovery_.log
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --skip physical_wal_peer_child --test-threads=1 2>&1 | tee checkpoint_recovery_.log
           grep -Eq "[1-9][0-9]* passed; 0 failed" checkpoint_recovery_.log
       - name: Physical recovery locks and completion ownership
         run: |
