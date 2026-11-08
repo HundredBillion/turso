@@ -1,3 +1,7 @@
+#[path = "shared_open_recovery.rs"]
+mod shared_open_recovery;
+pub(crate) use shared_open_recovery::{SharedInitialOpen, SharedInitialOpenResult};
+
 use super::*;
 
 #[allow(dead_code)]

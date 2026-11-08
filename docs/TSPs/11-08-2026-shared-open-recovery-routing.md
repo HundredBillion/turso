@@ -35,13 +35,13 @@ Introduce a sealed yielding initial-open driver and outcome:
 
 ```rust
 pub(crate) enum SharedInitialOpenResult {
-    Healthy(SharedOpenState),
+    Healthy(Box<SharedOpenState>),
     Recovered(Arc<Database>),
 }
 impl SharedMvccRuntime {
     pub(crate) fn begin_initial_open(
         self: &Arc<Self>, options: OpenOptions,
-    ) -> Result<SharedInitialOpen>;
+    ) -> Result<Box<SharedInitialOpen>>;
 }
 impl SharedInitialOpen {
     pub(crate) fn poll(&mut self) -> IOResultOr<SharedInitialOpenResult>;
@@ -86,3 +86,8 @@ Parent correction: neither nonempty logical-file length nor invalid bytes after 
 
 
 Baseline exact merged source94f425dd9dfc866aad01a11049869d67d413588e (contains parentf4) native42520094911 SUCCESS: healthy live-reader1 and readonly complete/corrupt/torn-tail1 PASS, genuine pending-ID public-open0/1RED at current bootstrap diagnostic, strict Core tests Clippy1m26s/fmt/integrity PASS. Local union libcheck9.97s. No production routing was present for this observed counterexample. Parent approved continuing the source-audited probe/driver seam and requested explicit real table/row-ID allocation after healthy probe; added to the healthy case.
+
+
+Probe source29e22f40ad9fb873bf4aae2a9f9fd0ce6d66d528 native42534317707 SUCCESS: directselector3 (actual prepared readonly facts; healthy live-reader/nonzero prefix/same-guard full ID load and real logical/rowid allocation; reused existing transport cancellation plus successful/error callback retirement), existing transport2, healthy public positives2, unchanged intended pending public0/1RED, strict tests Clippy51.33s/fmt. Parent source-reviewed actual two-page probe and read-view association helper CLEAR. Integrated parent33c atffa0fa849 before driver implementation. Standalone fresh-selection factory7717/testfix4532 is a dependency candidate; its native endpoint gate is separately owned by11558.
+
+New Core state and driver payload are boxed (including Healthy outcome and large stage payloads); this adds only one pointer to OpenDbAsyncState rather than a large inline recovery enum. Existing shared_open boxing is coordinated with the separate measured stack investigation owner. Live driver waits manifest and selector backend retirement before returning classifications/errors or changing admission phase; whole-state cancellation still retains native authority through backend completion pins.

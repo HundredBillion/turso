@@ -2,6 +2,7 @@
 mod shared_checkpoint_recovery_bootstrap;
 pub(crate) use shared_checkpoint_recovery_bootstrap::{
     RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+    SharedInitialOpen, SharedInitialOpenResult,
 };
 
 use super::*;
