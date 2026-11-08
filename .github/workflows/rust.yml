@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 36dfcb9ba3bf85af992cd7471d5685b0237b64a3
+          ref: f267be5c950201d698632d2624958017eb3dfa9c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,19 +28,21 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 36dfcb9ba3bf85af992cd7471d5685b0237b64a3
+          test "$(git rev-parse HEAD)" = f267be5c950201d698632d2624958017eb3dfa9c
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Actual old-handle retirement and exclusion probe
+      - name: Native creation, preparation and marker controls
         run: |
-          set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_old_handle_close -- --ignored --test-threads=1 --nocapture 2>&1 | tee lock-probe.log
-          code=${PIPESTATUS[0]}
-          set -e
-          echo "$code" > lock-probe-status.txt
-          grep '^test result:' lock-probe.log | tail -1 | tee lock-probe-summary.txt
-          test "$code" = 0 -o "$code" = 101
-          grep -Eq '^test result: (ok. 1 passed; 0 failed;|FAILED. 0 passed; 1 failed;)' lock-probe-summary.txt
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
+          grep -q '^test result: ok. 2 passed; 0 failed;' creation.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
+          grep -q '^test result: ok. 7 passed; 0 failed;' preparation.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --skip old_handle_close --test-threads=1 --nocapture 2>&1 | tee marker.log
+          grep -q '^test result: ok. 3 passed; 0 failed;' marker.log
+      - name: Strict library lint and formatting
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
       - uses: actions/upload-artifact@v4
         if: always()
         with:
