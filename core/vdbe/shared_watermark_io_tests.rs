@@ -1,6 +1,6 @@
 use super::*;
 use crate::io::{File, FileId, FileSyncType};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sync::Mutex;
 use crate::{Buffer, Completion, Result};
 use std::path::Path;
@@ -16,6 +16,7 @@ fn shared_watermark_io_native_reset_drop_resume_retains_physical_reads() {
             "drop_after",
             "resume",
         ] {
+            eprintln!("watermark read control {target}/{cancel}");
             let directory = tempfile::tempdir().unwrap();
             let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
             let control = Arc::new(ReadControl::default());
@@ -62,18 +63,28 @@ fn shared_watermark_io_native_reset_drop_resume_retains_physical_reads() {
             if cancel.ends_with("after") {
                 held.complete();
             }
+            if cancel.ends_with("before") {
+                *control.complete_on_step.lock() = Some(held.clone());
+            }
             if cancel.starts_with("reset") {
                 statement.as_mut().unwrap().reset().unwrap();
             }
             if cancel.starts_with("drop") {
                 drop(statement.take());
             }
+            if cancel.ends_with("before") {
+                assert_eq!(
+                    control.step_reads.load(Ordering::Acquire),
+                    1,
+                    "reset/drop must drive the actual pending read"
+                );
+            }
             let write = "INSERT INTO preserved(id,value) VALUES(90,'peer')";
             assert!(
                 matches!(peer.execute(write), Err(crate::LimboError::Busy)),
                 "{target}/{cancel}: released authority before physical completion"
             );
-            if !cancel.ends_with("after") {
+            if !held.completion.finished() {
                 held.complete();
             }
             assert!(
@@ -128,7 +139,10 @@ fn shared_watermark_io_native_reset_drop_resume_retains_physical_reads() {
 struct ReadControl {
     armed: AtomicBool,
     pending: Mutex<Option<HeldRead>>,
+    complete_on_step: Mutex<Option<HeldRead>>,
+    step_reads: AtomicUsize,
 }
+#[derive(Clone)]
 struct HeldRead {
     file: Arc<dyn File>,
     offset: u64,
@@ -230,6 +244,10 @@ impl crate::IO for DeferredIo {
         self.inner.supports_shared_wal_coordination()
     }
     fn step(&self) -> Result<()> {
+        if let Some(read) = self.control.complete_on_step.lock().take() {
+            read.complete();
+            self.control.step_reads.fetch_add(1, Ordering::Release);
+        }
         self.inner.step()
     }
 }
