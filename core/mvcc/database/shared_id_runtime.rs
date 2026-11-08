@@ -1,10 +1,15 @@
 use super::*;
 use crate::mvcc::database::shared_id_oracle::SharedIdOracle;
 use crate::mvcc::shared_ids::journal::{Domain, Owner};
-use crate::mvcc::shared_ids::policy::{IdAction, IdOperation, IdResult, SequenceDurability};
+use crate::mvcc::shared_ids::policy::{
+    IdAction, IdOperation, IdResult, SavepointMark, SequenceDurability,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SharedIdRequest {
+    ReleaseAfter {
+        next_ordinal: u64,
+    },
     ReserveRow {
         table_id: i64,
     },
@@ -24,6 +29,7 @@ pub(crate) enum SharedIdRequest {
 pub(crate) enum SharedIdResult {
     Value(i64),
     Claimed,
+    Released,
 }
 
 #[derive(Default)]
@@ -91,7 +97,9 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                 let tx = self.txs.get(&tx_id).ok_or_else(|| {
                     LimboError::InvalidArgument("shared ID requester is no longer active".into())
                 })?;
-                tx.value().ensure_peer_unconflicted()?;
+                if !matches!(request, SharedIdRequest::ReleaseAfter { .. }) {
+                    tx.value().ensure_peer_unconflicted()?;
+                }
                 if tx.value().state.load() != TransactionState::Active {
                     return Err(LimboError::InvalidArgument(
                         "shared ID requester is no longer active".into(),
@@ -151,7 +159,9 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                 let tx = self.txs.get(&tx_id).ok_or_else(|| {
                     LimboError::InvalidArgument("shared ID requester is no longer active".into())
                 })?;
-                tx.value().ensure_peer_unconflicted()?;
+                if !matches!(request, SharedIdRequest::ReleaseAfter { .. }) {
+                    tx.value().ensure_peer_unconflicted()?;
+                }
                 if tx.value().state.load() != TransactionState::Active {
                     return Err(LimboError::InvalidArgument(
                         "shared ID requester is no longer active".into(),
@@ -175,6 +185,12 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     sequence,
                 };
                 let action = match request {
+                    SharedIdRequest::ReleaseAfter { next_ordinal } => IdAction::ReleaseAfter {
+                        mark: SavepointMark {
+                            owner,
+                            next_ordinal,
+                        },
+                    },
                     SharedIdRequest::ReserveRow { table_id } => IdAction::ReserveRow {
                         owner,
                         domain: domain(table_id, false),
@@ -216,8 +232,21 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                 )?);
                 pending.refresh = None;
             }
-            let outcome = return_if_io!(pending.operation.as_mut().unwrap().poll());
+            let operation = pending.operation.as_mut().unwrap();
+            let result = operation.poll();
+            if !matches!(request, SharedIdRequest::ReleaseAfter { .. }) {
+                if let Some(mark) = operation.scope_boundary() {
+                    let tx = self.txs.get(&tx_id).ok_or(LimboError::Busy)?;
+                    for frame in tx.value().savepoint_stack.write().iter_mut() {
+                        frame.shared_id_boundary.get_or_insert(mark.next_ordinal);
+                    }
+                }
+            }
+            let outcome = return_if_io!(result);
             let value = match (request, outcome.result) {
+                (SharedIdRequest::ReleaseAfter { .. }, IdResult::Released) => {
+                    SharedIdResult::Released
+                }
                 (
                     SharedIdRequest::ReserveRow { .. } | SharedIdRequest::ReserveLogicalTable,
                     IdResult::Reserved { value, .. },
@@ -240,5 +269,19 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
             state.reset();
         }
         result
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn shared_named_id_boundary(&self, tx_id: TxID, name: &str) -> Option<u64> {
+        let tx = self.txs.get(&tx_id)?;
+        let frames = tx.value().savepoint_stack.read();
+        frames
+            .iter()
+            .rfind(|frame| {
+                matches!(&frame.kind,
+            SavepointKind::Named { name: found, .. } if found == name)
+            })
+            .and_then(|frame| frame.shared_id_boundary)
     }
 }

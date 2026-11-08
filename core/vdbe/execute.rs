@@ -5736,6 +5736,26 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
+            #[cfg(all(host_shared_wal, unix))]
+            if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+                if let Some(tx_id) = conn.get_mv_tx_id() {
+                    if let Some(next_ordinal) = store.shared_named_id_boundary(tx_id, name) {
+                        return_if_io!(
+                            state,
+                            store.shared_id_nonblock(
+                                &conn,
+                                pager.clone(),
+                                tx_id,
+                                crate::MAIN_DB_ID,
+                                crate::mvcc::database::SharedIdRequest::ReleaseAfter {
+                                    next_ordinal
+                                },
+                                &mut state.shared_id,
+                            )
+                        );
+                    }
+                }
+            }
             let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,

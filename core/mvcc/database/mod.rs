@@ -899,6 +899,8 @@ enum SavepointKind {
 /// Tracks row/index version deltas created inside a single savepoint scope.
 #[derive(Debug, Default)]
 pub struct Savepoint {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_id_boundary: Option<u64>,
     kind: SavepointKind,
     deferred_fk_violations: isize,
     header: DatabaseHeader,
