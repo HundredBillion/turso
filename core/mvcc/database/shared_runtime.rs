@@ -632,6 +632,48 @@ pub(crate) fn shared_runtime_fixture_with_limit(dir: &Path, limit: u64) -> PathB
 #[cfg(all(test, not(shuttle)))]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_prepare_native_idle_root_respects_checkpoint_pause() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let database = crate::Database::open(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap();
+        let main = std::fs::read(&path).unwrap();
+        let manifest = std::fs::read(runtime.files.namespace.join("manifest")).unwrap();
+        let logical = std::fs::read(runtime.files.namespace.join("logical")).unwrap();
+        let pause = runtime.gate.try_pause_admission().unwrap();
+        assert!(matches!(
+            connection.prepare("SELECT * FROM preserved"),
+            Err(LimboError::Busy)
+        ));
+        assert_eq!(connection.get_mv_tx_id_for_db(0), None);
+        let guard = runtime.files.authority.try_acquire().unwrap();
+        assert!(guard.live_registrations().unwrap().is_empty());
+        guard.finish().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main);
+        assert_eq!(
+            std::fs::read(runtime.files.namespace.join("manifest")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read(runtime.files.namespace.join("logical")).unwrap(),
+            logical
+        );
+        drop(pause);
+        assert!(connection.prepare("SELECT * FROM preserved").is_ok());
+    }
+
     #[test]
     fn shared_fixture_materializes_metadata_and_marker_through_pager() {
         let dir = tempfile::tempdir().unwrap();
