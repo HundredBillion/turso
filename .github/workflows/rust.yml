@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ff22860d14918724e3781f907babba0dab2a2793
+          ref: 9e6e2b1d51afb11613a6676148102f0f5f7cfbf3
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ff22860d14918724e3781f907babba0dab2a2793
+          test "$(git rev-parse HEAD)" = 9e6e2b1d51afb11613a6676148102f0f5f7cfbf3
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
@@ -51,6 +51,29 @@ jobs:
           cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ 2>&1 | tee peer-descriptors.log
           grep -q '4 passed; 0 failed' peer-descriptors.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+      - name: Commit preflight causal control and restored source
+        run: |
+          set -o pipefail
+          python3 - <<'CONTROL'
+          from pathlib import Path
+          path = Path('core/mvcc/shared_commit.rs')
+          source = path.read_text()
+          start = source.index('                        if let Err(error) = loaded.guard()?.check_append_size_with_metadata(')
+          end = source.index('                        let next = ManifestRecord::new(', start)
+          path.write_text(source[:start] + '                        // Validation-only: bypass commit capacity rejection.\n' + source[end:])
+          CONTROL
+          git diff -- core/mvcc/shared_commit.rs > commit-preflight-control.diff
+          set +e
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop -- --test-threads=1 --nocapture 2>&1 | tee commit-preflight-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '0 passed; 1 failed' commit-preflight-red.log
+          grep -Eq 'commit.run_with_row_callback|cap rejection modified published bytes|cap Busy discarded' commit-preflight-red.log
+          git restore core/mvcc/shared_commit.rs
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 2>&1 | tee restored-vdbe.log
+          grep -q '6 passed; 0 failed' restored-vdbe.log
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
