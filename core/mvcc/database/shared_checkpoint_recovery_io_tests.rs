@@ -153,6 +153,7 @@ struct RecoveryIoControl {
     delay_selector_read: crate::sync::atomic::AtomicBool,
     fail_slot_unlock: crate::sync::atomic::AtomicBool,
     pending_read: Mutex<Option<HeldManifestRead>>,
+    pause_handoff: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct RecoveryFile {
@@ -160,6 +161,7 @@ struct RecoveryFile {
     control: Arc<RecoveryIoControl>,
     manifest: bool,
     selector: bool,
+    authority: bool,
 }
 
 impl File for RecoveryFile {
@@ -230,6 +232,12 @@ impl File for RecoveryFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<bool> {
+        if self.authority && offset == 66 && exclusive {
+            let handoff = self.control.pause_handoff.lock().take();
+            if let Some(handoff) = handoff {
+                handoff();
+            }
+        }
         self.inner.shared_wal_try_lock_byte(offset, exclusive, kind)
     }
     fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
@@ -280,6 +288,7 @@ impl crate::IO for RecoveryIo {
                 control: self.control.clone(),
                 manifest: name == Some("manifest"),
                 selector: name == Some("ids-selector"),
+                authority: name == Some("authority"),
             }))
         } else {
             Ok(file)
@@ -495,4 +504,71 @@ fn shared_open_recovery_native_public_cancel_before_store_and_retry() {
         let connection = database.connect(crate::ConnectOpts::new()).unwrap();
         connection.execute("UPDATE preserved SET value='public retry committed' WHERE id=1; CREATE TABLE public_retry_id(id INTEGER PRIMARY KEY); INSERT INTO public_retry_id DEFAULT VALUES").unwrap();
     }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn shared_open_recovery_native_reclassifies_after_competing_recovery() {
+    let fixture =
+        shared_completed_checkpoint_fixture(|_| Arc::new(crate::io::SyscallIO::new().unwrap()));
+    let path = fixture.path.clone();
+    let limit = fixture.limit;
+    let _directory = fixture.directory;
+    drop(fixture.connection);
+    drop(fixture.database);
+    drop(fixture.ids);
+    drop(fixture.proof);
+    drop(fixture.guard);
+    drop(fixture.pause);
+    drop(fixture.io);
+    let control = Arc::new(RecoveryIoControl::default());
+    let io: Arc<dyn crate::IO> = Arc::new(RecoveryIo {
+        inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+        control: control.clone(),
+    });
+    let peer = Arc::new(Mutex::new(None));
+    let handoff_peer = peer.clone();
+    let handoff_io = io.clone();
+    let handoff_path = path.clone();
+    *control.pause_handoff.lock() = Some(Box::new(move || {
+        let database = crate::Database::open(
+            handoff_io,
+            handoff_path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        connection.execute("UPDATE preserved SET value='competing recovery committed' WHERE id=1; BEGIN; SELECT value FROM preserved").unwrap();
+        *handoff_peer.lock() = Some(connection);
+    }));
+    let database = crate::Database::open(
+        io,
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    )
+    .unwrap();
+    assert!(
+        control.pause_handoff.lock().is_none(),
+        "public open never reached actual recovery handoff"
+    );
+    let peer = peer
+        .lock()
+        .take()
+        .expect("competing recovery did not complete");
+    let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+    let mut values = Vec::new();
+    connection
+        .prepare("SELECT value FROM preserved WHERE id=1")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, ["competing recovery committed"]);
+    peer.execute("ROLLBACK").unwrap();
+    connection
+        .execute("UPDATE preserved SET value='reclassified public open writes' WHERE id=1")
+        .unwrap();
 }

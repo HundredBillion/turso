@@ -274,3 +274,29 @@ fn shared_open_selector_native_healthy_handoff_keeps_bindings_free() {
     drop(admission);
     connection.execute("ROLLBACK; CREATE TABLE allocated_after_selector(id INTEGER PRIMARY KEY); INSERT INTO allocated_after_selector DEFAULT VALUES").unwrap();
 }
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn shared_open_recovery_native_readonly_pending_ids_requires_writer() {
+    let (_directory, path, logical, limit) = completed_files(false);
+    let physical_wal = logical.parent().unwrap().join("physical-wal");
+    let before = [&path, &logical, &physical_wal].map(|path| std::fs::read(path).unwrap());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let options = crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+        .with_shared_mvcc_for_test(limit)
+        .flags(crate::OpenFlags::ReadOnly);
+    let error = match crate::Database::open(io, path.to_str().unwrap(), options) {
+        Err(error) => error,
+        Ok(_) => panic!("readonly participant repaired pending checkpoint content"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("requires a writable participant"),
+        "{error}"
+    );
+    assert_eq!(
+        [&path, &logical, &physical_wal].map(|path| std::fs::read(path).unwrap()),
+        before
+    );
+}
