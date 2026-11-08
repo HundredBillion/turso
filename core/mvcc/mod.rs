@@ -47,6 +47,8 @@ mod guarded_file;
 #[allow(dead_code)]
 mod mode_transition;
 #[cfg(all(host_shared_wal, unix))]
+pub(crate) use mode_transition::downgrade_marker::PreparedDowngradeMarker;
+#[cfg(all(host_shared_wal, unix))]
 pub(crate) use mode_transition::recovery::PreparedMarkerRecovery;
 pub mod persistent_storage;
 #[cfg(feature = "conn_raw_api")]
