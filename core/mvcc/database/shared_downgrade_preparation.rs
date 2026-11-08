@@ -1401,4 +1401,92 @@ mod tests {
         assert_eq!(std::fs::read_dir(&namespace).unwrap().count(), entries);
         assert_eq!(std::fs::read(unknown).unwrap(), b"must remain");
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
+    fn shared_downgrade_partial_native_rejects_uncheckpointed_marker_and_wrong_timestamp() {
+        use std::os::unix::fs::FileExt;
+        for phase in ["intent", "commit", "cleanup-start"] {
+            let (_directory, path, _limit, namespace) = killed_downgrade(phase);
+            if phase == "cleanup-start" {
+                let manifest = namespace.join("manifest");
+                let bytes = std::fs::read(&manifest).unwrap();
+                let record = ManifestRecord::decode(&bytes[..RECORD_SIZE])
+                    .unwrap()
+                    .unwrap();
+                let mut prefix = record.prefix();
+                prefix.committed_timestamp += 1;
+                let wrong = ManifestRecord::new(
+                    record.sequence(),
+                    record.database_id(),
+                    record.log_generation(),
+                    0,
+                    prefix,
+                )
+                .unwrap()
+                .begin_downgrade(record.downgrade_intent().unwrap().basename_wal_id)
+                .unwrap();
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(manifest)
+                    .unwrap();
+                for offset in [0, SLOT_SIZE] {
+                    file.write_all_at(&wrong.encode(), offset as u64).unwrap();
+                }
+                file.sync_all().unwrap();
+            }
+            let mut paths = vec![
+                path.clone(),
+                PathBuf::from(format!("{}-wal", path.display())),
+            ];
+            paths.extend(
+                std::fs::read_dir(&namespace)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+            let before: Vec<_> = paths
+                .into_iter()
+                .map(|path| {
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect();
+            let error = crate::mvcc::mode_transition::downgrade_cleanup::resume_cleanup(
+                &path,
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .err()
+            .expect("unproven cleanup must reject");
+            if phase == "cleanup-start" {
+                assert!(error
+                    .to_string()
+                    .contains("cleanup target differs from materialized timestamp"));
+            }
+            assert_unchanged(&before);
+        }
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
+    fn shared_downgrade_partial_native_missing_manifest_rejects_nonempty_namespace_or_log() {
+        for add_log in [false, true] {
+            let (_directory, path, _limit, namespace) = killed_downgrade("cleanup-manifest");
+            assert_eq!(std::fs::read_dir(&namespace).unwrap().count(), 0);
+            let unrelated = if add_log {
+                path.with_extension("db-log")
+            } else {
+                namespace.join("unexpected")
+            };
+            std::fs::write(&unrelated, []).unwrap();
+            let main = std::fs::read(&path).unwrap();
+            assert!(
+                crate::mvcc::mode_transition::downgrade_cleanup::resume_cleanup(
+                    &path,
+                    OfflinePrerequisite::AllOlderWorkersStopped
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), main);
+            assert!(unrelated.exists());
+            assert!(namespace.exists());
+        }
+    }
 }
