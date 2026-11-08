@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ae5ea2076dc484ac01fc11dd14aed1e02a3839f3
+          ref: 1c61e2306b8c37ff71728e19819ba572338e2d74
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,14 +24,14 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ae5ea2076dc484ac01fc11dd14aed1e02a3839f3
+          test "$(git rev-parse HEAD)" = 1c61e2306b8c37ff71728e19819ba572338e2d74
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Native watermark boundary and live claims
         run: |
           set -o pipefail
           timeout 1200 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_watermark_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark.log
-          grep -q '2 passed; 0 failed' watermark.log
+          grep -q '3 passed; 0 failed' watermark.log
       - name: Strict library lint
         run: |
           set -o pipefail
