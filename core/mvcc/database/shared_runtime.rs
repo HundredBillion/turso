@@ -12,7 +12,9 @@ mod shared_recovery_test_helper;
     target_pointer_width = "64",
     not(shuttle)
 ))]
-pub use shared_recovery_test_helper::recovered_checkpoint_for_test;
+pub use shared_recovery_test_helper::{
+    hold_shared_prepare_authority_for_test, recovered_checkpoint_for_test,
+};
 
 #[path = "shared_store_claim.rs"]
 mod shared_store_claim;

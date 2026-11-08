@@ -138,7 +138,7 @@ mod shared_commit_integration_tests;
     target_pointer_width = "64",
     not(shuttle)
 ))]
-pub use shared_runtime::recovered_checkpoint_for_test;
+pub use shared_runtime::{hold_shared_prepare_authority_for_test, recovered_checkpoint_for_test};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};

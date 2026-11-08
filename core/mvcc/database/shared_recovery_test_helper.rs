@@ -40,3 +40,19 @@ pub fn recovered_checkpoint_for_test(
     let mut bootstrap = reclaimed.begin_bootstrap()?;
     Ok(io.block(|| bootstrap.poll())?.into_parts())
 }
+
+pub fn hold_shared_prepare_authority_for_test(
+    connection: &Arc<Connection>,
+) -> Result<Box<dyn FnOnce() -> Result<()> + Send>> {
+    let store = connection
+        .db
+        .get_mv_store()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| LimboError::InvalidArgument("test connection requires MVCC".into()))?;
+    let runtime = store.shared_runtime.get().ok_or_else(|| {
+        LimboError::InvalidArgument("test connection requires shared MVCC".into())
+    })?;
+    let guard = runtime.files.authority.try_acquire()?;
+    Ok(Box::new(move || guard.finish()))
+}

@@ -4343,6 +4343,114 @@ mod tests {
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     #[test]
     #[ignore = "requires native shared MVCC files"]
+    fn shared_prepare_busy_native_callback_observes_handle() {
+        const CHILD: &str = "TURSO_C_PREPARE_BUSY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::shared_prepare_busy_native_callback_observes_handle",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "busy callback blocked on handle introspection: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        struct Context {
+            handle: *mut sqlite3,
+            release: Option<Box<dyn FnOnce() -> turso_core::Result<()> + Send>>,
+            count: i32,
+            readonly: i32,
+            error: i32,
+            released: bool,
+        }
+        unsafe extern "C" fn busy(context: *mut ffi::c_void, count: ffi::c_int) -> ffi::c_int {
+            let context = &mut *context.cast::<Context>();
+            context.count = count + 1;
+            context.readonly = sqlite3_db_readonly(context.handle, c"main".as_ptr());
+            context.error = sqlite3_errcode(context.handle);
+            context.released = context
+                .release
+                .take()
+                .is_some_and(|release| release().is_ok());
+            i32::from(context.released)
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (database, connection) = turso_core::mvcc::database::recovered_checkpoint_for_test(
+            directory.path(),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect)).db_opts(default_db_opts()),
+        )
+        .unwrap();
+        let release =
+            turso_core::mvcc::database::hold_shared_prepare_authority_for_test(&connection)
+                .unwrap();
+        let handle = sqlite3::new(connection, CString::new("callback.db").unwrap()).into_raw();
+        let mut context = Context {
+            handle,
+            release: Some(release),
+            count: 0,
+            readonly: -1,
+            error: -1,
+            released: false,
+        };
+        unsafe {
+            assert_eq!(
+                sqlite3_busy_handler(handle, Some(busy), (&mut context as *mut Context).cast()),
+                SQLITE_OK
+            );
+            let mut statement = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    handle,
+                    c"BEGIN".as_ptr(),
+                    -1,
+                    &mut statement,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(context.count, 1);
+            assert_eq!(context.readonly, 0);
+            assert_eq!(context.error, SQLITE_OK);
+            assert!(context.released);
+            assert_eq!(sqlite3_get_autocommit(handle), 1);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(sqlite3_close(handle), SQLITE_OK);
+        }
+        drop(database);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native shared MVCC files"]
     fn recovered_checkpoint_uses_sqlite_dialect_and_c_connection() {
         use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
         #[derive(Debug)]
