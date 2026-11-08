@@ -1,4 +1,4 @@
-name: Completed target ID inspection native validation
+name: Shared ID cleanup capacity validation
 on:
   workflow_dispatch:
 permissions:
@@ -8,7 +8,6 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  RUST_BACKTRACE: "1"
 jobs:
   coordinator:
     runs-on: ubuntu-24.04
@@ -16,43 +15,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e60715199572d8fc168d40e2c08e179404248341
+          ref: 3b75bdcdf0c3bc9bf5eea5a67d80d1fb4fd138e6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Record exact source and filesystem
+      - name: Exact source and native filesystem
         run: |
-          git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = "$(git rev-parse e60715199572d8fc168d40e2c08e179404248341)"
+          test "$(git rev-parse HEAD)" = "3b75bdcdf0c3bc9bf5eea5a67d80d1fb4fd138e6"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
-      - name: Verified recovery and physical-collector prerequisites
+      - name: Journal capacity and existing protocols
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
-          grep -q '3 passed; 0 failed' entry.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_bootstrap::tests:: -- --test-threads=1 --nocapture 2>&1 | tee collector.log
-          grep -q '4 passed; 0 failed' collector.log
-      - name: Retained physical inspection with recovery still required
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids -- --test-threads=1 2>&1 | tee protocol.log
+          grep -q '74 passed; 0 failed; 1 ignored' protocol.log
+      - name: Native allocation and sequence watermarks
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-green.log
-          grep -q '1 passed; 0 failed' physical-green.log
-      - name: Read-only target ID inspection without mapped recovery
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 2>&1 | tee ids.log
+          grep -q '13 passed; 0 failed' ids.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --test-threads=1 2>&1 | tee watermark.log
+          grep -q '3 passed; 0 failed' watermark.log
+      - name: MVCC regression suite and lint
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ids_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-green.log
-          grep -q '1 passed; 0 failed' ids-green.log
-      - name: Existing ID protocol and full MVCC behavior
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids::io_protocol::tests:: -- --test-threads=1 --nocapture 2>&1 | tee ids-protocol.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' ids-protocol.log
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=2 2>&1 | tee mvcc.log
           grep -Eq '[1-9][0-9]* passed; 0 failed' mvcc.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          cargo fmt --all -- --check
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: checkpoint-coordinator-native
-          path: |
-            source.txt
-            *.log
+          name: id-cleanup-capacity
+          path: '*.log'
