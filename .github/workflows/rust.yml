@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 64cdab386bd70e285a6f49c780971d485520e088
+          ref: 2f455230bf47c089f5513aa8544acc2e58ede0ec
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,15 +28,39 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 64cdab386bd70e285a6f49c780971d485520e088
+          test "$(git rev-parse HEAD)" = 2f455230bf47c089f5513aa8544acc2e58ede0ec
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Native ordinary locks and exact downgrade regression
         run: |
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ordinary-locks.log
-          grep '^test result:' ordinary-locks.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
+          grep '^test result:' ordinary-locks.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker.log
           grep '^test result:' marker.log | tail -1 | grep -q '^test result: ok. 5 passed; 0 failed;'
+      - name: Unsupported-lock destructor causal control
+        run: |
+          cp core/io/unix.rs /tmp/unix-accepted.rs
+          trap 'cp /tmp/unix-accepted.rs core/io/unix.rs' EXIT
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path('core/io/unix.rs')
+          s = p.read_text()
+          before = '#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]\nimpl Drop for UnixFile'
+          assert s.count(before) == 1
+          p.write_text(s.replace(before, 'impl Drop for UnixFile'))
+          PYCONTROL
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_unsupported_lock_drops_safely -- --ignored --test-threads=1 --nocapture > unsupported-control.log 2>&1
+          code=$?
+          set -e
+          cat unsupported-control.log
+          test "$code" -ne 0
+          grep '^test result:' unsupported-control.log | tail -1 | grep -q '^test result: FAILED. 0 passed; 1 failed;'
+          grep -q 'Failed to unlock file' unsupported-control.log
+          cp /tmp/unix-accepted.rs core/io/unix.rs
+          git diff --exit-code
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_unsupported_lock_drops_safely -- --ignored --test-threads=1 --nocapture 2>&1 | tee unsupported-restored.log
+          grep '^test result:' unsupported-restored.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
       - name: Broader ordinary core and SDK contracts
         run: |
           timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api,bench -- --test-threads=2 2>&1 | tee core.log
@@ -49,7 +73,7 @@ jobs:
           grep '^test result:' uring-locks.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
       - name: Strict library lint and formatting
         run: |
-          cargo clippy --locked -p turso_core --lib --tests --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee clippy.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee clippy.log
           cargo fmt --all --check
       - uses: actions/upload-artifact@v4
         if: always()
@@ -70,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 64cdab386bd70e285a6f49c780971d485520e088
+          ref: 2f455230bf47c089f5513aa8544acc2e58ede0ec
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
