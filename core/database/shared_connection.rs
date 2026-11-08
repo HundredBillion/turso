@@ -52,7 +52,9 @@ impl SharedConnectState {
         }
         return_if_io!(self.open.poll_manifest());
         if self.captured_generation.is_none() {
-            self.captured_generation = Some(self.open.capture_connection_generation()?);
+            self.captured_generation = Some(return_if_io!(self
+                .open
+                .capture_connection_generation(database)));
         }
         if self.pager.is_none() {
             self.pager = Some(Arc::new(return_if_io!(database._init_nonblock(
