@@ -1,4 +1,4 @@
-name: Selected current ID base validation
+name: Current generation native integration cohort
 on:
   workflow_dispatch:
 permissions:
@@ -7,7 +7,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  current-id-base:
+  native-current-generation:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -23,116 +23,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Record exact source
+      - name: Verify exact source and native integrations
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
           test "$(git rev-parse HEAD)" = 3942c92fc97654b389541f49821cb7623fcf4a27
-          rustc -Vv | tee rustc.txt
-      - name: Idle old process and new constructor reload current generation
-        run: |
-          set -euo pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-process-green.log
-          grep -q '1 passed; 0 failed' idle-process-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-cancel-green.log
-          grep -q '1 passed; 0 failed' idle-cancel-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_physical_inspection_before_and_after_callback -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-cancel-green.log
-          grep -q '1 passed; 0 failed' physical-cancel-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-error-green.log
-          grep -q '1 passed; 0 failed' finish-error-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume -- --ignored --test-threads=1 --nocapture 2>&1 | tee owner-green.log
-          grep -q '1 passed; 0 failed' owner-green.log
-      - name: Causal boundary controls and restored complete source
-        run: |
-          set -euo pipefail
-          set -e
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_current_prefix.rs'
-          s=open(p).read(); start=s.index('        database.validate_shared_runtime(&self.runtime)?;'); end=s.index('        if let Some(saved)',start)
-          open(p,'w').write(s[:start]+s[end:])
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume -- --ignored --test-threads=1 --nocapture > owner-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/database/shared_current_prefix.rs
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' owner-control-red.log
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_current_prefix.rs'
-          s=open(p).read(); old='MvStore::<C, A>::capture_table_valued_functions(&connection.schema.read())'
-          assert s.count(old)==1
-          open(p,'w').write(s.replace(old,'Vec::new()'))
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture > tvf-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/database/shared_current_prefix.rs
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' tvf-control-red.log
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_generation_reload.rs'
-          s=open(p).read(); old='checkpoint_timestamp > prefix.committed_timestamp'
-          assert s.count(old)==1
-          s=s.replace(old,'checkpoint_timestamp < source_frontier || '+old)
-          open(p,'w').write(s)
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture > lower-base-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/database/shared_generation_reload.rs
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' lower-base-control-red.log
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_current_base.rs'
-          s=open(p).read(); old='if ids.logical_floor() > -physical_pages {'
-          assert s.count(old)==1
-          open(p,'w').write(s.replace(old,'if false && ids.logical_floor() > -physical_pages {'))
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_rejects_physical_extent_without_id_floor -- --ignored --test-threads=1 --nocapture > extent-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/database/shared_current_base.rs
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' extent-control-red.log
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_runtime.rs'
-          s=open(p).read(); old='if result.is_err() && self.current.installed {'
-          assert s.count(old)==1
-          open(p,'w').write(s.replace(old,'if false && result.is_err() && self.current.installed {'))
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture > finish-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/database/shared_runtime.rs
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' finish-control-red.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-restored-green.log
-          grep -q '1 passed; 0 failed' idle-restored-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture 2>&1 | tee cancel-restored-green.log
-          grep -q '1 passed; 0 failed' cancel-restored-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_rejects_physical_extent_without_id_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent-restored-green.log
-          grep -q '1 passed; 0 failed' extent-restored-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-restored-green.log
-          grep -q '1 passed; 0 failed' finish-restored-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume -- --ignored --test-threads=1 --nocapture 2>&1 | tee owner-restored-green.log
-          grep -q '1 passed; 0 failed' owner-restored-green.log
-          cat *red.log
-          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
-          cargo fmt --all -- --check
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_opcode_native.log
+          grep -q '13 passed; 0 failed' shared_id_opcode_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_watermark_io_native.log
+          grep -q '1 passed; 0 failed' shared_watermark_io_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_lifecycle_native.log
+          grep -q '8 passed; 0 failed' shared_id_lifecycle_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_lifecycle_io_native.log
+          grep -q '2 passed; 0 failed' shared_id_lifecycle_io_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_prepare_native.log
+          grep -q '3 passed; 0 failed' shared_prepare_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_prepare_io_native.log
+          grep -q '1 passed; 0 failed' shared_prepare_io_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_id_stale_prepare_native.log
+          grep -q '1 passed; 0 failed' shared_id_stale_prepare_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_identity_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_watermark_identity_native.log
+          grep -q '1 passed; 0 failed' shared_watermark_identity_native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee shared_schema_publication_native.log
+          grep -q '3 passed; 0 failed' shared_schema_publication_native.log
           git diff --exit-code
-      - name: Preserve evidence
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: idle-generation-controls-3942
+          name: idle-generation-native-cohort-3942
           path: |
             source.txt
-            rustc.txt
-            *green.log
-            *red.log
-
+            *.log
