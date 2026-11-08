@@ -130,6 +130,15 @@ pub(in crate::mvcc) use shared_runtime::{
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
 mod shared_commit_integration_tests;
 
+#[cfg(all(
+    feature = "test_helper",
+    host_shared_wal,
+    target_os = "linux",
+    target_pointer_width = "64",
+    not(shuttle)
+))]
+pub use shared_runtime::recovered_checkpoint_for_test;
+
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
