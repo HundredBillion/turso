@@ -50,3 +50,95 @@ Before using this maximum, bootstrap must write and FULL-sync the selected ID wi
 Cancellation or failure before the mirrored proof leaves admission disabled and recovery required. Successful reconciliation changes only coordination metadata; read-only database contents remain unchanged. Subsequent processes joining a live reconciled authority do not change its incarnation. The proof assumes the existing failure model of checksum-detected torn writes and successful FULL-sync durability; it does not treat process-kill tests as power-loss evidence.
 
 Every bootstrap validates the selected ID journal, including processes joining an already reconciled live authority. Readiness only controls incarnation reconciliation; it is not a substitute for durable metadata validation. A prepared checkpoint generation requires coordinator recovery before admission, even when the completed manifest is already durable and an idle participant kept the authority alive across the coordinator's death. Matching finalized state on a live incarnation needs no selector writes.
+
+## Overlapping schema publication audit (2026-11-08)
+
+Issue7 requires coordinated schema publication; this audit found no source-backed
+requirement for a separate global DDL-exclusive lock. The existing commit path
+refreshes peers under publication authority before validating the transaction.
+Peer schema installation advances `last_committed_schema_change_ts`; preparation
+rejects a write whose snapshot predates that timestamp, including a transaction
+that changed its own schema header.
+
+Test-only source `f448a526c9b7c367c272bc2870b43c34a4d59724`, based on composite
+`2049aa8457f1368c9b14b50ecfa2b2bc98039d62`, adds native coverage in
+`core/vdbe/shared_schema_publication_tests.rs`. Three parent tests cover16 cases:
+CREATE TABLE and CREATE SEQUENCE, same versus different names, both commit orders,
+and independent stores versus real independent worker processes. Both workers
+acknowledge BEGIN, a snapshot read and staged CREATE before either may commit.
+Table cases also stage distinct marker data. The controller records each actual
+COMMIT acknowledgement without SQL retry and verifies exact catalog counts, no
+duplicate names, acknowledged data/sequence start values, and rejected-object
+absence through existing peers, a fresh peer and reopen. Worker replies and exit
+handling have bounded deadlines.
+
+Run https://github.com/HundredBillion/turso/actions/runs/42482021571 passed all
+three tests:16 first-commit acknowledgements and16 `SchemaConflict` responses for
+the second commit. This includes different-name DDL: current validation is
+conservative rather than merging concurrent schema transactions. First table-only
+run42481656583 independently passed8 cases.
+
+A validation-only control disabled **only** the `schema_updated` rejection in
+commit preparation. Both different-name commits then acknowledged, but a later
+catalog/data verification failed with `no such table: created_b` (0passed/1failed).
+Restoring the exact source passed all3 parent tests again; strict library Clippy
+passed and the workflow confirmed a clean source tree. The control demonstrates
+the existing check's necessity; it is not a defect present in the tested product
+source. Artifact `shared-schema-publication-audit` retains logs, source identity,
+toolchain and the one-line control diff.
+
+No engine behavior, ordinary-mode path or public activation changed. This is
+bounded CREATE/publication evidence, not coverage of every ALTER/DROP/index DDL,
+DDL crash recovery, arbitrary I/O failure, or the complete PHP release gate.
+
+## Independent-worker DML and API audit (2026-11-08)
+
+Existing `shared_commit_native_` tests already covered separate stores, overlapping
+updates, stable/fresh readers and reopening acknowledged writes. The existing
+process harness covered sequence-owner liveness and schema publication. Neither
+was evidence for real-process delete/secondary-UNIQUE conflicts or an external
+ACK ledger across multi-row rolling restarts, so the new cases reuse the schema
+worker protocol rather than introducing another service or retry layer.
+
+Exact test source `4c4cbb97bec4444c00d15c08a41aca42ca823834` passed Linux native
+run https://github.com/HundredBillion/turso/actions/runs/42484506488:
+
+- Update/update, delete/update, and secondary-UNIQUE conflicts, each in both worker
+  orders. Both processes first hold explicit snapshots. Updates reject the losing
+  write with `Busy` during staging. Delete/update and UNIQUE cases stage both
+  writes, then reject the losing COMMIT with `WriteWriteConflict`. UNIQUE cases
+  use distinct primary keys; the shared secondary key is the conflict. A fresh
+  process verifies exactly the accepted state and `PRAGMA integrity_check='ok'`.
+- Disjoint updates, a delete and an insert stage in two processes before either
+  commits, and both commits succeed in either order. Fresh-process rows and
+  integrity checks match the independent expected state.
+- Three FULL multi-row commits transfer10 between two balances and append one
+  transfer record in the same transaction. A surviving controller fsyncs an
+  external ACK record only after COMMIT replies. A long-lived reader retains
+  `[100,100]` and zero transfer rows throughout; fresh workers observe each
+  acknowledged version. Workers exit/reopen, including asserted SIGKILL after
+  the second acknowledged commit. A final new process verifies `[70,130]`, exact
+  transfer IDs1–3, total30, and integrity. Main-file bytes remain unchanged,
+  keeping this test within one physical generation.
+
+All5 parent tests and strict library Clippy passed. Artifact
+`shared-worker-acceptance-audit` records source/toolchain/logs. The first tracer
+run42483728194 passed the ACK/restart case but incorrectly required both updating
+workers to stage successfully; its `Busy` result was an allowed early conflict,
+not a product failure. Phase-specific tests in42484118213 confirmed that behavior
+before the disjoint-write/integrity controls were added. No engine code changed.
+
+C API source audit: `sqlite3_step` drives the current core statement once through
+`run_one_step_blocking`; Busy and WriteWriteConflict map to SQLITE_BUSY, while
+SchemaConflict maps to SQLITE_SCHEMA. `sqlite3_exec` stops/finalizes at the first
+error and has no transaction replay loop. Core schema reprepare handles
+SchemaUpdated, not SchemaConflict, and the busy handler resumes execution state.
+These are source findings, not new-mode PHP end-to-end evidence. One separate
+mapping inconsistency remains: core/open handling maps BusySnapshot to busy,
+while C's step error mapper falls through to SQLITE_ERROR. Its producer found in
+this audit is ordinary WAL snapshot upgrade; no actual shared-mode counterexample
+or C behavior change is claimed here.
+
+Public C/PDO opt-in remains rejected. These process tests do not establish PHP
+acceptance, power-loss/torn-write recovery, every partial-statement error path,
+checkpoint-generation transitions, or a fix for the legacy-WAL report11383.

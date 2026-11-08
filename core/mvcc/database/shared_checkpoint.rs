@@ -1,4 +1,6 @@
 use super::super::checkpoint_state_machine::MaterializedCheckpointProof;
+#[path = "shared_checkpoint_base.rs"]
+mod shared_checkpoint_base;
 use super::*;
 use crate::mvcc::checkpoint_gate::CheckpointPause;
 use crate::mvcc::commit_manifest::checkpoint_publication::{
@@ -11,6 +13,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_prepare::{
 };
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::wal::CheckpointMode;
+pub(in crate::mvcc) use shared_checkpoint_base::InstalledDowngradeSource;
 
 /// The caller must verify and install the new physical generation before releasing admission.
 /// Logical history remains intact until that downstream proof authorizes reclamation.

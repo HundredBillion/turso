@@ -715,6 +715,7 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     assert!(
         db.mvcc_store
             .table_id_to_rootpage
+            .load()
             .get(&MVTableId::from(-999_i64))
             .is_none(),
         "stale root-page entries must be cleared"
@@ -8039,6 +8040,8 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         peer_conflicted: AtomicBool::new(false),
         #[cfg(host_shared_wal)]
         shared_snapshot: None,
+        #[cfg(all(host_shared_wal, unix))]
+        shared_pending_release: Mutex::new(None),
         before_mutation_lock: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
@@ -9834,6 +9837,8 @@ fn transaction_display() {
         peer_conflicted: AtomicBool::new(false),
         #[cfg(host_shared_wal)]
         shared_snapshot: None,
+        #[cfg(all(host_shared_wal, unix))]
+        shared_pending_release: Mutex::new(None),
         before_mutation_lock: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
@@ -15361,13 +15366,22 @@ fn test_checkpoint_drop_table_removes_stale_rootpage_mapping() {
     );
     let rootpage = rows[0][0].as_int().unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
-    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+    assert!(db
+        .mvcc_store
+        .table_id_to_rootpage
+        .load()
+        .get(&table_id)
+        .is_some());
 
     db.conn.execute("DROP TABLE stale_root").unwrap();
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     assert!(
-        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        db.mvcc_store
+            .table_id_to_rootpage
+            .load()
+            .get(&table_id)
+            .is_none(),
         "dropped checkpointed table mapping must not survive rootpage reuse"
     );
 }
@@ -15393,7 +15407,12 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
     );
     let rootpage = rows[0][0].as_int().unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
-    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+    assert!(db
+        .mvcc_store
+        .table_id_to_rootpage
+        .load()
+        .get(&table_id)
+        .is_some());
 
     db.conn.execute("DROP TABLE stale_root").unwrap();
     db.conn
@@ -15409,7 +15428,11 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     assert!(
-        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        db.mvcc_store
+            .table_id_to_rootpage
+            .load()
+            .get(&table_id)
+            .is_none(),
         "dropped checkpointed table mapping must be removed after retry"
     );
 }
@@ -25466,6 +25489,7 @@ fn recovery_decodes_entire_frame_before_mutating_store_or_context() {
     assert!(db
         .mvcc_store
         .table_id_to_rootpage
+        .load()
         .get(&rowid.table_id)
         .is_none());
     assert_eq!(ctx.max_commit_ts_seen, 17);
@@ -26036,6 +26060,282 @@ fn empty_peer_context<C: LogicalClock, A: ConcurrentAllocator>(
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn peer_import_sequence_frame_installs_descriptor_before_preparation() {
+    let source = MvccTestDb::new();
+    source
+        .conn
+        .execute("CREATE SEQUENCE peer_sequence START 7 INCREMENT 3")
+        .unwrap();
+    source
+        .conn
+        .execute("CREATE TABLE unrelated(value)")
+        .unwrap();
+    source.conn.execute("DROP SEQUENCE peer_sequence").unwrap();
+    source
+        .conn
+        .execute("CREATE SEQUENCE peer_sequence START 13 INCREMENT 5")
+        .unwrap();
+    let target = MvccTestDb::new();
+    let mut context = empty_peer_context(&target.mvcc_store, &target.conn);
+    context.max_commit_ts_seen = 0;
+    let mut reader = StreamingLogicalLogReader::new(source.mvcc_store.get_logical_log_file(), None);
+    source
+        .db
+        .io
+        .block(|| reader.try_read_header_nonblock())
+        .unwrap();
+    let mut imported = 0;
+    let mut starts = Vec::new();
+    while let Some(frame) = source
+        .db
+        .io
+        .block(|| reader.next_transaction_frame())
+        .unwrap()
+    {
+        let mut prepared = Some(
+            target
+                .mvcc_store
+                .prepare_recovery_frame(&target.conn, &context, frame.ops)
+                .unwrap(),
+        );
+        target
+            .mvcc_store
+            .install_peer_frame(&target.conn, &mut context, &mut prepared)
+            .unwrap();
+        imported += 1;
+        let backing = crate::translate::sequence::sequence_backing_table_name("peer_sequence");
+        if context
+            .current_schema
+            .get_btree_table(NamespaceId::ROOT, &backing)
+            .is_some()
+        {
+            starts.push(
+                target
+                    .conn
+                    .find_sequence("peer_sequence")
+                    .unwrap()
+                    .1
+                    .start_value,
+            );
+        } else {
+            assert!(target.conn.find_sequence("peer_sequence").is_err());
+        }
+    }
+    assert!(imported > 0);
+    assert!(
+        target
+            .conn
+            .prepare("SELECT nextval('peer_sequence')")
+            .is_ok(),
+        "a complete committed sequence frame must publish its descriptor with its backing table"
+    );
+    let sequence = target.conn.find_sequence("peer_sequence").unwrap().1;
+    assert!(starts.contains(&7));
+    assert_eq!(sequence.start_value, 13);
+    assert_eq!(sequence.increment_by, 5);
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_sequence_frame_preserves_autoincrement_rename() {
+    let source = MvccTestDb::new();
+    source
+        .conn
+        .execute("CREATE TABLE original(id INTEGER PRIMARY KEY AUTOINCREMENT, value)")
+        .unwrap();
+    source
+        .conn
+        .execute("ALTER TABLE original RENAME TO renamed")
+        .unwrap();
+    let target = MvccTestDb::new();
+    let mut context = empty_peer_context(&target.mvcc_store, &target.conn);
+    context.max_commit_ts_seen = 0;
+    let mut reader = StreamingLogicalLogReader::new(source.mvcc_store.get_logical_log_file(), None);
+    source
+        .db
+        .io
+        .block(|| reader.try_read_header_nonblock())
+        .unwrap();
+    let mut imported = 0;
+    while let Some(frame) = source
+        .db
+        .io
+        .block(|| reader.next_transaction_frame())
+        .unwrap()
+    {
+        let mut prepared = Some(
+            target
+                .mvcc_store
+                .prepare_recovery_frame(&target.conn, &context, frame.ops)
+                .unwrap(),
+        );
+        target
+            .mvcc_store
+            .install_peer_frame(&target.conn, &mut context, &mut prepared)
+            .unwrap();
+        imported += 1;
+    }
+    assert!(imported >= 2);
+    let name = crate::schema::autoincrement_sequence_name("renamed");
+    let sequence = target.conn.find_sequence(&name).unwrap().1;
+    assert_eq!(sequence.name, name);
+    assert!(target
+        .conn
+        .prepare("INSERT INTO renamed(value) VALUES('after replay')")
+        .is_ok());
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_sequence_frame_rejects_invalid_metadata_before_publication() {
+    let source = MvccTestDb::new();
+    source
+        .conn
+        .execute("CREATE SEQUENCE peer_sequence")
+        .unwrap();
+    let backing = crate::translate::sequence::sequence_backing_table_name("peer_sequence");
+    let root = source
+        .conn
+        .schema
+        .read()
+        .get_btree_table(NamespaceId::ROOT, &backing)
+        .unwrap()
+        .root_page;
+    let table_id = source.mvcc_store.get_table_id_from_root_page(root);
+    let mut ops = collect_mvcc_recovery_ops(&source.conn);
+    let invalid = ImmutableRecord::from_values(
+        &[
+            Value::Null,
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(i64::MAX),
+            Value::from_i64(0),
+        ],
+        7,
+    )
+    .unwrap();
+    let mut original = None;
+    for op in &mut ops {
+        if let ParsedOp::UpsertTable {
+            table_id: id,
+            record_bytes,
+            ..
+        } = op
+        {
+            if *id == table_id {
+                assert!(original.replace(record_bytes.clone()).is_none());
+                *record_bytes = crate::types::value_blob_from_slice(invalid.as_blob()).unwrap();
+            }
+        }
+    }
+    let original = original.expect("CREATE SEQUENCE persists its metadata row");
+    let target = MvccTestDb::new();
+    let store = &target.mvcc_store;
+    let mut context = empty_peer_context(store, &target.conn);
+    context.max_commit_ts_seen = 0;
+    let schema = target.conn.schema.read().clone();
+    let mut prepared = Some(
+        store
+            .prepare_recovery_frame(&target.conn, &context, ops)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store.install_peer_frame(&target.conn, &mut context, &mut prepared),
+        Err(LimboError::Corrupt(_))
+    ));
+    assert!(prepared.is_some());
+    assert_eq!(context.max_commit_ts_seen, 0);
+    assert!(Arc::ptr_eq(&schema, &target.conn.schema.read()));
+    assert!(target.conn.find_sequence("peer_sequence").is_err());
+    let row = prepared
+        .as_mut()
+        .unwrap()
+        .decoded_frame
+        .iter_mut()
+        .find_map(|op| match op {
+            StreamingResult::UpsertTableRow { row, .. } if row.id.table_id == table_id => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    *row = Row::new_table_row(row.id.clone(), &original).unwrap();
+    store
+        .install_peer_frame(&target.conn, &mut context, &mut prepared)
+        .unwrap();
+    assert!(prepared.is_none());
+    assert_eq!(
+        target
+            .conn
+            .find_sequence("peer_sequence")
+            .unwrap()
+            .1
+            .increment_by,
+        1
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn peer_import_sequence_frame_rejects_deleted_new_descriptor() {
+    let source = MvccTestDb::new();
+    source
+        .conn
+        .execute("CREATE SEQUENCE peer_sequence")
+        .unwrap();
+    let backing = crate::translate::sequence::sequence_backing_table_name("peer_sequence");
+    let root = source
+        .conn
+        .schema
+        .read()
+        .get_btree_table(NamespaceId::ROOT, &backing)
+        .unwrap()
+        .root_page;
+    let id = source.mvcc_store.get_table_id_from_root_page(root);
+    let mut ops = collect_mvcc_recovery_ops(&source.conn);
+    let (rowid, commit_ts) = ops
+        .iter()
+        .find_map(|op| match op {
+            ParsedOp::UpsertTable {
+                table_id,
+                rowid,
+                commit_ts,
+                ..
+            } if *table_id == id => Some((rowid.clone(), *commit_ts)),
+            _ => None,
+        })
+        .unwrap();
+    ops.push(ParsedOp::DeleteTable {
+        rowid,
+        record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+        pk_record_bytes: crate::types::value_blob_from_slice(&[]).unwrap(),
+        commit_ts,
+        btree_resident: false,
+    });
+    let target = MvccTestDb::new();
+    let store = &target.mvcc_store;
+    let mut context = empty_peer_context(store, &target.conn);
+    context.max_commit_ts_seen = 0;
+    let schema = target.conn.schema.read().clone();
+    let mut prepared = Some(
+        store
+            .prepare_recovery_frame(&target.conn, &context, ops)
+            .unwrap(),
+    );
+    assert!(
+        matches!(
+            store.install_peer_frame(&target.conn, &mut context, &mut prepared),
+            Err(LimboError::Corrupt(_))
+        ),
+        "a deleted row cannot supply a new sequence descriptor"
+    );
+    assert!(prepared.is_some());
+    assert_eq!(context.max_commit_ts_seen, 0);
+    assert!(Arc::ptr_eq(&schema, &target.conn.schema.read()));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn peer_import_allocation_failures_preserve_chains_and_retry_same_frame() {
     let mut failures = 0;
     let mut reached_success = false;
@@ -26466,5 +26766,41 @@ fn peer_import_publishes_dropped_physical_roots_for_checkpoint() {
     assert_eq!(
         versions[0].data.as_deref().unwrap(),
         record.as_blob().as_slice()
+    );
+}
+
+#[cfg(all(host_shared_wal, unix))]
+#[test]
+fn shared_generation_reload_allocation_failure_keeps_existing_map_and_clock() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("generation-reload.db-log"),
+        alloc.clone(),
+        false,
+    )
+    .unwrap();
+    store.insert_table_id_to_rootpage(MVTableId::from(-90), Some(42));
+    let previous = store.table_id_to_rootpage.load_full();
+    let before_txid = store.tx_ids.load(Ordering::SeqCst);
+    let before_floor = store.next_table_id.load(Ordering::SeqCst);
+    let before_clock = store.clock.get_timestamp(crate::mvcc::clock::no_op);
+    let mut header = DatabaseHeader::default();
+    header.database_size = 42.into();
+    header.read_version = crate::storage::sqlite3_ondisk::RawVersion(SHARED_MVCC_VERSION);
+    header.write_version = header.read_version;
+    alloc.fail_allocations(true);
+    let result = store.prepare_generation_reload(header, &Schema::new(), 100);
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
+    assert!(Arc::ptr_eq(
+        &previous,
+        &store.table_id_to_rootpage.load_full()
+    ));
+    assert_eq!(store.current_root_page(&MVTableId::from(-90)), Some(42));
+    assert_eq!(store.tx_ids.load(Ordering::SeqCst), before_txid);
+    assert_eq!(store.next_table_id.load(Ordering::SeqCst), before_floor);
+    assert_eq!(
+        store.clock.get_timestamp(crate::mvcc::clock::no_op),
+        before_clock + 1
     );
 }

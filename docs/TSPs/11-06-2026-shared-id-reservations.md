@@ -264,9 +264,18 @@ floor-only replacement bank. This is separate from factual retained bytes; alrea
 retained inactive-bank space counts toward the same total and is not reserved twice.
 Both ID appends and logical-log commit preflight must use `required_budget_bytes`
 plus the prospective logical prefix. Without this reserve an active bank could fill
-the cap and make quiescent compaction permanently impossible. Offline initialization requires a separate `MIN_HISTORY_LIMIT` of 32KiB: the
-16KiB initial files, 8KiB replacement capacity, one 4KiB claim and a small 4KiB
-logical frame. This does not guarantee any-sized write fits. `MIN_ID_BUDGET_BYTES`
+the cap and make quiescent compaction permanently impossible.
+
+Admission additionally reserves one 4KiB release record per retained claim and one
+per unretired owner, including owners whose claims were released by a savepoint.
+Use the proposed post-append state: a release consumes its existing reserve rather
+than demanding additional free capacity. Reserve journal and selector sequence
+increments for these records too, and reject a claim before acknowledging ordinal
+exhaustion. Idempotent retirement retries need no append or additional capacity.
+
+Offline initialization retains the structural `MIN_HISTORY_LIMIT` of 32KiB.
+This minimum does not guarantee room for a claim and logical frame once release
+capacity is included. `MIN_ID_BUDGET_BYTES`
 is 24KiB after compaction, before adding a claim or logical frame. A single frame
 that cannot fit even that empty-generation minimum returns TooBig; retained-history
 pressure returns bounded BUSY. Neither error promises that checkpointing can always
@@ -777,7 +786,7 @@ then answers this case before unrelated dead-owner cleanup, so an existing claim
 can be used even at the retained-byte cap. New reservations still perform cleanup
 and enforce their ordinary budget/conflict checks.
 
-Savepoint release removes claims at or after its mark. A released value receives
+Rollback-to releases claims at or after its mark. A released value receives
 a new monotone ordinal when claimed again; a claim predating the mark keeps its
 original ID. Retired owners remain invalid. Cross-owner row conflicts and existing
 cross-owner sequence/CYCLE semantics are unchanged. The codec still accepts old
@@ -809,3 +818,177 @@ The runtime owner reviewed this factor without a blocker. It compiled during the
 71-test portable ID run and passed library lint, but the recovered-proof positive
 and crash-reopen tests still require the physical evidence constructor. This entry
 is committed to unblock that integration; it is not native recovery acceptance.
+
+## Shared watermark reader continuation (2026-11-07)
+
+The scalar reader uses a separate yielding read state, because a standalone SELECT
+need not own a user transaction and a read-only participant must not allocate a
+claim. It retains one publication authority across committed-prefix refresh, a
+checked oracle read of the sequence backing row, and the journal's existing
+`LowestLiveSequenceClaim` query. Neither journal cleanup nor tail repair is part
+of this operation. Existing outer transactions keep their identity, snapshot, and
+uncommitted rows. No writer reacquires the checkpoint admission gate.
+
+The committed boundary uses `first_unsafe_sequence_watermark`: an uncalled row
+returns its value; called ascending non-CYCLE returns checked value + increment
+(with overflow retaining value); called descending/CYCLE retains value. The
+result is the numeric minimum of that boundary and live claims, matching the
+existing conservative local rule without promising descending/CYCLE scan order.
+
+Acceptance starts with an outer owner retaining allocation 1 while a peer commits
+allocation 2: both readers return 1; after outer rollback both return 3, including
+from an older local store. Further checks cover standalone/read-only reads,
+unchanged durable files, uncalled/non-unit/descending/CYCLE boundaries, invalid
+names/NULL, and suspended-read reset and backend retirement. Main-only oracle
+support remains explicit; attached shared readers are not silently redirected.
+
+The shared initial boundary is the committed uncalled backing value (for example,
+1). Ordinary mode still returns NULL before its local watermark map is populated;
+this path is unchanged. The shared value is an exclusive safe-scan boundary, not
+an allocation. An absent committed backing domain is accepted only when the
+current Active transaction records that exact created table ID and the selected
+journal proves the same live owner's logical-table reservation. Its boundary is
+NULL before any allocation and the live claim minimum afterward; no committed
+row is invented. Unreserved, foreign, released, dead, stale, and wrong-generation
+proofs fail without journal writes. Native CREATE/INSERT and provisional
+CREATE SEQUENCE/nextval/watermark schedules cover commit and rollback.
+
+For committed sequences the oracle checks the backing name and descriptor fields
+under authority. A root resolved before authority acquisition cannot silently
+supply another sequence's boundary after remapping. Delayed main, manifest, and
+selector reads must retain physical authority through statement reset/drop and
+backend completion retirement; a callback alone is not retirement.
+
+### Reader validation, 2026-11-07
+
+[Linux run 42433119912](https://github.com/HundredBillion/turso/actions/runs/42433119912)
+validated exact source `ba3c6d0bf659497f2c4625c8c967ea9638c09506` with Rust1.88:
+
+| Gate | Result |
+| --- | --- |
+| Native ID opcode cases, including provisional create/insert/sequence | 13 passed |
+| Wrong backing name/root and descriptor, followed by valid retry | 1 passed |
+| Main/manifest/selector delayed reads: reset/drop before and after callback, resume | 15 cases in 1 passing test |
+| Separate process live claim, rollback, SIGKILL; physical read-only observer | 1 passed |
+| Journal policy, including invalid provisional ownership | 12 passed |
+| Sequence regression filter | 29 passed, 5 ignored |
+| Strict core library lint (`conn_raw_api,bench`) | passed |
+
+The subprocess case retains an actual outer insert and sequence claim while the
+parent commits a later allocation. The observer returns the lower live claim,
+then advances after rollback and actual process death. Durable-file comparisons
+exclude only the writable authority and physical coordination mapping. This is
+native subprocess evidence; public PHP activation is a separate acceptance gate.
+
+Validation-only removal of the watermark reset hook failed with retained
+publication ownership after backend retirement. Restoring the exact source made
+all delayed-read cases pass again. The earlier exact logical-owner-check bypass
+also failed its unreserved-domain test. Neither negative-control mutation is part
+of the product branch. The first delayed-read fixture timed out because it did
+not drive reads during synchronous statement reset; its corrected `IO::step`
+performs the real read while retaining the backend completion, preserving the
+physical-retirement assertion.
+
+Reproduction selectors are `shared_id_opcode_native_`,
+`shared_watermark_identity_native_`, `shared_watermark_io_native_`, and
+`shared_watermark_process_native_`, each using `--ignored --test-threads=1`
+with `cargo test -p turso_core --lib --features conn_raw_api`. The child helper is
+invoked only by its parent test. Main-only oracle support remains explicit;
+shared ATTACH, transaction-wide savepoint claim release, checkpoint/recovery
+integration, and public PHP process acceptance are not established by this reader
+milestone. The separate peer-schema descriptor fix must still be integrated and
+validated with this branch.
+
+### Scoped rollback and abandoned statements (2026-11-08)
+
+Actual native counterexamples on the watermark/peer-schema union returned success
+from `ROLLBACK TO` after undoing local rows, but a peer still received BUSY when
+claiming those IDs. Failed multirow statements, reset and Drop had the same leak.
+Run42434329574 reproduced all four independently while checking that earlier
+claims, the outer transaction identity and its snapshot remained intact.
+
+Reservation policy now captures the selected journal's next owner ordinal before
+an append or the same-owner idempotence shortcut. The runtime records that boundary
+on currently unmarked transaction savepoints. A repeated claim therefore keeps its
+earlier ordinal; it does not become owned by a newer savepoint. Cleanup actions do
+not capture reservation marks, so retrying retirement of an already-retired owner
+remains a no-op. SQL `RELEASE` keeps the changes and their claims; `ROLLBACK TO`
+uses `ReleaseAfter` and retains the named frame for another rollback.
+
+Durable ID release and local undo are one publication critical section. Returning
+the publication guard immediately after the journal append would let a peer claim
+and commit a row while the old local version was still present. The release result
+therefore retains the actual authority guard through version undo, schema/frame
+restoration and bookkeeping. A transaction fence blocks other new/resumed programs
+and COMMIT while this work is incomplete. The fence mutex spans native unlock and
+success-only clearing, so another scope cannot have its fence accidentally cleared.
+
+Reset/Drop finishes the captured typed rollback continuation, not the SQL text.
+Shared explicit write statements get a local statement scope even when ordinary
+single-row analysis would omit one: a durable reservation can precede the first
+local row mutation. An in-flight reservation is drained before that scope is
+released. Publication ownership remains held through the local statement undo.
+A failed cleanup does not acknowledge release; the transaction remains fenced.
+
+An autonomous sequence inner commit needs the same ownership ordering. The first
+physical manifest-write cancellation test failed because the inner commit still
+owned publication while outer-scope cleanup tried to acquire it. Shared cleanup now
+finishes an already-started inner commit state machine, then drops it before any
+rollbackability decision, restoring the saved outer transaction only afterward.
+This observes sticky durability even after a failed poll. It does not run nextval
+or any other SQL again, and it uses the pending database's actual pager.
+
+Evidence before budget integration:
+
+- Exact9698edf3f, run42435846654: native lifecycle7, global ID opcodes13, ordinary
+  named-savepoint1, policy12 and strict library lint passed. Local ordinary
+  statement lifecycle41 and sequence32 passed.
+- Exact8eaf4c05a, run42477790527: 12 real deferred ID-bank write/sync/truncate
+  reservation/named-reset/drop cases passed. Autonomous manifest-write reset was
+  a real BUSY failure, not an acknowledged successful cancellation.
+- Exact202f692b6, run42478189818: those 12 cases plus four actual autonomous
+  manifest-write/sync reset/drop cases passed. The controller retains the backend
+  Completion beyond callback, verifies peers remain excluded and cleanup has not
+  acknowledged, then retires it. The outer snapshot/prior claim survive, the peer
+  can acquire the released row, and the autonomous committed sequence value remains.
+
+The cleanup-credit union feff5190c passes local full core2810/40ignored. Final
+source2fb0d40f040dcd5c0c340880070d198c6634ff66 passed hosted run42479545684:
+lifecycle8, physical cancellation2 (16 cases), global IDs13, watermark identity1,
+watermark deferred-I/O1, watermark subprocess1, peer refresh-then-prepare1,
+COMMIT/RELEASE VDBE6, shared IDs75/3ignored, descriptor replay4, and strict library
+lint. Original budget1c79786e4 is an ancestor through merge02932db1b.
+
+The first combined run42478570321 exposed an obsolete128KiB cap fixture: cleanup
+credits made the second UPDATE reservation fail before the intended COMMIT test.
+The two fixtures now use192KiB and assert the exact metadata/frame inequalities,
+unchanged published manifest/log bytes after BUSY, retained local writes/savepoint,
+and successful rollback. A validation-only negative control removes commit cap
+preflight: the explicit COMMIT test fails its expected-BUSY assertion (0pass/1fail).
+Restoring the exact source passes all six VDBE cases and leaves the source clean.
+Raw evidence is retained in artifact `shared-id-lifecycle-budget-union` on
+https://github.com/HundredBillion/turso/actions/runs/42479545684.
+
+This validates the lifecycle branch, not its later checkpoint/pager union. That
+union's run42479473704 exposed two sequence-watermark failures after generation
+certification cleared a source pager layout memo. Source9c019ad35 fixes that seam:
+the independent read-pinned oracle copies the source transform configuration,
+reads its own header asynchronously when the memo is absent, and validates page
+size, reserved-space bounds and checksum mode before constructing a cursor. The
+request is captured before that read; the caller's pager/snapshot is unchanged.
+
+Run42480677435 passes factory1, lifecycle8, physical cancellation2 (16cases),
+IDs13, watermark identity1/deferred-I/O1 (30cases)/process1, peerprepare1, VDBE6,
+IDs75/3ignored, descriptors4 and strictliblint. Restoring the old source-memo
+requirement makes the reset-memo factory test fail (0pass/1fail); restoring the
+source passes1. The first factory run42480446821 exposed an old fixture assumption
+that connect populated the memo; the fixture now performs an actual table read
+before its populated-layout half, then explicitly resets for its uncached half.
+Evidence artifact `shared-sequence-oracle-layout` is attached to
+https://github.com/HundredBillion/turso/actions/runs/42480677435.
+The verified lifecycle milestone is merged through3c80d5744; its only runtime
+addition to the tested layout source is the separately validated2fb step-guard
+short-circuit ordering.
+Immediate idle-peer compilation after new DDL is also a separate tracked gate.
+Successful physical retirement tests do not establish arbitrary injected-I/O-error
+recovery or full shared-mode release readiness. Public activation remains off.

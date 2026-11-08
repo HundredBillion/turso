@@ -1589,6 +1589,10 @@ pub struct SharedPagerState {
 }
 
 impl SharedPagerState {
+    pub(crate) fn page_size(&self) -> Option<PageSize> {
+        PageSize::new(self.page_size.load(Ordering::SeqCst))
+    }
+
     pub fn new(init_page_1: Option<PageRef>) -> Self {
         let page_size = init_page_1.as_ref().map_or(0, |page| {
             let contents = page.get_contents();
@@ -1612,10 +1616,20 @@ impl SharedPagerState {
     }
 }
 
+#[cfg(all(host_shared_wal, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedPagerGeneration {
+    pub database_id: crate::io::FileId,
+    pub generation: u64,
+    pub checkpoint_timestamp: u64,
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
 pub struct Pager {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_generation: Mutex<Option<SharedPagerGeneration>>,
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
@@ -1958,6 +1972,8 @@ impl Pager {
             RwLock::new(AllocatePage1State::Done)
         };
         Ok(Self {
+            #[cfg(all(host_shared_wal, unix))]
+            shared_generation: Mutex::new(None),
             db_file,
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
@@ -3230,12 +3246,7 @@ impl Pager {
 
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
-        let value = self.shared.page_size.load(Ordering::SeqCst);
-        if value == 0 {
-            None
-        } else {
-            PageSize::new(value)
-        }
+        self.shared.page_size()
     }
 
     /// Get the current page size, panicking if not set.
@@ -5519,6 +5530,77 @@ impl Pager {
     #[cfg(test)]
     pub fn test_evict_all_unpinned_clean(&self) {
         self.page_cache.write().test_evict_all_unpinned_clean();
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn ensure_shared_generation(&self, generation: SharedPagerGeneration) -> Result<()> {
+        let mut current = self.shared_generation.lock();
+        if *current != Some(generation) {
+            self.reset_shared_generation()?;
+            *current = Some(generation);
+        }
+        Ok(())
+    }
+
+    /// Detach reads from the previous shared generation under the caller's
+    /// quiescent connection ownership. This does not cancel backend reads:
+    /// their callbacks may finish only the detached PageRefs they captured.
+    #[allow(dead_code)] // Private generation installer is integrated separately.
+    pub(crate) fn reset_shared_generation(&self) -> Result<()> {
+        let commit = self.commit_info.read();
+        if self.holds_read_lock()
+            || self.holds_write_lock()
+            || !self.dirty_pages.read().is_empty()
+            || !self.savepoints.read().is_empty()
+            || self.subjournal_in_use()
+            || self.syncing.load(Ordering::SeqCst)
+            || !matches!(commit.state, CommitState::PrepareWal)
+            || commit.group.is_some()
+            || commit.completion_group.is_some()
+            || commit.pending_sync.is_some()
+            || !commit.collected_pages.is_empty()
+            || !commit.page_sources.is_empty()
+            || !commit.prepared_frames.is_empty()
+            || commit.page_source_cursor != 0
+            || !matches!(
+                self.checkpoint_state.read().phase,
+                CheckpointPhase::NotCheckpointing
+            )
+            || !matches!(*self.allocate_page_state.read(), AllocatePageState::Start)
+            || !matches!(*self.allocate_page1_state.read(), AllocatePage1State::Done)
+            || !self.shared.initialized()
+            || self.shared.is_init_locked()
+            || !matches!(*self.free_page_state.read(), FreePageState::Start)
+            || !matches!(*self.spill_state.read(), SpillState::Idle)
+            || !matches!(*self.cacheflush_state.read(), CacheFlushState::Init)
+        {
+            return Err(LimboError::Busy);
+        }
+        #[cfg(feature = "autovacuum")]
+        {
+            let vacuum = self.vacuum_state.read();
+            if !matches!(vacuum.ptrmap_get_state, PtrMapGetState::Start)
+                || !matches!(vacuum.ptrmap_put_state, PtrMapPutState::Start)
+                || !matches!(
+                    vacuum.btree_create_vacuum_full_state,
+                    BtreeCreateVacuumFullState::Start
+                )
+            {
+                return Err(LimboError::Busy);
+            }
+        }
+        // The cache validates every dirty flag before changing ownership.
+        self.page_cache.write().detach_clean_pages()?;
+        self.invalidate_all_cursors();
+        let mut pending = self.pending_reads.write();
+        pending.clear();
+        self.has_pending_reads.store(false, Ordering::Release);
+        *self.header_ref_state.write() = HeaderRefState::Start;
+        self.schema_cookie
+            .store(Self::SCHEMA_COOKIE_NOT_SET, Ordering::SeqCst);
+        self.reserved_space
+            .store(RESERVED_SPACE_NOT_SET, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn clear_page_cache(&self, clear_dirty: bool) {
@@ -8139,3 +8221,7 @@ mod checkpoint_phase_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pager_generation_tests.rs"]
+mod generation_tests;

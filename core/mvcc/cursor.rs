@@ -770,6 +770,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(())
     }
 
+    /// Logical table and snapshot owner bound when this cursor was opened.
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn shared_id_identity(&self) -> (i64, u64) {
+        (self.table_id.into(), self.tx_id)
+    }
+
     pub fn start_new_rowid(&mut self) -> IOResultOr<NextRowidResult> {
         tracing::trace!("start_new_rowid");
 

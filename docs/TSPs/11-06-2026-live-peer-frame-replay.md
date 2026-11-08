@@ -105,3 +105,54 @@ Logical-table allocator lowering uses atomic fetch_min so concurrent local
 reservations cannot be overwritten. Imported i64::MIN table IDs are rejected
 before publication. Global table/row/sequence reservation integration remains a
 separate required task; this local monotonicity repair does not provide it.
+
+## Sequence descriptors during live import
+
+A live schema replacement now stages sequence descriptors before publishing the
+frame. New backing-table metadata comes from a row that survives the complete
+frame; a later deletion cannot supply the descriptor. An unchanged backing-table
+identity preserves its prior descriptor across unrelated DDL. AUTOINCREMENT table
+renaming preserves that identity while updating the descriptor name. Dropping
+and recreating a sequence uses the new domain and metadata. Missing or invalid
+new metadata rejects installation without advancing the visible schema or replay
+frontier, retaining the pending frame for retry.
+
+This is a private live-import repair. Ordinary startup recovery keeps its existing
+post-replay descriptor-loading path. It does not add prepare-time peer refresh,
+checkpoint recovery, or public shared-mode activation.
+
+## Refresh before compiling an idle connection's SQL
+
+An idle connection must import peer DDL before resolving table and sequence names.
+Refresh root statements before compilation when no transaction or schema bootstrap
+is active. Internal helpers keep their caller's authority and schema; active
+transactions retain their established snapshot. Use the existing bounded manifest
+reader and atomic peer-frame installer under checkpoint admission and publication
+authority, without registering a transaction merely to prepare SQL. The public
+prepare API is synchronous, so it drives the existing yielding reader through the
+connection's I/O backend. It must await backend retirement before finishing
+authority. Generation changes still require the separate physical-base reload.
+
+Native counterexamples at `0d95c591d` (run `42478695225`) reproduce both missing
+sequence and missing table errors when the second connection prepares immediately
+after peer DDL, without an intervening transaction to trigger replay. The older
+test with an intervening SELECT passes on the same source. The new implementation
+must additionally preserve active snapshots, avoid recursive internal preparation,
+reject preparation while a checkpoint pauses admission, and retain authority over
+delayed physical reads.
+
+Logical reader lifetime is shared by prepare, transaction admission, bootstrap,
+commit refresh and checkpoint refresh. A normal selected manifest authorizes the
+read transport even while mapped publication still requires replay recovery.
+`ReadPinnedFile::for_manifest_replay` accepts that sealed manifest and retains its
+lease in every physical read callback. It supplies no readiness or checkpoint
+proof. `SharedRefresh` already waits for physical retirement before adopting
+storage state or returning authority. Central wrapping in `reset_reader` applies
+the same lifetime rule to every caller.
+
+Native source `b21428dff` (run `42479654326`) passed checkpoint-pause protection
+and the manifest read case, then failed the logical read case after callback
+completion while the backend still retained its completion. A portable cancelled
+refresh test also fails when central wrapping is removed: authority becomes
+available before the physical read callback. Both regressions must pass with the
+wrapper restored.

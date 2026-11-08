@@ -1,8 +1,19 @@
 #[path = "shared_store_claim.rs"]
 mod shared_store_claim;
 
+#[path = "shared_current_prefix.rs"]
+mod shared_current_prefix;
+
+#[path = "shared_current_base.rs"]
+mod shared_current_base;
+pub(in crate::mvcc) use shared_current_base::CurrentBaseEvidence;
+
+#[path = "shared_pager_generation.rs"]
+mod shared_pager_generation;
+
 #[path = "shared_checkpoint.rs"]
 mod shared_checkpoint;
+pub(in crate::mvcc) use shared_checkpoint::InstalledDowngradeSource;
 
 #[path = "shared_checkpoint_recovery.rs"]
 mod shared_checkpoint_recovery;
@@ -18,6 +29,10 @@ pub(in crate::mvcc) use shared_checkpoint_recovery_ids::RecoveryCompletionEviden
 mod shared_id_runtime;
 pub(crate) use shared_id_runtime::{SharedIdRequest, SharedIdResult, SharedIdState};
 
+#[path = "shared_sequence_watermark.rs"]
+mod shared_sequence_watermark;
+pub(crate) use shared_sequence_watermark::SharedSequenceWatermarkState;
+
 use super::shared_refresh::{SharedBeginOptions, SharedRefresh, SharedReplayContext};
 use super::*;
 use crate::io::FileId;
@@ -31,6 +46,7 @@ use crate::mvcc::shared_ids::io_protocol::{IdLoad, RecoveryIdentity, SharedIds};
 use crate::mvcc::shared_ids::DatabaseGeneration;
 use crate::storage::shared_wal_coordination::MappedSharedWalCoordination;
 use crate::sync::Weak;
+use crate::MAIN_DB_ID;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct SharedMvccRuntime {
@@ -67,6 +83,9 @@ pub(crate) struct SharedOpenState {
     failed: bool,
     manifest_ready: bool,
     bindings: Vec<FileBinding>,
+    pin_physical_reads: bool,
+    connection_refreshed: bool,
+    current: shared_current_prefix::CurrentPrefixState,
 }
 
 #[derive(Default)]
@@ -207,6 +226,17 @@ impl SharedMvccRuntime {
     }
 
     pub(crate) fn begin_open(self: &Arc<Self>) -> Result<SharedOpenState> {
+        self.begin_open_with_read_policy(false)
+    }
+
+    pub(crate) fn begin_read_pinned_open(self: &Arc<Self>) -> Result<SharedOpenState> {
+        self.begin_open_with_read_policy(true)
+    }
+
+    fn begin_open_with_read_policy(
+        self: &Arc<Self>,
+        pin_physical_reads: bool,
+    ) -> Result<SharedOpenState> {
         let admission = self.gate.try_enter_admission()?;
         let guard = self.files.authority.try_acquire()?;
         let load = ManifestLoad::new(self.files.manifest.clone(), guard, self.database_id)?;
@@ -219,6 +249,9 @@ impl SharedMvccRuntime {
             failed: false,
             manifest_ready: false,
             bindings: Vec::new(),
+            pin_physical_reads,
+            connection_refreshed: false,
+            current: Default::default(),
         })
     }
 }
@@ -245,10 +278,17 @@ impl SharedOpenState {
                 }
                 let bindings = (|| {
                     let guard = loaded.guard()?;
-                    Ok::<_, LimboError>(vec![
-                        self.runtime.main.bind(guard)?,
-                        self.runtime.wal.bind(guard)?,
-                    ])
+                    Ok::<_, LimboError>(if self.pin_physical_reads {
+                        vec![
+                            self.runtime.main.bind_reads(guard)?,
+                            self.runtime.wal.bind_reads(guard)?,
+                        ]
+                    } else {
+                        vec![
+                            self.runtime.main.bind(guard)?,
+                            self.runtime.wal.bind(guard)?,
+                        ]
+                    })
                 })();
                 match bindings {
                     Ok(bindings) => self.bindings = bindings,
@@ -268,6 +308,64 @@ impl SharedOpenState {
         }
     }
 
+    pub(crate) fn capture_connection_generation(
+        &mut self,
+        database: &Arc<crate::Database>,
+    ) -> IOResultOr<crate::storage::pager::SharedPagerGeneration> {
+        return_if_io!(self.poll_current_base(database));
+        let identity = if let Some(base) = self.current.base.as_ref() {
+            base.identity().database
+        } else {
+            self.runtime
+                .replay
+                .lock()
+                .as_ref()
+                .ok_or(LimboError::Busy)?
+                .identity()?
+                .database
+        };
+        Ok(IOResult::Done(
+            crate::storage::pager::SharedPagerGeneration {
+                database_id: self.runtime.database_id,
+                generation: identity.generation,
+                checkpoint_timestamp: identity.checkpoint_timestamp,
+            },
+        ))
+    }
+
+    pub(crate) fn finish_connection<C: LogicalClock, A: ConcurrentAllocator>(
+        &mut self,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+        captured: crate::storage::pager::SharedPagerGeneration,
+    ) -> IOResultOr<()> {
+        return_if_io!(self.poll_current_prefix(store, connection, MAIN_DB_ID, Some(captured)));
+        let guard = self.loaded.as_ref().ok_or(LimboError::Busy)?.guard()?;
+        if !guard.io_retired() {
+            return Ok(IOResult::IO(crate::types::IOCompletions(
+                guard.retirement_completion(),
+            )));
+        }
+        self.finish_current_prefix()?;
+        Ok(IOResult::Done(()))
+    }
+
+    fn finish_current_prefix(&mut self) -> Result<()> {
+        let result = self
+            .loaded
+            .take()
+            .ok_or(LimboError::Busy)?
+            .into_guard()?
+            .finish();
+        if result.is_err() && self.current.installed {
+            self.runtime.replay.lock().take();
+        }
+        result?;
+        self.bindings.clear();
+        self.admission = None;
+        Ok(())
+    }
+
     fn abort(&mut self) {
         self.bindings.clear();
         self.refresh = None;
@@ -279,6 +377,25 @@ impl SharedOpenState {
 }
 
 impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
+    pub(crate) fn refresh_shared_schema_for_prepare(
+        &self,
+        connection: &Arc<Connection>,
+    ) -> Result<()> {
+        use crate::IOExt;
+        let Some(runtime) = self.shared_runtime.get() else {
+            return Ok(());
+        };
+        let io = connection.get_pager().io.clone();
+        let mut open = runtime.begin_open()?;
+        if connection.get_mv_tx().is_some() {
+            return Ok(());
+        }
+        io.block(|| open.poll_manifest())?;
+        io.block(|| open.poll_current_prefix(self, connection, MAIN_DB_ID, None))?;
+        open.finish_current_prefix()?;
+        Ok(())
+    }
+
     pub(crate) fn attach_shared_runtime(&self, runtime: Arc<SharedMvccRuntime>) -> Result<()> {
         let expected: Arc<dyn crate::mvcc::persistent_storage::DurableStorage> = runtime.storage();
         if !Arc::ptr_eq(&self.storage, &expected) || self.experimental_mvcc_passive_checkpoint {
@@ -342,14 +459,9 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
             }
             let open = state.open.as_mut().unwrap();
             return_if_io!(open.poll_manifest());
-            if open.refresh.is_none() {
-                let replay = runtime.replay.lock().clone().ok_or_else(|| {
-                    LimboError::InvalidArgument("shared runtime has not completed bootstrap".into())
-                })?;
-                open.refresh =
-                    Some(replay.refresh(open.loaded.take().unwrap(), runtime.logical.clone())?);
-            }
-            open.refresh.as_mut().unwrap().poll_begin(
+            return_if_io!(open.poll_current_prefix(self, connection, database_id, None));
+            let result = SharedRefresh::begin_loaded(
+                open.loaded.take().unwrap(),
                 self,
                 connection,
                 SharedBeginOptions {
@@ -359,7 +471,11 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                     database_id,
                     exclusive,
                 },
-            )
+            );
+            if result.is_err() && open.current.installed {
+                runtime.replay.lock().take();
+            }
+            result
         })();
         if !matches!(&result, Ok(IOResult::IO(_))) {
             state.reset();
@@ -507,7 +623,9 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                                 .into());
                             }
                             if loaded.guard().incarnation_ready()? {
-                                loaded.into_guard().finish()?;
+                                let guard = loaded.into_guard();
+                                runtime.certify_current_pager(connection, None, &guard)?;
+                                guard.finish()?;
                             } else {
                                 state.ids_mirror = Some(loaded.mirror_current_witness()?);
                             }
@@ -517,6 +635,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                             state.ids_mirror = None;
                             let (mut guard, maximum) = proof.into_guard_and_max_owner_epoch();
                             guard.reconcile_incarnation(maximum.unwrap_or(0))?;
+                            runtime.certify_current_pager(connection, None, &guard)?;
                             guard.finish()?;
                         }
                         open.bindings.clear();
@@ -622,6 +741,48 @@ pub(crate) fn shared_runtime_fixture_with_limit(dir: &Path, limit: u64) -> PathB
 #[cfg(all(test, not(shuttle)))]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_prepare_native_idle_root_respects_checkpoint_pause() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let database = crate::Database::open(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap();
+        let main = std::fs::read(&path).unwrap();
+        let manifest = std::fs::read(runtime.files.namespace.join("manifest")).unwrap();
+        let logical = std::fs::read(runtime.files.namespace.join("logical")).unwrap();
+        let pause = runtime.gate.try_pause_admission().unwrap();
+        assert!(matches!(
+            connection.prepare("SELECT * FROM preserved"),
+            Err(LimboError::Busy)
+        ));
+        assert_eq!(connection.get_mv_tx_id_for_db(0), None);
+        let guard = runtime.files.authority.try_acquire().unwrap();
+        assert!(guard.live_registrations().unwrap().is_empty());
+        guard.finish().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), main);
+        assert_eq!(
+            std::fs::read(runtime.files.namespace.join("manifest")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read(runtime.files.namespace.join("logical")).unwrap(),
+            logical
+        );
+        drop(pause);
+        assert!(connection.prepare("SELECT * FROM preserved").is_ok());
+    }
+
     #[test]
     fn shared_fixture_materializes_metadata_and_marker_through_pager() {
         let dir = tempfile::tempdir().unwrap();
@@ -1269,5 +1430,13 @@ fn shared_checkpoint_native_completion_requires_id_finalization_before_admission
 mod shared_physical_native_tests;
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_connection_tests.rs"]
+mod shared_connection_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_checkpoint_recovery_io_tests.rs"]
 mod shared_checkpoint_recovery_io_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_idle_generation_tests.rs"]
+mod shared_idle_generation_tests;

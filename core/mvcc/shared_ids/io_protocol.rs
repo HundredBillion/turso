@@ -1,3 +1,6 @@
+#[path = "current_generation.rs"]
+pub(in crate::mvcc) mod current_generation;
+
 #[path = "checkpoint_prepare.rs"]
 pub(in crate::mvcc) mod checkpoint_prepare;
 
@@ -86,19 +89,17 @@ impl SharedIds {
                 "ID journal oracle prefix differs from publication authority",
             ));
         }
-        self.start_load(guard, identity)
+        self.start_load(guard, IdLoadTarget::Known(identity))
     }
 
-    fn start_load(
-        self: &Arc<Self>,
-        guard: AuthorityGuard,
-        identity: RecoveryIdentity,
-    ) -> Result<IdLoad> {
+    fn start_load(self: &Arc<Self>, guard: AuthorityGuard, target: IdLoadTarget) -> Result<IdLoad> {
         use crate::io::File;
-        if identity.database.generation == 0
-            || identity.database.checkpoint_timestamp > identity.prefix.committed_timestamp
-        {
-            return Err(invalid("ID journal recovery identity is inconsistent"));
+        if let IdLoadTarget::Known(identity) = &target {
+            if identity.database.generation == 0
+                || identity.database.checkpoint_timestamp > identity.prefix.committed_timestamp
+            {
+                return Err(invalid("ID journal recovery identity is inconsistent"));
+            }
         }
         if self.selector.size()? != (2 * PAGE_SIZE) as u64 {
             return Err(corrupt("invalid published ID selector length"));
@@ -112,7 +113,7 @@ impl SharedIds {
         data[0].try_reserve_exact(2 * PAGE_SIZE)?;
         Ok(IdLoad {
             files: self.clone(),
-            identity,
+            target,
             ownership: Arc::new(Mutex::new(Some(guard))),
             bindings: Some(bindings),
             data,
@@ -132,9 +133,55 @@ struct PendingRead {
     count: Arc<AtomicI32>,
 }
 
+enum IdLoadTarget {
+    Known(RecoveryIdentity),
+    Current {
+        generation: u64,
+        prefix: crate::mvcc::shared_authority::PublishedPrefix,
+    },
+}
+
+impl IdLoadTarget {
+    fn prefix(&self) -> crate::mvcc::shared_authority::PublishedPrefix {
+        match self {
+            Self::Known(identity) => identity.prefix,
+            Self::Current { prefix, .. } => *prefix,
+        }
+    }
+
+    fn resolve_current(&mut self, selector: IdSelector) -> Result<()> {
+        if let Self::Current { generation, prefix } = self {
+            if selector.prepared.is_some() {
+                return Err(invalid(
+                    "current generation IDs require completed finalization",
+                ));
+            }
+            if selector.active.database.generation != *generation
+                || selector.active.database.checkpoint_timestamp > prefix.committed_timestamp
+            {
+                return Err(corrupt(
+                    "active IDs do not match the selected current generation",
+                ));
+            }
+            *self = Self::Known(RecoveryIdentity {
+                database: selector.active.database,
+                prefix: *prefix,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolved(&self) -> Result<RecoveryIdentity> {
+        match self {
+            Self::Known(identity) => Ok(*identity),
+            Self::Current { .. } => Err(invalid("current ID base has not been inspected")),
+        }
+    }
+}
+
 pub(in crate::mvcc) struct IdLoad {
     files: Arc<SharedIds>,
-    identity: RecoveryIdentity,
+    target: IdLoadTarget,
     ownership: Arc<Mutex<Option<AuthorityGuard>>>,
     bindings: Option<[FileBinding; 3]>,
     data: [Vec<u8>; 3],
@@ -215,14 +262,9 @@ impl LoadedIds {
             })
     }
 
-    /// Includes room for a floor-only replacement bank before the selected bank can be reclaimed.
+    /// Reserves a replacement bank and durable release records for retained claims/owners.
     pub(in crate::mvcc) fn required_budget_bytes(&self) -> Result<u64> {
-        use crate::io::File;
-        let inactive = 1 - usize::from(self.selection.selected.bank);
-        let headroom = ((2 * PAGE_SIZE) as u64).saturating_sub(self.files.banks[inactive].size()?);
-        self.retained_bytes()?
-            .checked_add(headroom)
-            .ok_or(LimboError::TooBig)
+        self.required_budget_for(&self.state, self.selection.selector.sequence)
     }
 
     pub(in crate::mvcc) fn into_guard(self) -> AuthorityGuard {
@@ -240,6 +282,9 @@ impl LoadedIds {
             return Err(invalid(
                 "ID append requires the current finalized generation",
             ));
+        }
+        if let journal::Change::Claim { ordinal, .. } = change {
+            ordinal.checked_add(1).ok_or(LimboError::DatabaseFull)?;
         }
         let record = journal::Record {
             sequence: self
@@ -261,16 +306,6 @@ impl LoadedIds {
             .ok_or(LimboError::TooBig)?;
         let bank = usize::from(selector.active.bank);
         let physical_active = self.files.banks[bank].size()?;
-        let required = self
-            .required_budget_bytes()?
-            .checked_add(self.identity.prefix.end_offset)
-            .and_then(|bytes| {
-                bytes.checked_add(selector.active.end.saturating_sub(physical_active))
-            })
-            .ok_or(LimboError::TooBig)?;
-        if required > self.files.history_budget {
-            return Err(LimboError::Busy);
-        }
         let bytes = &mut self.banks[bank];
         bytes.try_reserve_exact(PAGE_SIZE)?;
         bytes.extend_from_slice(&record);
@@ -281,6 +316,16 @@ impl LoadedIds {
             self.identity.database.generation,
             (selector.active.snapshot_end as usize) - PAGE_SIZE,
         )?;
+        let required = self
+            .required_budget_for(&self.state, selector.sequence)?
+            .checked_add(self.identity.prefix.end_offset)
+            .and_then(|bytes| {
+                bytes.checked_add(selector.active.end.saturating_sub(physical_active))
+            })
+            .ok_or(LimboError::TooBig)?;
+        if required > self.files.history_budget {
+            return Err(LimboError::Busy);
+        }
         let selector_bytes = selector.encode()?;
         let record_buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
         record_buffer.as_mut_slice().copy_from_slice(&record);
@@ -302,6 +347,27 @@ impl LoadedIds {
             pending: None,
             finished: false,
         })
+    }
+
+    fn required_budget_for(&self, state: &journal::State, selector_sequence: u64) -> Result<u64> {
+        use crate::io::File;
+        let credits = state.release_record_credits()?;
+        state
+            .last_record
+            .checked_add(credits)
+            .ok_or(LimboError::DatabaseFull)?;
+        selector_sequence
+            .checked_add(credits)
+            .ok_or(LimboError::DatabaseFull)?;
+        let cleanup = credits
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(LimboError::TooBig)?;
+        let inactive = 1 - usize::from(self.selection.selected.bank);
+        let headroom = ((2 * PAGE_SIZE) as u64).saturating_sub(self.files.banks[inactive].size()?);
+        self.retained_bytes()?
+            .checked_add(headroom)
+            .and_then(|bytes| bytes.checked_add(cleanup))
+            .ok_or(LimboError::TooBig)
     }
 }
 
@@ -396,12 +462,13 @@ impl IdLoad {
                 self.data[self.index].extend_from_slice(&read.buffer.as_slice()[..count as usize]);
             }
             if self.index == 3 {
+                let identity = self.target.resolved()?;
                 if self.selected.is_none() {
                     let selected = select(
                         [&self.data[0][..PAGE_SIZE], &self.data[0][PAGE_SIZE..]],
                         [&self.data[1], &self.data[2]],
                         self.files.database_id,
-                        self.identity.database,
+                        identity.database,
                     )?;
                     self.replayed =
                         Some(replay_selected(selected, [&self.data[1], &self.data[2]])?);
@@ -421,7 +488,7 @@ impl IdLoad {
                     files: self.files.clone(),
                     guard: self.ownership.lock().take().unwrap(),
                     bindings: self.bindings.take().unwrap(),
-                    identity: self.identity,
+                    identity,
                     selection: self.selected.take().unwrap(),
                     state: self.replayed.take().unwrap(),
                     banks: [
@@ -469,6 +536,7 @@ impl IdLoad {
             [&self.data[0][..PAGE_SIZE], &self.data[0][PAGE_SIZE..]],
             self.files.database_id,
         )?;
+        self.target.resolve_current(selector)?;
         for reference in [Some(selector.active), selector.prepared]
             .into_iter()
             .flatten()
@@ -485,7 +553,7 @@ impl IdLoad {
         let required = self
             .expected
             .iter()
-            .try_fold(self.identity.prefix.end_offset, |total, size| {
+            .try_fold(self.target.prefix().end_offset, |total, size| {
                 total.checked_add(*size as u64)
             })
             .ok_or(LimboError::TooBig)?;
@@ -1126,6 +1194,7 @@ mod tests {
                 },
                 IdQuery::RowExists { value, .. } => IdFact::RowExists(self.maximum == Some(*value)),
                 IdQuery::LogicalFloor => IdFact::LogicalFloor(-1),
+                IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
             }))
         }
     }
@@ -1156,10 +1225,16 @@ mod tests {
         let IOResult::Done(outcome) = operation.poll().unwrap() else {
             panic!("synchronous oracle");
         };
+        let state = journal::State::replay(&f.bank.bytes.lock()[PAGE_SIZE..], 1).unwrap();
+        let release_records: usize = state
+            .active_owners()
+            .map(|owner| state.claims(owner).count() + 1)
+            .sum();
         assert_eq!(
             outcome.required_budget_bytes,
             outcome.retained_bytes
                 + ((2 * PAGE_SIZE) as u64).saturating_sub(f.unused.size().unwrap())
+                + (release_records * PAGE_SIZE) as u64
         );
         assert_eq!(
             outcome.retained_bytes,
@@ -1418,6 +1493,106 @@ mod tests {
     }
 
     #[test]
+    fn id_policy_provisional_watermark_requires_live_exact_logical_owner() {
+        use super::super::policy::{IdAction, IdResult, SequenceDurability};
+        for invalid_case in [
+            "unreserved",
+            "foreign",
+            "released",
+            "dead",
+            "stale",
+            "generation",
+        ] {
+            let f = writable_fixture();
+            let mut registration_a = Some(registration(&f));
+            let registration_b = registration(&f);
+            let owner_a = owner(registration_a.as_ref().unwrap());
+            let (_, table) = reserved(policy(
+                &f,
+                IdAction::ReserveLogicalTable { owner: owner_a },
+                None,
+            ));
+            let mut domain = journal::Domain {
+                generation: 1,
+                table,
+                sequence: true,
+            };
+            assert_eq!(
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: Some(owner_a)
+                    },
+                    None
+                ),
+                IdResult::LowestClaim(None)
+            );
+            policy(
+                &f,
+                IdAction::ClaimSequence {
+                    owner: owner_a,
+                    domain,
+                    value: 5,
+                    durability: SequenceDurability::OuterTransaction,
+                },
+                None,
+            );
+            assert_eq!(
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: Some(owner_a)
+                    },
+                    None
+                ),
+                IdResult::LowestClaim(Some(5))
+            );
+            let mut supplied = owner_a;
+            match invalid_case {
+                "unreserved" => domain.table -= 1,
+                "foreign" => supplied = owner(&registration_b),
+                "released" => {
+                    policy(&f, IdAction::ReleaseOwner { owner: owner_a }, None);
+                }
+                "dead" => {
+                    drop(registration_a.take());
+                }
+                "stale" => supplied.epoch += 1,
+                "generation" => domain.generation += 1,
+                _ => unreachable!(),
+            }
+            let bank = f.bank.bytes.lock().clone();
+            let selector = f.selector.bytes.lock().clone();
+            let operation = f.files.start(
+                f.authority.try_acquire().unwrap(),
+                f.identity,
+                Box::new(Oracle {
+                    identity: f.identity,
+                    maximum: None,
+                }),
+                Arc::new(crate::MemoryIO::new()),
+                IdAction::LowestLiveSequenceClaim {
+                    domain,
+                    provisional_owner: Some(supplied),
+                },
+            );
+            let result = operation.and_then(|mut operation| operation.poll());
+            assert!(
+                result.is_err(),
+                "accepted {invalid_case} provisional ownership"
+            );
+            assert_eq!(*f.bank.bytes.lock(), bank, "{invalid_case} wrote bank");
+            assert_eq!(
+                *f.selector.bytes.lock(),
+                selector,
+                "{invalid_case} wrote selector"
+            );
+        }
+    }
+
+    #[test]
     fn id_policy_sequence_claims_preserve_supplied_cycle_descending_and_boundary_values() {
         use super::super::policy::{IdAction, IdResult, SequenceDurability};
         for durability in [
@@ -1445,13 +1620,27 @@ mod tests {
                 assert_eq!(recorded, value);
             }
             assert_eq!(
-                policy(&f, IdAction::LowestLiveSequenceClaim { domain }, None),
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: None
+                    },
+                    None
+                ),
                 IdResult::LowestClaim(Some(i64::MIN))
             );
             let mutations = f.bank.mutations.load(Ordering::Acquire);
             drop(a);
             assert_eq!(
-                policy(&f, IdAction::LowestLiveSequenceClaim { domain }, None),
+                policy(
+                    &f,
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner: None
+                    },
+                    None
+                ),
                 IdResult::LowestClaim(None)
             );
             assert_eq!(
@@ -1555,6 +1744,7 @@ mod tests {
                     autoincrement_floor: 100,
                 },
                 IdQuery::LogicalFloor => IdFact::LogicalFloor(-1000),
+                IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
                 IdQuery::RowExists { .. } => panic!("no random fallback below exhaustion"),
             }))
         }
@@ -1834,6 +2024,113 @@ mod tests {
         let physical =
             f.bank.size().unwrap() + f.unused.size().unwrap() + f.selector.size().unwrap();
         assert_eq!(f.files.history_budget - physical, (2 * PAGE_SIZE) as u64);
+    }
+
+    #[test]
+    fn id_claim_reserves_selector_sequences_for_release_and_retirement() {
+        for sequence in [u64::MAX - 3, u64::MAX - 2] {
+            let f = writable_fixture();
+            let registration = registration(&f);
+            let mut current = loaded(&f);
+            current.selection.selector.sequence = sequence;
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            let result = current.append(journal::Change::Claim {
+                owner: owner(&registration),
+                ordinal: 1,
+                claim: journal::Claim {
+                    key: journal::ClaimKey::LogicalTable,
+                    value: -200,
+                },
+            });
+            if sequence == u64::MAX - 3 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(LimboError::DatabaseFull)));
+            }
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+        }
+    }
+
+    #[test]
+    fn id_append_reserves_release_capacity_at_a_fixed_budget() {
+        let mut f = writable_fixture();
+        Arc::get_mut(&mut f.files).unwrap().history_budget = (9 * PAGE_SIZE) as u64;
+        let registration = registration(&f);
+        let owner = owner(&registration);
+        let mut append = loaded(&f)
+            .append(journal::Change::Claim {
+                owner,
+                ordinal: 1,
+                claim: journal::Claim {
+                    key: journal::ClaimKey::LogicalTable,
+                    value: -200,
+                },
+            })
+            .unwrap();
+        let IOResult::Done(current) = append.poll().unwrap() else {
+            panic!("synchronous claim fixture");
+        };
+        drop(append);
+        assert_eq!(
+            current.required_budget_bytes().unwrap(),
+            f.files.history_budget,
+            "acknowledged claim must reserve its release record as well as checkpoint headroom"
+        );
+        let before = f.bank.bytes.lock().clone();
+        assert!(
+            matches!(
+                current.append(journal::Change::LogicalFloor(-300)),
+                Err(LimboError::Busy)
+            ),
+            "unrelated append spent mandatory release capacity"
+        );
+        assert_eq!(*f.bank.bytes.lock(), before);
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(f.identity.prefix).unwrap();
+        let mut loading = f.files.load(guard, f.identity).unwrap();
+        let IOResult::Done(current) = loading.poll().unwrap() else {
+            panic!("synchronous load fixture");
+        };
+        let mut release = current
+            .append(journal::Change::ReleaseAfter {
+                owner,
+                next_ordinal: 1,
+            })
+            .unwrap();
+        let IOResult::Done(released) = release.poll().unwrap() else {
+            panic!("synchronous release fixture");
+        };
+        assert_eq!(released.state.claims(owner).count(), 0);
+        assert_eq!(released.state.logical_floor, -200);
+        assert!(released.required_budget_bytes().unwrap() <= f.files.history_budget);
+        let mut retirement = released
+            .append(journal::Change::ReleaseOwner { owner })
+            .unwrap();
+        let IOResult::Done(retired) = retirement.poll().unwrap() else {
+            panic!("synchronous owner retirement fixture");
+        };
+        assert!(retired.state.owner_retired(owner));
+        assert!(retired.required_budget_bytes().unwrap() <= f.files.history_budget);
+        retired.guard.finish().unwrap();
+        let before =
+            [&f.bank, &f.unused, &f.selector].map(|file| file.mutations.load(Ordering::Acquire));
+        assert_eq!(
+            policy(
+                &f,
+                super::super::policy::IdAction::ReleaseOwner { owner },
+                None
+            ),
+            super::super::policy::IdResult::Released
+        );
+        assert_eq!(
+            [&f.bank, &f.unused, &f.selector].map(|file| file.mutations.load(Ordering::Acquire)),
+            before
+        );
     }
 
     #[test]
@@ -2910,5 +3207,150 @@ mod tests {
             panic!("backend retirement must unblock load");
         };
         loaded.guard.finish().unwrap();
+    }
+    fn current_manifest(
+        f: &Fixture,
+        generation: u64,
+    ) -> (Arc<TestFile>, crate::mvcc::commit_manifest::LoadedManifest) {
+        use crate::mvcc::commit_manifest::{ManifestLoad, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+        let prefix = PublishedPrefix {
+            committed_timestamp: 37,
+            end_offset: 128,
+            running_crc: 29,
+        };
+        drop(f.authority.try_acquire().unwrap());
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(prefix).unwrap();
+        let record = ManifestRecord::new(2, f.files.database_id, generation, 7, prefix).unwrap();
+        let mut bytes = vec![0; 2 * SLOT_SIZE];
+        for slot in [0, SLOT_SIZE] {
+            bytes[slot..slot + RECORD_SIZE].copy_from_slice(&record.encode());
+        }
+        let file = TestFile::new(15, bytes);
+        let mut load = ManifestLoad::new(file.clone(), guard, f.files.database_id).unwrap();
+        let IOResult::Done(loaded) = load.poll().unwrap() else {
+            panic!("synchronous manifest");
+        };
+        (file, loaded)
+    }
+
+    #[test]
+    fn id_current_base_uses_active_physical_timestamp_and_preserves_readers() {
+        use crate::mvcc::commit_manifest::ManifestLoad;
+        let f = fixture();
+        let registration = registration(&f);
+        let (manifest_file, manifest) = current_manifest(&f, f.identity.database.generation);
+        let snapshots = manifest.guard().unwrap().live_registrations().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let prefix = manifest.record().prefix();
+        let before = [&f.selector, &f.bank, &f.unused].map(|file| file.bytes.lock().clone());
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        let IOResult::Done(inspected) = inspection.poll().unwrap() else {
+            panic!("synchronous ID inspection");
+        };
+        let (base, guard) = inspected.suspend();
+        assert_eq!(base.identity().database, f.identity.database);
+        assert_eq!(base.identity().prefix, prefix);
+        assert!(prefix.committed_timestamp > base.identity().database.checkpoint_timestamp);
+        assert_eq!(base.logical_floor(), -100);
+        assert_eq!(guard.live_registrations().unwrap(), snapshots);
+        let mut reselect =
+            ManifestLoad::new(manifest_file.clone(), guard, f.files.database_id).unwrap();
+        let IOResult::Done(selected) = reselect.poll().unwrap() else {
+            panic!("synchronous reselection");
+        };
+        base.validate_selection(&selected).unwrap();
+        selected.into_guard().unwrap().finish().unwrap();
+        let mut replacement = ManifestLoad::new(
+            manifest_file,
+            f.authority.try_acquire().unwrap(),
+            f.files.database_id,
+        )
+        .unwrap();
+        let IOResult::Done(selected) = replacement.poll().unwrap() else {
+            panic!("synchronous replacement lease");
+        };
+        assert!(base.validate_selection(&selected).is_err());
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.bytes.lock().clone()),
+            before
+        );
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
+        selected.into_guard().unwrap().finish().unwrap();
+        drop(registration);
+    }
+
+    #[test]
+    fn id_current_base_rejects_a_different_selected_generation() {
+        let f = fixture();
+        let (_, manifest) = current_manifest(&f, f.identity.database.generation + 1);
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        assert!(matches!(inspection.poll(), Err(LimboError::Corrupt(_))));
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn id_current_base_requires_finalized_active_ids() {
+        let f = fixture();
+        let bytes = f.selector.bytes.lock().clone();
+        let (mut selector, _) = select_witness(
+            [&bytes[..PAGE_SIZE], &bytes[PAGE_SIZE..]],
+            f.files.database_id,
+        )
+        .unwrap();
+        let active = selector.active;
+        selector.prepared = Some(BankRef {
+            bank: 1 - active.bank,
+            bank_generation: active.bank_generation + 1,
+            database: DatabaseGeneration {
+                generation: active.database.generation + 1,
+                ..active.database
+            },
+            ..active
+        });
+        let encoded = selector.encode().unwrap();
+        let mut image = encoded.to_vec();
+        image.extend_from_slice(&encoded);
+        *f.selector.bytes.lock() = image;
+        let (_, manifest) = current_manifest(&f, active.database.generation + 1);
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        assert!(matches!(
+            inspection.poll(),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn id_current_base_cancellation_keeps_the_backend_authority() {
+        let f = fixture();
+        let (_, manifest) = current_manifest(&f, f.identity.database.generation);
+        f.selector.delayed.store(true, Ordering::Release);
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        let IOResult::IO(waiter) = inspection.poll().unwrap() else {
+            panic!("delayed selector");
+        };
+        drop(waiter);
+        drop(inspection);
+        assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+        f.selector.complete_pending(true);
+        assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+        f.selector.retire();
+        let guard = f.authority.try_acquire().unwrap();
+        assert!(guard.requires_recovery());
+        assert!(guard.published().is_err());
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
     }
 }

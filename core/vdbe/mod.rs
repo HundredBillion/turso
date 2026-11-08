@@ -40,6 +40,9 @@ pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
 mod statement_lifecycle_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+mod shared_id_tests;
 pub mod vacuum;
 pub mod value;
 #[allow(unused_imports)] // for benchmarks
@@ -1122,6 +1125,12 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     #[cfg(all(host_shared_wal, unix))]
     pub(crate) shared_begin: crate::mvcc::database::SharedBeginState,
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) shared_id: crate::mvcc::database::SharedIdState,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_named_rollback: Option<(String, crate::mvcc::database::TxID, u64)>,
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) shared_watermark: crate::mvcc::database::SharedSequenceWatermarkState,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -1307,6 +1316,12 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_begin: Default::default(),
+            #[cfg(all(host_shared_wal, unix))]
+            shared_id: Default::default(),
+            #[cfg(all(host_shared_wal, unix))]
+            shared_named_rollback: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_watermark: Default::default(),
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1404,6 +1419,15 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
+    pub(crate) fn reset_shared_id(&mut self) {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.shared_id.reset();
+            self.shared_named_rollback = None;
+            self.shared_watermark.reset();
+        }
+    }
+
     pub(crate) fn reset_shared_begin(&mut self) {
         #[cfg(all(host_shared_wal, unix))]
         self.shared_begin.reset();
@@ -1422,6 +1446,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.reset_shared_begin();
+        self.reset_shared_id();
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -1832,7 +1857,7 @@ impl ProgramState {
     /// while FK bookkeeping still needs cleanup.
     pub fn end_statement(
         &mut self,
-        connection: &Connection,
+        connection: &Arc<Connection>,
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
@@ -1860,6 +1885,42 @@ impl ProgramState {
         if !self.has_stmt_transaction {
             return Ok(());
         }
+        let main_tx = self
+            .sequence_inner_tx_pending
+            .as_ref()
+            .filter(|pending| pending.db == crate::MAIN_DB_ID)
+            .and_then(|pending| pending.saved_outer.map(|(tx, _)| tx))
+            .or_else(|| connection.get_mv_tx_id());
+        #[cfg(all(host_shared_wal, unix))]
+        let mut shared_rollback = None;
+        #[cfg(all(host_shared_wal, unix))]
+        if end_statement == EndStatement::RollbackSavepoint {
+            if let Some(store) = connection
+                .mv_store()
+                .as_ref()
+                .filter(|store| store.is_shared())
+            {
+                if let Some(tx_id) = main_tx {
+                    if let Some(next_ordinal) = store.shared_statement_id_boundary(tx_id) {
+                        use crate::IOExt;
+                        let mut release = crate::mvcc::database::SharedIdState::default();
+                        pager.io.block(|| {
+                            store.shared_id_nonblock(
+                                connection,
+                                pager.clone(),
+                                tx_id,
+                                crate::MAIN_DB_ID,
+                                crate::mvcc::database::SharedIdRequest::ReleaseAfter {
+                                    next_ordinal,
+                                },
+                                &mut release,
+                            )
+                        })?;
+                        shared_rollback = Some((store.clone(), tx_id, release));
+                    }
+                }
+            }
+        }
         self.has_stmt_transaction = false;
 
         // The change log was empty when this write statement started (see
@@ -1878,7 +1939,7 @@ impl ProgramState {
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
-                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                    if let Some(tx_id) = main_tx {
                         mv_store.release_savepoint(tx_id);
                     }
                     connection.for_each_attached_mv_tx(|db_id, tx_id| {
@@ -1906,7 +1967,7 @@ impl ProgramState {
                 // Rollback pager/MVCC savepoint if one was opened.
                 let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
                     let mut err = None;
-                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                    if let Some(tx_id) = main_tx {
                         if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
                             err = Some(e);
                         }
@@ -1975,6 +2036,12 @@ impl ProgramState {
         }
         for p in &attached_pagers {
             p.stop_use_subjournal();
+        }
+        #[cfg(all(host_shared_wal, unix))]
+        if result.is_ok() {
+            if let Some((store, tx_id, mut release)) = shared_rollback {
+                store.finish_shared_local_rollback(tx_id, &mut release)?;
+            }
         }
         result
     }
@@ -2586,7 +2653,30 @@ impl Program {
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
+        #[cfg(all(host_shared_wal, unix))]
+        let cleanup_blocks_step = self.connection.mv_store().as_ref().is_some_and(|store| {
+            store.is_shared()
+                && self
+                    .connection
+                    .get_mv_tx_id()
+                    .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+        }) && !self.connection.is_nested_stmt()
+            && state.shared_named_rollback.is_none()
+            && !self.insns.iter().any(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::AutoCommit { rollback: true, .. }
+                        | Insn::Savepoint {
+                            op: insn::SavepointOp::RollbackTo,
+                            ..
+                        }
+                )
+            });
+        #[cfg(not(all(host_shared_wal, unix)))]
+        let cleanup_blocks_step = false;
+        let result = if cleanup_blocks_step {
+            ProgramStep::Error(Box::new(LimboError::Busy))
+        } else if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
@@ -3587,6 +3677,54 @@ impl Program {
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         state.reset_shared_begin();
+        #[cfg(all(host_shared_wal, unix))]
+        if state.shared_named_rollback.is_none() {
+            if let Err(error) = state.shared_id.finish_pending_reservation() {
+                capture_abort_error(
+                    &mut abort_error,
+                    error,
+                    "Failed to retire shared ID reservation before rollback",
+                );
+            }
+        }
+        #[cfg(all(host_shared_wal, unix))]
+        if let Err(error) = self.finish_shared_sequence_inner_before_rollback(state) {
+            capture_abort_error(
+                &mut abort_error,
+                error,
+                "Failed to retire autonomous shared commit before outer rollback",
+            );
+        }
+        #[cfg(all(host_shared_wal, unix))]
+        if let Err(error) =
+            execute::finish_abandoned_shared_named_rollback(state, &self.connection, pager)
+        {
+            capture_abort_error(
+                &mut abort_error,
+                error,
+                "Failed to finish shared named rollback",
+            );
+        }
+        state.reset_shared_id();
+        #[cfg(all(host_shared_wal, unix))]
+        if let Some(store) = self
+            .connection
+            .mv_store()
+            .as_ref()
+            .filter(|store| store.is_shared())
+        {
+            if self
+                .connection
+                .get_mv_tx_id()
+                .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+            {
+                capture_abort_error(
+                    &mut abort_error,
+                    LimboError::Busy,
+                    "Shared ID rollback is not locally complete",
+                );
+            }
+        }
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.
@@ -3730,11 +3868,17 @@ impl Program {
             if let Some(pending) = state.sequence_inner_tx_pending.as_ref() {
                 if let Some((outer_tx_id, _)) = pending.saved_outer {
                     if let Some(mv_store) = self.connection.mv_store_for_db(pending.db) {
-                        if let Err(e) = mv_store.rollback_first_savepoint(outer_tx_id) {
-                            tracing::error!(
-                                "Failed to rollback outer-tx savepoint after sequence \
+                        #[cfg(all(host_shared_wal, unix))]
+                        let shared = mv_store.is_shared();
+                        #[cfg(not(all(host_shared_wal, unix)))]
+                        let shared = false;
+                        if !shared {
+                            if let Err(e) = mv_store.rollback_first_savepoint(outer_tx_id) {
+                                tracing::error!(
+                                    "Failed to rollback outer-tx savepoint after sequence \
                                  inner-tx aborted: {e}"
-                            );
+                                );
+                            }
                         }
                     }
                 }
@@ -4078,6 +4222,44 @@ impl Program {
             return Err(err);
         }
         Ok(())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    fn finish_shared_sequence_inner_before_rollback(&self, state: &mut ProgramState) -> Result<()> {
+        use crate::IOExt;
+        let Some(pending) = state.sequence_inner_tx_pending.as_ref() else {
+            return Ok(());
+        };
+        let Some(store) = self
+            .connection
+            .mv_store_for_db(pending.db)
+            .filter(|store| store.is_shared())
+        else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        let inner = pending.inner_tx_id;
+        let saved_outer = pending.saved_outer;
+        // Complete an already-started autonomous commit, not the nextval SQL.
+        // Its publication lease and durable outcome must retire before the outer
+        // savepoint can release claims under that same authority.
+        let result = match state.sequence_inner_commit.as_mut() {
+            Some(commit) => pager.io.block(|| commit.step(&store)),
+            None => Ok(()),
+        };
+        // Drop observes sticky durability even after a failed poll. It must run
+        // before any decision to roll back the inner transaction.
+        state.sequence_inner_commit = None;
+        if store.is_tx_rollbackable(inner) {
+            store.rollback_tx(inner, pager, &self.connection, db);
+        }
+        self.connection.set_mv_tx_for_db(db, saved_outer);
+        if saved_outer.is_some() {
+            self.connection.auto_commit.store(false, Ordering::SeqCst);
+        }
+        state.sequence_inner_tx_pending = None;
+        result
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {

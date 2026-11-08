@@ -525,6 +525,10 @@ enum PublicationStage {
 }
 
 impl LoadedManifest {
+    pub(super) fn belongs_to_file(&self, file: &Arc<dyn File>) -> bool {
+        Arc::ptr_eq(&self.file, file)
+    }
+
     pub(super) fn record(&self) -> ManifestRecord {
         self.record
     }

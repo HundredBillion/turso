@@ -62,6 +62,7 @@ use tracing::Level;
 
 pub mod checkpoint_state_machine;
 mod persistent_metadata;
+mod sequence_replay;
 #[cfg(not(nightly))]
 mod version_chain;
 pub use checkpoint_state_machine::{
@@ -79,6 +80,9 @@ mod shared_refresh;
 pub(crate) const SHARED_MVCC_VERSION: u8 = crate::mvcc::mode_transition::SHARED_MVCC_VERSION;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
+mod shared_generation_reload;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
 mod shared_id_oracle;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
@@ -90,12 +94,15 @@ mod shared_runtime;
 #[allow(unused_imports)]
 pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_runtime::InstalledDowngradeSource;
+#[cfg(all(host_shared_wal, unix))]
 pub(in crate::mvcc) use shared_runtime::RecoveryCompletionEvidence;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
     SharedBeginState, SharedBootstrapState, SharedIdRequest, SharedIdResult, SharedIdState,
-    SharedMvccRuntime, SharedOpenState,
+    SharedMvccRuntime, SharedOpenState, SharedSequenceWatermarkState,
 };
 
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
@@ -703,6 +710,7 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
 ) -> i64 {
     mvcc_store
         .table_id_to_rootpage
+        .load()
         .get(&table_id)
         .and_then(|entry| entry.value().root_page)
         .map(|rootpage| rootpage as i64)
@@ -901,6 +909,8 @@ enum SavepointKind {
 /// Tracks row/index version deltas created inside a single savepoint scope.
 #[derive(Debug, Default)]
 pub struct Savepoint {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_id_boundary: Option<u64>,
     kind: SavepointKind,
     deferred_fk_violations: isize,
     header: DatabaseHeader,
@@ -1040,6 +1050,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     begin_ts: u64,
     #[cfg(host_shared_wal)]
     shared_snapshot: Option<Box<Mutex<Option<super::shared_authority::SnapshotRegistration>>>>,
+    // Blocks ordinary work if durable ID release outlives its local undo.
+    #[cfg(all(host_shared_wal, unix))]
+    shared_pending_release: Mutex<Option<u64>>,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
@@ -1123,6 +1136,8 @@ impl<A: RowVersionAllocator> Transaction<A> {
             peer_conflicted: AtomicBool::new(false),
             #[cfg(host_shared_wal)]
             shared_snapshot: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_pending_release: Mutex::new(None),
             #[cfg(test)]
             before_mutation_lock: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
@@ -1132,6 +1147,10 @@ impl<A: RowVersionAllocator> Transaction<A> {
     }
 
     fn ensure_peer_unconflicted(&self) -> Result<()> {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.shared_pending_release.lock().is_some() {
+            return Err(LimboError::Busy);
+        }
         if self.peer_conflicted.load(Ordering::Acquire) {
             return Err(LimboError::WriteWriteConflict);
         }
@@ -2625,7 +2644,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             if log_id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                 return log_id;
             }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&log_id.table_id) {
+            if let Some(entry) = mvcc_store.table_id_to_rootpage.load().get(&log_id.table_id) {
                 if let Some(root_page) = entry.value().root_page {
                     log_id.table_id = MVTableId::from(-(root_page as i64));
                 }
@@ -3103,6 +3122,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
                 mvcc_store
                     .table_id_to_rootpage
+                    .load()
                     .get(&table_id)
                     .and_then(|entry| entry.value().root_page)
                     .map(|rootpage| rootpage as i64)
@@ -4695,7 +4715,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// been checkpointed yet have no real root page assigned yet.
     ///
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
-    pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    pub table_id_to_rootpage: arc_swap::ArcSwap<SkipMap<MVTableId, RootEntry, BasicComparator, A>>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4957,7 +4977,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             #[cfg(all(host_shared_wal, unix))]
             shared_runtime: std::sync::OnceLock::new(),
             rows: SkipMap::new_in(alloc.clone()),
-            table_id_to_rootpage,
+            table_id_to_rootpage: arc_swap::ArcSwap::from_pointee(table_id_to_rootpage),
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
@@ -5049,6 +5069,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let root_page = root_page as u64;
         self.table_id_to_rootpage
+            .load()
             .iter()
             .filter(|entry| {
                 let e = entry.value();
@@ -5109,18 +5130,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// allocation of a real root page goes through [`Self::record_rootpage_alloc`] instead.
     pub fn insert_table_id_to_rootpage(&self, table_id: MVTableId, root_page: Option<u64>) {
         self.table_id_to_rootpage
+            .load()
             .insert(table_id, RootEntry::live(root_page));
         self.bump_next_table_id_below(table_id, root_page);
     }
 
     pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
-        self.table_id_to_rootpage.remove(table_id);
+        self.table_id_to_rootpage.load().remove(table_id);
         self.table_id_to_last_rowid.write().remove(table_id);
     }
 
     /// The current physical root page of `table_id`, if it is checkpointed and live.
     pub fn current_root_page(&self, table_id: &MVTableId) -> Option<u64> {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .and_then(|entry| entry.value().root_page)
     }
@@ -5137,7 +5160,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         begin_ts: u64,
         materialized_at: WalPos,
     ) {
-        self.table_id_to_rootpage.insert(
+        self.table_id_to_rootpage.load().insert(
             table_id,
             RootEntry {
                 root_page: Some(root_page),
@@ -5151,6 +5174,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // else two live bindings resolve to one page (integrity_check: referenced twice).
         let stale: Vec<(MVTableId, RootEntry)> = self
             .table_id_to_rootpage
+            .load()
             .iter()
             .filter(|entry| {
                 let e = entry.value();
@@ -5160,7 +5184,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .collect();
         for (key, mut entry) in stale {
             entry.end = begin_ts;
-            self.table_id_to_rootpage.insert(key, entry);
+            self.table_id_to_rootpage.load().insert(key, entry);
         }
         self.bump_next_table_id_below(table_id, Some(root_page));
     }
@@ -5170,10 +5194,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// transaction whose read mark reaches that position. Called in the checkpoint's post-commit
     /// publish window. No-op if the entry is gone (e.g. dropped same checkpoint).
     pub fn publish_rootpage_visible(&self, table_id: MVTableId, materialized_at: WalPos) {
-        if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+        if let Some(entry) = self.table_id_to_rootpage.load().get(&table_id) {
             let mut e = *entry.value();
             e.materialized_at = materialized_at;
-            self.table_id_to_rootpage.insert(table_id, e);
+            self.table_id_to_rootpage.load().insert(table_id, e);
         }
     }
 
@@ -5181,10 +5205,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// transaction whose snapshot predates the drop can still resolve the (read-mark-protected)
     /// root page. Reclaimed by [`Self::gc_rootpage_entries`] once `end_ts <= lwm`.
     pub fn retire_rootpage(&self, table_id: MVTableId, end_ts: u64) {
-        if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+        if let Some(entry) = self.table_id_to_rootpage.load().get(&table_id) {
             let mut e = *entry.value();
             e.end = end_ts;
-            self.table_id_to_rootpage.insert(table_id, e);
+            self.table_id_to_rootpage.load().insert(table_id, e);
         }
     }
 
@@ -5194,6 +5218,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn gc_rootpage_entries(&self, lwm: u64) -> usize {
         let stale: Vec<MVTableId> = self
             .table_id_to_rootpage
+            .load()
             .iter()
             .filter(|entry| {
                 let e = entry.value();
@@ -5202,7 +5227,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|entry| *entry.key())
             .collect();
         for key in &stale {
-            self.table_id_to_rootpage.remove(key);
+            self.table_id_to_rootpage.load().remove(key);
             self.table_id_to_last_rowid.write().remove(key);
         }
         stale.len()
@@ -5304,7 +5329,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         // Clears live and retired bindings alike: both reference pre-VACUUM root pages that
         // would alias new objects after root-page reuse.
-        self.table_id_to_rootpage.clear();
+        self.table_id_to_rootpage.load().clear();
         self.table_id_to_last_rowid.write().clear();
         // TODO: vacuum related code, not handling alloc errors for now
         self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
@@ -7858,7 +7883,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for savepoint in rolledback_savepoints.into_iter().rev() {
             self.rollback_savepoint_changes(tx_id, savepoint);
         }
-
         Ok(Some(deferred_fk_violations))
     }
 
@@ -9848,6 +9872,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return None;
             }
             self.table_id_to_rootpage
+                .load()
                 .get(&MVTableId::from(root_page))
                 .filter(|e| e.value().is_live())
                 .and_then(|e| e.value().root_page)
@@ -9882,6 +9907,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return root_page;
         }
         self.table_id_to_rootpage
+            .load()
             .get(&MVTableId::from(root_page))
             .filter(|e| e.value().is_live())
             .and_then(|e| e.value().root_page)
@@ -9969,6 +9995,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // negative root and reports its materialized page as orphaned ("never used").
             let root_page = if root_page < 0 {
                 self.table_id_to_rootpage
+                    .load()
                     .get(&MVTableId::from(root_page))
                     .filter(|e| e.value().is_live())
                     .and_then(|e| e.value().root_page)
@@ -10690,7 +10717,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             if has_btree {
                                 if root_page < 0 {
                                     let table_id = MVTableId::from(root_page);
-                                    if self.table_id_to_rootpage.get(&table_id).is_none() {
+                                    if self.table_id_to_rootpage.load().get(&table_id).is_none() {
                                         self.insert_table_id_to_rootpage(table_id, None);
                                     }
                                 } else {
@@ -10706,7 +10733,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     ),
                                 );
                             });
-                        } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        } else if self
+                            .table_id_to_rootpage
+                            .load()
+                            .get(&rowid.table_id)
+                            .is_none()
+                        {
                             // Data row references a table_id not yet in the map. This can happen
                             // with logs written before the schema-first serialization fix: in a
                             // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
@@ -10742,7 +10774,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         if commit_ts <= replay_cutoff_ts {
                             continue;
                         }
-                        if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        if self
+                            .table_id_to_rootpage
+                            .load()
+                            .get(&rowid.table_id)
+                            .is_none()
+                        {
                             // See comment in UpsertTableRow: old logs may have data rows
                             // serialized before the schema INSERT that registers the table_id.
                             self.insert_table_id_to_rootpage(rowid.table_id, None);
@@ -11086,6 +11123,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         for id in &roots {
             self.table_id_to_rootpage
+                .load()
                 .try_get_or_insert(*id, RootEntry::live(None))?;
         }
         let mut targets = Vec::new();
@@ -11128,6 +11166,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|schema| -> Result<_> {
                 let mut schema = crate::alloc::TryClone::try_clone(schema.as_ref())?;
                 schema.dropped_root_pages.clone_from(&dropped_roots);
+                self.prepare_peer_sequence_schema(&mut schema, &ctx.current_schema, frame)?;
                 Ok(Arc::new(schema))
             })
             .transpose()?;
@@ -11313,6 +11352,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // negative root and reports its materialized page as orphaned ("never used").
             let root_page = if root_page < 0 {
                 self.table_id_to_rootpage
+                    .load()
                     .get(&MVTableId::from(root_page))
                     .filter(|e| e.value().is_live())
                     .and_then(|e| e.value().root_page)
@@ -11395,6 +11435,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// transaction reads use [`Self::is_btree_readable_at`].
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .is_some_and(|entry| entry.value().root_page.is_some() && entry.value().is_live())
     }
@@ -11416,6 +11457,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         read_mark: WalPos,
     ) -> bool {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .is_some_and(|entry| {
                 let e = entry.value();
@@ -11452,6 +11494,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// [`RowVersion::materialized_at`] in [`Self::gc_version_chain`], not here.
     fn rootpage_gc_protected(&self, table_id: &MVTableId, min_reader_mark: WalPos) -> bool {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .is_some_and(|e| e.value().materialized_at > min_reader_mark)
     }

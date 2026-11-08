@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const HISTORY_LIMIT: u64 = 64 * 1024;
+const HISTORY_LIMIT: u64 = 20 * PAGE_SIZE as u64;
 const TEST_NAME: &str =
     "mvcc::shared_ids::native_process::native_id_reservations_survive_death_compaction_and_reopen";
 const ROLE: &str = "TURSO_NATIVE_ID_TEST_ROLE";
@@ -240,6 +240,7 @@ impl CommittedIdOracle for EmptyOracle {
             },
             IdQuery::RowExists { .. } => IdFact::RowExists(false),
             IdQuery::LogicalFloor => IdFact::LogicalFloor(-1),
+            IdQuery::SequenceState { .. } => panic!("fixture does not read sequence state"),
         }))
     }
 }

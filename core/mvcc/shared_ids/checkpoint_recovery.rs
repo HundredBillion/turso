@@ -75,7 +75,7 @@ impl SharedIds {
             ));
         }
         Ok(RecoveryTargetIdLoad {
-            load: Some(self.start_load(guard, identity)?),
+            load: Some(self.start_load(guard, IdLoadTarget::Known(identity))?),
             physical_floor,
         })
     }

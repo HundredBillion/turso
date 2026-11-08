@@ -4278,16 +4278,20 @@ pub enum OpTransactionState {
 pub(crate) enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
+    AfterSharedRowClaim,
+    AfterSharedScopeRelease,
 }
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
-    const POINT_COUNT: u8 = 2;
+    const POINT_COUNT: u8 = 4;
 
     fn ordinal(self) -> u8 {
         match self {
             TransactionYieldPoint::BeforeStart => 0,
             TransactionYieldPoint::BeforeMvccBegin => 1,
+            TransactionYieldPoint::AfterSharedRowClaim => 2,
+            TransactionYieldPoint::AfterSharedScopeRelease => 3,
         }
     }
 }
@@ -4640,6 +4644,16 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let mut started_secondary_tx = false;
+                #[cfg(all(host_shared_wal, unix))]
+                if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+                    if !conn.is_nested_stmt()
+                        && conn
+                            .get_mv_tx_id_for_db(*db)
+                            .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+                    {
+                        return Err(LimboError::Busy.into());
+                    }
+                }
                 conn.check_database_storage(*db)?;
                 if write {
                     conn.ensure_database_writable(*db)?;
@@ -5131,6 +5145,13 @@ pub fn op_transaction_inner(
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
+                // A durable shared claim can precede the first local row mutation.
+                // Even a simple insert needs an undo scope if it is abandoned there.
+                #[cfg(all(host_shared_wal, unix))]
+                let needs_stmt_journal = needs_stmt_journal
+                    || (in_explicit_txn
+                        && statement_writes_db
+                        && mv_store.as_ref().is_some_and(|store| store.is_shared()));
                 if needs_stmt_journal {
                     if is_main_db {
                         let res = state.begin_statement(
@@ -5282,6 +5303,17 @@ pub fn op_auto_commit(
     let conn = program.connection.clone();
     let fk_on = conn.foreign_keys_enabled();
     let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
+    #[cfg(all(host_shared_wal, unix))]
+    if !*rollback {
+        if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+            if conn
+                .get_mv_tx_id()
+                .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+            {
+                return Err(LimboError::Busy.into());
+            }
+        }
+    }
 
     // Drive any multi-step commit/rollback that's already in progress.
     // This handles main DB commits (Committing), attached DB commits
@@ -5734,74 +5766,120 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
-            let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
-                match conn.get_mv_tx_id() {
-                    Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
-                    None => None,
-                }
-            } else {
-                pager.rollback_to_named_savepoint(name)?
-            };
-
-            let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
-                mark_unlikely();
-                return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
-            };
-            let frame_info = conn.rollback_named_savepoint_frame(name);
-            mirror_named_savepoint_to_active_non_main_databases(
-                &conn,
-                SavepointMirror::Rollback(name),
-            )?;
-            conn.fk_deferred_violations
-                .store(deferred_fk_snapshot, Ordering::Release);
-
-            // Restore all in-memory schemas (main, temp, attached) from the
-            // frame's snapshot. The mirror call above rolled back on-disk
-            // pages for temp and attached pagers; main DB pages are rolled
-            // back by `pager.rollback_to_named_savepoint`. Without this
-            // restore, the in-memory schemas would keep DDL that the disk-
-            // level rollback just undid.
-            //
-            // The main-DB snapshot replaces an older code path that
-            // reparsed `sqlite_schema` from disk here. That path blocked
-            // on cursor I/O (and, with sequences, on `prepare_internal +
-            // run_with_row_callback` driving `pager.io.step` synchronously)
-            // — both vdbe async-contract violations. The snapshot is cheap
-            // (`Arc<Schema>` clone at SAVEPOINT begin) and carries the full
-            // schema including the sequences map, so the restore is
-            // consistent across tables / indexes / sequences without any
-            // I/O.
-            if let Some(info) = frame_info {
-                *conn.schema.write() = info.main_schema_snapshot;
-                if let Some(temp_db) = conn.temp.database.read().as_ref() {
-                    match info.temp_schema_snapshot {
-                        Some(snap) => *temp_db.db.schema.lock() = snap,
-                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
+            #[cfg(all(host_shared_wal, unix))]
+            if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+                if let Some(tx_id) = conn.get_mv_tx_id() {
+                    let boundary = store.shared_named_id_boundary(tx_id, name);
+                    if boundary.is_none() && store.shared_id_cleanup_pending(tx_id) {
+                        return Err(LimboError::Busy.into());
+                    }
+                    if let Some(next_ordinal) = boundary {
+                        state.shared_named_rollback = Some((name.clone(), tx_id, next_ordinal));
+                        return_if_io!(
+                            state,
+                            store.shared_id_nonblock(
+                                &conn,
+                                pager.clone(),
+                                tx_id,
+                                crate::MAIN_DB_ID,
+                                crate::mvcc::database::SharedIdRequest::ReleaseAfter {
+                                    next_ordinal
+                                },
+                                &mut state.shared_id,
+                            )
+                        );
+                        #[cfg(any(test, injected_yields))]
+                        if let Some(IOResult::IO(io)) =
+                            crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                conn.yield_injector().as_ref(),
+                                0,
+                                tx_id,
+                                TransactionYieldPoint::AfterSharedScopeRelease,
+                            )
+                        {
+                            return Ok(state.suspend_on_io(io));
+                        }
                     }
                 }
-                *conn.database_schemas().write() = info.staged_schema_snapshot;
-                conn.bump_prepare_context_generation();
-                if let (Some(hooks), Some(memo)) = (conn.hooks(), &info.hooks_memo) {
-                    hooks.rolled_back_to_savepoint(&conn, memo);
-                }
             }
-
-            // Invalidate cached schema cookies on ALL pagers whose pages may
-            // have been rolled back. Next header read repopulates them from
-            // the restored on-disk pages — which now match the in-memory
-            // snapshot we just installed.
-            conn.with_all_attached_pagers_with_index(|pagers| {
-                for (_db_id, attached_pager) in pagers {
-                    attached_pager.set_schema_cookie(None);
-                }
-            });
-            pager.set_schema_cookie(None);
-            conn.index_methods_on_savepoint_rolled_back();
+            rollback_named_savepoint_locally(&conn, pager, name)?;
+            #[cfg(all(host_shared_wal, unix))]
+            finish_shared_named_rollback(state, &conn)?;
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
     }
+}
+
+fn rollback_named_savepoint_locally(
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    name: &str,
+) -> Result<()> {
+    let mv_store = conn.mv_store();
+    let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
+        match conn.get_mv_tx_id() {
+            Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
+            None => None,
+        }
+    } else {
+        pager.rollback_to_named_savepoint(name)?
+    };
+
+    let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
+        mark_unlikely();
+        return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+    };
+    let frame_info = conn.rollback_named_savepoint_frame(name);
+    mirror_named_savepoint_to_active_non_main_databases(conn, SavepointMirror::Rollback(name))?;
+    conn.fk_deferred_violations
+        .store(deferred_fk_snapshot, Ordering::Release);
+
+    // Restore all in-memory schemas (main, temp, attached) from the
+    // frame's snapshot. The mirror call above rolled back on-disk
+    // pages for temp and attached pagers; main DB pages are rolled
+    // back by `pager.rollback_to_named_savepoint`. Without this
+    // restore, the in-memory schemas would keep DDL that the disk-
+    // level rollback just undid.
+    //
+    // The main-DB snapshot replaces an older code path that
+    // reparsed `sqlite_schema` from disk here. That path blocked
+    // on cursor I/O (and, with sequences, on `prepare_internal +
+    // run_with_row_callback` driving `pager.io.step` synchronously)
+    // — both vdbe async-contract violations. The snapshot is cheap
+    // (`Arc<Schema>` clone at SAVEPOINT begin) and carries the full
+    // schema including the sequences map, so the restore is
+    // consistent across tables / indexes / sequences without any
+    // I/O.
+    if let Some(info) = frame_info {
+        *conn.schema.write() = info.main_schema_snapshot;
+        if let Some(temp_db) = conn.temp.database.read().as_ref() {
+            match info.temp_schema_snapshot {
+                Some(snap) => *temp_db.db.schema.lock() = snap,
+                None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
+            }
+        }
+        *conn.database_schemas().write() = info.staged_schema_snapshot;
+        conn.bump_prepare_context_generation();
+        if let (Some(hooks), Some(memo)) = (conn.hooks(), &info.hooks_memo) {
+            hooks.rolled_back_to_savepoint(conn, memo);
+        }
+    }
+
+    // Invalidate cached schema cookies on ALL pagers whose pages may
+    // have been rolled back. Next header read repopulates them from
+    // the restored on-disk pages — which now match the in-memory
+    // snapshot we just installed.
+    conn.with_all_attached_pagers_with_index(|pagers| {
+        for (_db_id, attached_pager) in pagers {
+            attached_pager.set_schema_cookie(None);
+        }
+    });
+    pager.set_schema_cookie(None);
+    conn.index_methods_on_savepoint_rolled_back();
+
+    Ok(())
 }
 
 fn release_commit_insn() -> Insn {
@@ -11204,6 +11282,7 @@ pub fn op_function(
                     Value::Text(text) => text.as_str(),
                     Value::Null => {
                         state.registers[*dest].set_value(Value::Null);
+                        state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
                     }
                     _ => {
@@ -11214,6 +11293,43 @@ pub fn op_function(
                     }
                 };
                 let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
+                #[cfg(all(host_shared_wal, unix))]
+                if let Some(store) = program
+                    .connection
+                    .mv_store_for_db(namespace.database_id)
+                    .filter(|store| store.is_shared())
+                {
+                    let name = crate::translate::sequence::sequence_backing_table_name(
+                        &mangle_name(namespace.id, &sequence.name),
+                    );
+                    let root = program
+                        .connection
+                        .with_schema(namespace.database_id, |schema| {
+                            schema
+                                .get_btree_table(NamespaceId::ROOT, &name)
+                                .map(|table| table.root_page)
+                        })
+                        .ok_or(LimboError::SchemaUpdated)?;
+                    let watermark = match store.shared_sequence_watermark_nonblock(
+                        &program.connection,
+                        namespace.database_id,
+                        root,
+                        &name,
+                        sequence,
+                        &mut state.shared_watermark,
+                    )? {
+                        IOResult::Done(value) => value,
+                        IOResult::IO(io) => {
+                            return Ok(state.suspend_on_io(io));
+                        }
+                    };
+                    match watermark {
+                        Some(value) => state.registers[*dest].set_int(value),
+                        None => state.registers[*dest].set_value(Value::Null),
+                    }
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 let watermark = program
                     .connection
                     .mv_store_for_db(namespace.database_id)
@@ -12829,6 +12945,8 @@ pub enum OpInsertSubState {
     /// Must complete before Insert so that cursor.rowid()/record() are never
     /// interleaved with a partially-completed cursor.insert().
     NoopCheck,
+    /// Persist a shared row claim before the cursor can mutate the table.
+    ClaimSharedRow,
     /// Insert the row into the table.
     Insert,
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
@@ -13142,6 +13260,63 @@ pub fn op_insert(
                         }
                     }
                 }
+                state.active_op_state.insert().sub_state = OpInsertSubState::ClaimSharedRow;
+                continue;
+            }
+            OpInsertSubState::ClaimSharedRow => {
+                #[cfg(all(host_shared_wal, unix))]
+                if !state.active_op_state.insert().is_noop_update {
+                    let has_rowid = state.get_cursor(*cursor_id).as_btree_mut().has_rowid();
+                    if has_rowid {
+                        if let Some((db_id, table_id, tx_id)) =
+                            shared_id_cursor(program, state, *cursor_id)?
+                        {
+                            let value = state.registers[*key_reg].get_value().as_int().ok_or_else(
+                                || {
+                                    LimboError::InternalError(
+                                        "shared row claim requires an integer key".into(),
+                                    )
+                                },
+                            )?;
+                            let store = program.connection.mv_store_for_db(db_id).unwrap();
+                            let bound_pager = program.get_pager_from_database_index(&db_id)?;
+                            let result = return_if_io!(
+                                state,
+                                store.shared_id_nonblock(
+                                    &program.connection,
+                                    bound_pager,
+                                    tx_id,
+                                    db_id,
+                                    crate::mvcc::database::SharedIdRequest::ClaimExplicitRow {
+                                        table_id,
+                                        value
+                                    },
+                                    &mut state.shared_id,
+                                )
+                            );
+                            if !matches!(result, crate::mvcc::database::SharedIdResult::Claimed) {
+                                return Err(LimboError::InternalError(
+                                    "shared explicit claim returned an allocation".into(),
+                                )
+                                .into());
+                            }
+                            state.reset_shared_id();
+                            state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
+                            #[cfg(any(test, injected_yields))]
+                            if let Some(IOResult::IO(io)) =
+                                crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                    program.connection.yield_injector().as_ref(),
+                                    0,
+                                    tx_id,
+                                    TransactionYieldPoint::AfterSharedRowClaim,
+                                )
+                            {
+                                return Ok(state.suspend_on_io(io));
+                            }
+                        }
+                    }
+                }
+                // A later yielding insert resumes after the durable claim.
                 state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                 continue;
             }
@@ -13873,6 +14048,36 @@ pub enum OpNewRowidState {
     GoNext,
 }
 
+/// Resolve the bound MVCC cursor rather than deriving a domain from a SQL
+/// name or a physical root page that may belong to another generation.
+#[cfg(all(host_shared_wal, unix))]
+fn shared_id_cursor(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+) -> Result<Option<(usize, i64, u64)>> {
+    let Some(db_id) = state.cursor_databases.get(cursor_id).copied().flatten() else {
+        return Ok(None);
+    };
+    let Some(store) = program.connection.mv_store_for_db(db_id) else {
+        return Ok(None);
+    };
+    if !store.is_shared() {
+        return Ok(None);
+    }
+    let cursor = state.get_cursor(cursor_id).as_btree_mut() as &mut dyn Any;
+    let Some(cursor) = cursor.downcast_ref::<MvCursor>() else {
+        return Ok(None);
+    };
+    if !Arc::ptr_eq(&store, &cursor.db) {
+        return Err(LimboError::InternalError(
+            "shared ID cursor belongs to another store".into(),
+        ));
+    }
+    let (table_id, tx_id) = cursor.shared_id_identity();
+    Ok(Some((db_id, table_id, tx_id)))
+}
+
 pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
@@ -13914,6 +14119,40 @@ fn new_rowid_inner(
         },
         insn
     );
+
+    #[cfg(all(host_shared_wal, unix))]
+    if let Some((db_id, table_id, tx_id)) = shared_id_cursor(program, state, *cursor)? {
+        if *prev_largest_reg != 0 {
+            return Err(LimboError::InternalError(
+                "shared rowid generation cannot publish a previous-maximum register".into(),
+            )
+            .into());
+        }
+        let store = program.connection.mv_store_for_db(db_id).unwrap();
+        let bound_pager = program.get_pager_from_database_index(&db_id)?;
+        let result = return_if_io!(
+            state,
+            store.shared_id_nonblock(
+                &program.connection,
+                bound_pager,
+                tx_id,
+                db_id,
+                crate::mvcc::database::SharedIdRequest::ReserveRow { table_id },
+                &mut state.shared_id,
+            )
+        );
+        let crate::mvcc::database::SharedIdResult::Value(value) = result else {
+            return Err(LimboError::InternalError(
+                "shared row reservation returned no value".into(),
+            )
+            .into());
+        };
+        state.reset_shared_id();
+        state.registers[*rowid_reg].set_int(value);
+        state.active_op_state.clear();
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
@@ -14668,6 +14907,35 @@ pub fn op_create_btree(
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let Some(mv_store) = mv_store.as_ref() {
+        #[cfg(all(host_shared_wal, unix))]
+        if mv_store.is_shared() {
+            let tx_id = program.connection.get_mv_tx_id_for_db(*db).ok_or_else(|| {
+                LimboError::InternalError("shared table allocation has no transaction".into())
+            })?;
+            let bound_pager = program.get_pager_from_database_index(db)?;
+            let result = return_if_io!(
+                state,
+                mv_store.shared_id_nonblock(
+                    &program.connection,
+                    bound_pager,
+                    tx_id,
+                    *db,
+                    crate::mvcc::database::SharedIdRequest::ReserveLogicalTable,
+                    &mut state.shared_id,
+                )
+            );
+            let crate::mvcc::database::SharedIdResult::Value(value) = result else {
+                return Err(LimboError::InternalError(
+                    "shared table reservation returned no value".into(),
+                )
+                .into());
+            };
+            state.reset_shared_id();
+            mv_store.record_created_table_id(tx_id, value);
+            state.registers[*root].set_int(value);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
         let root_page = mv_store.get_next_table_id();
         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
             mv_store.record_created_table_id(tx_id, root_page);
@@ -15414,6 +15682,62 @@ pub fn op_set_sequence_currval(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[cfg(all(host_shared_wal, unix))]
+fn claim_shared_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    db_id: usize,
+    tx_id: u64,
+    sequence_name: &str,
+    value: i64,
+    autonomous: bool,
+) -> crate::types::IOResultOr<()> {
+    let Some(store) = program.connection.mv_store_for_db(db_id) else {
+        return Ok(IOResult::Done(()));
+    };
+    if !store.is_shared() {
+        return Ok(IOResult::Done(()));
+    }
+    let backing = crate::translate::sequence::sequence_backing_table_name(sequence_name);
+    let root = program
+        .connection
+        .with_schema(db_id, |schema| {
+            schema
+                .get_btree_table(NamespaceId::ROOT, &backing)
+                .map(|table| table.root_page)
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError("shared sequence backing table is missing".into())
+        })?;
+    let table_id = store
+        .try_get_table_id_from_root_page_at(root, store.read_snapshot_ts(tx_id))
+        .ok_or(LimboError::SchemaUpdated)?;
+    let pager = program.get_pager_from_database_index(&db_id)?;
+    let result = match store.shared_id_nonblock(
+        &program.connection,
+        pager,
+        tx_id,
+        db_id,
+        crate::mvcc::database::SharedIdRequest::ClaimSequence {
+            table_id: table_id.into(),
+            value,
+            autonomous,
+        },
+        &mut state.shared_id,
+    )? {
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        IOResult::Done(result) => result,
+    };
+    if !matches!(result, crate::mvcc::database::SharedIdResult::Claimed) {
+        return Err(LimboError::InternalError(
+            "shared sequence claim returned an allocation".into(),
+        )
+        .into());
+    }
+    state.reset_shared_id();
+    Ok(IOResult::Done(()))
+}
+
 /// Publish sequence allocation metadata used by `sequence_watermark_experimental()`.
 ///
 /// The translator emits this only after the sequence backing-table RMW has
@@ -15455,13 +15779,26 @@ pub fn op_sequence_track_allocation(
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
         let mangled_seq_name = mangle_name(*namespace, seq_name);
-        mv_store.set_sequence_watermark(&mangled_seq_name, current_watermark);
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
+                #[cfg(all(host_shared_wal, unix))]
+                return_if_io!(
+                    state,
+                    claim_shared_sequence(
+                        program,
+                        state,
+                        *db,
+                        tx_id,
+                        &mangled_seq_name,
+                        value,
+                        false
+                    )
+                );
                 mv_store.register_sequence_allocation(tx_id, &mangled_seq_name, value)?;
             }
         }
+        mv_store.set_sequence_watermark(&mangled_seq_name, current_watermark);
     }
 
     state.pc += 1;
@@ -15527,6 +15864,19 @@ pub fn op_sequence_register_allocation(
 
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         if mv_store.is_tx_rollbackable(outer_tx_id) {
+            #[cfg(all(host_shared_wal, unix))]
+            return_if_io!(
+                state,
+                claim_shared_sequence(
+                    program,
+                    state,
+                    *db,
+                    outer_tx_id,
+                    &mangle_name(*namespace, seq_name),
+                    value,
+                    true
+                )
+            );
             mv_store.register_sequence_allocation(
                 outer_tx_id,
                 &mangle_name(*namespace, seq_name),
@@ -21976,6 +22326,7 @@ mod shared_begin_tests {
     struct Fixture {
         connection: Arc<Connection>,
         authority_file: Arc<dyn File>,
+        namespace: std::path::PathBuf,
         _directory: tempfile::TempDir,
     }
 
@@ -22019,7 +22370,11 @@ mod shared_begin_tests {
                 _directory: directory,
                 connection,
                 authority_file,
+                namespace: authority.parent().unwrap().to_path_buf(),
             }
+        }
+        fn committed_bytes(&self) -> [Vec<u8>; 2] {
+            ["manifest", "logical"].map(|name| std::fs::read(self.namespace.join(name)).unwrap())
         }
         fn hold_publication(&self) {
             assert!(self
@@ -22124,14 +22479,18 @@ mod shared_begin_tests {
     #[test]
     fn shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop() {
         for reset in [true, false] {
-            let f =
-                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+            // One payload and credited reservations fit; two payloads plus the
+            // structural ID minimum cannot fit, even before framing overhead.
+            let cap = 192 * 1024;
+            assert!(2 * 90_000 + 6 * 4096 > cap);
+            let f = Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(cap));
             f.connection
                 .execute(format!(
                     "UPDATE preserved SET value='{}'",
                     "a".repeat(90_000)
                 ))
                 .unwrap();
+            let committed = f.committed_bytes();
             f.connection.execute("BEGIN CONCURRENT").unwrap();
             f.connection
                 .execute(format!(
@@ -22147,6 +22506,11 @@ mod shared_begin_tests {
                     commit.run_with_row_callback(|_| Ok(())),
                     Err(LimboError::Busy)
                 ));
+                assert_eq!(
+                    f.committed_bytes(),
+                    committed,
+                    "cap rejection modified published bytes"
+                );
             }
             if reset {
                 commit.reset().unwrap();
@@ -22196,14 +22560,18 @@ mod shared_begin_tests {
     #[test]
     fn shared_vdbe_release_cap_busy_retains_named_savepoints_on_reset_or_drop() {
         for reset in [true, false] {
-            let f =
-                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(128 * 1024));
+            // One payload and credited reservations fit; two payloads plus the
+            // structural ID minimum cannot fit, even before framing overhead.
+            let cap = 192 * 1024;
+            assert!(2 * 90_000 + 6 * 4096 > cap);
+            let f = Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(cap));
             f.connection
                 .execute(format!(
                     "UPDATE preserved SET value='{}'",
                     "a".repeat(90_000)
                 ))
                 .unwrap();
+            let committed = f.committed_bytes();
             f.connection.execute("SAVEPOINT held").unwrap();
             f.connection
                 .execute(format!(
@@ -22229,6 +22597,11 @@ mod shared_begin_tests {
                     Err(LimboError::Busy)
                 ));
                 assert_eq!(names(), ["held", "nested"]);
+                assert_eq!(
+                    f.committed_bytes(),
+                    committed,
+                    "cap rejection modified published bytes"
+                );
             }
             if reset {
                 release.reset().unwrap();
@@ -22305,4 +22678,42 @@ mod shared_begin_tests {
         assert!(f.connection.get_mv_tx().is_none());
         assert!(!f.connection.pager.load().holds_read_lock());
     }
+}
+
+#[cfg(all(host_shared_wal, unix))]
+fn finish_shared_named_rollback(state: &mut ProgramState, conn: &Arc<Connection>) -> Result<()> {
+    if let Some((_, tx_id, _)) = state.shared_named_rollback.as_ref() {
+        let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
+        store.finish_shared_local_rollback(*tx_id, &mut state.shared_id)?;
+        state.shared_named_rollback = None;
+    }
+    Ok(())
+}
+
+#[cfg(all(host_shared_wal, unix))]
+pub(super) fn finish_abandoned_shared_named_rollback(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+) -> Result<()> {
+    use crate::IOExt;
+    let Some((name, tx_id, next_ordinal)) = state.shared_named_rollback.clone() else {
+        return Ok(());
+    };
+    let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
+    if conn.get_mv_tx_id() != Some(tx_id) {
+        return Err(LimboError::Busy);
+    }
+    pager.io.block(|| {
+        store.shared_id_nonblock(
+            conn,
+            pager.clone(),
+            tx_id,
+            crate::MAIN_DB_ID,
+            crate::mvcc::database::SharedIdRequest::ReleaseAfter { next_ordinal },
+            &mut state.shared_id,
+        )
+    })?;
+    rollback_named_savepoint_locally(conn, pager, &name)?;
+    finish_shared_named_rollback(state, conn)
 }

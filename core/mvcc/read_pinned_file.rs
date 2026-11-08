@@ -15,6 +15,20 @@ impl ReadPinnedFile {
         Ok(Arc::new(Self { inner, lease }))
     }
 
+    pub(super) fn for_manifest_replay(
+        inner: Arc<dyn File>,
+        manifest: &super::commit_manifest::LoadedManifest,
+    ) -> Result<Arc<Self>> {
+        if manifest.record().requires_recovery() {
+            return Err(LimboError::InvalidArgument(
+                "logical replay requires a normal manifest".into(),
+            ));
+        }
+        let lease = manifest.guard()?.io_lease();
+        PublicationLease::pin(&lease)?;
+        Ok(Arc::new(Self { inner, lease }))
+    }
+
     /// Physical inspection must retain ownership without trusting an unrecovered mapped prefix.
     pub(super) fn new_for_checkpoint_recovery(
         inner: Arc<dyn File>,
