@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: df1f14b1f566f0c189cd18b897588ac3ef68aeec
+          ref: 240d86ef44b7f6c848291c47f13e827ff1495180
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,14 +28,14 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = df1f14b1f566f0c189cd18b897588ac3ef68aeec
+          test "$(git rev-parse HEAD)" = 240d86ef44b7f6c848291c47f13e827ff1495180
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
       - name: Actual captured configuration and genuine missing-bootstrap RED
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api recovery_open_config_ -- --test-threads=1 2>&1 | tee config.log
-          grep -q '2 passed; 0 failed' config.log
+          grep -q '4 passed; 0 failed' config.log
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_preserves_captured_config -- --ignored --test-threads=1 --nocapture 2>&1 | tee config-native.log
           grep -q '1 passed; 0 failed' config-native.log
           set +e
@@ -45,6 +45,32 @@ jobs:
           test "$status" -ne 0
           grep -q 'normal recovered database bootstrap is not implemented' bootstrap-red.log
           grep -q '0 passed; 1 failed' bootstrap-red.log
+      - name: One actual Store cancellation permissions and original opt-in
+        run: |
+          for test in checkpoint_recovery_bootstrap_native_retains_exactly_one_store checkpoint_recovery_bootstrap_native_failed_allocation_releases_unused_claim checkpoint_recovery_bootstrap_native_missing_factory_withdraws_store checkpoint_recovery_bootstrap_native_last_arc_drops_store_before_authority checkpoint_recovery_bootstrap_native_readonly_requires_writable_recovery checkpoint_recovery_bootstrap_native_original_optin_survives checkpoint_recovery_bootstrap_native_rejects_changed_history; do
+            timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api "$test" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$test.log"
+            grep -q '1 passed; 0 failed' "$test.log"
+          done
+      - name: Default evidence drop-order bypass must fail
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs'
+          s=open(p).read()
+          old='pub(crate) struct RecoveryBootstrapEvidence {\n    store: Arc<crate::MvStore>,\n    record: crate::mvcc::commit_manifest::ManifestRecord,\n    recovered: FinalizedRecoveredCheckpoint,\n}'
+          new='pub(crate) struct RecoveryBootstrapEvidence {\n    recovered: FinalizedRecoveredCheckpoint,\n    record: crate::mvcc::commit_manifest::ManifestRecord,\n    store: Arc<crate::MvStore>,\n}'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,new))
+          PYCONTROL
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_last_arc_drops_store_before_authority -- --ignored --test-threads=1 --nocapture 2>&1 | tee drop-order-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'recovery evidence released authority before dropping its Store' drop-order-red.log
+          grep -q '0 passed; 1 failed' drop-order-red.log
+          git checkout -- core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_last_arc_drops_store_before_authority -- --ignored --test-threads=1 --nocapture 2>&1 | tee drop-order-restored.log
+          grep -q '1 passed; 0 failed' drop-order-restored.log
       - name: Existing native recovery selection and IDs
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
@@ -85,7 +111,7 @@ jobs:
           grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' core.log
       - name: Strict library lint and source integrity
         run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
+          cargo clippy --locked -p turso_core --tests --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
