@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b21428dff093b0b9669464186d3b40545930eafd
+          ref: 6a3e9f78d0bd1debef6b467775450e61a6af9463
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b21428dff093b0b9669464186d3b40545930eafd
+          test "$(git rev-parse HEAD)" = 6a3e9f78d0bd1debef6b467775450e61a6af9463
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -33,15 +33,29 @@ jobs:
         run: |
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_idle_root_respects_checkpoint_pause -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause.log
           grep -q '1 passed; 0 failed' pause.log
-      - name: Missing logical read pins must fail actual retirement control
+      - name: Manifest and logical physical retirement
         run: |
-          set +e
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_no_result_until_manifest_and_logical_backend_retire -- --ignored --test-threads=1 --nocapture 2>&1 | tee logical-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'logical: prepare returned before physical retirement' logical-red.log
-          grep -q '0 passed; 1 failed' logical-red.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_no_result_until_manifest_and_logical_backend_retire -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-green.log
+          grep -q '1 passed; 0 failed' retirement-green.log
+      - name: Immediate peer schema import
+        run: |
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee prepare-green.log
+          grep -q '3 passed; 0 failed' prepare-green.log
+      - name: Central replay cancellation and read pins
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_refresh -- --test-threads=1 2>&1 | tee refresh.log
+          grep -q '6 passed; 0 failed' refresh.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::read_pinned_file -- --test-threads=1 2>&1 | tee pins.log
+          grep -q '2 passed; 0 failed' pins.log
+      - name: Watermark cancellation sibling and shared metadata
+        run: |
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_io_native_reset_drop_resume_retains_physical_reads -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark-io.log
+          grep -q '1 passed; 0 failed' watermark-io.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
+          grep -q '0 failed' mvcc.log
+      - name: Strict library lint
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
       - name: Source integrity
         run: |
           cargo fmt --all --check
