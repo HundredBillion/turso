@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5739a896f3e53b814aad72b01977e2c91ad680aa
+          ref: f6ece7fb6ef0eb2e9369f3a421cc3e66c3017c14
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5739a896f3e53b814aad72b01977e2c91ad680aa
+          test "$(git rev-parse HEAD)" = f6ece7fb6ef0eb2e9369f3a421cc3e66c3017c14
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
