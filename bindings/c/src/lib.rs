@@ -4249,6 +4249,105 @@ mod tests {
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     #[test]
     #[ignore = "requires native shared MVCC files"]
+    fn shared_mvcc_uri_native_opens_prepared_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let options =
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect)).db_opts(default_db_opts());
+        let (database, connection) =
+            turso_core::mvcc::database::recovered_checkpoint_for_test(directory.path(), options)
+                .unwrap();
+        connection.close().unwrap();
+        drop(connection);
+        drop(database);
+        let path = directory.path().join("recovered.db");
+        for readonly in [false, true] {
+            let uri = CString::new(format!(
+                "file:{}?mode={}&turso_mvcc=shared",
+                path.display(),
+                if readonly { "ro" } else { "rwc" }
+            ))
+            .unwrap();
+            unsafe {
+                let mut handle = ptr::null_mut();
+                let rc = sqlite3_open_v2(
+                    uri.as_ptr(),
+                    &mut handle,
+                    SQLITE_OPEN_URI
+                        | if readonly {
+                            SQLITE_OPEN_READONLY
+                        } else {
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+                        },
+                    ptr::null(),
+                );
+                assert_eq!(
+                    rc,
+                    SQLITE_OK,
+                    "{}",
+                    CStr::from_ptr(sqlite3_errmsg(handle)).to_string_lossy()
+                );
+                assert_eq!(
+                    sqlite3_db_readonly(handle, c"main".as_ptr()),
+                    i32::from(readonly)
+                );
+                let mut statement = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(
+                        handle,
+                        c"PRAGMA turso_mvcc_mode".as_ptr(),
+                        -1,
+                        &mut statement,
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(statement), SQLITE_ROW);
+                assert_eq!(
+                    CStr::from_ptr(sqlite3_column_text(statement, 0).cast()).to_bytes(),
+                    b"shared"
+                );
+                assert_eq!(sqlite3_step(statement), SQLITE_DONE);
+                assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_exec(
+                        handle,
+                        c"SELECT value FROM preserved WHERE id=1".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        handle,
+                        c"UPDATE preserved SET value='through actual URI' WHERE id=1".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    if readonly { SQLITE_READONLY } else { SQLITE_OK }
+                );
+                if !readonly {
+                    assert_eq!(
+                        sqlite3_exec(
+                            handle,
+                            c"PRAGMA wal_checkpoint(TRUNCATE)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                }
+                assert_eq!(sqlite3_close(handle), SQLITE_OK);
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native shared MVCC files"]
     fn recovered_checkpoint_uses_sqlite_dialect_and_c_connection() {
         use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
         #[derive(Debug)]
