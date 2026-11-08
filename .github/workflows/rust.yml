@@ -1,4 +1,4 @@
-name: Shared ID savepoint regression
+name: Shared schema publication audit
 on:
   workflow_dispatch:
 permissions:
@@ -9,13 +9,13 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
-  generation:
+  schema:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 71578623c63ef9502cd88d0729807fc04ed6229f
+          ref: 6faf5d5a16c5c9059272da516f60f15357a65f63
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,40 +24,20 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 71578623c63ef9502cd88d0729807fc04ed6229f
+          test "$(git rev-parse HEAD)" = 6faf5d5a16c5c9059272da516f60f15357a65f63
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Build exact native tests
+      - name: Native overlapping schema commit audit
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee build.log
-      - name: Native ID lifecycle and physical retirement
-        run: |
-          set -o pipefail
-          for spec in 'shared_oracle_pager_uses_retained_identity_and_independent_read_state:1' 'shared_id_lifecycle_native_:8' 'shared_id_lifecycle_io_native_:2' 'shared_id_opcode_native_:13' 'shared_watermark_identity_native_:1' 'shared_watermark_io_native_:1' 'shared_watermark_process_native_:1' 'shared_id_stale_prepare_native_:1'; do
-            selector=${spec%:*}
-            count=${spec#*:}
-            timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
-            grep -q "$count passed; 0 failed" "$selector.log"
-          done
-      - name: Cap preservation and shared ID policy
-        run: |
-          set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 2>&1 | tee vdbe.log
-          grep -q '6 passed; 0 failed' vdbe.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_ids:: -- --test-threads=2 2>&1 | tee id-policy-all.log
-          grep -q '0 failed' id-policy-all.log
-          ! grep -q '0 passed; 0 failed' id-policy-all.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ 2>&1 | tee peer-descriptors.log
-          grep -q '4 passed; 0 failed' peer-descriptors.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee schema.log
+          grep -q '2 passed; 0 failed' schema.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-sequence-oracle-layout
+          name: shared-schema-publication-audit
           path: |
             source.txt
             rustc.txt
             *.log
-            *.diff
           retention-days: 14
