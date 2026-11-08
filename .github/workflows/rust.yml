@@ -1,4 +1,4 @@
-name: Intent recovery owned Store missing behavior RED
+name: Intent recovery source Store ownership GREEN
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3f6a4f89380fa7811a3a064d4699635f99a2c0b1
+          ref: ab727898f4d9ab4e34ece36a628424d73692ad53
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 3f6a4f89380fa7811a3a064d4699635f99a2c0b1
+          test "$(git rev-parse HEAD)" = ab727898f4d9ab4e34ece36a628424d73692ad53
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
@@ -37,14 +37,28 @@ jobs:
           grep -q '5 passed; 0 failed' merged-committed-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-precommit-green.log
           grep -q '4 passed; 0 failed' merged-precommit-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owned-store-green.log
+          grep -q '5 passed; 0 failed' owned-store-green.log
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_checkpoint_intent_store.rs'
+          s=open(p).read()
+          old='    authority_owner: Arc<PublicationLease>,\n'; assert s.count(old)==1; s=s.replace(old,'')
+          old='            authority_owner,\n'; assert s.count(old)==1; s=s.replace(old,'')
+          old='            || !Arc::ptr_eq(\n                &self.authority_owner,\n                &self.lease.upgrade().ok_or(LimboError::Busy)?,\n            )\n'
+          assert s.count(old)==1; s=s.replace(old,'')
+          open(p,'w').write(s)
+          PATCH
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture > owned-store-red.log 2>&1
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_callee_error_drops_store_before_native_authority -- --ignored --test-threads=1 --nocapture > owner-lease-red.log 2>&1
           code=$?
           set -e
-          cat owned-store-red.log
+          git restore core/mvcc/database/shared_checkpoint_intent_store.rs
+          cat owner-lease-red.log
           test "$code" -ne 0
-          grep -q '0 passed; 1 failed' owned-store-red.log
-          grep -q 'interrupted source Store ownership is not implemented' owned-store-red.log
+          grep -q '0 passed; 1 failed' owner-lease-red.log
+          grep -q 'original guard error released native authority before Store destruction' owner-lease-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owned-store-restored-green.log
+          grep -q '5 passed; 0 failed' owned-store-restored-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
