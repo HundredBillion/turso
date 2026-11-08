@@ -441,3 +441,107 @@ fn checkpoint_recovery_intent_native_cancel_retains_backend_until_retirement() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_intent_native_rejects_changed_actual_record_before_writes() {
+    let control = Control::new();
+    let fixture = IntentCrashFixture::with_parent_io(CrashPoint::SecondIntentWrite, 1, |path| {
+        control.io(path)
+    });
+    let selection = inspect_crash(&fixture, CrashPoint::SecondIntentWrite);
+    let expected = selection.manifest.record();
+    let path = fixture.runtime.files.namespace.join("manifest");
+    let original = std::fs::read(&path).unwrap();
+    let mut mirror = selection.begin_intent_mirror().unwrap();
+    let mut record_bytes = expected.encode();
+    record_bytes[16..24]
+        .copy_from_slice(&expected.sequence().checked_add(1).unwrap().to_le_bytes());
+    let checksum = crc32c::crc32c(&record_bytes[..RECORD_SIZE - 4]);
+    record_bytes[RECORD_SIZE - 4..].copy_from_slice(&checksum.to_le_bytes());
+    let changed = ManifestRecord::decode(&record_bytes).unwrap().unwrap();
+    assert_eq!(changed.checkpoint_intent(), expected.checkpoint_intent());
+    assert_eq!(changed.prefix(), expected.prefix());
+    let mut image = original.clone();
+    for slot in image.chunks_exact_mut(SLOT_SIZE).take(2) {
+        slot[..RECORD_SIZE].copy_from_slice(&record_bytes);
+    }
+    std::fs::write(&path, &image).unwrap();
+    control.arm(Fault::None);
+    assert!(
+        matches!(fixture.io.block(|| mirror.poll()), Err(LimboError::InvalidArgument(message)) if message.contains("selection changed before mirroring"))
+    );
+    assert_eq!(
+        *control.events.lock(),
+        [Event::Read(0), Event::Read(SLOT_SIZE as u64)]
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), image);
+    assert!(fixture.runtime.replay.lock().is_none());
+    fixture.assert_durable_unchanged();
+    let pause = fixture.runtime.gate.try_pause_admission().unwrap();
+    let guard = fixture.runtime.files.authority.try_acquire().unwrap();
+    std::fs::write(&path, original).unwrap();
+    drop(guard);
+    drop(pause);
+    let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
+    let mut retry = selected.begin_intent_mirror().unwrap();
+    let recovered = fixture.io.block(|| retry.poll()).unwrap();
+    assert_eq!(recovered.record(), expected);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_intent_native_rejects_replacement_lease() {
+    let fixture = IntentCrashFixture::new(CrashPoint::SecondIntentWrite, 1);
+    let selection = inspect_crash(&fixture, CrashPoint::SecondIntentWrite);
+    let evidence =
+        RecoveryIntentEvidence::new(fixture.runtime.clone(), &selection.manifest).unwrap();
+    let expected = selection.manifest.record();
+    let CheckpointRecoverySelection {
+        runtime,
+        manifest,
+        pause,
+    } = selection;
+    drop(manifest.into_guard().unwrap());
+    let replacement = runtime.files.authority.try_acquire().unwrap();
+    assert!(
+        matches!(evidence.validate(&runtime.files.manifest, expected, &replacement), Err(LimboError::InvalidArgument(message)) if message.contains("changed owner, files or selected record"))
+    );
+    assert!(replacement.requires_recovery());
+    assert!(replacement.published().is_err());
+    assert!(runtime.replay.lock().is_none());
+    fixture.assert_durable_unchanged();
+    drop(replacement);
+    drop(pause);
+    let mut opening = runtime.begin_checkpoint_recovery().unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
+    let mut retry = selected.begin_intent_mirror().unwrap();
+    let recovered = fixture.io.block(|| retry.poll()).unwrap();
+    assert_eq!(recovered.record(), expected);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_intent_native_rejects_normal_selected_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let canonical = path.canonicalize().unwrap();
+    let main = io
+        .open_file(canonical.to_str().unwrap(), crate::OpenFlags::NoLock, false)
+        .unwrap();
+    let id = main.file_id().unwrap().unwrap();
+    let runtime =
+        SharedMvccRuntime::open_existing(io.clone(), main, id, &canonical, limit, false).unwrap();
+    let path = runtime.files.namespace.join("manifest");
+    let before = std::fs::read(&path).unwrap();
+    let mut opening = runtime.begin_checkpoint_recovery().unwrap();
+    let selected = io.block(|| opening.poll()).unwrap();
+    assert!(selected.manifest.record().checkpoint_intent().is_none());
+    assert!(
+        matches!(selected.begin_intent_mirror(), Err(LimboError::InvalidArgument(message)) if message.contains("actual retained checkpoint selection"))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(runtime.replay.lock().is_none());
+}
