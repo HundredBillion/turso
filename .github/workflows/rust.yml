@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9058a97e048b8bba9943b99dc6709b784d72b3cc
+          ref: 8f7349eb66fcbc15edf8cd2e45e616f69f15ad04
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,7 +23,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 9058a97e048b8bba9943b99dc6709b784d72b3cc
+          test "$(git rev-parse HEAD)" = 8f7349eb66fcbc15edf8cd2e45e616f69f15ad04
           rustc -Vv | tee rustc.txt
       - name: Idle old process and new constructor reload current generation
         run: |
@@ -114,6 +114,7 @@ jobs:
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 2>&1 | tee constructor-green.log
           grep -q '6 passed; 0 failed' constructor-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee ready-green.log
+          grep -q '4 passed; 0 failed' ready-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee full-core-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
