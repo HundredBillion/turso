@@ -268,12 +268,15 @@ fn start(fixture: &IntentCrashFixture) -> CheckpointPhysicalWalRecovery {
         .begin_physical_wal_recovery(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
         .unwrap()
 }
-fn fixture(control: &Arc<Control>) -> IntentCrashFixture {
-    IntentCrashFixture::with_parent_io(CrashPoint::FirstMainBackfillWrite, 1, |path| {
-        control.io(path)
-    })
+fn fixture(control: &Arc<Control>, point: CrashPoint, commits: usize) -> IntentCrashFixture {
+    IntentCrashFixture::with_parent_io(point, commits, |path| control.io(path))
 }
-fn verify_output(fixture: &IntentCrashFixture, recovered: &RecoveredIntentPhysicalBase) {
+fn verify_output(
+    fixture: &IntentCrashFixture,
+    recovered: &RecoveredIntentPhysicalBase,
+    point: CrashPoint,
+    commits: usize,
+) {
     assert!(recovered.guard().requires_recovery());
     assert!(recovered.guard().published().is_err());
     assert!(recovered.guard().io_retired());
@@ -300,7 +303,25 @@ fn verify_output(fixture: &IntentCrashFixture, recovered: &RecoveredIntentPhysic
             Ok(())
         })
         .unwrap();
-    assert_eq!(rows, ["acknowledged before checkpoint 1"]);
+    let expected = if point.is_precommit() {
+        assert_eq!(
+            recovered.parts.persistent_timestamp,
+            recovered
+                .record()
+                .checkpoint_intent()
+                .unwrap()
+                .source_checkpoint_timestamp
+        );
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+        "durable payload".to_owned()
+    } else {
+        assert_eq!(
+            recovered.parts.persistent_timestamp,
+            recovered.record().prefix().committed_timestamp
+        );
+        format!("acknowledged before checkpoint {commits}")
+    };
+    assert_eq!(rows, [expected]);
     assert!(fixture.runtime.replay.lock().is_none());
     assert_eq!(fixture.runtime.files.physical_wal.size().unwrap(), 0);
     for (path, bytes) in &fixture.durable_before {
@@ -313,13 +334,20 @@ fn verify_output(fixture: &IntentCrashFixture, recovered: &RecoveredIntentPhysic
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn checkpoint_recovery_wal_io_native_every_operation_error_and_short_write_retries() {
+    for (point, commits) in cases() {
+        eprintln!("PHYSICAL_IO_CASE {point:?} parity={commits}");
+        errors_case(point, commits);
+    }
+}
+
+fn errors_case(point: CrashPoint, commits: usize) {
     let control = Control::new();
-    let baseline = fixture(&control);
+    let baseline = fixture(&control, point, commits);
     let mut recovery = start(&baseline);
     control.arm(Fault::None);
     let output = baseline.io.block(|| recovery.poll()).unwrap();
     control.armed.store(false, Ordering::Release);
-    verify_output(&baseline, &output);
+    verify_output(&baseline, &output, point, commits);
     let events = control.events.lock().clone();
     eprintln!("PHYSICAL_RECOVERY_IO_TRACE {events:?}");
     assert!(events
@@ -345,7 +373,7 @@ fn checkpoint_recovery_wal_io_native_every_operation_error_and_short_write_retri
                 index + 1
             );
             let control = Control::new();
-            let fixture = fixture(&control);
+            let fixture = fixture(&control, point, commits);
             let mut recovery = start(&fixture);
             control.arm(if short {
                 Fault::Short(index + 1)
@@ -357,6 +385,7 @@ fn checkpoint_recovery_wal_io_native_every_operation_error_and_short_write_retri
                 "ignored fault at {event:?}"
             );
             control.armed.store(false, Ordering::Release);
+            assert_eq!(control.events.lock().get(index), Some(event));
             drop(recovery);
             assert!(control.held.lock().is_none());
             let mut retry = start(&fixture);
@@ -364,7 +393,7 @@ fn checkpoint_recovery_wal_io_native_every_operation_error_and_short_write_retri
             let output = fixture.io.block(|| retry.poll()).unwrap();
             control.armed.store(false, Ordering::Release);
             assert_full_main_sync_before_wal_discard(&control.events.lock());
-            verify_output(&fixture, &output);
+            verify_output(&fixture, &output, point, commits);
         }
     }
 }
@@ -372,8 +401,15 @@ fn checkpoint_recovery_wal_io_native_every_operation_error_and_short_write_retri
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn checkpoint_recovery_wal_io_native_cancel_before_callback_and_before_retirement() {
+    for (point, commits) in cases() {
+        eprintln!("PHYSICAL_IO_CASE {point:?} parity={commits}");
+        cancellation_case(point, commits);
+    }
+}
+
+fn cancellation_case(point: CrashPoint, commits: usize) {
     let control = Control::new();
-    let baseline = fixture(&control);
+    let baseline = fixture(&control, point, commits);
     let mut recovery = start(&baseline);
     control.arm(Fault::None);
     let output = baseline.io.block(|| recovery.poll()).unwrap();
@@ -389,7 +425,7 @@ fn checkpoint_recovery_wal_io_native_cancel_before_callback_and_before_retiremen
                 index + 1
             );
             let control = Control::new();
-            let fixture = fixture(&control);
+            let fixture = fixture(&control, point, commits);
             let mut recovery = start(&fixture);
             control.arm(Fault::Hold(index + 1));
             let mut polls = 0;
@@ -447,7 +483,7 @@ fn checkpoint_recovery_wal_io_native_cancel_before_callback_and_before_retiremen
             let output = fixture.io.block(|| retry.poll()).unwrap();
             control.armed.store(false, Ordering::Release);
             assert_full_main_sync_before_wal_discard(&control.events.lock());
-            verify_output(&fixture, &output);
+            verify_output(&fixture, &output, point, commits);
         }
     }
 }
@@ -508,4 +544,19 @@ fn checkpoint_recovery_wal_precommit_native_full_main_sync_precedes_discard() {
         assert!(output.guard().requires_recovery());
         assert!(output.guard().published().is_err());
     }
+}
+
+fn cases() -> impl Iterator<Item = (CrashPoint, usize)> {
+    [
+        CrashPoint::FirstMainBackfillWrite,
+        CrashPoint::PartialMainBackfill,
+        CrashPoint::MainSyncedBeforeWalTruncate,
+        CrashPoint::BeforeWalHeader,
+        CrashPoint::TornWalHeader,
+        CrashPoint::BeforeWalFrame,
+        CrashPoint::TornWalFrame,
+        CrashPoint::BeforeWalCommit,
+    ]
+    .into_iter()
+    .flat_map(|point| [1, 2].into_iter().map(move |commits| (point, commits)))
 }
