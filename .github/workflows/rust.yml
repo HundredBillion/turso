@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fda7b28bec7314b6129220bacddd1c430a838cbd
+          ref: 62a62cbcc74901d166bc2eed9cd360ea81321206
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,39 +28,53 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = fda7b28bec7314b6129220bacddd1c430a838cbd
+          test "$(git rev-parse HEAD)" = 62a62cbcc74901d166bc2eed9cd360ea81321206
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Inventory real ordinary ownership failures and SDK independently
+      - name: Native ordinary locks and exact downgrade regression
         run: |
-          failed=0
-          for selector in 'mvcc::database::tests::' page_codec test_shm_; do
-            label=$(printf '%s' "$selector" | tr ':/' '__')
-            set +e
-            timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,bench "$selector" -- --test-threads=2 > "$label.log" 2>&1
-            code=$?
-            set -e
-            printf '%s\n' "$code" > "$label-status.txt"
-            tail -100 "$label.log"
-            if test "$code" -ne 0; then failed=1; fi
-          done
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ordinary-locks.log
+          grep '^test result:' ordinary-locks.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker.log
+          grep '^test result:' marker.log | tail -1 | grep -q '^test result: ok. 5 passed; 0 failed;'
+      - name: Unsupported-lock destructor causal control
+        run: |
+          cp core/io/unix.rs /tmp/unix-accepted.rs
+          trap 'cp /tmp/unix-accepted.rs core/io/unix.rs' EXIT
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path('core/io/unix.rs')
+          s = p.read_text()
+          before = '#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]\nimpl Drop for UnixFile'
+          assert s.count(before) == 1
+          p.write_text(s.replace(before, 'impl Drop for UnixFile'))
+          PYCONTROL
           set +e
-          timeout 600 cargo test --locked -p turso_sdk_kit --lib -- --test-threads=2 > sdk.log 2>&1
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_unsupported_lock_drops_safely -- --ignored --test-threads=1 --nocapture > unsupported-control.log 2>&1
           code=$?
           set -e
-          printf '%s\n' "$code" > sdk-status.txt
-          tail -100 sdk.log
-          if test "$code" -ne 0; then failed=1; fi
-          python3 - <<'PYCOUNTS'
-          import re
-          from pathlib import Path
-          for file in [Path('mvcc__database__tests__.log'), Path('page_codec.log'), Path('test_shm_.log'), Path('sdk.log')]:
-              lines = [line for line in file.read_text().splitlines() if line.startswith('test result:')]
-              assert lines, file
-              match = re.search(r'(\d+) passed; (\d+) failed;', lines[-1])
-              assert match and sum(map(int, match.groups())) > 0, (file, lines[-1])
-          PYCOUNTS
-          test "$failed" -eq 0
+          cat unsupported-control.log
+          test "$code" -ne 0
+          grep '^test result:' unsupported-control.log | tail -1 | grep -q '^test result: FAILED. 0 passed; 1 failed;'
+          grep -q 'Failed to unlock file' unsupported-control.log
+          cp /tmp/unix-accepted.rs core/io/unix.rs
+          git diff --exit-code
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api linux_ordinary_lock_native_unsupported_lock_drops_safely -- --ignored --test-threads=1 --nocapture 2>&1 | tee unsupported-restored.log
+          grep '^test result:' unsupported-restored.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+      - name: Broader ordinary core and SDK contracts
+        run: |
+          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api,bench -- --test-threads=2 2>&1 | tee core.log
+          grep '^test result:' core.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_sdk_kit --lib -- --test-threads=2 2>&1 | tee sdk.log
+          grep '^test result:' sdk.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
+      - name: Actual io_uring lock ownership
+        run: |
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,io_uring linux_ordinary_lock_native_uring_alias_cache_and_sigkill -- --ignored --test-threads=1 --nocapture 2>&1 | tee uring-locks.log
+          grep '^test result:' uring-locks.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+      - name: Strict library lint and formatting
+        run: |
+          cargo clippy --locked -p turso_core --lib --tests --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,10 +83,21 @@ jobs:
             source.txt
             rustc.txt
             *.log
-            test-clippy.json
-            empty-harness.json
-            engine-control.json
             *.diff
             *status.txt
             *summary.txt
           retention-days: 14
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 62a62cbcc74901d166bc2eed9cd360ea81321206
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-windows
+          cache-on-failure: true
+      - run: cargo check --locked -p turso_core --lib --features conn_raw_api
