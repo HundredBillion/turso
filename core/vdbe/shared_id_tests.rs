@@ -944,7 +944,23 @@ mod shared_id_lifecycle_io_tests;
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_id_lifecycle_native_empty_scopes_do_not_create_journal_owners() {
-    let (_directory, first, second) = pair();
+    let (directory, first, second) = pair();
+    let namespace = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".turso-mvcc-")
+        })
+        .expect("shared namespace");
+    let capture = || {
+        ["ids-a", "ids-b", "ids-selector"].map(|name| std::fs::read(namespace.join(name)).unwrap())
+    };
+    let before = capture();
     first.execute("SAVEPOINT empty").unwrap();
     first.execute("SAVEPOINT nested").unwrap();
     first.execute("ROLLBACK TO nested").unwrap();
@@ -956,6 +972,7 @@ fn shared_id_lifecycle_native_empty_scopes_do_not_create_journal_owners() {
     first.execute("ROLLBACK TO empty").unwrap();
     first.execute("RELEASE empty").unwrap();
     first.execute("COMMIT").unwrap();
+    assert_eq!(capture(), before, "empty scopes appended ID metadata");
     second
         .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
         .unwrap();

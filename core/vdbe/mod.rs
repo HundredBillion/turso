@@ -3687,7 +3687,7 @@ impl Program {
             }
         }
         #[cfg(all(host_shared_wal, unix))]
-        if let Err(error) = self.finish_shared_sequence_inner_before_rollback(state, pager) {
+        if let Err(error) = self.finish_shared_sequence_inner_before_rollback(state) {
             capture_abort_error(
                 &mut abort_error,
                 error,
@@ -4224,11 +4224,7 @@ impl Program {
     }
 
     #[cfg(all(host_shared_wal, unix))]
-    fn finish_shared_sequence_inner_before_rollback(
-        &self,
-        state: &mut ProgramState,
-        pager: &Arc<Pager>,
-    ) -> Result<()> {
+    fn finish_shared_sequence_inner_before_rollback(&self, state: &mut ProgramState) -> Result<()> {
         use crate::IOExt;
         let Some(pending) = state.sequence_inner_tx_pending.as_ref() else {
             return Ok(());
@@ -4241,6 +4237,7 @@ impl Program {
             return Ok(());
         };
         let db = pending.db;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
         let inner = pending.inner_tx_id;
         let saved_outer = pending.saved_outer;
         // Complete an already-started autonomous commit, not the nextval SQL.
@@ -4254,7 +4251,7 @@ impl Program {
         // before any decision to roll back the inner transaction.
         state.sequence_inner_commit = None;
         if store.is_tx_rollbackable(inner) {
-            store.rollback_tx(inner, pager.clone(), &self.connection, db);
+            store.rollback_tx(inner, pager, &self.connection, db);
         }
         self.connection.set_mv_tx_for_db(db, saved_outer);
         if saved_outer.is_some() {
