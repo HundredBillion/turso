@@ -61,6 +61,7 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
+mod persistent_metadata;
 #[cfg(not(nightly))]
 mod version_chain;
 pub use checkpoint_state_machine::{
@@ -5355,18 +5356,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Shared validation/normalization for the persistent-tx-ts-max metadata
     /// value used by both the blocking and non-blocking readers.
     fn validate_persistent_tx_ts_max(value: Option<i64>) -> Result<Option<u64>> {
-        let value = value.ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}"
-            ))
-        })?;
-
-        if value < 0 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid MVCC metadata value for {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}: {value}"
-            )));
-        }
-        Ok(Some(value as u64))
+        ReadPersistentTxTsMaxState::validate(value)
     }
 
     /// Non-blocking variant of [`Self::try_read_persistent_tx_ts_max`]: runs the
@@ -5378,54 +5368,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection: &Arc<Connection>,
         st: &mut ReadPersistentTxTsMaxState,
     ) -> IOResultOr<Option<u64>> {
-        loop {
-            match st {
-                ReadPersistentTxTsMaxState::Start => {
-                    let query_result = connection.query(format!(
-                        "SELECT v FROM {MVCC_META_TABLE_NAME}
-                         WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
-                    ));
-                    let maybe_stmt = match query_result {
-                        Ok(stmt) => stmt,
-                        Err(LimboError::ParseError(msg)) if msg.contains("no such table") => {
-                            return Ok(IOResult::Done(None));
-                        }
-                        Err(err) => {
-                            return Err(LimboError::Corrupt(format!(
-                                "Failed to read MVCC metadata table: {err}"
-                            ))
-                            .into());
-                        }
-                    };
-                    match maybe_stmt {
-                        Some(stmt) => {
-                            *st = ReadPersistentTxTsMaxState::Running {
-                                stmt: Box::new(stmt),
-                                value: None,
-                            };
-                        }
-                        // No statement to run — fall through to the missing-row
-                        // error path (matches the blocking variant).
-                        None => {
-                            return Self::validate_persistent_tx_ts_max(None)
-                                .map(IOResult::Done)
-                                .map_err(Into::into);
-                        }
-                    }
-                }
-                ReadPersistentTxTsMaxState::Running { stmt, value } => {
-                    return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        *value = Some(row.get::<i64>(0)?);
-                        Ok(())
-                    }));
-                    let value = *value;
-                    *st = ReadPersistentTxTsMaxState::Start;
-                    return Self::validate_persistent_tx_ts_max(value)
-                        .map(IOResult::Done)
-                        .map_err(Into::into);
-                }
-            }
-        }
+        st.poll(connection)
     }
 
     /// Bootstrap the MV store from the SQLite schema table and logical log.
