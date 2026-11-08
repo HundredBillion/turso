@@ -293,3 +293,41 @@ Completed-token cleanup source26f48 passed native2/2 plus strict library lint an
 formatting in run42505270402: actual ordinary-MVCC-generated header-only log is
 removed before ordinary reopen, and unknown/replaced namespace files reject
 before any unlink. This is not partial-cleanup or process-death acceptance.
+
+## Confirmed ordinary lock lifetime defect and bounded prototype
+
+Corrected source273a in run42506332370 executes the actual child: the ordinary
+owner excludes it BEFORE old native-handle retirement, then the child acquires
+the lock AFTER the old Database/runtime/main aliases retire. The deliberate child
+failure control observes its exact failure diagnostic and one failed child before
+proving the supervisor rejects it. The earlier zero-selection conclusion is
+retracted, not treated as evidence against this defect.
+
+Both UnixFile and UringFile currently acquire process-scoped F_SETLK and explicitly
+unlock in Drop. Closing a different descriptor for the same inode can therefore
+release the live ordinary owner's lock. No Unix per-inode deferred-close registry
+exists in this source. A bounded prototype routes both backends through one helper:
+Linux64 uses nonblocking whole-file F_OFD_SETLK, including unlock; other Unix keeps
+the existing process-lock implementation. NoLock, ReadOnly and the explicit
+lock-disable environment behavior remain unchanged. Unsupported Linux64 OFD
+requests fail rather than silently restoring the unsafe process-lock ownership.
+
+A distinct raw same-process ordinary open now conflicts, matching exclusive
+ownership; process-wide Database cache reuse still shares the existing owner.
+Validation must cover actual Python SQLite POSIX locks in both cross-process
+directions, native/NoLock/read-only aliases closing, hardlink cached RW/RO callers,
+ordinary-owner SIGKILL release, the real downgrade regression, and optional Uring
+execution when the kernel actually permits it. Classic external SQLite ownership
+inside the same process is not claimed safe against arbitrary unrelated file
+closures; the existing explicit offline prerequisite still requires older workers
+to stop. No new user lifetime policy is being substituted for the defect fix.
+
+Partial-cleanup candidate cd5e4ec61 passed native run42506877040: final parent
+summaries were partial4, extent1, resume4, completed-cleanup2, missing-WAL2,
+preparation7 and marker4 (the known failing old-handle-close case was explicitly
+excluded). Partial coverage includes real SIGKILL at ten cleanup boundaries,
+read-only-view mutation rejection, stale target metadata and unexpected remaining
+files rejected before unlink. Strict Linux library lint/format and Windows check
+also passed. Downloaded logs are retained under
+`.local/issue-resolution/downgrade-partial-cd5` in the root checkout. These results
+do not clear the separately confirmed ordinary lock lifetime defect.

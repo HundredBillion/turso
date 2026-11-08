@@ -7,13 +7,13 @@ use super::{
 use crate::error::io_error;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::unix::{
-    unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
+    unix_file_lock, unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
 };
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
 use crate::turso_assert;
 use crate::{CompletionError, LimboError, Result};
-use rustix::fs::{self, FlockOperation};
+use rustix::fs::FlockOperation;
 use std::ptr::NonNull;
 use std::{
     collections::{HashMap, VecDeque},
@@ -709,9 +709,8 @@ impl File for UringFile {
 
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
-        // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
-        // or the process exits or after an explicit unlock.
-        fs::fcntl_lock(
+        // Use the same ordinary lock ownership as the synchronous Unix backend.
+        unix_file_lock(
             fd,
             if exclusive {
                 FlockOperation::NonBlockingLockExclusive
@@ -719,8 +718,7 @@ impl File for UringFile {
                 FlockOperation::NonBlockingLockShared
             },
         )
-        .map_err(|e| {
-            let io_error = std::io::Error::from(e);
+        .map_err(|io_error| {
             let message = match io_error.kind() {
                 ErrorKind::WouldBlock => {
                     "Failed locking file. File is locked by another process".to_string()
@@ -735,12 +733,8 @@ impl File for UringFile {
 
     fn unlock_file(&self) -> Result<()> {
         let fd = self.file.as_fd();
-        fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
-                "Failed to release file lock: {}",
-                std::io::Error::from(e)
-            ))
-        })?;
+        unix_file_lock(fd, FlockOperation::NonBlockingUnlock)
+            .map_err(|e| LimboError::LockingError(format!("Failed to release file lock: {e}")))?;
         Ok(())
     }
 
