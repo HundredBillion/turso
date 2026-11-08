@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 7df8f89ec43d405fe89d78b5939f1dd6e0b75157
+          ref: 2173b616f48269abc25b58de963c28d011cff55c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 7df8f89ec43d405fe89d78b5939f1dd6e0b75157
+          test "$(git rev-parse HEAD)" = 2173b616f48269abc25b58de963c28d011cff55c
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -42,39 +42,23 @@ jobs:
         run: |
           timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-staging-green.log
           grep -q '3 passed; 0 failed' physical-staging-green.log
-      - name: Unpinned physical input must release authority too early
+      - name: Verified generation and pager components
         run: |
-          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_checkpoint_base.rs"); s=p.read_text(); old="let file = ReadPinnedFile::new(runtime.files.main.clone(), self.finalized.guard())?;"; assert s.count(old)==1; p.write_text(s.replace(old,"let file = runtime.files.main.clone();"))'
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload -- --test-threads=1 2>&1 | tee generation-prep.log
+          grep -q '3 passed; 0 failed' generation-prep.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reset_ -- --test-threads=1 2>&1 | tee pager.log
+          grep -q '7 passed; 0 failed' pager.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee generation-native.log
+          grep -q '2 passed; 0 failed' generation-native.log
+      - name: Missing local installation must fail
+        run: |
           set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_cancel_retains_authority_through_header_and_schema_read_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee unpinned-red.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_reclaims_then_installs_without_admission_release -- --ignored --test-threads=1 --nocapture 2>&1 | tee local-install-red.log
           status=${PIPESTATUS[0]}
           set -e
-          git checkout -- core/mvcc/database/shared_checkpoint_base.rs
           test "$status" -ne 0
-          grep -q 'cancelled physical read released authority before backend retirement' unpinned-red.log
-          grep -q '0 passed; 1 failed' unpinned-red.log
-      - name: Bypassed retirement wait must return evidence too early
-        run: |
-          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_checkpoint_base.rs"); s=p.read_text(); old="        if !guard.io_retired() {\n            return Ok(IOResult::IO(IOCompletions(guard.retirement_completion())));\n        }\n"; assert s.count(old)==1; p.write_text(s.replace(old,""))'
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_evidence_waits_for_backend_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          git checkout -- core/mvcc/database/shared_checkpoint_base.rs
-          test "$status" -ne 0
-          grep -q 'physical evidence escaped before backend retirement' retirement-red.log
-          grep -q '0 passed; 1 failed' retirement-red.log
-      - name: Restored live physical staging
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-staging-restored.log
-          grep -q '3 passed; 0 failed' physical-staging-restored.log
-          git diff --exit-code
-      - name: Physical read pins and MVCC regressions
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api read_pinned_file -- --test-threads=1 --nocapture 2>&1 | tee pins.log
-          grep -q '2 passed; 0 failed' pins.log
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database -- --test-threads=1 2>&1 | tee database.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' database.log
+          grep -q 'local completed checkpoint installation is not implemented' local-install-red.log
+          grep -q '0 passed; 1 failed' local-install-red.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
