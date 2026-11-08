@@ -190,6 +190,53 @@ fn shared_connection_native_initial_open_cancel_keeps_header_authority_until_bac
     }
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_connection_native_initial_open_waits_for_completed_header_backend_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let control = Arc::new(ConnectionIoControl {
+        main_path: path.clone(),
+        ..Default::default()
+    });
+    let io: Arc<dyn crate::IO> = Arc::new(ConnectionIo {
+        inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+        control: control.clone(),
+    });
+    control.delay_at_read.store(1, Ordering::Release);
+    let options =
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit);
+    let mut state = crate::OpenDbAsyncState::new();
+    let waiter =
+        match crate::Database::open_async(&mut state, io.clone(), path.to_str().unwrap(), &options)
+            .unwrap()
+        {
+            IOResult::IO(waiter) => waiter,
+            IOResult::Done(_) => panic!("initial open bypassed delayed header"),
+        };
+    let held = control.pending_read.lock().take().unwrap();
+    held.complete();
+    drop(waiter);
+    let result =
+        crate::Database::open_async(&mut state, io.clone(), path.to_str().unwrap(), &options);
+    assert!(
+        matches!(result, Ok(IOResult::IO(_))),
+        "initial open did not wait for completed header backend release"
+    );
+    drop(result);
+    drop(held);
+    let database = io
+        .block(|| {
+            crate::Database::open_async(&mut state, io.clone(), path.to_str().unwrap(), &options)
+        })
+        .unwrap();
+    database
+        .connect(crate::ConnectOpts::new())
+        .unwrap()
+        .execute("SELECT value FROM preserved")
+        .unwrap();
+}
+
 struct HeldMainRead {
     file: Arc<dyn File>,
     offset: u64,
