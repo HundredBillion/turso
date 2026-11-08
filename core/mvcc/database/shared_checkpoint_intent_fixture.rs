@@ -32,6 +32,9 @@ pub(super) struct IntentCrashFixture {
 }
 impl IntentCrashFixture {
     pub fn new(point: CrashPoint, acknowledged_commits: usize) -> Self {
+        eprintln!(
+            "checkpoint crash fixture {point:?}, acknowledged commits={acknowledged_commits}"
+        );
         let directory = tempfile::tempdir().unwrap();
         let (path, limit) = shared_runtime_fixture(directory.path());
         let main_before = std::fs::read(&path).unwrap();
@@ -127,7 +130,7 @@ impl CrashChild {
                 .recv_timeout(remaining)
                 .expect("checkpoint child failed before acknowledgement")
                 .unwrap();
-            if let Some(message) = line.strip_prefix("INTENT_CRASH ") {
+            if let Some((_, message)) = line.split_once("INTENT_CRASH ") {
                 return message.to_owned();
             }
         }
