@@ -914,3 +914,40 @@ fn checkpoint_recovery_finalize_native_witness_and_final_bank_wait_for_physical_
         assert_finalized(&fixture, &finalized);
     }
 }
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_fresh_log_without_admission() {
+    for target_only in [false, true] {
+        let mut fixture = fresh_fixture(target_only);
+        let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+        let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+        assert_finalized(&fixture, &finalized);
+        assert!(
+            !std::fs::read(fixture.namespace.join("logical"))
+                .unwrap()
+                .is_empty(),
+            "fixture must retain real obsolete logical records"
+        );
+        let preserved =
+            [0, 1, 3, 4, 5, 6].map(|index| std::fs::read(&fixture.paths[index]).unwrap());
+        let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+        let _reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+        assert!(std::fs::read(fixture.namespace.join("logical"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            [0, 1, 3, 4, 5, 6].map(|index| std::fs::read(&fixture.paths[index]).unwrap()),
+            preserved
+        );
+        assert!(fixture.runtime.replay.lock().is_none());
+        assert!(matches!(
+            fixture.runtime.gate.try_enter_admission(),
+            Err(LimboError::Busy)
+        ));
+        assert!(matches!(
+            fixture.runtime.files.authority.try_acquire(),
+            Err(LimboError::Busy)
+        ));
+    }
+}
