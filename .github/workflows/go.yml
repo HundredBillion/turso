@@ -33,9 +33,9 @@ jobs:
     strategy:
       matrix:
         os:
-          - blacksmith-4vcpu-ubuntu-2404
-          - blacksmith-6vcpu-macos-latest
-          - blacksmith-4vcpu-windows-2025
+          - "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
+          - "${{ github.repository == 'HundredBillion/turso' && 'macos-latest' || 'blacksmith-6vcpu-macos-latest' }}"
+          - "${{ github.repository == 'HundredBillion/turso' && 'windows-2025' || 'blacksmith-4vcpu-windows-2025' }}"
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -319,7 +319,6 @@ jobs:
           TARGET_TAG: ${{ steps.vars.outputs.target_tag }}
           TARGET_BRANCH: ${{ steps.vars.outputs.target_branch }}
           NONCE: ${{ steps.vars.outputs.nonce }}
-          RESOLVED_VERSION: ${{ steps.update_dep.outputs.resolved_version }}
         run: |
           set -euo pipefail
 

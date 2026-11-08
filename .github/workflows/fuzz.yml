@@ -23,7 +23,7 @@ env:
 jobs:
   run-fuzz-tests:
     name: run-fuzz-tests (part ${{ matrix.partition }}/2)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     # nextest splits the fuzz tests between the two jobs; every test runs in
     # exactly one of them.
@@ -63,7 +63,7 @@ jobs:
       run: cargo nextest run --locked --no-fail-fast -E 'binary(fuzz_tests) | binary(pending_byte_tests)' --partition slice:${{ matrix.partition }}/2 --failure-output=final
 
   run-long-fuzz-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
 
     steps:
@@ -92,7 +92,7 @@ jobs:
       run: cargo nextest run --locked --no-fail-fast --run-ignored ignored-only -E 'test(/fuzz_long/)' --failure-output=final
 
   simple-stress-test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
@@ -116,7 +116,7 @@ jobs:
 
   fts-stress-test:
     name: FTS stress (${{ matrix.mode }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     # This job mostly runs the stress test rather than compiling it, so
     # build with optimizations. The dev profile keeps debug assertions and
@@ -150,7 +150,7 @@ jobs:
         --nr-threads 2 --nr-iterations 10000
 
   shuttle-stress-test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     # Two shuttle tests ran ~8-9 min each unoptimized. With optimizations
     # they run the same iterations with the same checks (the dev profile
@@ -184,7 +184,7 @@ jobs:
       run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
 
   libfuzzer-scalar-func:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4

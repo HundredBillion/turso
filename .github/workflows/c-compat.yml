@@ -30,7 +30,7 @@ jobs:
           - name: Linux
             os: ubuntu-latest
           - name: Windows MSVC
-            os: blacksmith-4vcpu-windows-2025
+            os: "${{ github.repository == 'HundredBillion/turso' && 'windows-2025' || 'blacksmith-4vcpu-windows-2025' }}"
 
     steps:
       - name: Checkout code
