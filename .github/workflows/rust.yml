@@ -1,4 +1,4 @@
-name: Current generation reload causal control
+name: Interrupted checkpoint intent fixture RED
 on:
   workflow_dispatch:
 permissions:
@@ -7,7 +7,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  current-generation-causal:
+  intent-native-red:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -18,39 +18,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3942c92fc97654b389541f49821cb7623fcf4a27
+          ref: 4b12adbcb07acf5bd2354147973627bba69f76f6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Verify exact source and native integrations
+      - name: Genuine coordinator crash fixture prerequisite
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 3942c92fc97654b389541f49821cb7623fcf4a27
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee current-path-green.log
-          grep -q '1 passed; 0 failed' current-path-green.log
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_current_prefix.rs'
-          s=open(p).read(); start=s.index('    pub(super) fn poll_current_base'); at=s.index('            if !database',start)
-          s=s[:at]+'            if identity.is_some_and(|identity| identity.database.generation != record.log_generation()) {\n                return Err(LimboError::Busy.into());\n            }\n'+s[at:]
-          open(p,'w').write(s)
-          PATCH
+          test "$(git rev-parse HEAD)" = 4b12adbcb07acf5bd2354147973627bba69f76f6
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_crash_fixtures_keep_acknowledged_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee crash-fixture-green.log
+          grep -q '1 passed; 0 failed' crash-fixture-green.log
+      - name: Missing intent mirror must fail behaviorally
+        run: |
+          set -euo pipefail
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture > current-path-control-red.log 2>&1
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_mirrors_actual_crashed_selection -- --ignored --test-threads=1 --nocapture > intent-mirror-red.log 2>&1
           code=$?
           set -e
-          git restore core/mvcc/database/shared_current_prefix.rs
+          cat intent-mirror-red.log
           test "$code" -ne 0
-          grep -q '0 passed; 1 failed' current-path-control-red.log
-          cat current-path-control-red.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee current-path-restored-green.log
-          grep -q '1 passed; 0 failed' current-path-restored-green.log
+          grep -q '0 passed; 1 failed' intent-mirror-red.log
+          grep -q 'interrupted checkpoint intent mirroring is not implemented' intent-mirror-red.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: idle-generation-path-control-3942
+          name: interrupted-intent-fixture-red-4b12adbcb
           path: |
             source.txt
             *.log
