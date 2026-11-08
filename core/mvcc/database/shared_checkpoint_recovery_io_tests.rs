@@ -299,7 +299,7 @@ impl crate::IO for RecoveryIo {
 #[test]
 #[ignore = "requires native shared MVCC files"]
 fn shared_open_selector_native_cancel_and_wait_for_backend_retirement() {
-    for mode in ["before", "after", "wait"] {
+    for mode in ["before", "after", "wait", "error"] {
         let directory = tempfile::tempdir().unwrap();
         let (path, limit) = shared_runtime_fixture(directory.path());
         let control = Arc::new(RecoveryIoControl::default());
@@ -327,11 +327,16 @@ fn shared_open_selector_native_cancel_and_wait_for_backend_retirement() {
             IOResult::Done(_) => panic!("selector facts escaped delayed read"),
         };
         let held = control.pending_read.lock().take().unwrap();
-        if mode != "before" {
+        if mode == "error" {
+            held.completion.error(crate::CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "injected selector callback failure",
+            ));
+        } else if mode != "before" {
             held.complete();
         }
         drop(waiting);
-        if mode == "wait" {
+        if mode == "wait" || mode == "error" {
             let mut retirement = None;
             for _ in 0..100 {
                 match probing.poll().unwrap() {
@@ -351,13 +356,24 @@ fn shared_open_selector_native_cancel_and_wait_for_backend_retirement() {
             ));
             drop(held);
             assert!(retirement.finished());
-            let inspected = io.block(|| Ok(probing.poll()?)).unwrap();
-            let (manifest, route) = inspected.into_parts();
-            assert_eq!(
-                route,
-                crate::mvcc::shared_ids::io_protocol::open_selection::InitialIdRoute::Healthy
-            );
-            manifest.into_guard().unwrap().finish().unwrap();
+            if mode == "error" {
+                let error = match probing.poll() {
+                    Err(error) => error,
+                    Ok(_) => panic!("selector callback error was discarded"),
+                };
+                assert!(error
+                    .to_string()
+                    .contains("injected selector callback failure"));
+                drop(probing);
+            } else {
+                let inspected = io.block(|| Ok(probing.poll()?)).unwrap();
+                let (manifest, route) = inspected.into_parts();
+                assert_eq!(
+                    route,
+                    crate::mvcc::shared_ids::io_protocol::open_selection::InitialIdRoute::Healthy
+                );
+                manifest.into_guard().unwrap().finish().unwrap();
+            }
             drop(opening);
         } else {
             drop(probing);
