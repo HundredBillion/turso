@@ -15,11 +15,11 @@ env:
 jobs:
   recovered-finalization:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f6ece7fb6ef0eb2e9369f3a421cc3e66c3017c14
+          ref: a15fabb1a9f9aae285ebc9fb6e42162c7b112d8b
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f6ece7fb6ef0eb2e9369f3a421cc3e66c3017c14
+          test "$(git rev-parse HEAD)" = a15fabb1a9f9aae285ebc9fb6e42162c7b112d8b
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -47,13 +47,94 @@ jobs:
       - name: Fresh recovered ID finalization keeps admission paused
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-green.log
-          grep -q '1 passed; 0 failed' finalization-green.log
+          grep -q '7 passed; 0 failed' finalization-green.log
+      - name: Captured maximum epoch causal control
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/database/shared_checkpoint_recovery_finalize.rs'
+          s=open(p).read()
+          assert s.count('self.max_owner_epoch')==1
+          s=s.replace('self.max_owner_epoch','None')
+          open(p,'w').write(s)
+          PYCONTROL
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_fresh_incarnation_preserves_epoch_without_admission -- --ignored --test-threads=1 --nocapture 2>&1 | tee epoch-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'recovered ID epoch witness differs' epoch-red.log
+          grep -q '0 passed; 1 failed' epoch-red.log
+          git checkout -- core/mvcc/database/shared_checkpoint_recovery_finalize.rs
+      - name: Epoch before forgetting references causal control
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/shared_ids/witness_mirror.rs'
+          s=open(p).read()
+          old='        self.loaded\n            .guard\n            .reconcile_incarnation(self.maximum_owner_epoch.unwrap_or(0))?;\n'
+          assert s.count(old)==1
+          s=s.replace(old,'')
+          open(p,'w').write(s)
+          PYCONTROL
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_fresh_incarnation_preserves_epoch_without_admission -- --ignored --test-threads=1 --nocapture 2>&1 | tee reconcile-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'ID selector forgot retained owner epochs before reconciliation' reconcile-red.log
+          grep -q '0 passed; 1 failed' reconcile-red.log
+          git checkout -- core/mvcc/shared_ids/witness_mirror.rs
+      - name: Old replay withdrawal causal control
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/database/shared_checkpoint_recovery_finalize.rs'
+          s=open(p).read()
+          old='        self.runtime.replay.lock().take();\n'
+          assert s.count(old)==1
+          s=s.replace(old,'')
+          open(p,'w').write(s)
+          PYCONTROL
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ready_and_finalized_targets_stay_unadmitted -- --ignored --test-threads=1 --nocapture 2>&1 | tee replay-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'ID mutation retained old runtime replay' replay-red.log
+          grep -q '0 passed; 1 failed' replay-red.log
+          git checkout -- core/mvcc/database/shared_checkpoint_recovery_finalize.rs
+      - name: Final physical retirement causal control
+        run: |
+          python3 - <<'PYCONTROL'
+          p='core/mvcc/shared_ids/checkpoint_finalize.rs'
+          s=open(p).read()
+          old='                    if !loaded.guard.io_retired() {\n                        let waiter = loaded.guard.retirement_completion();\n                        self.finished = false;\n                        return Ok(IOResult::IO(waiter));\n                    }\n'
+          assert s.count(old)==1
+          s=s.replace(old,'')
+          open(p,'w').write(s)
+          PYCONTROL
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_witness_and_final_bank_wait_for_physical_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'recovered ID finalization escaped before physical retirement 9' retirement-red.log
+          grep -q '0 passed; 1 failed' retirement-red.log
+          git checkout -- core/mvcc/shared_ids/checkpoint_finalize.rs
+      - name: Restored recovered finalization and existing finalizer
+        run: |
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-restored.log
+          grep -q '7 passed; 0 failed' finalization-restored.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api id_checkpoint_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee existing-finalizer.log
+          grep -q '3 passed; 0 failed' existing-finalizer.log
       - name: ID protocol and authority siblings
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee ids-protocol.log
           grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' ids-protocol.log
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority::tests:: -- --test-threads=1 2>&1 | tee authority.log
           grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' authority.log
+      - name: Full MVCC coverage
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' mvcc.log
       - name: Strict library lint
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
