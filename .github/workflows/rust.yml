@@ -1,4 +1,4 @@
-name: Private shared ID opcode regression
+name: Private shared generation installation validation
 on:
   workflow_dispatch:
 permissions:
@@ -9,34 +9,36 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
-  ids:
+  generation:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fa9d721b8e7724bc1232e618bbd0305bae0af8ab
+          ref: ebadc550a26e8e0fbcc8c808d9f3a4a82d75702c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Record source
+      - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = fa9d721b8e7724bc1232e618bbd0305bae0af8ab
+          test "$(git rev-parse HEAD)" = ebadc550a26e8e0fbcc8c808d9f3a4a82d75702c
           rustc -Vv | tee rustc.txt
-      - name: Combined budget and lifecycle integration
+          stat -f -c '%T %t' . /tmp
+      - name: Preparation and pager controls
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee vdbe-union.log
-          grep -q '6 passed; 0 failed' vdbe-union.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_physical_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical.log
-          grep -q '1 passed; 0 failed' physical.log
-          for selector in statement_lifecycle rowid sequence; do
-            cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --test-threads=1 2>&1 | tee "$selector.log"
-            grep -Eq '[1-9][0-9]* passed; 0 failed' "$selector.log"
-          done
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload_ -- --test-threads=1 --nocapture 2>&1 | tee preparation.log
+          grep -q '3 passed; 0 failed' preparation.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reset_ -- --test-threads=1 --nocapture 2>&1 | tee pager.log
+          grep -q '7 passed; 0 failed' pager.log
+      - name: Genuine completed-proof native installation and rejection
+        run: |
+          set -o pipefail
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee generation-native.log
+          grep -q '2 passed; 0 failed' generation-native.log
       - name: Strict library lint
         run: |
           set -o pipefail
@@ -44,7 +46,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-opcode-regression
+          name: shared-generation-installation
           path: |
             source.txt
             rustc.txt
