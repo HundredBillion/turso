@@ -22,6 +22,42 @@ pub(in crate::mvcc) struct PublishedSharedCheckpoint {
     pub pause: CheckpointPause,
 }
 
+pub(crate) fn checkpoint_shared(
+    connection: Arc<Connection>,
+    mode: CheckpointMode,
+) -> Result<CheckpointResult> {
+    if matches!(
+        mode,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: Some(_)
+        } | CheckpointMode::Truncate {
+            upper_bound_inclusive: Some(_)
+        }
+    ) {
+        return Err(LimboError::InvalidArgument(
+            "shared checkpoint does not support timestamp bounds".into(),
+        ));
+    }
+    let store = connection
+        .mv_store()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| LimboError::InvalidArgument("shared checkpoint requires MVCC".into()))?;
+    let io = connection.db.io.clone();
+    let mut publication = SharedCheckpointPublication::new(store.clone(), connection.clone())?;
+    let published = io.block(|| publication.poll())?;
+    let result = publication
+        .result
+        .take()
+        .expect("completed materialization result");
+    let mut reading = published.begin_physical_read(store.clone(), connection.clone())?;
+    let verified = io.block(|| reading.poll())?;
+    let mut installing = verified.begin_local_install(store, connection.clone())?;
+    let installed = io.block(|| installing.poll())?;
+    installed.publish_ready(connection)?;
+    Ok(result)
+}
+
 #[derive(Clone, Copy)]
 enum Phase {
     Refresh,
@@ -52,6 +88,7 @@ pub(in crate::mvcc) struct SharedCheckpointPublication<C: LogicalClock, A: Concu
     publication: Option<CheckpointIntentPublication>,
     intent: Option<MirroredCheckpointIntent>,
     checkpoint: Option<CheckpointStateMachine<C, A>>,
+    result: Option<CheckpointResult>,
     bindings: Vec<FileBinding>,
     materialized: Option<MaterializedCheckpointProof>,
     token: Option<CheckpointIntentToken>,
@@ -101,6 +138,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> SharedCheckpointPublication<C, A> 
             publication: None,
             intent: None,
             checkpoint: None,
+            result: None,
             bindings: Vec::new(),
             materialized: None,
             token: None,
@@ -211,7 +249,11 @@ impl<C: LogicalClock, A: ConcurrentAllocator> SharedCheckpointPublication<C, A> 
                 Phase::Materialize => match self.checkpoint.as_mut().unwrap().step(&())? {
                     TransitionResult::Io(waiter) => return Ok(IOResult::IO(waiter)),
                     TransitionResult::Continue => {}
-                    TransitionResult::Done(_) => self.phase = Phase::Materialized,
+                    TransitionResult::Done(mut result) => {
+                        result.release_guard();
+                        self.result = Some(result);
+                        self.phase = Phase::Materialized;
+                    }
                 },
                 Phase::Materialized => {
                     let proof = return_if_io!(self

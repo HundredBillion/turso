@@ -624,8 +624,9 @@ PRAGMA wal_checkpoint;
 
 A checkpoint writes pages from the WAL file back to the database file.
 
-On a read-only connection, this pragma leaves the database and WAL unchanged
-and returns `(0, -1, -1)`.
+On a read-only connection, this pragma returns a read-only error and leaves the database and WAL unchanged.
+
+For explicitly enabled shared MVCC databases, every checkpoint mode uses a full, durable checkpoint and truncates the completed logical history. It briefly pauses admission and returns BUSY when a participant still holds a transaction. Existing readers remain valid. A successful checkpoint makes the new physical generation available before admitting further transactions.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 
