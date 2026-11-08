@@ -26,14 +26,16 @@ fn pair_with_setup(setup: Option<&str>) -> (tempfile::TempDir, Arc<Connection>, 
     (directory, first, second)
 }
 fn integers(connection: &Arc<Connection>, sql: &str) -> Vec<i64> {
-    let mut statement = connection.prepare(sql).unwrap();
+    let mut statement = connection
+        .prepare(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
     let mut values = Vec::new();
     statement
         .run_with_row_callback(|row| {
             values.push(row.get_values().next().unwrap().as_int().unwrap());
             Ok(())
         })
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
     values
 }
 
