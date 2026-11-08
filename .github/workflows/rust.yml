@@ -47,23 +47,7 @@ jobs:
             cp /tmp/normal-bootstrap.rs core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs
             cp /tmp/normal-factory.rs core/database/shared_recovered.rs
             export MUTATION_NAME="$control"
-            python3 -c 'import os
-            from pathlib import Path
-            kind=os.environ["MUTATION_NAME"]
-            base=Path("core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs")
-            factory=Path("core/database/shared_recovered.rs")
-            mutations={
-            "install":(base,"self.prepared\n            .take()\n            .unwrap()\n            .install(&self.store, self.proof(), self.guard())?;","drop(self.prepared.take());"),
-            "connection":(base,"if !self.original_connection.as_ref().is_some_and(|original| {\n            crate::sync::Weak::ptr_eq(original, &Arc::downgrade(&connection))\n        }) ||", "if false ||"),
-            "certify":(base,"self.runtime\n            .certify_completed_pager(&connection, self.proof(), self.guard())?;", ""),
-            "withdraw":(base,"if let Err(error) = guard.finish() {\n            self.runtime.replay.lock().take();", "if let Err(error) = guard.finish() {"),
-            "retirement":(factory,"if let Some(waiter) = source.physical_retirement() {\n            return Ok(IOResult::IO(crate::types::IOCompletions(waiter)));\n        }", ""),
-            }
-            p,old,new=mutations[kind]
-            s=p.read_text()
-            assert s.count(old)==1,(kind,s.count(old))
-            p.write_text(s.replace(old,new,1))
-            '
+            python3 -c 'exec('"'"'import os\nfrom pathlib import Path\nkind=os.environ["MUTATION_NAME"]\nbase=Path("core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs")\nfactory=Path("core/database/shared_recovered.rs")\nmutations={\n"install":(base,"self.prepared\\n            .take()\\n            .unwrap()\\n            .install(&self.store, self.proof(), self.guard())?;","drop(self.prepared.take());"),\n"connection":(base,"if !self.original_connection.as_ref().is_some_and(|original| {\\n            crate::sync::Weak::ptr_eq(original, &Arc::downgrade(&connection))\\n        }) ||", "if false ||"),\n"certify":(base,"self.runtime\\n            .certify_completed_pager(&connection, self.proof(), self.guard())?;", ""),\n"withdraw":(base,"if let Err(error) = guard.finish() {\\n            self.runtime.replay.lock().take();", "if let Err(error) = guard.finish() {"),\n"retirement":(factory,"if let Some(waiter) = source.physical_retirement() {\\n            return Ok(IOResult::IO(crate::types::IOCompletions(waiter)));\\n        }", ""),\n}\np,old,new=mutations[kind]\ns=p.read_text()\nassert s.count(old)==1,(kind,s.count(old))\np.write_text(s.replace(old,new,1))\n'"'"')'
             case "$control" in
               install) filter=checkpoint_recovery_bootstrap_native_ready_reopens_admission_and_commits; marker='recovered Database is not ready for admission';;
               connection) filter=checkpoint_recovery_bootstrap_native_late_failures_leave_no_ready_replay; marker='ignored late fault 3';;
