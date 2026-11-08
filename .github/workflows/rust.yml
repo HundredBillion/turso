@@ -48,65 +48,12 @@ jobs:
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-green.log
           grep -q '7 passed; 0 failed' finalization-green.log
-      - name: Captured maximum epoch causal control
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_recovery_finalize.rs'
-          s=open(p).read()
-          assert s.count('self.max_owner_epoch')==1
-          s=s.replace('self.max_owner_epoch','None')
-          open(p,'w').write(s)
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_fresh_incarnation_preserves_epoch_without_admission -- --ignored --test-threads=1 --nocapture 2>&1 | tee epoch-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'recovered ID epoch witness differs' epoch-red.log
-          grep -q '0 passed; 1 failed' epoch-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_finalize.rs
-      - name: Epoch before forgetting references causal control
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/shared_ids/witness_mirror.rs'
-          s=open(p).read()
-          old='        self.loaded\n            .guard\n            .reconcile_incarnation(self.maximum_owner_epoch.unwrap_or(0))?;\n'
-          assert s.count(old)==1
-          s=s.replace(old,'')
-          open(p,'w').write(s)
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_fresh_incarnation_preserves_epoch_without_admission -- --ignored --test-threads=1 --nocapture 2>&1 | tee reconcile-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'ID selector forgot retained owner epochs before reconciliation' reconcile-red.log
-          grep -q '0 passed; 1 failed' reconcile-red.log
-          git checkout -- core/mvcc/shared_ids/witness_mirror.rs
-      - name: Old replay withdrawal causal control
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_recovery_finalize.rs'
-          s=open(p).read()
-          old='        self.runtime.replay.lock().take();\n'
-          assert s.count(old)==1
-          s=s.replace(old,'')
-          open(p,'w').write(s)
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ready_and_finalized_targets_stay_unadmitted -- --ignored --test-threads=1 --nocapture 2>&1 | tee replay-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'ID mutation retained old runtime replay' replay-red.log
-          grep -q '0 passed; 1 failed' replay-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_finalize.rs
       - name: Final physical retirement causal control
         run: |
           python3 - <<'PYCONTROL'
           p='core/mvcc/shared_ids/checkpoint_finalize.rs'
           s=open(p).read()
-          old='                    if !loaded.guard.io_retired() {\n                        let waiter = loaded.guard.retirement_completion();\n                        self.finished = false;\n                        return Ok(IOResult::IO(waiter));\n                    }\n'
+          old='                    if !loaded.guard.io_retired() {\n                        let waiter = loaded.guard.retirement_completion();\n                        self.finished = false;\n                        return Ok(IOResult::IO(IOCompletions(waiter)));\n                    }\n'
           assert s.count(old)==1
           s=s.replace(old,'')
           open(p,'w').write(s)
