@@ -457,7 +457,7 @@ impl crate::vtab::InternalVirtualTableCursor for LocalFunctionCursor {
         1
     }
     fn column(&self, _: usize) -> Result<Value> {
-        Ok(Value::Integer(42))
+        Ok(Value::from_i64(42))
     }
     fn filter(&mut self, _: &[Value], _: Option<String>, _: i32) -> Result<bool> {
         Ok(true)
