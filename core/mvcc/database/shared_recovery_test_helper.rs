@@ -5,7 +5,9 @@ pub fn recovered_checkpoint_for_test(
     options: crate::OpenOptions,
 ) -> Result<(Arc<crate::Database>, Arc<Connection>)> {
     let path = directory.join("recovered.db");
-    let timestamp = materialize_marked_fixture(&path);
+    let timestamp = materialize_marked_fixture_with_sql(&path,
+        "CREATE TABLE recovered_items(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);          INSERT INTO recovered_items VALUES(1,'original'),(9,'deleted');          DELETE FROM recovered_items WHERE id=9;          CREATE SEQUENCE recovered_sequence START WITH 41; SELECT nextval('recovered_sequence')",
+    );
     let history_limit = 64 * 1024 * 1024;
     crate::mvcc::mode_transition::prepare_test_namespace(&path, timestamp, history_limit)?;
     let path = path

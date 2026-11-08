@@ -4251,6 +4251,7 @@ mod tests {
     #[ignore = "requires native shared MVCC files"]
     fn recovered_checkpoint_uses_sqlite_dialect_and_c_connection() {
         use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
+        #[derive(Debug)]
         struct Answer;
         impl ScalarFunction for Answer {
             type Call = Self;
@@ -4288,7 +4289,7 @@ mod tests {
                 options,
             )
             .unwrap();
-            assert!(Arc::ptr_eq(database.dialect(), &dialect));
+            assert!(Arc::ptr_eq(&database.dialect(), &dialect));
             let mut answers = Vec::new();
             connection
                 .prepare("SELECT recovered_answer(), sqlite_version() FROM preserved WHERE id=1")
@@ -4301,6 +4302,31 @@ mod tests {
             assert_eq!(answers.len(), 1);
             assert_eq!(answers[0].0, 73);
             assert!(!answers[0].1.is_empty());
+            if !readonly {
+                connection
+                    .execute("INSERT INTO recovered_items(value) VALUES('after recovery')")
+                    .unwrap();
+                let mut ids = Vec::new();
+                connection
+                    .prepare("SELECT id FROM recovered_items ORDER BY id")
+                    .unwrap()
+                    .run_with_row_callback(|row| {
+                        ids.push(row.get::<i64>(0)?);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(ids, [1, 10]);
+                let mut sequence = Vec::new();
+                connection
+                    .prepare("SELECT nextval('recovered_sequence')")
+                    .unwrap()
+                    .run_with_row_callback(|row| {
+                        sequence.push(row.get::<i64>(0)?);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(sequence, [42]);
+            }
             let handle = sqlite3::new(connection, CString::new("recovered.db").unwrap()).into_raw();
             unsafe {
                 assert_eq!(

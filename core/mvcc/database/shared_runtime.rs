@@ -705,6 +705,11 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
 
 #[cfg(all(any(test, feature = "test_helper"), not(shuttle)))]
 pub(crate) fn materialize_marked_fixture(path: &Path) -> u64 {
+    materialize_marked_fixture_with_sql(path, "")
+}
+
+#[cfg(all(any(test, feature = "test_helper"), not(shuttle)))]
+pub(crate) fn materialize_marked_fixture_with_sql(path: &Path, extra_sql: &str) -> u64 {
     use crate::io::OpenFlags;
     let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
     let db = crate::Database::open_file_with_flags(
@@ -718,6 +723,9 @@ pub(crate) fn materialize_marked_fixture(path: &Path) -> u64 {
     .unwrap();
     let connection = db.connect(crate::ConnectOpts::new()).unwrap();
     connection.execute("CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO preserved VALUES(1,'durable payload')").unwrap();
+    if !extra_sql.is_empty() {
+        connection.execute(extra_sql).unwrap();
+    }
     connection
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
