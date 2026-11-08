@@ -15,14 +15,14 @@ pub(super) struct RetainedFile {
     pub(super) id: FileId,
 }
 impl RetainedFile {
-    fn open(path: PathBuf) -> Result<Self> {
+    pub(super) fn open(path: PathBuf) -> Result<Self> {
         let file = open_native(&path)?;
         let id = identity(&file)?;
         let retained = Self { path, file, id };
         retained.revalidate()?;
         Ok(retained)
     }
-    fn revalidate(&self) -> Result<()> {
+    pub(super) fn revalidate(&self) -> Result<()> {
         let metadata = std::fs::symlink_metadata(&self.path).map_err(fs_error)?;
         if !metadata.is_file()
             || identity(&self.file)? != self.id
@@ -419,7 +419,7 @@ fn invalid(message: &str) -> LimboError {
     LimboError::InvalidArgument(message.into())
 }
 
-fn validate_ordinary_log(log: &RetainedFile) -> Result<()> {
+pub(super) fn validate_ordinary_log(log: &RetainedFile) -> Result<()> {
     let length = log.file.metadata().map_err(fs_error)?.len();
     if length > LOG_HDR_SIZE as u64 {
         return Err(invalid("ordinary logical log contains frames"));

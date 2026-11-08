@@ -1036,7 +1036,12 @@ mod tests {
         let location = std::env::var("TURSO_DOWNGRADE_CRASH_LOCATION").unwrap();
         std::fs::write(
             &location,
-            format!("{}\n{}\n", fixture.path.display(), fixture.limit),
+            format!(
+                "{}\n{}\n{}\n",
+                fixture.path.display(),
+                fixture.limit,
+                fixture.namespace.display()
+            ),
         )
         .unwrap();
         let mut preparing = fixture
@@ -1055,7 +1060,7 @@ mod tests {
             .unwrap();
         panic!("requested crash phase was not reached");
     }
-    fn killed_downgrade(phase: &str) -> (tempfile::TempDir, PathBuf, u64) {
+    fn killed_downgrade(phase: &str) -> (tempfile::TempDir, PathBuf, u64, PathBuf) {
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
@@ -1107,13 +1112,14 @@ mod tests {
         let mut lines = location.lines();
         let path = PathBuf::from(lines.next().unwrap());
         let limit = lines.next().unwrap().parse().unwrap();
-        (directory, path, limit)
+        let namespace = PathBuf::from(lines.next().unwrap());
+        (directory, path, limit, namespace)
     }
     #[test]
     #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
     fn shared_downgrade_resume_native_sigkill_marker_phases_preserve_data() {
         for phase in ["intent", "commit", "checkpoint"] {
-            let (_directory, path, limit) = killed_downgrade(phase);
+            let (_directory, path, limit, _namespace) = killed_downgrade(phase);
             let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
                 &path,
                 limit,
@@ -1303,11 +1309,15 @@ mod tests {
             "cleanup-start",
             "cleanup-log",
             "cleanup-logical",
+            "cleanup-physical-wal",
+            "cleanup-physical-tshm",
             "cleanup-authority",
             "cleanup-ids-a",
+            "cleanup-ids-b",
+            "cleanup-ids-selector",
             "cleanup-manifest",
         ] {
-            let (_directory, path, _limit) = killed_downgrade(phase);
+            let (_directory, path, _limit, namespace) = killed_downgrade(phase);
             let main = std::fs::read(&path).unwrap();
             assert_eq!(&main[18..20], &[2, 2]);
             crate::mvcc::mode_transition::downgrade_cleanup::resume_cleanup(
@@ -1318,6 +1328,7 @@ mod tests {
                 "marker2 partial cleanup must resume without recreating missing namespace files",
             );
             assert_eq!(std::fs::read(&path).unwrap(), main);
+            assert!(!namespace.exists());
             assert!(!path.with_extension("db-log").exists());
             let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
             let db = Database::open(
@@ -1358,5 +1369,36 @@ mod tests {
             rejected.is_err(),
             "supervisor accepted deliberately failing child"
         );
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
+    fn shared_downgrade_partial_native_view_is_immutable_and_unknown_files_preserved() {
+        let (_directory, path, _limit, namespace) = killed_downgrade("cleanup-start");
+        let before = std::fs::read(&path).unwrap();
+        let proof = crate::mvcc::mode_transition::downgrade_cleanup::PreparedDowngradeCleanup::open_for_test(&path).unwrap();
+        let db = Database::open_offline_downgrade_cleanup(proof.clone()).unwrap();
+        let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        connection.execute("PRAGMA query_only=OFF").unwrap();
+        assert!(matches!(
+            connection.execute("UPDATE preserved SET value='forbidden' WHERE id=1"),
+            Err(LimboError::ReadOnly)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(connection);
+        drop(db);
+        drop(proof);
+        let unknown = namespace.join("unrelated");
+        std::fs::write(&unknown, b"must remain").unwrap();
+        let entries = std::fs::read_dir(&namespace).unwrap().count();
+        assert!(
+            crate::mvcc::mode_transition::downgrade_cleanup::resume_cleanup(
+                &path,
+                OfflinePrerequisite::AllOlderWorkersStopped
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&namespace).unwrap().count(), entries);
+        assert_eq!(std::fs::read(unknown).unwrap(), b"must remain");
     }
 }
