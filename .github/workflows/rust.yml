@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 19f37d76240f4db344faae1d47a7776303339728
+          ref: 3a21e099189c4a79b538a95947165e465d07e3ec
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,27 +28,22 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 19f37d76240f4db344faae1d47a7776303339728
+          test "$(git rev-parse HEAD)" = 3a21e099189c4a79b538a95947165e465d07e3ec
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Fresh terminal matching-bytes durability expected RED
+      - name: Fresh terminal controls including actual process death
+        run: |
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
+          grep -q '^test result: ok. 4 passed; 0 failed;' resume.log
+      - name: Genuine installed extent expected RED
         run: |
           set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_terminal_reopens_without_live_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee mirror-red.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_extent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent-red.log
           code=${PIPESTATUS[0]}
           set -e
           test "$code" = 101
-          grep -q '^test result: FAILED. 0 passed; 1 failed;' mirror-red.log
-          grep -q 'fresh recovery must establish both terminal durability barriers' mirror-red.log
-      - name: Completed cleanup expected RED
-        run: |
-          set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee cleanup-red.log
-          code=${PIPESTATUS[0]}
-          set -e
-          test "$code" = 101
-          grep -q '^test result: FAILED. 0 passed; 1 failed;' cleanup-red.log
-          grep -q 'durable marker must clean namespace and retained header-only ordinary log' cleanup-red.log
+          grep -q '^test result: FAILED. 0 passed; 1 failed;' extent-red.log
+          grep -q 'fresh downgrade must accept the unchanged genuine installed physical extent' extent-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
