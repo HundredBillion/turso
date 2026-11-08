@@ -429,6 +429,9 @@ fn update_pragma(
             program.add_pragma_result_column("journal_mode".into());
             Ok(TransactionMode::None)
         }
+        PragmaName::TursoMvccMode => Err(LimboError::InvalidArgument(
+            "turso_mvcc_mode is read-only; use an explicit offline operation to change mode".into(),
+        )),
         PragmaName::LockingMode => {
             let mode = match &value {
                 Expr::Name(name) => name.as_str().to_string(),
@@ -964,6 +967,18 @@ fn query_pragma(
                 dest: register,
                 new_mode: None,
             });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::TursoMvccMode => {
+            let store = connection.mv_store_for_db(database_id);
+            let mode = match store.as_ref() {
+                Some(store) if store.is_shared() => "shared",
+                Some(_) => "private",
+                None => "off",
+            };
+            program.emit_string8(mode.to_owned(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

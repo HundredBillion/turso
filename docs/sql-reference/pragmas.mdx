@@ -644,6 +644,19 @@ The setting applies only to the connection that sets it. Closing the last connec
 
 ## MVCC Tuning
 
+### turso_mvcc_mode
+
+Reports the database's actual MVCC mode:
+
+```sql
+PRAGMA turso_mvcc_mode;
+```
+
+The result is `shared` for explicitly initialized shared MVCC, `private` for
+ordinary MVCC, or `off` when MVCC is disabled. This informational pragma is
+read-only. Changing an existing database into shared mode requires the explicit
+offline upgrade with all older workers stopped.
+
 <Info>
 **Turso Extension**: these pragmas apply only when MVCC mode is enabled (`PRAGMA journal_mode = mvcc`).
 </Info>

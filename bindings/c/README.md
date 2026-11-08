@@ -34,17 +34,33 @@ succeeds.
 
 ## Shared MVCC URI options
 
-The binding reserves `turso_mvcc=shared` and
-`turso_mvcc_history_limit=<positive decimal bytes>` for the planned PHP PDO mode.
-The default history limit is 64 MiB. The limit requires the explicit opt-in;
-duplicate settings, unknown shared-mode options, memory databases and VFS
-overrides are rejected. `mode=ro` is valid configuration, with coordination
-metadata governed separately from read-only database contents.
+PHP PDO can explicitly request shared MVCC with
+`file:/absolute/app.db?turso_mvcc=shared&turso_mvcc_history_limit=67108864`.
+The default retained-history limit is 64 MiB. The limit requires the explicit
+opt-in; duplicate settings, unknown shared-mode options, memory databases and
+VFS overrides are rejected.
 
-Shared MVCC activation is not available in this build. An opted-in URI returns
-an error before opening or creating database files; it must never silently open
-an ordinary database. Existing URI options retain their ordinary behavior.
-This parsing support does not establish cross-process transaction support.
+The database must already be initialized for shared MVCC. Stop all older
+workers before upgrading an existing database:
+
+```sh
+tursodb /absolute/app.db --shared-mvcc-offline upgrade-existing --all-older-workers-stopped
+```
+
+The acknowledgement is an operator prerequisite; the engine also checks native
+participant exclusion. A URI open never upgrades an ordinary database, even
+with CREATE permission. Missing or uninitialized databases fail without creating
+a shared namespace. Ordinary URI behavior remains unchanged.
+
+Initial PHP support uses PDO on native Linux 64-bit ext-family filesystems.
+PHP's SQLite3 class rewrites database URIs and does not provide this opt-in.
+`mode=ro` restricts database contents; shared coordination metadata still needs
+write access. Unsupported backends fail explicitly.
+
+`PRAGMA turso_mvcc_mode` reports `shared` only for an actual shared store,
+`private` for ordinary MVCC, and `off` otherwise. It cannot change database mode.
+Explicit checkpoints use the globally quiescent shared protocol and return BUSY
+while participants retain transactions, preserving existing readers.
 
 ## Application functions
 

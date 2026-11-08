@@ -640,7 +640,8 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             shared_mvcc: None,
         }
     };
-    if let Some(options) = parsed.shared_mvcc {
+    let shared_mvcc = parsed.shared_mvcc;
+    if let Some(options) = &shared_mvcc {
         if !z_vfs.is_null() && !CStr::from_ptr(z_vfs).to_bytes().is_empty() {
             return failed_open(
                 db_out,
@@ -651,11 +652,6 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         trace!(
             history_limit = options.history_limit.get(),
             "shared MVCC requested"
-        );
-        return failed_open(
-            db_out,
-            SQLITE_ERROR,
-            "shared MVCC is not available in this build",
         );
     }
     let use_memory = parsed.memory;
@@ -733,14 +729,13 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             }
         };
         let open = |flags| {
-            turso_core::Database::open_file_with_flags(
-                io.clone(),
-                &effective_filename,
-                flags,
-                default_db_opts(),
-                None,
-                Arc::new(SqliteDialect),
-            )
+            let mut options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(flags)
+                .db_opts(default_db_opts());
+            if let Some(shared) = &shared_mvcc {
+                options = options.with_shared_mvcc(shared.history_limit.get());
+            }
+            turso_core::Database::open(io.clone(), &effective_filename, options)
         };
         let opened = match open(file_open_flags) {
             Err(LimboError::CompletionError(turso_core::CompletionError::IOError(
@@ -4193,7 +4188,7 @@ mod tests {
             if !db.is_null() {
                 assert_eq!(sqlite3_close(db), SQLITE_OK);
             }
-            assert_eq!(result, SQLITE_ERROR);
+            assert_eq!(result, SQLITE_CANTOPEN);
         }
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }

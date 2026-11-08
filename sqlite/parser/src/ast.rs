@@ -2125,6 +2125,7 @@ pub enum PragmaName {
     WalAutocheckpoint,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    TursoMvccMode,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
     /// Sets or queries the threshold (in newly inserted row versions since the
