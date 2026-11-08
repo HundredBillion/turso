@@ -683,7 +683,12 @@ mod tests {
             .args([
                 "--ignored",
                 "--exact",
-                &format!("{}::shared_downgrade_lock_child", module_path!()),
+                &format!(
+                    "{}::shared_downgrade_lock_child",
+                    module_path!()
+                        .strip_prefix("turso_core::")
+                        .unwrap_or(module_path!())
+                ),
                 "--nocapture",
             ])
             .env("TURSO_DOWNGRADE_LOCK_PATH", path)
@@ -704,6 +709,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let output = child.wait_with_output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed;"),
+            "lock child must execute exactly one test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         assert!(
             output.status.success(),
             "child lock probe failed: {} {}",
@@ -972,10 +983,39 @@ mod tests {
         assert_eq!(&std::fs::read(&fixture.path).unwrap()[18..20], &[2, 2]);
         drop(completed);
     }
+    fn write_header_only_log(fixture: &Fixture) {
+        let source_path = fixture._directory.path().join("header-source.db");
+        let source = Database::open(
+            fixture.io.clone(),
+            source_path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let source_connection = source.connect(crate::ConnectOpts::new()).unwrap();
+        source_connection
+            .execute("PRAGMA journal_mode=mvcc")
+            .unwrap();
+        source_connection
+            .execute("CREATE TABLE header_source(v)")
+            .unwrap();
+        let log = std::fs::read(source_path.with_extension("db-log")).unwrap();
+        let header = &log[..crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE];
+        crate::mvcc::persistent_storage::logical_log::LogHeader::validate_header_only_file(header)
+            .unwrap();
+        std::fs::write(fixture.path.with_extension("db-log"), header).unwrap();
+        drop(source_connection);
+        drop(source);
+    }
     #[test]
     #[ignore = "native downgrade process-death helper"]
     fn shared_downgrade_crash_child() {
         let mut fixture = installed_fixture();
+        if std::env::var("TURSO_DOWNGRADE_CRASH_PHASE")
+            .unwrap()
+            .starts_with("cleanup-")
+        {
+            write_header_only_log(&fixture);
+        }
         let location = std::env::var("TURSO_DOWNGRADE_CRASH_LOCATION").unwrap();
         std::fs::write(
             &location,
@@ -992,12 +1032,13 @@ mod tests {
             )
             .unwrap();
         let intent = fixture.io.block(|| preparing.poll()).unwrap();
-        crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent).unwrap();
+        crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent)
+            .unwrap()
+            .cleanup()
+            .unwrap();
         panic!("requested crash phase was not reached");
     }
-    #[test]
-    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
-    fn shared_downgrade_resume_native_sigkill_marker_phases_preserve_data() {
+    fn killed_downgrade(phase: &str) -> (tempfile::TempDir, PathBuf, u64) {
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
@@ -1008,43 +1049,54 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        for phase in ["intent", "commit", "checkpoint"] {
-            let directory = tempfile::tempdir().unwrap();
-            let ready = directory.path().join("ready");
-            let location = directory.path().join("location");
-            let mut child = KillChild(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--ignored",
-                        "--exact",
-                        &format!("{}::shared_downgrade_crash_child", module_path!()),
-                        "--nocapture",
-                    ])
-                    .env("TMPDIR", directory.path())
-                    .env("TURSO_DOWNGRADE_CRASH_PHASE", phase)
-                    .env("TURSO_DOWNGRADE_CRASH_READY", &ready)
-                    .env("TURSO_DOWNGRADE_CRASH_LOCATION", &location)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .unwrap(),
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let location = directory.path().join("location");
+        let mut child = KillChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    &format!(
+                        "{}::shared_downgrade_crash_child",
+                        module_path!()
+                            .strip_prefix("turso_core::")
+                            .unwrap_or(module_path!())
+                    ),
+                    "--nocapture",
+                ])
+                .env("TMPDIR", directory.path())
+                .env("TURSO_DOWNGRADE_CRASH_PHASE", phase)
+                .env("TURSO_DOWNGRADE_CRASH_READY", &ready)
+                .env("TURSO_DOWNGRADE_CRASH_LOCATION", &location)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ready.exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before {phase}"
             );
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !ready.exists() {
-                assert!(
-                    child.0.try_wait().unwrap().is_none(),
-                    "child exited before {phase}"
-                );
-                assert!(Instant::now() < deadline, "child did not reach {phase}");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert_eq!(std::fs::read_to_string(&ready).unwrap(), phase);
-            child.0.kill().unwrap();
-            assert_eq!(child.0.wait().unwrap().signal(), Some(9));
-            let location = std::fs::read_to_string(location).unwrap();
-            let mut lines = location.lines();
-            let path = PathBuf::from(lines.next().unwrap());
-            let limit = lines.next().unwrap().parse().unwrap();
+            assert!(Instant::now() < deadline, "child did not reach {phase}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&ready).unwrap(), phase);
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+        let location = std::fs::read_to_string(location).unwrap();
+        let mut lines = location.lines();
+        let path = PathBuf::from(lines.next().unwrap());
+        let limit = lines.next().unwrap().parse().unwrap();
+        (directory, path, limit)
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
+    fn shared_downgrade_resume_native_sigkill_marker_phases_preserve_data() {
+        for phase in ["intent", "commit", "checkpoint"] {
+            let (_directory, path, limit) = killed_downgrade(phase);
             let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
                 &path,
                 limit,
@@ -1087,27 +1139,7 @@ mod tests {
     #[ignore = "requires native Linux ext-family filesystem"]
     fn shared_downgrade_cleanup_native_removes_namespace_and_header_only_log() {
         let mut fixture = installed_fixture();
-        let source_path = fixture._directory.path().join("header-source.db");
-        let source = Database::open(
-            fixture.io.clone(),
-            source_path.to_str().unwrap(),
-            OpenOptions::new(Arc::new(EngineDialect)),
-        )
-        .unwrap();
-        let source_connection = source.connect(crate::ConnectOpts::new()).unwrap();
-        source_connection
-            .execute("PRAGMA journal_mode=mvcc")
-            .unwrap();
-        source_connection
-            .execute("CREATE TABLE header_source(v)")
-            .unwrap();
-        let log = std::fs::read(source_path.with_extension("db-log")).unwrap();
-        let header = &log[..crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE];
-        crate::mvcc::persistent_storage::logical_log::LogHeader::validate_header_only_file(header)
-            .unwrap();
-        std::fs::write(fixture.path.with_extension("db-log"), header).unwrap();
-        drop(source_connection);
-        drop(source);
+        write_header_only_log(&fixture);
         let mut preparing = fixture
             .installed
             .take()
@@ -1245,6 +1277,49 @@ mod tests {
                 std::fs::read_dir(&fixture.namespace).unwrap().count(),
                 if replacement { 8 } else { 9 }
             );
+        }
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
+    fn shared_downgrade_partial_native_sigkill_cleanup_resumes_without_recreating_files() {
+        for phase in [
+            "cleanup-start",
+            "cleanup-log",
+            "cleanup-logical",
+            "cleanup-authority",
+            "cleanup-ids-a",
+            "cleanup-manifest",
+        ] {
+            let (_directory, path, _limit) = killed_downgrade(phase);
+            let main = std::fs::read(&path).unwrap();
+            assert_eq!(&main[18..20], &[2, 2]);
+            crate::mvcc::mode_transition::downgrade_cleanup::resume_cleanup(
+                &path,
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .expect(
+                "marker2 partial cleanup must resume without recreating missing namespace files",
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), main);
+            assert!(!path.with_extension("db-log").exists());
+            let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+            let db = Database::open(
+                io,
+                path.to_str().unwrap(),
+                OpenOptions::new(Arc::new(EngineDialect)),
+            )
+            .unwrap();
+            let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+            let mut rows = Vec::new();
+            connection
+                .prepare("SELECT value FROM preserved WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    rows.push(row.get::<String>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, ["materialized shared row"]);
         }
     }
 }

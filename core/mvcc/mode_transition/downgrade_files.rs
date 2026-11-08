@@ -373,6 +373,8 @@ impl DowngradeFiles {
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(parent)
             .map_err(fs_error)?;
+        #[cfg(test)]
+        super::downgrade_marker::crash_barrier("cleanup-start");
         if let Some(log) = &self.log {
             log.revalidate()?;
             std::fs::remove_file(&log.path).map_err(fs_error)?;

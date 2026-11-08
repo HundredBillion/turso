@@ -219,8 +219,10 @@ pub(super) fn crash_barrier(phase: &str) {
         return;
     }
     let ready = std::env::var("TURSO_DOWNGRADE_CRASH_READY").unwrap();
-    std::fs::write(&ready, phase).unwrap();
-    std::fs::File::open(&ready).unwrap().sync_all().unwrap();
+    let pending = std::path::Path::new(&ready).with_extension("pending");
+    std::fs::write(&pending, phase).unwrap();
+    std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+    std::fs::rename(&pending, &ready).unwrap();
     loop {
         std::thread::park();
     }
