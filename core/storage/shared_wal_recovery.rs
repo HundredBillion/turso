@@ -9,7 +9,9 @@ pub(crate) struct SharedWalRecoveryLocks {
 
 impl SharedWalRecoveryLocks {
     pub(crate) fn acquire(mapping: Arc<MappedSharedWalCoordination>) -> Result<Arc<Self>> {
-        if !mapping.uses_linux_ofd_locking() {
+        if !cfg!(all(target_os = "linux", target_pointer_width = "64"))
+            || !mapping.uses_linux_ofd_locking()
+        {
             return Err(LimboError::InvalidArgument(
                 "physical WAL recovery requires native Linux OFD locks".into(),
             ));
