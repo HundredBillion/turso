@@ -1,4 +1,4 @@
-name: Recovery Store continuation native integration
+name: Source IDs genuine missing-behavior reproduction
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 198914e3ef213ea03805dca8d6e82550ef705732
+          ref: e46e031d5e1020a60a3a00a14baf7612a54cefc7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,22 +27,17 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 198914e3ef213ea03805dca8d6e82550ef705732
+          test "$(git rev-parse HEAD)" = e46e031d5e1020a60a3a00a14baf7612a54cefc7
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owned-carrier-green.log
-          grep -q '8 passed; 0 failed' owned-carrier-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --skip physical_wal_peer_child --list 2>&1 | tee recovery-test-list.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --skip physical_wal_peer_child --test-threads=1 --nocapture 2>&1 | tee recovery-continuation-green.log
-          python3 - <<'CHECK'
-          import re
-          names=[x for x in open('recovery-test-list.log') if x.rstrip().endswith(': test')]
-          assert len(names)>50,len(names)
-          rows=re.findall(r'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored',open('recovery-continuation-green.log').read())
-          assert rows and rows[-1]==(str(len(names)),'0','0'),(len(names),rows[-3:])
-          print('FINAL_RECOVERY_PARENT',rows[-1])
-          CHECK
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_ids_native_genuine_source_seeds_actual_floor_without_publication -- --ignored --test-threads=1 --nocapture 2>&1 | tee source-ids-missing.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -ne 0
+          grep -q 'test result: FAILED. 0 passed; 1 failed' source-ids-missing.log
+          grep -q 'source ID inspection is not implemented' source-ids-missing.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
