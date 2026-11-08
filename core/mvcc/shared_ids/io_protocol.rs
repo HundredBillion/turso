@@ -1,3 +1,7 @@
+#[cfg(all(host_shared_wal, unix))]
+#[path = "intent_source.rs"]
+pub(in crate::mvcc) mod intent_source;
+
 #[path = "current_generation.rs"]
 pub(in crate::mvcc) mod current_generation;
 

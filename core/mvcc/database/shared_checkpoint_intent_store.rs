@@ -40,6 +40,33 @@ pub(in crate::mvcc) struct SourceIntentStore {
     physical: RecoveredIntentPhysicalBase,
 }
 
+pub(in crate::mvcc) struct SourceIdInspection {
+    source: Option<SourceIntentStore>,
+}
+
+pub(in crate::mvcc) struct InspectedIntentSource {
+    owner: IntentRecoveryStore,
+    parts: PhysicalBaseParts,
+    config: Arc<RecoveryOpenConfig>,
+    runtime: Arc<SharedMvccRuntime>,
+    pause: crate::mvcc::checkpoint_gate::CheckpointPause,
+    ids: crate::mvcc::shared_ids::io_protocol::intent_source::LoadedSourceIds,
+}
+
+impl SourceIntentStore {
+    pub(in crate::mvcc) fn begin_source_id_inspection(self) -> Result<SourceIdInspection> {
+        self.owner.validate_source(&self.physical)?;
+        Ok(SourceIdInspection { source: Some(self) })
+    }
+}
+
+impl SourceIdInspection {
+    pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<InspectedIntentSource> {
+        self.source = None;
+        Err(LimboError::InvalidArgument("source ID inspection is not implemented".into()).into())
+    }
+}
+
 impl RecoveredIntentPhysicalBase {
     pub(in crate::mvcc) fn begin_source_store(self) -> Result<SourceIntentStore> {
         validate_source_base(&self)?;
@@ -300,6 +327,69 @@ mod tests {
         CrashPoint, IntentCrashFixture,
     };
     use std::ptr::NonNull;
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn intent_source_ids_native_genuine_source_seeds_actual_floor_without_publication() {
+        let (fixture, physical) = physical_case(
+            CrashPoint::BeforeWalCommit,
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+        );
+        let before = durable(&fixture);
+        let record = physical.record();
+        let source = physical.begin_source_store().unwrap();
+        let store = Arc::downgrade(&source.owner.store);
+        let mut inspection = source.begin_source_id_inspection().unwrap();
+        let inspected = fixture.io.block(|| inspection.poll()).unwrap();
+        assert!(Arc::ptr_eq(
+            &store.upgrade().unwrap(),
+            &inspected.owner.store
+        ));
+        inspected.owner.require_inspected_source().unwrap();
+        let identity = inspected.ids.identity();
+        assert_eq!(identity.database.generation, record.log_generation());
+        assert_eq!(
+            identity.database.checkpoint_timestamp,
+            record
+                .checkpoint_intent()
+                .unwrap()
+                .source_checkpoint_timestamp
+        );
+        assert_eq!(identity.prefix, record.prefix());
+        let floor = inspected.ids.logical_floor();
+        assert!(floor < -1);
+        assert_eq!(
+            inspected.owner.store.next_table_id.load(Ordering::Acquire),
+            floor - 1
+        );
+        assert!(inspected.owner.store.rows.is_empty());
+        assert!(inspected.owner.store.txs.is_empty());
+        assert_eq!(
+            inspected
+                .owner
+                .store
+                .last_committed_tx_ts
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            inspected
+                .owner
+                .store
+                .durable_txid_max
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(inspected.ids.guard().requires_recovery());
+        assert!(inspected.ids.guard().published().is_err());
+        assert!(inspected.ids.guard().io_retired());
+        assert!(fixture.runtime.replay.lock().is_none());
+        assert!(matches!(
+            fixture.runtime.begin_open(),
+            Err(LimboError::Busy)
+        ));
+        assert_durable(&before);
+    }
 
     #[test]
     #[ignore = "requires native Linux ext-family filesystem"]
