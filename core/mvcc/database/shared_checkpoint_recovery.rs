@@ -136,7 +136,7 @@ mod tests {
         )
         .unwrap();
         let connection = database.connect(crate::ConnectOpts::new()).unwrap();
-        let store = database.get_mv_store().as_ref().unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
         let runtime = store.shared_runtime.get().unwrap();
         connection
             .execute("BEGIN; SELECT value FROM preserved")
@@ -169,5 +169,61 @@ mod tests {
             std::fs::read(runtime.files.namespace.join("manifest")).unwrap(),
             before
         );
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn checkpoint_recovery_entry_native_invalid_manifest_releases_ownership_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let database = crate::Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap();
+        let manifest_path = runtime.files.namespace.join("manifest");
+        let original = std::fs::read(&manifest_path).unwrap();
+        let mut selection = runtime.begin_checkpoint_recovery().unwrap();
+        let selected = io.block(|| selection.poll()).unwrap();
+        let downgrade = selected
+            .manifest
+            .record()
+            .begin_downgrade(runtime.files.physical_wal.file_id().unwrap().unwrap())
+            .unwrap()
+            .encode();
+        drop(selected);
+        for (bytes, downgrade) in [(b"bad".as_slice(), false), (downgrade.as_slice(), true)] {
+            let guard = runtime.files.authority.try_acquire().unwrap();
+            std::fs::write(&manifest_path, bytes).unwrap();
+            drop(guard);
+            let mut recovery = runtime.begin_checkpoint_recovery().unwrap();
+            let error = match io.block(|| recovery.poll()) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid recovery manifest was accepted"),
+            };
+            if downgrade {
+                assert!(
+                    matches!(error, LimboError::InvalidArgument(message) if message.contains("cannot resume a downgrade"))
+                );
+            } else {
+                assert!(matches!(error, LimboError::Corrupt(_)));
+            }
+            assert!(recovery.poll().is_err());
+            assert!(runtime.gate.try_enter_admission().is_ok());
+            let guard = runtime.files.authority.try_acquire().unwrap();
+            assert!(guard.requires_recovery());
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), bytes);
+            std::fs::write(&manifest_path, &original).unwrap();
+            drop(guard);
+            let mut retry = runtime.begin_checkpoint_recovery().unwrap();
+            let selected = io.block(|| retry.poll()).unwrap();
+            assert!(!selected.manifest.record().requires_recovery());
+            assert!(selected.manifest.guard().unwrap().requires_recovery());
+        }
     }
 }
