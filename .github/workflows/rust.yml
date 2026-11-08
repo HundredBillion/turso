@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
+          ref: 4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -33,7 +33,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
+          test "$(git rev-parse HEAD)" = "4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -169,7 +169,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
+          ref: 4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -196,7 +196,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
+          ref: 4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -210,7 +210,7 @@ jobs:
           php -l bindings/c/tests/php_workers/worker.php
       - name: Exact source and supervisor controls
         run: |
-          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
+          test "$(git rev-parse HEAD)" = "4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c"
           python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py' 2>&1 | tee supervisor.log
           python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output pdo-results/sqlite-control 2>&1 | tee sqlite-pdo.log
       - name: Build and attest actual Turso PDO library
@@ -261,7 +261,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
+          ref: 4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -269,7 +269,7 @@ jobs:
           cache-on-failure: true
       - name: Exact source and production lint
         run: |
-          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
+          test "$(git rev-parse HEAD)" = "4a7fa7f7de69c6d33473a25ef1dca16de8b5cf9c"
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee production-lint.log
       - name: Strict core C SDK targets
         run: |
