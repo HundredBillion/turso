@@ -524,7 +524,7 @@ fn fs_error(error: std::io::Error) -> LimboError {
     crate::error::io_error(error, "MVCC offline mode transition")
 }
 
-#[cfg(all(test, target_os = "linux", not(shuttle)))]
+#[cfg(all(any(test, feature = "test_helper"), target_os = "linux", not(shuttle)))]
 pub(crate) fn prepare_test_namespace(
     path: &Path,
     timestamp: u64,

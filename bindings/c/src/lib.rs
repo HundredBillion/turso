@@ -4246,6 +4246,90 @@ mod tests {
     use super::*;
     use std::ptr;
 
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native shared MVCC files"]
+    fn recovered_checkpoint_uses_sqlite_dialect_and_c_connection() {
+        use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
+        struct Answer;
+        impl ScalarFunction for Answer {
+            type Call = Self;
+            fn create_call(&self) -> turso_core::Result<Self> {
+                Ok(Self)
+            }
+        }
+        impl ScalarCall for Answer {
+            type Output = i64;
+            fn step(
+                &mut self,
+                _: &Arc<turso_core::Connection>,
+                _: &[turso_core::Register],
+            ) -> turso_core::IOResultOr<i64> {
+                Ok(turso_core::IOResult::Done(73))
+            }
+        }
+        for readonly in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let dialect: Arc<dyn turso_core::Dialect> = Arc::new(SqliteDialect);
+            let mut options = turso_core::OpenOptions::new(dialect.clone()).extension_function(
+                turso_core::ExternalFunc::new_native_scalar(
+                    "recovered_answer".into(),
+                    FunctionArity::Exact(0),
+                    true,
+                    Answer,
+                )
+                .unwrap(),
+            );
+            if readonly {
+                options = options.flags(turso_core::OpenFlags::ReadOnly);
+            }
+            let (database, connection) = turso_core::mvcc::database::recovered_checkpoint_for_test(
+                directory.path(),
+                options,
+            )
+            .unwrap();
+            assert!(Arc::ptr_eq(database.dialect(), &dialect));
+            let mut answers = Vec::new();
+            connection
+                .prepare("SELECT recovered_answer(), sqlite_version() FROM preserved WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    answers.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_owned()));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(answers.len(), 1);
+            assert_eq!(answers[0].0, 73);
+            assert!(!answers[0].1.is_empty());
+            let handle = sqlite3::new(connection, CString::new("recovered.db").unwrap()).into_raw();
+            unsafe {
+                assert_eq!(
+                    sqlite3_db_readonly(handle, c"main".as_ptr()),
+                    i32::from(readonly)
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        handle,
+                        c"SELECT recovered_answer(), value FROM preserved".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                let changed = sqlite3_exec(
+                    handle,
+                    c"UPDATE preserved SET value='from recovered C connection' WHERE id=1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                assert_eq!(changed, if readonly { SQLITE_READONLY } else { SQLITE_OK });
+                assert_eq!(sqlite3_close(handle), SQLITE_OK);
+            }
+        }
+    }
+
     #[test]
     fn deferred_close_keeps_handle_alive_during_aggregate_cleanup() {
         struct Cleanup {

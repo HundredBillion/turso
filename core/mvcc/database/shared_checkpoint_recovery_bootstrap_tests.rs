@@ -576,3 +576,61 @@ fn checkpoint_recovery_bootstrap_native_late_failures_leave_no_ready_replay() {
         assert!(runtime.reserve_store().is_err());
     }
 }
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_factory_rejects_other_source_with_same_config() {
+    let (_first_directory, _first_io, first_runtime, first) = bootstrap_fixture();
+    let (_second_directory, _second_io, second_runtime, second) = bootstrap_fixture();
+    let mut first = first.begin_bootstrap().unwrap();
+    let mut second = second.begin_bootstrap().unwrap();
+    first.prepare_store().unwrap();
+    second.prepare_store().unwrap();
+    let source = first.evidence.as_ref().unwrap();
+    let mut factory =
+        crate::database::shared_recovered::RecoveredDatabaseFactory::new(source).unwrap();
+    let other = second.evidence.as_mut().unwrap();
+    other.config = source.config.clone();
+    let error = match factory.poll(other) {
+        Ok(_) => panic!("factory accepted another genuine owner with matching configuration"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("another owner or lease"),
+        "{error}"
+    );
+    assert!(first_runtime.replay.lock().is_none());
+    assert!(second_runtime.replay.lock().is_none());
+    drop(factory);
+    drop(first);
+    drop(second);
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_construction_permit_expires_after_finish() {
+    let (_directory, io, runtime, reclaimed) = bootstrap_fixture();
+    let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+    bootstrap.prepare_store().unwrap();
+    let evidence = bootstrap.evidence.as_mut().unwrap();
+    let mut factory =
+        crate::database::shared_recovered::RecoveredDatabaseFactory::new(evidence).unwrap();
+    io.block(|| factory.poll(evidence)).unwrap();
+    let (connection, _) = factory.test_connections().unwrap();
+    let permit = evidence.make_permit(&connection.db).unwrap();
+    permit.validate_database(&connection.db).unwrap();
+    let (ids, _proof) = evidence.finalized.take().unwrap().into_parts();
+    ids.into_guard().finish().unwrap();
+    assert!(matches!(
+        permit.validate_database(&connection.db),
+        Err(LimboError::Busy)
+    ));
+    assert!(runtime.replay.lock().is_none());
+    assert!(matches!(
+        runtime.gate.try_enter_admission(),
+        Err(LimboError::Busy)
+    ));
+    drop(connection);
+    drop(factory);
+    drop(bootstrap);
+}
