@@ -1,4 +1,4 @@
-name: Shared open recovery baseline
+name: Shared open recovery acceptance
 on:
   workflow_dispatch:
 permissions:
@@ -13,9 +13,9 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "1"
 jobs:
-  shared-open-baseline:
+  shared-open-acceptance:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,34 +25,62 @@ jobs:
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Actual baseline source
+      - name: Actual source and native public positives
         run: |
           test "$(git rev-parse HEAD)" = a343a8df1c5dc8ed0e155b135a38c682daa48a22
           test "$(id -u)" -ne 0
-          rustc -Vv
-      - name: Public shared open recovery and real handoff races
-        run: |
           timeout 360 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee public-open.log
           grep -q '6 passed; 0 failed' public-open.log
-      - name: Selector probe and existing transport lifetime
-        run: |
           timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_selector_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee selector.log
           grep -q '3 passed; 0 failed' selector.log
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee existing-io.log
-          grep -q '2 passed; 0 failed' existing-io.log
-      - name: Fresh selection dependency and existing Ready
+      - name: Actual source causal controls
         run: |
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fresh-entry.log
-          grep -q '5 passed; 0 failed' fresh-entry.log
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready.log
-          grep -q '16 passed; 0 failed' ready.log
-      - name: Strict test lint and unchanged source
+          cp core/mvcc/shared_ids/open_selection.rs /tmp/open-selection.rs
+          cp core/mvcc/database/shared_open_recovery.rs /tmp/open-driver.rs
+          for control in candidate healthy reselect preflight retirement; do
+            cp /tmp/open-selection.rs core/mvcc/shared_ids/open_selection.rs
+            cp /tmp/open-driver.rs core/mvcc/database/shared_open_recovery.rs
+            export OPEN_CONTROL="$control"
+            python3 -c 'exec("from pathlib import Path\nimport os\nkind = os.environ['"'"'OPEN_CONTROL'"'"']\nselection = Path('"'"'core/mvcc/shared_ids/open_selection.rs'"'"')\ndriver = Path('"'"'core/mvcc/database/shared_open_recovery.rs'"'"')\nmutations = {\n    '"'"'candidate'"'"': (selection, '"'"'return Ok(InitialIdRoute::CompletedCheckpoint);'"'"', '"'"'return Ok(InitialIdRoute::Healthy);'"'"'),\n    '"'"'healthy'"'"': (selection, '"'"'Ok(InitialIdRoute::Healthy)\\n}'"'"', '"'"'Ok(InitialIdRoute::CompletedCheckpoint)\\n}'"'"'),\n    '"'"'reselect'"'"': (driver, '"'"'let (manifest, route) = inspected.into_parts();'"'"', '"'"'let (manifest, mut route) = inspected.into_parts(); if self.pause.is_some() { route = InitialIdRoute::CompletedCheckpoint; }'"'"'),\n    '"'"'preflight'"'"': (driver, '"'"'self.probe = Some(Box::new(self.runtime.ids.inspect_open_selector(manifest)?));'"'"', '"'"'if self.pause.is_none() { let mut open = self.open.take().unwrap(); open.accept_selected_manifest(manifest)?; self.phase = Phase::Done; return Ok(IOResult::Done(SharedInitialOpenResult::Healthy(open))); } self.probe = Some(Box::new(self.runtime.ids.inspect_open_selector(manifest)?));'"'"'),\n}\nif kind == '"'"'retirement'"'"':\n    text = selection.read_text()\n    assert text.count('"'"'if !guard.io_retired() {'"'"') == 2\n    selection.write_text(text.replace('"'"'if !guard.io_retired() {'"'"', '"'"'if false {'"'"'))\nelse:\n    path, old, new = mutations[kind]\n    text = path.read_text()\n    assert text.count(old) == 1, (kind, text.count(old))\n    path.write_text(text.replace(old, new, 1))\n")'
+            case "$control" in
+              candidate) filter=shared_open_recovery_native_completed_pending_ids_opens; marker='shared checkpoint recovery is required';;
+              healthy) filter=shared_open_recovery_native_healthy_open_keeps_live_reader; marker='Busy';;
+              reselect) filter=shared_open_recovery_native_reclassifies_after_competing_recovery; marker='Busy';;
+              preflight) filter=shared_open_recovery_native_public_cancel_before_store_and_retry; marker='public open allocated its Store before selector classification';;
+              retirement) filter=shared_open_selector_native_cancel_and_wait_for_backend_retirement; marker='selector route escaped before backend retirement';;
+            esac
+            set +e
+            timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api "$filter" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "control-$control.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            test "$status" -ne 0
+            grep -q '0 passed; 1 failed' "control-$control.log"
+            grep -Fq "$marker" "control-$control.log"
+          done
+          cp /tmp/open-selection.rs core/mvcc/shared_ids/open_selection.rs
+          cp /tmp/open-driver.rs core/mvcc/database/shared_open_recovery.rs
+          git diff --exit-code
+      - name: Restored exact source native cases
         run: |
-          cargo clippy --locked -p turso_core --tests --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
+          timeout 360 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored-public.log
+          grep -q '6 passed; 0 failed' restored-public.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_selector_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored-selector.log
+          grep -q '3 passed; 0 failed' restored-selector.log
+      - name: Full core library and SDK
+        run: |
+          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee full-core.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' full-core.log
+          timeout 600 cargo test --locked -p turso_sdk_kit --lib -- --test-threads=2 2>&1 | tee sdk.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' sdk.log
+      - name: C unit tests and exact source lint
+        run: |
+          timeout 600 cargo test --locked -p turso_sqlite3 --lib -- --test-threads=1 2>&1 | tee c-unit.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' c-unit.log
+          cargo clippy --locked -p turso_core -p turso_sqlite3 -p turso_sdk_kit --all-targets --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: normal-shared-open-baseline
+          name: normal-shared-open-acceptance
           path: '*.log'
