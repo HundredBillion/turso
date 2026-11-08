@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2049aa8457f1368c9b14b50ecfa2b2bc98039d62
+          ref: 07cff3dc54f351a60a57262b4144fbdad66e361e
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -26,7 +26,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "2049aa8457f1368c9b14b50ecfa2b2bc98039d62"
+          test "$(git rev-parse HEAD)" = "07cff3dc54f351a60a57262b4144fbdad66e361e"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -71,6 +71,34 @@ jobs:
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --skip shared_watermark_process_child --skip shared_prepare_io_native_ --test-threads=1 2>&1 | tee watermark.log
           grep -q '3 passed; 0 failed' watermark.log
+      - name: Fresh completed recovery
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --test-threads=1 2>&1 | tee checkpoint_recovery_.log
+          grep -Eq "[1-9][0-9]* passed; 0 failed" checkpoint_recovery_.log
+      - name: Idle generation reload
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_ -- --ignored --skip shared_idle_generation_native_child --test-threads=1 2>&1 | tee shared_idle_generation_native_.log
+          grep -Eq "[1-9][0-9]* passed; 0 failed" shared_idle_generation_native_.log
+      - name: Current prefix ownership
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_ -- --ignored --test-threads=1 2>&1 | tee shared_current_prefix_native_.log
+          grep -Eq "[1-9][0-9]* passed; 0 failed" shared_current_prefix_native_.log
+      - name: Current physical base
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_ -- --ignored --test-threads=1 2>&1 | tee current_base_native_.log
+          grep -Eq "[1-9][0-9]* passed; 0 failed" current_base_native_.log
+      - name: Private generation install
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api current_local_install_native_ -- --ignored --test-threads=1 2>&1 | tee current_local_install_native_.log
+          grep -Eq "[1-9][0-9]* passed; 0 failed" current_local_install_native_.log
+      - name: Schema and worker acceptance
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 2>&1 | tee shared_schema_publication_native_.log
+          grep -Eq "[1-9][0-9]* passed; 0 failed" shared_schema_publication_native_.log
+      - name: Independent worker acceptance
+        run: |
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_worker_native_ -- --ignored --test-threads=1 2>&1 | tee workers.log
+          grep -q "5 passed; 0 failed" workers.log
       - name: Full ordinary core and strict lint
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee core.log
@@ -89,7 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2049aa8457f1368c9b14b50ecfa2b2bc98039d62
+          ref: 07cff3dc54f351a60a57262b4144fbdad66e361e
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
