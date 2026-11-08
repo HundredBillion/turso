@@ -1,3 +1,6 @@
+#[path = "shared_checkpoint_recovery_confirmation.rs"]
+mod shared_checkpoint_recovery_confirmation;
+
 use super::shared_checkpoint_recovery_physical::InspectedRecoveryBase;
 use super::*;
 use crate::mvcc::checkpoint_gate::CheckpointPause;
