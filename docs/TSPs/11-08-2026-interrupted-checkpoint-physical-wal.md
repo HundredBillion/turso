@@ -99,6 +99,8 @@ For effective-image inspection, build an **in-process** `WalFile` from the exact
 
 Require effective persistent timestamp equal to `intent.source_checkpoint_timestamp` or `record.prefix().committed_timestamp`, with actual marked main/WAL header page size/reserved bytes, bounded extent, root layout and schema validation. Reject any intermediate timestamp even if ordinary physical inspection's broader range check would accept it. Require the original actual manifest record after reselection and no pending backend I/O before the first mutation.
 
+Fresh intent reselection must not consume or expose the original mirrored owner. Add a recovery-only `CheckpointIntentInspection` child behind `MirroredCheckpointIntent::inspect_exact_for_physical_recovery(&RecoveryWalEvidence)`. It reuses `ManifestLoad::start(None)` internally on the actual retained manifest's guarded read binding, which retains the original MVCC lease and physical owner. Return only `Done(())` after full record/file/native identity/lease checks and backend retirement; never return the guardless `LoadedManifest`. Capture and revalidate the exact owner across resumes, reject reuse after completion/error and keep normal manifest constructors owned-guard-only. The parent approved this bounded parser reuse; it introduces neither a second parser nor a generic guardless inspection/rejoin API.
+
 Use a fresh private pager with the actual guarded main storage, scanned in-process WAL and independent cache/shared-pager state. Set page size, reserved bytes and IO context from the inspected actual image. Drive:
 
 ```rust
@@ -119,11 +121,11 @@ After successful checkpoint completion, wait for actual backend retirement, veri
 
 **Consumes:** Actual retained mapping and authority guard. **Produces:** `Arc<SharedWalRecoveryLocks>` retained by physical file completions.
 
-- [ ] Add native tests with same-process writer/checkpoint/WAL-reader/main-reader owners and independent child owners. Recovery acquisition is bounded `Busy`, preserves each old owner, and succeeds only after real release/death.
-- [ ] Add explicit native backend read/write/sync/truncate retention tests: drop state before callback and after callback but before backend Arc retirement; both new physical reader registration and actual shared open remain blocked until backend release.
-- [ ] Add the missing implementation and observe the ownership tests fail at explicit missing behavior, then implement the typed owner/binding and run them green.
-- [ ] Inject acquisition/unlock failures at every acquired prefix. Verify exact cleanup and poisoned reuse on unlock failure. Remove the same-process count gate and completion-retention capture separately; require intended failures, restore and rerun.
-- [ ] Commit this independently tested ownership seam before physical file mutation is implemented.
+- [x] Add native tests with same-process writer/checkpoint/WAL-reader/main-reader owners and independent child owners. Recovery acquisition is bounded `Busy`, preserves each old owner, and succeeds only after real release/death.
+- [x] Add explicit native backend read/write/sync/truncate retention tests: drop state before callback and after callback but before backend Arc retirement; both new physical reader registration and actual shared open remain blocked until backend release.
+- [x] Add the missing implementation and observe the ownership tests fail at explicit missing behavior, then implement the typed owner/binding and run them green.
+- [x] Inject acquisition/unlock failures at every acquired prefix. Verify exact cleanup and poisoned reuse on unlock failure. Remove the same-process count gate and completion-retention capture separately; require intended failures, restore and rerun.
+- [x] Commit this independently tested ownership seam before physical file mutation is implemented.
 
 ## Task 2: Genuine committed-WAL recovery
 
@@ -167,3 +169,12 @@ The parent is the independent design hardening reviewer. Existing user protocol 
 - Independent review caught a normal writer/checkpoint ownership race in liveness probing. Recheck current local ownership for the requested byte under the same mutex as the OFD probe; a previously sampled boolean is insufficient. The deterministic regression samples false, acquires the actual local owner, then invokes the probe and checks independent-fd exclusion.
 - Distinct physical schema parses are compared by actual header/catalog root rows/custom-type definitions, not schema Arc identity. The existing `PhysicalBaseParts` already retains immutable catalog records suitable for a semantic comparison.
 - Keep a fresh runtime unclaimed while opening only private nonshared physical readers. If a later materialization phase attaches a real shared Store, retain/reuse it under the one-Store-per-Runtime reservation; never reset that claim or construct a second Store for the handoff.
+
+
+## Task1 verification record
+
+Engine `1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb` passed [final native and Windows checks](https://github.com/HundredBillion/turso/actions/runs/42507078556). Linux restored native8/recovery24 and the full-core final parent summary2900passed/152ignored all report zero failures. Strict library Clippy, formatting and source integrity passed. Local-reader count and physical completion-owner removals each failed the intended single test before exact restoration. Windows old-Unix-cfg restoration produced E0432, then the actual fixed source library check passed. Native acquisition remains restricted to supported Linux64 OFD storage.
+
+The ownership matrix includes263 native lock failure positions, ten actual native I/O callback/cancellation combinations, real same-process/child participants with SIGKILL/retry, a stale ownership-sample regression, and actual same-inode/foreign-Arc/foreign-authority binding negatives. Earlier genuine missing-behavior and stale-probe/retention RED runs are preserved separately. Raw source pins, environment, control logs and parent summaries are retained in `.local/issue-resolution/checkpoint-physical-wal/` (final Linux artifact13627792711).
+
+The parent reviewed the owner and lifetime implementation, identified the stale normal-count probe and Windows cfg mismatch, and those corrections have causal tests. Matching final portability-source acknowledgement is requested; whole-TSP final review remains a Task3 gate. No physical-WAL copy, mapping repair or Ready behavior is claimed by this Task1 record.
