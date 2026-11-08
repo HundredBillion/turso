@@ -206,13 +206,20 @@ mod tests {
         installed_fixture_with_io(false)
     }
     fn installed_fixture_with_io(platform: bool) -> Fixture {
-        let fixture = shared_completed_checkpoint_fixture(|_| {
-            if platform {
-                Arc::new(crate::io::PlatformIO::new().unwrap())
-            } else {
-                Arc::new(crate::io::SyscallIO::new().unwrap())
-            }
-        });
+        installed_fixture_with_tail(platform, false)
+    }
+    fn installed_fixture_with_tail(platform: bool, extra_tail: bool) -> Fixture {
+        let fixture =
+            crate::mvcc::database::shared_runtime::shared_completed_checkpoint_fixture_with_tail(
+                |_| {
+                    if platform {
+                        Arc::new(crate::io::PlatformIO::new().unwrap())
+                    } else {
+                        Arc::new(crate::io::SyscallIO::new().unwrap())
+                    }
+                },
+                extra_tail,
+            );
         let store = fixture.database.get_mv_store().as_ref().unwrap().clone();
         let runtime = store.shared_runtime.get().unwrap().clone();
         let mut finalizer = fixture.ids.finalize(fixture.guard, fixture.proof).unwrap();
@@ -1135,5 +1142,65 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, ["materialized shared row"]);
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_extent_native_accepts_genuine_installed_unused_tail() {
+        let mut fixture = installed_fixture_with_tail(false, true);
+        let header = fixture
+            .connection
+            .get_pager()
+            .io
+            .block(|| fixture.connection.get_pager().with_header(|header| *header))
+            .unwrap();
+        let bytes = std::fs::metadata(&fixture.path).unwrap().len();
+        assert!(bytes > u64::from(header.page_size.get()) * u64::from(header.database_size.get()));
+        assert!(
+            fixture
+                .installed
+                .as_ref()
+                .unwrap()
+                .proof
+                .materialized_floor()
+                <= -i64::try_from(bytes / u64::from(header.page_size.get())).unwrap()
+        );
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        drop(intent);
+        drop(preparing);
+        drop(fixture.connection);
+        drop(fixture.runtime);
+        let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
+            &fixture.path,
+            fixture.limit,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+        )
+        .expect("fresh downgrade must accept the unchanged genuine installed physical extent");
+        drop(completed);
+        let db = Database::open(
+            fixture.io.clone(),
+            fixture.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        let mut rows = Vec::new();
+        connection
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, ["ok"]);
     }
 }

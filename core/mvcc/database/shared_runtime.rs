@@ -1153,7 +1153,15 @@ pub(in crate::mvcc) fn shared_prepared_checkpoint_fixture(
 pub(in crate::mvcc) fn shared_completed_checkpoint_fixture(
     io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
 ) -> SharedCompletedCheckpointFixture {
-    let fixture = shared_prepared_checkpoint_fixture(io_factory);
+    shared_completed_checkpoint_fixture_with_tail(io_factory, false)
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+pub(in crate::mvcc) fn shared_completed_checkpoint_fixture_with_tail(
+    io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+    extra_tail: bool,
+) -> SharedCompletedCheckpointFixture {
+    let fixture = run_shared_checkpoint_fixture_with_tail(true, io_factory, extra_tail).unwrap();
     let source = fixture.prepared.source_identity();
     let target = fixture.prepared.target();
     let log_path = fixture.namespace.join("logical");
@@ -1196,6 +1204,15 @@ pub(in crate::mvcc) fn shared_completed_checkpoint_fixture(
 fn run_shared_checkpoint_fixture(
     complete: bool,
     io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+) -> Option<SharedPreparedCheckpointFixture> {
+    run_shared_checkpoint_fixture_with_tail(complete, io_factory, false)
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+fn run_shared_checkpoint_fixture_with_tail(
+    complete: bool,
+    io_factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+    extra_tail: bool,
 ) -> Option<SharedPreparedCheckpointFixture> {
     use crate::state_machine::{StateTransition, TransitionResult};
     use crate::storage::wal::CheckpointMode;
@@ -1288,6 +1305,17 @@ fn run_shared_checkpoint_fixture(
             IOResult::Done(intent) => break intent,
         }
     };
+    if extra_tail {
+        let header = connection
+            .get_pager()
+            .io
+            .block(|| connection.get_pager().with_header(|header| *header))
+            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() + u64::from(header.page_size.get()))
+            .unwrap();
+        file.sync_all().unwrap();
+    }
     let main_binding = runtime.main.bind(intent.guard()).unwrap();
     let wal_binding = runtime.wal.bind(intent.guard()).unwrap();
     let mut checkpoint = CheckpointStateMachine::new(
