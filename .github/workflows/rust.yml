@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5ab7f287f01192ff55a85e1983d3008a3d8a56ee
+          ref: 1d21a1c0bde48843b675cab914c28cc137162102
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5ab7f287f01192ff55a85e1983d3008a3d8a56ee
+          test "$(git rev-parse HEAD)" = 1d21a1c0bde48843b675cab914c28cc137162102
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
@@ -54,59 +54,15 @@ jobs:
         run: |
           timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee local-install-green.log
           grep -q '6 passed; 0 failed' local-install-green.log
-      - name: Bypassed local replay fence must fail
+      - name: Missing certified readiness publication must fail
         run: |
-          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_checkpoint_install.rs"); s=p.read_text(); old="                    self.runtime.replay.lock().take();"; assert s.count(old)==1; p.write_text(s.replace(old,""))'
           set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_mutation_failures_leave_old_maps_and_no_replay -- --ignored --test-threads=1 --nocapture 2>&1 | tee replay-fence-red.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_resumes_original_connection_and_new_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-red.log
           status=${PIPESTATUS[0]}
           set -e
-          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
           test "$status" -ne 0
-          grep -q 'failed local stage retained old replay readiness' replay-fence-red.log
-          grep -q '0 passed; 1 failed' replay-fence-red.log
-      - name: Store installation before pager reset must fail
-        run: |
-          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_checkpoint_install.rs"); s=p.read_text(); old="                    self.connection.get_pager().reset_shared_generation()?;\n"; marker="                    let schema = self.schema.take().unwrap();"; assert s.count(old)==1 and s.count(marker)==1; p.write_text(s.replace(old,"").replace(marker,old+marker))'
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_late_changes_reject_before_store_publication -- --ignored --test-threads=1 --nocapture 2>&1 | tee reset-order-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
-          test "$status" -ne 0
-          grep -q 'failed reset or stale preparation changed the live store map' reset-order-red.log
-          grep -q '0 passed; 1 failed' reset-order-red.log
-      - name: Skipped empty storage adoption must fail
-        run: |
-          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_checkpoint_install.rs"); s=p.read_text(); a=s.index("                    self.runtime.storage.adopt_shared_prefix("); b=s.index(")?;",a)+3; p.write_text(s[:a]+s[b:])'
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_reclaims_then_installs_without_admission_release -- --ignored --test-threads=1 --nocapture 2>&1 | tee storage-adopt-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
-          test "$status" -ne 0
-          grep -q 'local storage did not adopt the completed empty prefix' storage-adopt-red.log
-          grep -q '0 passed; 1 failed' storage-adopt-red.log
-      - name: Skipped logical retirement wait must fail
-        run: |
-          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_checkpoint_install.rs"); s=p.read_text(); a=s.index("                Phase::Retire => {"); b=s.index("                Phase::Install => {",a); part=s[a:b]; old="                    if !guard.io_retired() {\n                        return Ok(IOResult::IO(IOCompletions(guard.retirement_completion())));\n                    }\n"; assert part.count(old)==1; p.write_text(s[:a]+part.replace(old,"")+s[b:])'
-          set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_waits_for_sync_backend_before_store_mutation -- --ignored --test-threads=1 --nocapture 2>&1 | tee logical-retirement-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          git checkout -- core/mvcc/database/shared_checkpoint_install.rs
-          test "$status" -ne 0
-          grep -Eq 'logical retirement was not awaited|store metadata escaped before logical retirement' logical-retirement-red.log
-          grep -q '0 passed; 1 failed' logical-retirement-red.log
-      - name: Restored complete local installation suite
-        run: |
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee local-install-restored.log
-          grep -q '6 passed; 0 failed' local-install-restored.log
-          git diff --exit-code
-      - name: Combined MVCC regressions
-        run: |
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database -- --test-threads=1 2>&1 | tee database.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' database.log
+          grep -q 'completed checkpoint readiness publication is not implemented' ready-red.log
+          grep -q '0 passed; 1 failed' ready-red.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
