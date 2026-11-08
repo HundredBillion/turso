@@ -932,7 +932,14 @@ fn checkpoint_recovery_reclaim_native_fresh_log_without_admission() {
         let preserved =
             [0, 1, 3, 4, 5, 6].map(|index| std::fs::read(&fixture.paths[index]).unwrap());
         let mut reclaiming = finalized.begin_log_reclamation().unwrap();
-        let _reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+        let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+        assert_eq!(reclaimed.proof().source_identity(), None);
+        assert_eq!(reclaimed.proof().target_identity(), fixture.target);
+        assert_eq!(
+            reclaimed.guard().published().unwrap(),
+            fixture.target.prefix
+        );
+        assert!(fixture.runtime.reserve_store().is_err());
         assert!(std::fs::read(fixture.namespace.join("logical"))
             .unwrap()
             .is_empty());
@@ -1054,5 +1061,26 @@ fn checkpoint_recovery_reclaim_native_reservation_is_linear() {
     store
         .attach_shared_runtime(fixture.runtime.clone())
         .unwrap();
+    assert!(fixture.runtime.reserve_store().is_err());
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_rejects_preexisting_store_before_mutation() {
+    let mut fixture = ready_fixture(false);
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+    assert!(fixture.runtime.replay.lock().is_none());
+    let before = std::fs::read(fixture.namespace.join("logical")).unwrap();
+    assert!(!before.is_empty());
+    assert!(matches!(
+        finalized.begin_log_reclamation(),
+        Err(LimboError::Busy)
+    ));
+    assert_eq!(
+        std::fs::read(fixture.namespace.join("logical")).unwrap(),
+        before
+    );
+    assert!(fixture.runtime.replay.lock().is_none());
     assert!(fixture.runtime.reserve_store().is_err());
 }

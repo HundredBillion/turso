@@ -54,10 +54,10 @@ The runtime reservation implementation uses a private mutex with states Free, Re
 
 **Interfaces:** Produce the runtime reservation and exact recovery entry/result above; the first recovery poll initially returns `InvalidArgument("recovered logical reclamation is not implemented")`.
 
-- [ ] Add native genuine fresh fixture regression: run actual confirmation and recovered IDs finalization; assert old logical bytes remain nonempty; call begin_log_reclamation and require eventual empty logical storage under the retained cap. The initial stub must fail at the exact missing reclamation diagnostic after finalization succeeds.
-- [ ] Add reservation tests: two Store attachments to one runtime reject the second; reattaching the same Store/runtime succeeds; an uncommitted reservation excludes attachment and becomes available after drop; a committed attachment remains claimed after its Store is dropped. Use actual runtime.storage for both Stores; a mismatched storage rejection must not consume the claim.
-- [ ] Run exact native stub RED and portable attachment tests. Record exact source, run, test count and expected failure; do not count compilation or fixture failures as the RED.
-- [ ] Implement the private reservation and ordinary attachment changes, then run ownership tests and existing normal open/begin coverage. Commit the independently reviewable ownership+stub milestone.
+- [x] Add native genuine fresh fixture regression: run actual confirmation and recovered IDs finalization; assert old logical bytes remain nonempty; call begin_log_reclamation and require eventual empty logical storage under the retained cap. The initial stub must fail at the exact missing reclamation diagnostic after finalization succeeds.
+- [x] Add reservation tests: two Store attachments to one runtime reject the second; reattaching the same Store/runtime succeeds; an uncommitted reservation excludes attachment and becomes available after drop; a committed attachment remains claimed after its Store is dropped. Use actual runtime.storage for both Stores; a mismatched storage rejection must not consume the claim.
+- [x] Run exact native stub RED and portable attachment tests. Record exact source, run, test count and expected failure; do not count compilation or fixture failures as the RED.
+- [x] Implement the private reservation and ordinary attachment changes, then run ownership tests and existing normal open/begin coverage. Commit the independently reviewable ownership+stub milestone.
 
 ## Task 2: Proof-gated durable reclamation
 
