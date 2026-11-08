@@ -315,7 +315,7 @@ mod tests {
             fixture.runtime.database_id,
         )
         .unwrap();
-        let fake = io.block(|| load.poll()).unwrap();
+        let fake = io.block(|| Ok(load.poll()?)).unwrap();
         let error = match CheckpointRecoverySelection::fresh(fixture.runtime.clone(), fake, pause) {
             Ok(_) => panic!("substitute manifest authorized fresh recovery"),
             Err(error) => error,
