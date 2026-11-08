@@ -33,6 +33,22 @@ jobs:
           cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-check.log
           cargo fmt --all -- --check
           git diff --exit-code
+      - name: Removing the Unix guard must reproduce the Windows field error
+        run: |
+          trap 'git restore core/mvcc/database/shared_refresh.rs' EXIT
+          python -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_refresh.rs"); s=p.read_text(); old="        #[cfg(all(host_shared_wal, unix))]\n"; assert s.count(old)==1; p.write_text(s.replace(old,""))'
+          set +e
+          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-cfg-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'E0609' windows-cfg-red.log
+          grep -q 'shared_runtime' windows-cfg-red.log
+          git restore core/mvcc/database/shared_refresh.rs
+      - name: Restored Windows source must typecheck
+        run: |
+          git diff --exit-code
+          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-restored.log
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -42,3 +58,5 @@ jobs:
             source.txt
             rustc.txt
             windows-check.log
+            windows-cfg-red.log
+            windows-restored.log
