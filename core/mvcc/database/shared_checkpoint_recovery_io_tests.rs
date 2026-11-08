@@ -397,3 +397,102 @@ fn shared_open_selector_native_cancel_and_wait_for_backend_retirement() {
             .unwrap();
     }
 }
+
+#[derive(Clone)]
+struct OpenStoreAllocator(Arc<crate::sync::atomic::AtomicUsize>);
+unsafe impl crate::alloc::ApiAllocator for OpenStoreAllocator {
+    fn allocate(
+        &self,
+        layout: crate::alloc::Layout,
+    ) -> std::result::Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        crate::alloc::ApiAllocator::allocate(&crate::alloc::Global, layout)
+    }
+    unsafe fn deallocate(&self, pointer: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+        unsafe { crate::alloc::ApiAllocator::deallocate(&crate::alloc::Global, pointer, layout) }
+    }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn shared_open_recovery_native_public_cancel_before_store_and_retry() {
+    for after_callback in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let control = Arc::new(RecoveryIoControl::default());
+        let io: Arc<dyn crate::IO> = Arc::new(RecoveryIo {
+            inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+            control: control.clone(),
+        });
+        let canonical = path.canonicalize().unwrap();
+        let raw = io
+            .open_file(canonical.to_str().unwrap(), crate::OpenFlags::NoLock, false)
+            .unwrap();
+        let identity = raw.file_id().unwrap().unwrap();
+        let watcher =
+            SharedMvccRuntime::open_existing(io.clone(), raw, identity, &canonical, limit, false)
+                .unwrap();
+        let allocations = Arc::new(crate::sync::atomic::AtomicUsize::new(0));
+        let options = crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+            .with_shared_mvcc_for_test(limit)
+            .allocators(crate::DatabaseAllocators {
+                mv_store: crate::alloc::DynAllocator::new(OpenStoreAllocator(allocations.clone())),
+                ..Default::default()
+            });
+        control.delay_selector_read.store(true, Ordering::Release);
+        let mut state = crate::OpenDbAsyncState::new();
+        for _ in 0..100 {
+            match crate::Database::open_async(
+                &mut state,
+                io.clone(),
+                canonical.to_str().unwrap(),
+                &options,
+            )
+            .unwrap()
+            {
+                IOResult::IO(waiting) => {
+                    if control.pending_read.lock().is_some() {
+                        drop(waiting);
+                        break;
+                    }
+                    io.wait_for_completion(waiting.0).unwrap();
+                }
+                IOResult::Done(_) => {
+                    panic!("public open returned before delayed selector preflight")
+                }
+            }
+        }
+        let held = control
+            .pending_read
+            .lock()
+            .take()
+            .expect("public open did not read actual selector");
+        assert_eq!(
+            allocations.load(Ordering::Acquire),
+            0,
+            "public open allocated its Store before selector classification"
+        );
+        if after_callback {
+            held.complete();
+        }
+        drop(state);
+        assert_eq!(allocations.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            watcher.files.authority.try_acquire(),
+            Err(LimboError::Busy)
+        ));
+        if !after_callback {
+            held.complete();
+        }
+        assert!(
+            matches!(watcher.files.authority.try_acquire(), Err(LimboError::Busy)),
+            "public cancellation released authority before actual backend retirement"
+        );
+        drop(held);
+        drop(watcher.files.authority.try_acquire().unwrap());
+        let database = crate::Database::open(io, canonical.to_str().unwrap(), options).unwrap();
+        assert!(allocations.load(Ordering::Acquire) > 0);
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        connection.execute("UPDATE preserved SET value='public retry committed' WHERE id=1; CREATE TABLE public_retry_id(id INTEGER PRIMARY KEY); INSERT INTO public_retry_id DEFAULT VALUES").unwrap();
+    }
+}
