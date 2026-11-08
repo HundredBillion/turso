@@ -282,7 +282,7 @@ mod tests {
     fn intent_source_store_native_ack_base_cannot_allocate_source_store() {
         let probe = Arc::new(AllocationProbe::default());
         let (fixture, physical) =
-            physical(CrashPoint::MainSyncedBeforeWalTruncate, options(&probe));
+            physical_case(CrashPoint::MainSyncedBeforeWalTruncate, options(&probe));
         let before = durable(&fixture);
         let attempts = probe.attempts.load(Ordering::Acquire);
         assert!(matches!(
