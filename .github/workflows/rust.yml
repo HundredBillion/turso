@@ -1,4 +1,4 @@
-name: Shared ID lifecycle union acceptance
+name: Shared ID savepoint regression
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d45a5e1f47c9f53e6e02651a3690b3db3138010c
+          ref: 9fc58f691cc2c3de28bc6bcee4d0eadb96d2878a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,39 +24,27 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = d45a5e1f47c9f53e6e02651a3690b3db3138010c
+          test "$(git rev-parse HEAD)" = 9fc58f691cc2c3de28bc6bcee4d0eadb96d2878a
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee build.log
-      - name: Native ID and watermark gates
+      - name: Expected scoped rollback regression
         run: |
           set -o pipefail
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-native.log
-          grep -q '13 passed; 0 failed' ids-native.log
-          for selector in shared_watermark_identity_native_ shared_watermark_io_native_ shared_watermark_process_native_ shared_id_stale_prepare_native_; do
-            timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
-            grep -q '1 passed; 0 failed' "$selector.log"
-          done
-      - name: Peer descriptor preparation controls
-        run: |
-          set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ 2>&1 | tee peer-descriptors.log
-          grep -q '4 passed; 0 failed' peer-descriptors.log
-      - name: Policy ordinary sequences and lint
-        run: |
-          set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api id_policy_ 2>&1 | tee policy.log
-          grep -q '12 passed; 0 failed' policy.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api sequence -- --test-threads=2 2>&1 | tee sequences.log
-          grep -q 'test_sequence_watermark_tracks_nextval_allocations ... ok' sequences.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          set +e
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee lifecycle-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '0 passed; 1 failed' lifecycle-red.log
+          grep -q 'ROLLBACK TO acknowledged but retained scoped ID claims' lifecycle-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-lifecycle-union
+          name: shared-id-lifecycle-red
           path: |
             source.txt
             rustc.txt
