@@ -1,4 +1,4 @@
-name: Committed physical WAL recovery RED
+name: Committed physical WAL recovery GREEN
 on:
   workflow_dispatch:
 permissions:
@@ -7,7 +7,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  physical-wal-red:
+  physical-wal-green:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -18,35 +18,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2c0ff89aff3359f652952bbb372d1b8362e9130f
+          ref: 073e3565aaf0a2258a0dfff8a15e2db76b83c5c4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Genuine committed WAL fixtures then missing recovery
+      - name: Actual committed physical WAL recovery
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 2c0ff89aff3359f652952bbb372d1b8362e9130f
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_crash_fixtures_cover_old_partial_and_synced_main -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-wal-fixtures-green.log
-          grep -q '1 passed; 0 failed' physical-wal-fixtures-green.log
+          test "$(git rev-parse HEAD)" = 073e3565aaf0a2258a0dfff8a15e2db76b83c5c4
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-wal-green.log
+          grep -q '4 passed; 0 failed' physical-wal-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-regression-green.log
+          grep -q '8 passed; 0 failed' physical-owner-regression-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-regression-green.log
           grep -q '9 passed; 0 failed' intent-regression-green.log
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_restores_committed_image_without_completion_or_admission -- --ignored --test-threads=1 --nocapture > physical-wal-missing-red.log 2>&1
-          code=$?
-          set -e
-          cat physical-wal-missing-red.log
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' physical-wal-missing-red.log
-          grep -q 'committed physical WAL recovery is not implemented' physical-wal-missing-red.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: committed-physical-wal-red
+          name: committed-physical-wal-green
           path: |
             source.txt
             *.log
