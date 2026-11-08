@@ -496,9 +496,15 @@ fn shared_worker_native_disjoint_updates_delete_and_insert_both_commit() {
             Worker::open(&path, limit, true),
             Worker::open(&path, limit, true),
         ];
-        for worker in &mut workers {
+        for (index, worker) in workers.iter_mut().enumerate() {
             assert_eq!(worker.execute("BEGIN CONCURRENT"), "OK");
-            assert_eq!(worker.query("SELECT count(*) FROM disjoint"), "[3]");
+            assert_eq!(
+                worker.query(&format!(
+                    "SELECT value FROM disjoint WHERE id={}",
+                    index + 1
+                )),
+                format!("[{}]", (index + 1) * 100)
+            );
         }
         assert_eq!(
             workers[0].execute(
