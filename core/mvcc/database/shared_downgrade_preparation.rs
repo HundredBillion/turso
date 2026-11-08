@@ -811,4 +811,66 @@ mod tests {
             assert_unchanged(&before);
         }
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_resume_native_terminal_reopens_without_live_source() {
+        let mut fixture = installed_fixture();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        let namespace_bytes: Vec<_> = [
+            "manifest",
+            "logical",
+            "physical-wal",
+            "ids-a",
+            "ids-b",
+            "ids-selector",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                fixture.namespace.join(name),
+                std::fs::read(fixture.namespace.join(name)).unwrap(),
+            )
+        })
+        .collect();
+        drop(intent);
+        drop(preparing);
+        drop(fixture.connection);
+        drop(fixture.runtime);
+        let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
+            &fixture.path,
+            fixture.limit,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+        )
+        .expect("fresh terminal downgrade must resume without a live installed source");
+        assert_eq!(&std::fs::read(&fixture.path).unwrap()[18..20], &[2, 2]);
+        assert_unchanged(&namespace_bytes);
+        drop(completed);
+        let ordinary = crate::Database::open(
+            fixture.io.clone(),
+            fixture.path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+        )
+        .unwrap();
+        let connection = ordinary.connect(crate::ConnectOpts::new()).unwrap();
+        let mut count = 0;
+        connection
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get::<String>(0)?, "ok");
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }
