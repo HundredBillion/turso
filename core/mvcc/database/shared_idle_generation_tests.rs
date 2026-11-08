@@ -178,6 +178,12 @@ fn shared_idle_generation_native_child() {
     )
     .unwrap();
     let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+    let source_function = if !hold {
+        connection.register_internal_vtab(LocalFunction).unwrap();
+        Some(assert_local_function(&connection))
+    } else {
+        None
+    };
     if hold {
         connection.execute("BEGIN CONCURRENT").unwrap();
     }
@@ -270,6 +276,13 @@ fn shared_idle_generation_native_child() {
                 read_value(&connection)
             } {
                 Ok(value) => {
+                    if let Some(original) = source_function.as_ref() {
+                        let current = assert_local_function(&connection);
+                        assert!(
+                            Arc::ptr_eq(original, &current),
+                            "local reload replaced a caller-defined function instance"
+                        );
+                    }
                     if let Some((base, partial, old_latest, clock)) = cancelled.take() {
                         let identity = runtime.replay.lock().as_ref().unwrap().identity().unwrap();
                         assert_eq!(identity.database.checkpoint_timestamp, base);
@@ -397,4 +410,86 @@ impl Drop for IdleGenerationChild {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct LocalFunction;
+impl crate::vtab::InternalVirtualTable for LocalFunction {
+    fn name(&self) -> String {
+        "source_only_function".into()
+    }
+    fn sql(&self) -> String {
+        "CREATE TABLE source_only_function(value INTEGER)".into()
+    }
+    fn open(
+        &self,
+        _: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn crate::vtab::InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(LocalFunctionCursor)))
+    }
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        Ok(turso_ext::IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: constraints
+                .iter()
+                .map(|_| turso_ext::ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                })
+                .collect(),
+        })
+    }
+}
+struct LocalFunctionCursor;
+impl crate::vtab::InternalVirtualTableCursor for LocalFunctionCursor {
+    fn next(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+    fn rowid(&self) -> i64 {
+        1
+    }
+    fn column(&self, _: usize) -> Result<Value> {
+        Ok(Value::Integer(42))
+    }
+    fn filter(&mut self, _: &[Value], _: Option<String>, _: i32) -> Result<bool> {
+        Ok(true)
+    }
+}
+fn assert_local_function(connection: &Arc<Connection>) -> Arc<crate::vtab::VirtualTable> {
+    assert!(
+        connection
+            .db
+            .schema
+            .lock()
+            .has_table(NamespaceId::ROOT, "source_only_function"),
+        "local reload dropped a source-only function"
+    );
+    let mut values = Vec::new();
+    connection
+        .prepare("SELECT value FROM source_only_function")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<i64>(0)?);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, [42]);
+    let table = connection
+        .db
+        .schema
+        .lock()
+        .get_table(NamespaceId::ROOT, "source_only_function")
+        .unwrap();
+    let Table::Virtual(function) = table.as_ref() else {
+        panic!("source-only function changed kind")
+    };
+    function.clone()
 }

@@ -1,5 +1,6 @@
 use super::shared_current_base::{CurrentBaseInspection, InspectedCurrentBase};
 use super::*;
+use crate::alloc::TryClone;
 use crate::storage::pager::SharedPagerGeneration;
 
 #[derive(Default)]
@@ -97,8 +98,14 @@ impl SharedOpenState {
                     }
                     database.validate_shared_pager_owner(&pager, &self.runtime)?;
                     let (evidence, manifest, parts) = inspected.into_parts();
-                    let schema = parts.schema.clone();
-                    let context = parts.into_context(store);
+                    let mut context = parts.into_context(store);
+                    let functions =
+                        MvStore::<C, A>::capture_table_valued_functions(&connection.schema.read());
+                    let mut schema = context.current_schema.as_ref().try_clone()?;
+                    MvStore::<C, A>::rehydrate_table_valued_functions(&mut schema, &functions);
+                    let schema = Arc::new(schema);
+                    context.current_schema = schema.clone();
+                    context.preserved_table_valued_functions = functions;
                     self.runtime.replay.lock().take();
                     let prepared = store.prepare_current_generation_reload(&evidence, &manifest)?;
                     pager.reset_shared_generation()?;
