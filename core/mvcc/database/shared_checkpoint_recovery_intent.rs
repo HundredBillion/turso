@@ -14,6 +14,13 @@ pub(in crate::mvcc) struct RecoveredCheckpointIntent {
 }
 
 impl RecoveredCheckpointIntent {
+    pub(super) fn begin_source_id_inspection(
+        self,
+        input: super::shared_checkpoint_recovery_wal::SourceIdInspectionInput,
+    ) -> Result<super::shared_checkpoint_recovery_wal::SourceIdInspection> {
+        input.begin(self.runtime, self.intent, self.pause)
+    }
+
     pub(super) fn retained_runtime(&self) -> &Arc<SharedMvccRuntime> {
         &self.runtime
     }

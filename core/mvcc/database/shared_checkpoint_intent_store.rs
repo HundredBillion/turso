@@ -41,7 +41,12 @@ pub(in crate::mvcc) struct SourceIntentStore {
 }
 
 pub(in crate::mvcc) struct SourceIdInspection {
-    source: Option<SourceIntentStore>,
+    owner: Option<IntentRecoveryStore>,
+    parts: Option<PhysicalBaseParts>,
+    config: Arc<RecoveryOpenConfig>,
+    runtime: Arc<SharedMvccRuntime>,
+    load: Option<crate::mvcc::shared_ids::io_protocol::intent_source::IntentSourceIdLoad>,
+    pause: Option<crate::mvcc::checkpoint_gate::CheckpointPause>,
 }
 
 pub(in crate::mvcc) struct InspectedIntentSource {
@@ -49,21 +54,211 @@ pub(in crate::mvcc) struct InspectedIntentSource {
     parts: PhysicalBaseParts,
     config: Arc<RecoveryOpenConfig>,
     runtime: Arc<SharedMvccRuntime>,
-    pause: crate::mvcc::checkpoint_gate::CheckpointPause,
     ids: crate::mvcc::shared_ids::io_protocol::intent_source::LoadedSourceIds,
+    pause: crate::mvcc::checkpoint_gate::CheckpointPause,
+}
+
+pub(in crate::mvcc::database::shared_runtime) struct SourceIdInspectionInput {
+    owner: IntentRecoveryStore,
+    parts: PhysicalBaseParts,
+    config: Arc<RecoveryOpenConfig>,
+    evidence: Arc<IntentSourceIdEvidence>,
+}
+
+pub(in crate::mvcc) struct IntentSourceIdEvidence {
+    runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
+    record: ManifestRecord,
+    lease: Weak<PublicationLease>,
+    main_id: FileId,
+    wal_id: FileId,
+    manifest_id: FileId,
+    coordination_id: FileId,
+    main_bytes: u64,
+    physical_floor: i64,
 }
 
 impl SourceIntentStore {
     pub(in crate::mvcc) fn begin_source_id_inspection(self) -> Result<SourceIdInspection> {
         self.owner.validate_source(&self.physical)?;
-        Ok(SourceIdInspection { source: Some(self) })
+        let evidence = Arc::new(IntentSourceIdEvidence::new(&self)?);
+        let SourceIntentStore { owner, physical } = self;
+        let RecoveredIntentPhysicalBase {
+            config,
+            parts,
+            intent,
+        } = physical;
+        intent.begin_source_id_inspection(SourceIdInspectionInput {
+            owner,
+            parts,
+            config,
+            evidence,
+        })
+    }
+}
+
+impl SourceIdInspectionInput {
+    pub(in crate::mvcc::database::shared_runtime) fn begin(
+        self,
+        runtime: Arc<SharedMvccRuntime>,
+        intent: crate::mvcc::commit_manifest::checkpoint_publication::MirroredCheckpointIntent,
+        pause: crate::mvcc::checkpoint_gate::CheckpointPause,
+    ) -> Result<SourceIdInspection> {
+        let load = runtime.ids.inspect_intent_source(intent, self.evidence)?;
+        Ok(SourceIdInspection {
+            owner: Some(self.owner),
+            parts: Some(self.parts),
+            config: self.config,
+            runtime,
+            load: Some(load),
+            pause: Some(pause),
+        })
     }
 }
 
 impl SourceIdInspection {
     pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<InspectedIntentSource> {
-        self.source = None;
-        Err(LimboError::InvalidArgument("source ID inspection is not implemented".into()).into())
+        let result = self.poll_inner();
+        if result.is_err() {
+            self.owner = None;
+            self.load = None;
+            self.parts = None;
+            self.pause = None;
+        }
+        result
+    }
+
+    fn poll_inner(&mut self) -> IOResultOr<InspectedIntentSource> {
+        let load = self
+            .load
+            .as_mut()
+            .ok_or_else(|| LimboError::InvalidArgument("source ID inspection has ended".into()))?;
+        let ids = return_if_io!(load.poll());
+        self.load = None;
+        let owner = self.owner.as_mut().unwrap();
+        ids.validate_owner(&self.runtime, &self.config, owner.record)?;
+        if owner.source_ids_seeded
+            || !owner.store.rows.is_empty()
+            || !owner.store.txs.is_empty()
+            || owner.store.last_committed_tx_ts.load(Ordering::Acquire) != 0
+            || owner.store.durable_txid_max.load(Ordering::Acquire) != 0
+        {
+            return Err(LimboError::InvalidArgument(
+                "source Store changed before ID inspection".into(),
+            )
+            .into());
+        }
+        let next = ids
+            .logical_floor()
+            .checked_sub(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        owner.store.next_table_id.fetch_min(next, Ordering::AcqRel);
+        owner.source_ids_seeded = true;
+        Ok(IOResult::Done(InspectedIntentSource {
+            owner: self.owner.take().unwrap(),
+            parts: self.parts.take().unwrap(),
+            config: self.config.clone(),
+            runtime: self.runtime.clone(),
+            ids,
+            pause: self.pause.take().unwrap(),
+        }))
+    }
+}
+
+impl IntentSourceIdEvidence {
+    fn new(source: &SourceIntentStore) -> Result<Self> {
+        source.owner.validate_source(&source.physical)?;
+        let owner = &source.owner;
+        let physical_floor =
+            i64::try_from(owner.main_bytes / u64::from(owner.header.page_size.get()))
+                .ok()
+                .and_then(i64::checked_neg)
+                .filter(|floor| *floor < 0 && *floor != i64::MIN)
+                .ok_or(LimboError::DatabaseFull)?;
+        Ok(Self {
+            runtime: owner.runtime.clone(),
+            config: owner.config.clone(),
+            record: owner.record,
+            lease: owner.lease.clone(),
+            main_id: owner.main_id,
+            wal_id: owner.wal_id,
+            manifest_id: owner.manifest_id,
+            coordination_id: owner.coordination_id,
+            main_bytes: owner.main_bytes,
+            physical_floor,
+        })
+    }
+
+    pub(in crate::mvcc) fn validate(
+        &self,
+        ids: &Arc<SharedIds>,
+        record: ManifestRecord,
+        guard: &AuthorityGuard,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(ids, &self.runtime.ids)
+            || record != self.record
+            || !self.runtime.owns_authority(guard)
+            || !Weak::ptr_eq(&self.lease, &guard.io_lease())
+            || self.runtime.original_readonly
+            || self.runtime.replay.lock().is_some()
+            || require_native_id(&self.runtime.files.main)? != self.main_id
+            || require_native_id(&self.runtime.files.physical_wal)? != self.wal_id
+            || require_native_id(&self.runtime.files.manifest)? != self.manifest_id
+            || self.runtime.files.physical_coordination.file_id()? != Some(self.coordination_id)
+            || self.runtime.files.main.size()? != self.main_bytes
+            || self.runtime.files.physical_wal.size()? != 0
+        {
+            return Err(LimboError::InvalidArgument(
+                "source IDs changed their retained owner or files".into(),
+            ));
+        }
+        self.config
+            .validate_history(self.runtime.files.authority.configured_history_limit())?;
+        guard.ensure_no_snapshot_locks()?;
+        if !guard.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        Ok(())
+    }
+
+    pub(in crate::mvcc) fn identity(&self) -> RecoveryIdentity {
+        RecoveryIdentity {
+            database: DatabaseGeneration {
+                generation: self.record.log_generation(),
+                checkpoint_timestamp: self
+                    .record
+                    .checkpoint_intent()
+                    .unwrap()
+                    .source_checkpoint_timestamp,
+            },
+            prefix: self.record.prefix(),
+        }
+    }
+
+    pub(in crate::mvcc) fn target(&self) -> DatabaseGeneration {
+        DatabaseGeneration {
+            generation: self.record.checkpoint_intent().unwrap().target_generation,
+            checkpoint_timestamp: self.record.prefix().committed_timestamp,
+        }
+    }
+
+    pub(in crate::mvcc) fn physical_floor(&self) -> i64 {
+        self.physical_floor
+    }
+
+    pub(in crate::mvcc) fn validate_owner(
+        &self,
+        runtime: &Arc<SharedMvccRuntime>,
+        config: &Arc<RecoveryOpenConfig>,
+        record: ManifestRecord,
+        guard: &AuthorityGuard,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(runtime, &self.runtime) || !Arc::ptr_eq(config, &self.config) {
+            return Err(LimboError::InvalidArgument(
+                "source IDs changed their retained configuration".into(),
+            ));
+        }
+        self.validate(&runtime.ids, record, guard)
     }
 }
 

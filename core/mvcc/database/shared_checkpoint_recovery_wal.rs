@@ -696,3 +696,6 @@ mod io_tests;
 mod shared_checkpoint_intent_store;
 pub(super) use shared_checkpoint_intent_store::IntentRecoveryStore;
 pub(in crate::mvcc::database) use shared_checkpoint_intent_store::SourceStoreLifetime;
+
+pub(in crate::mvcc) use shared_checkpoint_intent_store::IntentSourceIdEvidence;
+pub(super) use shared_checkpoint_intent_store::{SourceIdInspection, SourceIdInspectionInput};
