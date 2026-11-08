@@ -1,6 +1,7 @@
 use super::*;
 use crate::mvcc::database::{shared_runtime_fixture, SharedMvccRuntime};
 use crate::storage::shared_wal_coordination::SharedWalRecoveryLocks;
+use crate::util::IOExt;
 use crate::{OpenFlags, IO};
 
 #[derive(Clone)]

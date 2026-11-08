@@ -162,6 +162,41 @@ mod tests {
         drop(SharedWalRecoveryLocks::acquire(mapping).unwrap());
     }
 
+    #[test]
+    #[ignore = "requires native Linux OFD locks"]
+    fn physical_wal_recovery_native_stale_probe_preserves_new_local_owner() {
+        for (role, offset) in [
+            ("writer", WRITER_LOCK_OFFSET),
+            ("checkpoint", CHECKPOINT_LOCK_OFFSET),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("tshm");
+            let mapping = native_mapping(&path);
+            let sampled_owned = mapping.with_local_lock_state(|local| {
+                if offset == WRITER_LOCK_OFFSET {
+                    local.writer_lock_held
+                } else {
+                    local.checkpoint_lock_held
+                }
+            });
+            assert!(!sampled_owned);
+            let participant = Participant::acquire(&mapping, role);
+            assert!(
+                mapping.byte_lock_is_held(offset, sampled_owned),
+                "stale probe released the newly acquired local {role}"
+            );
+            let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+            let foreign = io
+                .open_file(path.to_str().unwrap(), OpenFlags::NoLock, false)
+                .unwrap();
+            assert!(!foreign
+                .shared_wal_try_lock_byte(offset, true, mapping.lock_kind())
+                .unwrap());
+            participant.assert_unchanged(&mapping);
+            participant.release(&mapping);
+        }
+    }
+
     enum Participant {
         Writer,
         Checkpoint,
