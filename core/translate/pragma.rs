@@ -1004,7 +1004,7 @@ fn query_pragma(
             // Allocate two more here as one was allocated at the top.
             let passive_allowed = connection
                 .mv_store_for_db(database_id)
-                .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
+                .is_none_or(|mv_store| mv_store.is_shared() || mv_store.uses_passive_checkpoint());
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());

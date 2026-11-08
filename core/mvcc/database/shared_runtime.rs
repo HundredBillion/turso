@@ -31,6 +31,7 @@ mod shared_pager_generation;
 mod shared_checkpoint;
 #[path = "shared_offline_downgrade.rs"]
 mod shared_offline_downgrade;
+pub(crate) use shared_checkpoint::checkpoint_shared;
 pub(in crate::mvcc) use shared_checkpoint::InstalledDowngradeSource;
 pub(in crate::mvcc) use shared_offline_downgrade::downgrade_existing;
 

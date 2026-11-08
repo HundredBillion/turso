@@ -94,17 +94,18 @@ mod shared_runtime;
 #[allow(unused_imports)]
 pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[cfg(all(host_shared_wal, unix))]
-#[allow(unused_imports)]
-pub(in crate::mvcc) use shared_runtime::{downgrade_existing, InstalledDowngradeSource};
-#[cfg(all(host_shared_wal, unix))]
 pub(in crate::mvcc) use shared_runtime::RecoveryWalEvidence;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
-    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
-    SharedBeginState, SharedBootstrapState, SharedIdRequest, SharedIdResult, SharedIdState,
-    SharedMvccRuntime, SharedOpenState, SharedSequenceWatermarkState,
+    checkpoint_shared, RecoveredDatabaseReady, RecoveryBootstrapEvidence,
+    RecoveryConstructionPermit, SharedBeginState, SharedBootstrapState, SharedIdRequest,
+    SharedIdResult, SharedIdState, SharedMvccRuntime, SharedOpenState,
+    SharedSequenceWatermarkState,
 };
+#[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_runtime::{downgrade_existing, InstalledDowngradeSource};
 #[cfg(all(host_shared_wal, unix))]
 pub(crate) use shared_runtime::{RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence};
 #[cfg(all(host_shared_wal, unix))]

@@ -627,34 +627,51 @@ pub fn op_checkpoint(
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
         use crate::state_machine::{StateTransition, TransitionResult};
-        // MVCC honors the requested checkpoint mode: Truncate/Restart reset the WAL
+        // Ordinary MVCC honors the requested checkpoint mode: Truncate/Restart reset the WAL
         // file, Passive/Full backfill and leave it (relying on restart-on-write).
-        let mut ckpt_sm = CheckpointStateMachine::new(
-            pager.clone(),
-            mv_store.clone(),
-            program.connection.clone(),
-            true,
-            sync_mode,
-            *database,
-            *checkpoint_mode,
-        );
+        let run_ordinary = || -> Result<CheckpointResult> {
+            let mut ckpt_sm = CheckpointStateMachine::new(
+                pager.clone(),
+                mv_store.clone(),
+                program.connection.clone(),
+                true,
+                sync_mode,
+                *database,
+                *checkpoint_mode,
+            );
+            loop {
+                match ckpt_sm.step(&()) {
+                    Ok(TransitionResult::Continue) => {}
+                    Ok(TransitionResult::Done(result)) => return Ok(result),
+                    Ok(TransitionResult::Io(iocompletions)) => {
+                        if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
+                            ckpt_sm.cleanup_after_external_io_error(err.clone())?;
+                            return Err(err);
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        };
+        #[cfg(all(host_shared_wal, unix))]
+        let result = if mv_store.is_shared() {
+            if *database != crate::MAIN_DB_ID {
+                return Err(LimboError::InvalidArgument(
+                    "shared checkpoint requires the main database".into(),
+                )
+                .into());
+            }
+            crate::mvcc::database::checkpoint_shared(program.connection.clone(), *checkpoint_mode)
+        } else {
+            run_ordinary()
+        };
+        #[cfg(not(all(host_shared_wal, unix)))]
+        let result = run_ordinary();
         let CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
             ..
-        } = loop {
-            match ckpt_sm.step(&()) {
-                Ok(TransitionResult::Continue) => {}
-                Ok(TransitionResult::Done(result)) => break result,
-                Ok(TransitionResult::Io(iocompletions)) => {
-                    if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
-                        ckpt_sm.cleanup_after_external_io_error(err.clone())?;
-                        return Err(err.into());
-                    }
-                }
-                Err(err) => return Err(err.into()),
-            }
-        };
+        } = result?;
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest].set_int(0);

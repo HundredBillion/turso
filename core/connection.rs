@@ -2597,6 +2597,11 @@ impl Connection {
         let _checkpoint_guard =
             self.begin_explicit_checkpoint(self.pager.load().clone(), false, crate::MAIN_DB_ID)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
+            #[cfg(all(host_shared_wal, unix))]
+            if mv_store.is_shared() {
+                return crate::mvcc::database::checkpoint_shared(self.clone(), mode);
+            }
+
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(
                     matches!(
