@@ -7,6 +7,9 @@ mod shared_checkpoint_recovery;
 #[path = "shared_checkpoint_recovery_physical.rs"]
 mod shared_checkpoint_recovery_physical;
 
+#[path = "shared_checkpoint_recovery_ids.rs"]
+mod shared_checkpoint_recovery_ids;
+
 #[path = "shared_id_runtime.rs"]
 mod shared_id_runtime;
 pub(crate) use shared_id_runtime::{SharedIdRequest, SharedIdResult, SharedIdState};

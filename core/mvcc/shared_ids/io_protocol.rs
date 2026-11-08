@@ -1,6 +1,9 @@
 #[path = "checkpoint_prepare.rs"]
 pub(in crate::mvcc) mod checkpoint_prepare;
 
+#[path = "checkpoint_recovery.rs"]
+pub(in crate::mvcc) mod checkpoint_recovery;
+
 #[path = "witness_mirror.rs"]
 pub(in crate::mvcc) mod witness_mirror;
 
