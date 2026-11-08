@@ -1021,9 +1021,7 @@ fn checkpoint_recovery_reclaim_native_rejects_second_store() {
     );
     drop(first);
     assert!(
-        second
-            .attach_shared_runtime(fixture.runtime.clone())
-            .is_err(),
+        second.attach_shared_runtime(fixture.runtime).is_err(),
         "dropping the first Store reopened its runtime claim"
     );
 }
