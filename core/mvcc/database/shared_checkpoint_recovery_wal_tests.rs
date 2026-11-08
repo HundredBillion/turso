@@ -87,7 +87,7 @@ fn checkpoint_recovery_wal_native_crash_fixtures_cover_old_partial_and_synced_ma
                     assert_ne!(main, fixture.main_before);
                     assert_eq!(main, expected);
                 }
-                CrashPoint::SecondIntentWrite => unreachable!(),
+                _ => unreachable!(),
             }
             let acknowledged = format!("acknowledged before checkpoint {commits}");
             assert!(expected
@@ -422,4 +422,119 @@ fn physical_wal_peer_child() {
     assert!(runtime.replay.lock().is_none());
     println!("WAL_PEER {role} ACK {commits}");
     std::io::stdout().flush().unwrap();
+}
+
+fn precommit_points() -> [CrashPoint; 5] {
+    [
+        CrashPoint::BeforeWalHeader,
+        CrashPoint::TornWalHeader,
+        CrashPoint::BeforeWalFrame,
+        CrashPoint::TornWalFrame,
+        CrashPoint::BeforeWalCommit,
+    ]
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_wal_precommit_native_genuine_crashes_preserve_source_main() {
+    for point in precommit_points() {
+        for commits in [1, 2] {
+            let fixture = IntentCrashFixture::new(point, commits);
+            let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+            let selected = fixture.io.block(|| opening.poll()).unwrap();
+            let record = selected.manifest.record();
+            assert!(record.checkpoint_intent().is_some());
+            assert!(record.prefix().end_offset > 0);
+            assert_eq!(
+                record.prefix().end_offset,
+                fixture.runtime.files.logical.size().unwrap()
+            );
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+            let file: Arc<dyn File> = ReadPinnedFile::new_for_checkpoint_recovery(
+                fixture.runtime.files.physical_wal.clone(),
+                selected.manifest.guard().unwrap(),
+            )
+            .unwrap();
+            let mut scanner = BuildSharedWal::begin(&file).unwrap();
+            let scanned = fixture.io.block(|| scanner.poll()).unwrap();
+            assert_eq!(scanned.read().metadata.max_frame.load(Ordering::Acquire), 0);
+            let size = fixture.runtime.files.physical_wal.size().unwrap();
+            match point {
+                CrashPoint::BeforeWalHeader => assert_eq!(size, 0),
+                CrashPoint::TornWalHeader => assert_eq!(size, 16),
+                CrashPoint::BeforeWalFrame => assert_eq!(size, 32),
+                CrashPoint::TornWalFrame => assert!(size > 32 && size < 32 + 24 + 4096),
+                CrashPoint::BeforeWalCommit => assert!(size >= 32 + 24 + 4096),
+                _ => unreachable!(),
+            }
+            fixture.assert_durable_unchanged();
+            eprintln!("PRECOMMIT_SOURCE_UNCHANGED {point:?} parity={commits} wal_bytes={size}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_wal_precommit_native_recovers_source_without_discarding_logical_ack() {
+    for point in precommit_points() {
+        for commits in [1, 2] {
+            let fixture = IntentCrashFixture::new(point, commits);
+            let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+            let selected = fixture.io.block(|| opening.poll()).unwrap();
+            let record = selected.manifest.record();
+            let mut mirror = selected.begin_intent_mirror().unwrap();
+            let intent = fixture.io.block(|| mirror.poll()).unwrap();
+            let mut recovery = intent
+                .begin_physical_wal_recovery(crate::OpenOptions::new(Arc::new(
+                    crate::EngineDialect,
+                )))
+                .unwrap();
+            let recovered = fixture.io.block(|| recovery.poll()).unwrap();
+            assert_eq!(recovered.record(), record);
+            assert_eq!(
+                recovered.parts.persistent_timestamp,
+                record
+                    .checkpoint_intent()
+                    .unwrap()
+                    .source_checkpoint_timestamp
+            );
+            assert!(recovered.guard().requires_recovery());
+            assert!(recovered.guard().published().is_err());
+            assert!(recovered.guard().io_retired());
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+            assert_eq!(fixture.runtime.files.physical_wal.size().unwrap(), 0);
+            let file: Arc<dyn File> = ReadPinnedFile::new_for_checkpoint_recovery(
+                fixture.runtime.files.main.clone(),
+                recovered.guard(),
+            )
+            .unwrap();
+            let mut opening = SharedPhysicalConnection::new_with_retained_file(
+                fixture.io.clone(),
+                fixture.path.to_str().unwrap().to_owned(),
+                crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+                file,
+            )
+            .unwrap();
+            let connection = fixture.io.block(|| opening.poll()).unwrap();
+            let mut rows = Vec::new();
+            connection
+                .prepare("SELECT value FROM preserved WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    rows.push(row.get::<&str>(0)?.to_owned());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, ["durable payload"]);
+            for (path, bytes) in &fixture.durable_before {
+                if path != &fixture.path
+                    && path != &fixture.runtime.files.namespace.join("physical-wal")
+                {
+                    assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                }
+            }
+            assert!(fixture.runtime.replay.lock().is_none());
+            eprintln!("PRECOMMIT_SOURCE_RECOVERED_ACK_RETAINED {point:?} parity={commits}");
+        }
+    }
 }

@@ -11,14 +11,34 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CrashPoint {
     SecondIntentWrite,
+    BeforeWalHeader,
+    TornWalHeader,
+    BeforeWalFrame,
+    TornWalFrame,
+    BeforeWalCommit,
     FirstMainBackfillWrite,
     PartialMainBackfill,
     MainSyncedBeforeWalTruncate,
 }
 impl CrashPoint {
+    pub fn is_precommit(self) -> bool {
+        matches!(
+            self,
+            Self::BeforeWalHeader
+                | Self::TornWalHeader
+                | Self::BeforeWalFrame
+                | Self::TornWalFrame
+                | Self::BeforeWalCommit
+        )
+    }
     fn name(self) -> &'static str {
         match self {
             Self::SecondIntentWrite => "second-intent",
+            Self::BeforeWalHeader => "before-wal-header",
+            Self::TornWalHeader => "torn-wal-header",
+            Self::BeforeWalFrame => "before-wal-frame",
+            Self::TornWalFrame => "torn-wal-frame",
+            Self::BeforeWalCommit => "before-wal-commit",
             Self::FirstMainBackfillWrite => "first-main",
             Self::PartialMainBackfill => "partial-main",
             Self::MainSyncedBeforeWalTruncate => "synced-main",
@@ -60,7 +80,13 @@ impl IntentCrashFixture {
         child.kill();
         let after_crash = std::fs::read(&path).unwrap();
         match point {
-            CrashPoint::SecondIntentWrite | CrashPoint::FirstMainBackfillWrite => {
+            CrashPoint::SecondIntentWrite
+            | CrashPoint::FirstMainBackfillWrite
+            | CrashPoint::BeforeWalHeader
+            | CrashPoint::TornWalHeader
+            | CrashPoint::BeforeWalFrame
+            | CrashPoint::TornWalFrame
+            | CrashPoint::BeforeWalCommit => {
                 assert_eq!(after_crash, main_before);
             }
             CrashPoint::PartialMainBackfill | CrashPoint::MainSyncedBeforeWalTruncate => {
@@ -199,6 +225,11 @@ fn checkpoint_intent_crash_child() {
     let control = Arc::new(CrashControl {
         point: match point.as_str() {
             "second-intent" => CrashPoint::SecondIntentWrite,
+            "before-wal-header" => CrashPoint::BeforeWalHeader,
+            "torn-wal-header" => CrashPoint::TornWalHeader,
+            "before-wal-frame" => CrashPoint::BeforeWalFrame,
+            "torn-wal-frame" => CrashPoint::TornWalFrame,
+            "before-wal-commit" => CrashPoint::BeforeWalCommit,
             "first-main" => CrashPoint::FirstMainBackfillWrite,
             "partial-main" => CrashPoint::PartialMainBackfill,
             "synced-main" => CrashPoint::MainSyncedBeforeWalTruncate,
@@ -208,6 +239,7 @@ fn checkpoint_intent_crash_child() {
         main: canonical,
         manifest: namespace.join("manifest"),
         wal: namespace.join("physical-wal"),
+        wal_stopped: AtomicBool::new(false),
         intent_writes: AtomicUsize::new(0),
         intent_syncs: AtomicUsize::new(0),
         wal_syncs: AtomicUsize::new(0),
@@ -262,6 +294,7 @@ enum FileRole {
     Other,
 }
 struct CrashControl {
+    wal_stopped: AtomicBool,
     point: CrashPoint,
     main: PathBuf,
     main_before: Vec<u8>,
@@ -346,6 +379,46 @@ impl File for CrashFile {
         buffer: Arc<crate::Buffer>,
         completion: Completion,
     ) -> Result<Completion> {
+        if matches!(self.role, FileRole::Wal)
+            && self.control.intent_syncs.load(Ordering::Acquire) == 2
+            && self.control.point.is_precommit()
+        {
+            let point = self.control.point;
+            let stop = self.control.wal_stopped.load(Ordering::Acquire)
+                || (offset == 0
+                    && matches!(
+                        point,
+                        CrashPoint::BeforeWalHeader | CrashPoint::TornWalHeader
+                    ))
+                || (offset >= 32
+                    && matches!(point, CrashPoint::BeforeWalFrame | CrashPoint::TornWalFrame))
+                || (offset >= 32
+                    && matches!(point, CrashPoint::BeforeWalCommit)
+                    && buffer.len() >= 24
+                    && u32::from_be_bytes(buffer.as_slice()[4..8].try_into().unwrap()) != 0);
+            if stop {
+                if !self.control.wal_stopped.swap(true, Ordering::AcqRel) {
+                    let partial = match point {
+                        CrashPoint::TornWalHeader => 16,
+                        CrashPoint::TornWalFrame => buffer.len() / 2,
+                        _ => 0,
+                    };
+                    if partial > 0 {
+                        let bytes = Arc::new(crate::Buffer::new_temporary(partial));
+                        bytes
+                            .as_mut_slice()
+                            .copy_from_slice(&buffer.as_slice()[..partial]);
+                        let written =
+                            self.inner
+                                .pwrite(offset, bytes, Completion::new_write(|_| {}))?;
+                        assert!(written.succeeded());
+                    }
+                }
+                assert_eq!(self.control.changed_main_writes.load(Ordering::Acquire), 0);
+                self.control.pending.lock().push(completion.clone());
+                return Ok(completion);
+            }
+        }
         let stop = match self.role {
             FileRole::Manifest => {
                 let intent = buffer.len() >= RECORD_SIZE
@@ -385,7 +458,7 @@ impl File for CrashFile {
                     assert_eq!(self.control.changed_main_writes.load(Ordering::Acquire), 1);
                     assert!(self.control.wal_syncs.load(Ordering::Acquire) > 0);
                 }
-                CrashPoint::MainSyncedBeforeWalTruncate => unreachable!(),
+                _ => unreachable!(),
             }
             self.control.pending.lock().push(completion.clone());
             return Ok(completion);
