@@ -1,6 +1,9 @@
 #[path = "shared_checkpoint.rs"]
 mod shared_checkpoint;
 
+#[path = "shared_checkpoint_recovery.rs"]
+mod shared_checkpoint_recovery;
+
 #[path = "shared_id_runtime.rs"]
 mod shared_id_runtime;
 pub(crate) use shared_id_runtime::{SharedIdRequest, SharedIdResult, SharedIdState};
