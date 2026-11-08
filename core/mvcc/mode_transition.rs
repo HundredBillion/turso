@@ -524,6 +524,22 @@ fn fs_error(error: std::io::Error) -> LimboError {
     crate::error::io_error(error, "MVCC offline mode transition")
 }
 
+#[cfg(all(test, target_os = "linux", not(shuttle)))]
+pub(crate) fn prepare_test_namespace(
+    path: &Path,
+    timestamp: u64,
+    history_limit: u64,
+) -> Result<()> {
+    let file = File::open(path).map_err(fs_error)?;
+    require_marker(&file, SHARED_MVCC_VERSION)?;
+    let id = identity(&file)?;
+    let namespace = namespace_for(path, id)?;
+    let floor = -i64::try_from(file.metadata().map_err(fs_error)?.len() / 512)
+        .map_err(|_| LimboError::DatabaseFull)?
+        .max(1);
+    prepare_namespace(&namespace, id, timestamp, floor, history_limit)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1153,20 +1169,4 @@ pub(super) mod tests {
         assert_eq!(fs::read(&destination).unwrap(), original);
         assert!(second.exists());
     }
-}
-
-#[cfg(all(test, target_os = "linux", not(shuttle)))]
-pub(crate) fn prepare_test_namespace(
-    path: &Path,
-    timestamp: u64,
-    history_limit: u64,
-) -> Result<()> {
-    let file = File::open(path).map_err(fs_error)?;
-    require_marker(&file, SHARED_MVCC_VERSION)?;
-    let id = identity(&file)?;
-    let namespace = namespace_for(path, id)?;
-    let floor = -i64::try_from(file.metadata().map_err(fs_error)?.len() / 512)
-        .map_err(|_| LimboError::DatabaseFull)?
-        .max(1);
-    prepare_namespace(&namespace, id, timestamp, floor, history_limit)
 }

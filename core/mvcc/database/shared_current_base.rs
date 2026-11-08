@@ -517,12 +517,9 @@ mod tests {
             .live_registrations()
             .unwrap();
         assert_eq!(snapshots.len(), 1);
-        let mut inspecting = CurrentBaseInspection::new(
-            runtime.clone(),
-            database.clone(),
-            open.loaded.take().unwrap(),
-        )
-        .unwrap();
+        let mut inspecting =
+            CurrentBaseInspection::new(runtime.clone(), database, open.loaded.take().unwrap())
+                .unwrap();
         let inspected = io.block(|| inspecting.poll()).unwrap();
         let (evidence, manifest, _parts) = inspected.into_parts();
         let previous = runtime.replay.lock().take().unwrap();

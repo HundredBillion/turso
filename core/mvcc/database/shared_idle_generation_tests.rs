@@ -68,7 +68,7 @@ fn run_idle_generation_case(role: &str) {
         .unwrap();
     let verified = fixture.io.block(|| reading.poll()).unwrap();
     let mut installing = verified
-        .begin_local_install(store.clone(), fixture.connection.clone())
+        .begin_local_install(store, fixture.connection.clone())
         .unwrap();
     let installed = fixture.io.block(|| installing.poll()).unwrap();
     installed.publish_ready(fixture.connection.clone()).unwrap();
