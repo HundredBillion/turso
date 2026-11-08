@@ -1,4 +1,4 @@
-name: Live sequence descriptor native validation
+name: Recovery physical inspection native validation
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 149f5562eed349e8ff79a414c9df52ae1e71c4e2
+          ref: c98f47d3b4c66565c089f98ff4e6bc4c2a3804fe
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,22 +25,28 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = "$(git rev-parse 149f5562eed349e8ff79a414c9df52ae1e71c4e2)"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse c98f47d3b4c66565c089f98ff4e6bc4c2a3804fe)"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
-      - name: Complete-frame descriptor regressions
+      - name: Verified recovery and physical-collector prerequisites
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ -- --test-threads=1 --nocapture 2>&1 | tee descriptor.log
-          grep -q '4 passed; 0 failed' descriptor.log
-      - name: Previously failing independent peer sequence preparation
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
+          grep -q '3 passed; 0 failed' entry.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_bootstrap::tests:: -- --test-threads=1 --nocapture 2>&1 | tee collector.log
+          grep -q '4 passed; 0 failed' collector.log
+      - name: Retained physical inspection with recovery still required
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native_peer_sequence_ddl -- --ignored --test-threads=1 --nocapture 2>&1 | tee peer-sequence.log
-          grep -q '1 passed; 0 failed' peer-sequence.log
-      - name: Shared ID opcode compatibility
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-green.log
+          grep -q '1 passed; 0 failed' physical-green.log
+      - name: Recovery cancellation and existing physical reader/pins
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee id-opcodes.log
-          grep -q '9 passed; 0 failed' id-opcodes.log
-      - name: Complete MVCC database and strict library lint
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee recovery-io.log
+          grep -q '2 passed; 0 failed' recovery-io.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_physical_connection_ -- --test-threads=1 --nocapture 2>&1 | tee factory.log
+          grep -q '3 passed; 0 failed' factory.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api read_pinned_file::tests:: -- --test-threads=1 --nocapture 2>&1 | tee pin.log
+          grep -q '2 passed; 0 failed' pin.log
+      - name: Full MVCC and strict library lint
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=2 2>&1 | tee mvcc.log
           grep -Eq '[1-9][0-9]* passed; 0 failed' mvcc.log
