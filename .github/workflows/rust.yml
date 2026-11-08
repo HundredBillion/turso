@@ -1,4 +1,4 @@
-name: Shared provisional domain probes
+name: Shared provisional watermark and identity control
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3382852547e58bd69282496d3b85d56d00d592d7
+          ref: 3f0b48067707bef2f6ebbf21617b67b203f3c7d0
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,26 +24,37 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 3382852547e58bd69282496d3b85d56d00d592d7
+          test "$(git rev-parse HEAD)" = 3f0b48067707bef2f6ebbf21617b67b203f3c7d0
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Provisional table and sequence probes
+      - name: Native provisional and committed watermark acceptance
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run
-          for selector in shared_id_opcode_native_provisional_sequence_; do
-            set +e
-            timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
-            result=${PIPESTATUS[0]}
-            set -e
-            echo "$result" > "$selector.exit.log"
-            test "$result" -eq 0 -o "$result" -eq 101
-            grep -Eq '(1 passed; 0 failed|0 passed; 1 failed)' "$selector.log"
-          done
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_provisional_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee provisional.log
+          grep -q '2 passed; 0 failed' provisional.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_watermark_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark.log
+          grep -q '3 passed; 0 failed' watermark.log
+      - name: Expected backing identity counterexample
+        run: |
+          set -o pipefail
+          set +e
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_identity_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee identity-red.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 101
+          grep -q '0 passed; 1 failed' identity-red.log
+          grep -Fq 'accepted a backing root for another sequence: Ok(Some(' identity-red.log
+      - name: Policy and library lint
+        run: |
+          set -o pipefail
+          cargo test --locked -p turso_core --lib --features conn_raw_api id_policy_ 2>&1 | tee policy.log
+          grep -q '12 passed; 0 failed' policy.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-provisional-probes
+          name: shared-provisional-watermark
           path: |
             source.txt
             rustc.txt
