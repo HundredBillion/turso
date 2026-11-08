@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 0c6390c7c90dae52292f99580830d7d7516b75c2
+          ref: 9f843b50b244644076d72edf5be3c68804c1a165
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 0c6390c7c90dae52292f99580830d7d7516b75c2
+          test "$(git rev-parse HEAD)" = 9f843b50b244644076d72edf5be3c68804c1a165
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -45,15 +45,17 @@ jobs:
           test "$status" -ne 0
           grep -q 'recovered logical reclamation is not implemented' stub-red.log
           grep -q '0 passed; 1 failed' stub-red.log
-      - name: Existing runtime accepts an unsafe second Store RED
+      - name: Linear Store claim and sealed finalized-ID suspension
         run: |
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_rejects_second_store -- --ignored --test-threads=1 --nocapture 2>&1 | tee ownership-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'a second Store attached to an already claimed runtime' ownership-red.log
-          grep -q '0 passed; 1 failed' ownership-red.log
+          for test in checkpoint_recovery_reclaim_native_rejects_second_store checkpoint_recovery_reclaim_native_reservation_is_linear checkpoint_recovery_reclaim_native_finalized_suspension; do
+            timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api "$test" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$test.log"
+            grep -q '1 passed; 0 failed' "$test.log"
+          done
+      - name: Strict library lint and source integrity
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api -- --deny=warnings 2>&1 | tee clippy.log
+          cargo fmt --all -- --check
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
