@@ -553,3 +553,74 @@ fn shared_checkpoint_ready_native_late_failures_leave_no_replay() {
         assert!(fixture.runtime.gate.try_enter_admission().is_ok());
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_checkpoint_ready_native_sleeping_private_pager_resets_before_read_and_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let options =
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit);
+    let db = crate::Database::open(io.clone(), path.to_str().unwrap(), options).unwrap();
+    let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+    let idle = db.connect(crate::ConnectOpts::new()).unwrap();
+    assert!(!Arc::ptr_eq(&connection.get_pager(), &idle.get_pager()));
+    idle.execute("SELECT * FROM preserved").unwrap();
+    let pager = idle.get_pager();
+    let (cached_header, completion) = io.block(|| pager.read_page(1)).unwrap();
+    if let Some(completion) = completion {
+        io.wait_for_completion(completion).unwrap();
+    }
+    assert!(Arc::ptr_eq(
+        &cached_header,
+        &pager.cache_get(1).unwrap().unwrap()
+    ));
+    connection
+        .execute("UPDATE preserved SET value='before local checkpoint' WHERE id=1")
+        .unwrap();
+    let store = db.get_mv_store().as_ref().unwrap().clone();
+    let mut coordinator =
+        SharedCheckpointPublication::new(store.clone(), connection.clone()).unwrap();
+    let published = io.block(|| coordinator.poll()).unwrap();
+    let mut reading = published
+        .begin_physical_read(store.clone(), connection.clone())
+        .unwrap();
+    let verified = io.block(|| reading.poll()).unwrap();
+    let mut installing = verified
+        .begin_local_install(store, connection.clone())
+        .unwrap();
+    let installed = io.block(|| installing.poll()).unwrap();
+    installed.publish_ready(connection).unwrap();
+    assert!(
+        Arc::ptr_eq(&cached_header, &pager.cache_get(1).unwrap().unwrap()),
+        "private idle cache was reset before its own admission"
+    );
+    let mut values = Vec::new();
+    idle.prepare("SELECT value FROM preserved WHERE id=1")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, ["before local checkpoint"]);
+    assert!(
+        !pager
+            .cache_get(1)
+            .unwrap()
+            .is_some_and(|page| Arc::ptr_eq(&page, &cached_header)),
+        "idle pager retained its old-generation cached header"
+    );
+    idle.execute("UPDATE preserved SET value='after local checkpoint' WHERE id=1")
+        .unwrap();
+    let mut values = Vec::new();
+    idle.prepare("SELECT value FROM preserved WHERE id=1")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            values.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values, ["after local checkpoint"]);
+}
