@@ -219,7 +219,7 @@ fn shared_id_opcode_native_claim_yield_resume_reset_drop() {
 }
 
 #[test]
-#[ignore = "known stale prepare regression; requires native Linux ext-family filesystem"]
+#[ignore = "requires native Linux ext-family filesystem"]
 fn shared_id_stale_prepare_native_peer_sequence_ddl() {
     let (_directory, first, second) = pair();
     first.execute("CREATE SEQUENCE peer_sequence").unwrap();
