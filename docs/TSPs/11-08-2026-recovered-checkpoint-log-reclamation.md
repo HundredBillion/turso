@@ -1,6 +1,6 @@
 # Recovered Checkpoint Log Reclamation Technical Spec
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use dmi-superpowers:executing-plans to implement this TSP task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use dmi-superpowers:executing-plans to implement this TSP task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Reclaim the obsolete logical log after genuine recovered completion and ID finalization, while retaining continuous authority, admission pause and exclusive permission to construct the runtime's first Store.
 
@@ -88,8 +88,25 @@ Validate -> FreshManifest -> ValidateAgain -> Truncate(0)
 
 **Interfaces:** Exercise the same genuine proof/IDs/runtime constructors and logical transport seam; add no test-only proof or mutable ownership escape.
 
-- [ ] Inject submission errors and callback errors at actual truncate and FULLsync. Assert no sealed result, no replay readiness, no early peer publication, and fresh real recovery can retry both pre-truncate and already-truncated durable states.
-- [ ] Hold truncate and FULLsync before callback and after callback-before-physical-retirement; drop the state at each boundary. Competing authority remains Busy until the actual backend retires, then fresh recovery can acquire and reconstruct a new proof. Live state cannot return output after callback alone.
-- [ ] Reject wrong Runtime/native owner, foreign original lease/proof, nonempty physical WAL, changed actual main extent, changed target map or fresh normal record, and pending IDs before the first logical mutation. An already-attached runtime must reject even after runtime.replay is withdrawn.
-- [ ] Run causal controls: bypass first-Store reservation to fail the existing-Store mutation guard; remove logical final-retirement wait to fail callback-before-retirement output guard; remove concrete append adoption to fail a seeded real previous append-state assertion. Restore exact source after each RED.
-- [ ] With strict Bash pipefail, run restored focused tests, existing witness/finalization/native ownership tests, full MVCC suite, strict library Clippy, format and source-integrity checks. Inspect raw cargo summaries, not only workflow conclusion. Obtain independent whole-branch review, record exact SHA/run/counts, and retain the private branch for parent integration. Bootstrap/Ready remain separate work.
+- [x] Inject submission errors and callback errors at actual truncate and FULLsync. Assert no sealed result, no replay readiness, no early peer publication, and fresh real recovery can retry both pre-truncate and already-truncated durable states.
+- [x] Hold truncate and FULLsync before callback and after callback-before-physical-retirement; drop the state at each boundary. Competing authority remains Busy until the actual backend retires, then fresh recovery can acquire and reconstruct a new proof. Live state cannot return output after callback alone.
+- [x] Reject wrong Runtime/native owner, foreign original lease/proof, nonempty physical WAL, changed actual main extent, changed target map or fresh normal record, and pending IDs before the first logical mutation. An already-attached runtime must reject even after runtime.replay is withdrawn.
+- [x] Run causal controls: bypass first-Store reservation to fail the existing-Store mutation guard; remove logical final-retirement wait to fail callback-before-retirement output guard; remove concrete append adoption to fail a seeded real previous append-state assertion. Restore exact source after each RED.
+- [x] With strict Bash pipefail, run restored focused tests, existing witness/finalization/native ownership tests, full MVCC suite, strict library Clippy, format and source-integrity checks. Inspect raw cargo summaries, not only workflow conclusion. Obtain independent whole-branch review, record exact SHA/run/counts, and retain the private branch for parent integration. Bootstrap/Ready remain separate work.
+
+## Verification evidence
+
+- Stub source `e7d7b3dc6`, native run `42502479400`: existing recovered finalization 7 PASS, genuine retained obsolete log, then expected missing reclamation 0/1 RED.
+- Ownership source `0c6390c7c`, native run `42502645187`: actual duplicate Store attachment 0/1 RED. The same-Store concurrency assertion was strengthened to simultaneous initial attachment in the candidate.
+- Ownership source `1465e2cd5`, native run `42503399878`: finalization 7 PASS, ownership/reservation/sealed suspension 3 PASS, expected reclamation stub RED, strict lint/format/source integrity PASS. An earlier native-only barrier declaration mistake and the initially incorrect lint feature subset were corrected; neither failure was claimed as behavioral evidence.
+- Reclamation production source `75f2ededb`, native run `42503716692`: reclamation/ownership 5 PASS, existing finalization 7 PASS, strict lint/format/source integrity PASS. Parent independently reviewed runtime claim, sealed suspension and complete reclamation production source without a blocker.
+- Final test source `d05a253dc`, native run `42504393531`: initial/restored reclamation 9 PASS, existing finalization 7 PASS, confirmation 8 PASS, ID protocol 72 PASS/3 ignored, authority 13 PASS, full MVCC 842 PASS/62 ignored, strict library Clippy with `conn_raw_api,bench` finished successfully, format and source integrity PASS.
+- The final native test cohort includes truncate/FULLsync submission and callback failures with real recovery retries (4 cases), cancellation before/after callback with physical authority retention and recovery retries (4), live callback-before-retirement barriers (2), and wrong owner/foreign finalized IDs/nonempty physical WAL/changed main extent/physical timestamp/actual manifest rejection before logical mutation (6).
+- Three final actual source bypasses each produced the intended 0/1 RED: first-Store reservation (`reclamation accepted a runtime with a preexisting Store`), final physical retirement (`logical reclamation escaped before physical retirement 0`), and concrete append adoption (`recovered logical append state is not empty`). Exact source was restored before the 9-test cohort and broader checks.
+- Append-cache controls save only the real old Store's header/offset/CRC before all old holders drop. The fresh Runtime is still genuinely reopened after coordination loss; the saved actual old append state is installed under retained authority solely to make stale framing observable. No proof, generation or source database is synthesized.
+- Finalized IDs cannot regain a pending selector through the new sealed suspension token: rejoin checks original proof/lease, exact published target, no pending checkpoint and floor. The token provides no generic LoadedIds escape; already-attached runtimes reject reclamation even after replay withdrawal.
+- Raw evidence is retained under the root repository's `.local/issue-resolution/recovered-reclaim-*.log`; the final full log is `recovered-reclaim-d05-final-native.log`. Linux validation uses explicit Bash with pipefail, including Clippy.
+
+Database/Store bootstrap, pager certification, actual readiness/admission handoff and public PDO activation are not implemented by this TSP. The next approved work must design those owned lifetimes together and validate the genuine post-recovery write/reopen path before public activation.
+
+Independent final review: parent reviewed the full production/test package and actual final raw logs and reported CLEAR. The branch is retained privately for parent integration; no public opt-in or Ready path is enabled.
