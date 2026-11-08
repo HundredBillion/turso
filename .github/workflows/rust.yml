@@ -1,4 +1,4 @@
-name: Normal recovery Ready acceptance
+name: Shared open recovery baseline
 on:
   workflow_dispatch:
 permissions:
@@ -13,72 +13,45 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "1"
 jobs:
-  recovered-finalization:
+  shared-open-baseline:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f7a3eb67a7b5ad738a6b0e43ce65f282661be6ed
+          ref: 94f425dd9dfc866aad01a11049869d67d413588e
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Exact native source
+      - name: Actual baseline source
         run: |
-          git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f7a3eb67a7b5ad738a6b0e43ce65f282661be6ed
+          test "$(git rev-parse HEAD)" = 94f425dd9dfc866aad01a11049869d67d413588e
           test "$(id -u)" -ne 0
           rustc -Vv
-      - name: Actual SQLite dialect and native extension through C
+      - name: Healthy live readers and unacknowledged tails
         run: |
-          timeout 300 cargo test --locked -p turso_sqlite3 --lib recovered_checkpoint_uses_sqlite_dialect_and_c_connection -- --ignored --test-threads=1 --nocapture 2>&1 | tee real-c.log
-          grep -q '1 passed; 0 failed' real-c.log
-      - name: Normal Ready ownership and failure controls
-        run: |
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api,test_helper checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready.log
-          grep -q '16 passed; 0 failed' ready.log
-      - name: Causal removal of installation and admission checks
-        run: |
-          cp core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs /tmp/normal-bootstrap.rs
-          cp core/database/shared_recovered.rs /tmp/normal-factory.rs
-          for control in retirement; do
-            cp /tmp/normal-bootstrap.rs core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs
-            cp /tmp/normal-factory.rs core/database/shared_recovered.rs
-            export MUTATION_NAME="$control"
-            python3 -c 'exec('"'"'import os\nfrom pathlib import Path\nkind=os.environ["MUTATION_NAME"]\nbase=Path("core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs")\nfactory=Path("core/database/shared_recovered.rs")\nmutations={\n"install":(base,"self.prepared\\n            .take()\\n            .unwrap()\\n            .install(&self.store, self.proof(), self.guard())?;","drop(self.prepared.take());"),\n"connection":(base,"if !self.original_connection.as_ref().is_some_and(|original| {\\n            crate::sync::Weak::ptr_eq(original, &Arc::downgrade(&connection))\\n        }) ||", "if false ||"),\n"certify":(base,"self.runtime\\n            .certify_completed_pager(&connection, self.proof(), self.guard())?;", ""),\n"withdraw":(base,"if let Err(error) = guard.finish() {\\n            self.runtime.replay.lock().take();", "if let Err(error) = guard.finish() {"),\n"retirement":(factory,"if let Some(waiter) = source.physical_retirement() {\\n            return Ok(IOResult::IO(crate::types::IOCompletions(waiter)));\\n        }", ""),\n}\np,old,new=mutations[kind]\ns=p.read_text()\nassert s.count(old)==1,(kind,s.count(old))\np.write_text(s.replace(old,new,1))\n'"'"')'
-            case "$control" in
-              install) filter=checkpoint_recovery_bootstrap_native_ready_reopens_admission_and_commits; marker='recovered Database is not ready for admission';;
-              connection) filter=checkpoint_recovery_bootstrap_native_late_failures_leave_no_ready_replay; marker='ignored late fault 3';;
-              certify) filter=checkpoint_recovery_bootstrap_native_late_failures_leave_no_ready_replay; marker='ignored late fault 1';;
-              withdraw) filter=checkpoint_recovery_bootstrap_native_late_failures_leave_no_ready_replay; marker='assertion failed: runtime.replay.lock().is_none()';;
-              retirement) filter=checkpoint_recovery_bootstrap_native_factory_waits_for_physical_retirement; marker='factory completed before retained physical read retired';;
-            esac
-            set +e
-            timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api,test_helper "$filter" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "control-$control.log"
-            status=${PIPESTATUS[0]}
-            set -e
-            test "$status" -ne 0
-            grep -q '0 passed; 1 failed' "control-$control.log"
-            grep -Fq "$marker" "control-$control.log"
+          for filter in shared_open_recovery_native_healthy_open_keeps_live_reader shared_open_recovery_native_empty_prefix_ignores_unacknowledged_tail; do
+            timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api "$filter" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$filter.log"
+            grep -q '1 passed; 0 failed' "$filter.log"
           done
-          cp /tmp/normal-bootstrap.rs core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs
-          cp /tmp/normal-factory.rs core/database/shared_recovered.rs
-          git diff --exit-code
-      - name: Restored native Ready and C unit suite
+      - name: Genuine pending checkpoint public open counterexample
         run: |
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api,test_helper checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored.log
-          grep -q '16 passed; 0 failed' restored.log
-          timeout 300 cargo test --locked -p turso_sqlite3 --lib -- --test-threads=1 2>&1 | tee c-unit.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' c-unit.log
-      - name: Strict tests lint and source integrity
+          set +e
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_recovery_native_completed_pending_ids_opens -- --ignored --test-threads=1 --nocapture 2>&1 | tee pending-ids.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' pending-ids.log
+          grep -q 'shared checkpoint recovery is required' pending-ids.log
+      - name: Strict test lint and unchanged source
         run: |
-          cargo clippy --locked -p turso_core -p turso_sqlite3 --tests --features conn_raw_api,bench,turso_core/test_helper -- --deny=warnings 2>&1 | tee clippy.log
+          cargo clippy --locked -p turso_core --tests --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: recovered-ready-acceptance
+          name: normal-shared-open-baseline
           path: '*.log'
