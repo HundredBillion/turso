@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: cde1b85918f86c0248b80518f8a1fb55586290bc
+          ref: 0b37ca84557e4bd2f1b34c67cc50c263e7a47840
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -26,7 +26,7 @@ jobs:
       - name: Record exact source and platform
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = cde1b85918f86c0248b80518f8a1fb55586290bc
+          test "$(git rev-parse HEAD)" = 0b37ca84557e4bd2f1b34c67cc50c263e7a47840
           rustc -Vv | tee rustc.txt
       - name: Windows shared-refresh typecheck
         run: |
@@ -45,6 +45,18 @@ jobs:
           grep -q 'E0609' windows-cfg-red.log
           grep -q 'shared_runtime' windows-cfg-red.log
           git restore core/mvcc/database/shared_refresh.rs
+      - name: Removing the native checkpoint guard must reproduce its missing proof type
+        run: |
+          trap 'git restore core/mvcc/commit_manifest/checkpoint_publication.rs' EXIT
+          python -c 'from pathlib import Path; p=Path("core/mvcc/commit_manifest/checkpoint_publication.rs"); s=p.read_text(); old="    #[cfg(all(host_shared_wal, unix))]\n    pub(in crate::mvcc) fn begin_completion("; assert s.count(old)==1; p.write_text(s.replace(old,"    pub(in crate::mvcc) fn begin_completion("))'
+          set +e
+          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-proof-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'E0412' windows-proof-red.log
+          grep -q 'MaterializedCheckpointProof' windows-proof-red.log
+          git restore core/mvcc/commit_manifest/checkpoint_publication.rs
       - name: Restored Windows source must typecheck
         run: |
           git diff --exit-code
@@ -53,10 +65,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pager-generation-cde1-windows
+          name: pager-generation-0b37-windows
           path: |
             source.txt
             rustc.txt
             windows-check.log
             windows-cfg-red.log
+            windows-proof-red.log
             windows-restored.log
