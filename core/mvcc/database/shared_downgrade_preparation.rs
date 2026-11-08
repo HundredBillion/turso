@@ -17,6 +17,11 @@ pub(in crate::mvcc) struct InstalledDowngradeSource {
 }
 impl InstalledDowngradeSource {
     pub(in crate::mvcc) fn validate(&self, loaded: &LoadedManifest) -> Result<()> {
+        if !loaded.belongs_to_file(&self.files.manifest()) {
+            return Err(LimboError::InvalidArgument(
+                "downgrade manifest is not the retained synchronous alias".into(),
+            ));
+        }
         let guard = loaded.guard()?;
         let target = self.proof.target_identity();
         let record = loaded.record();
