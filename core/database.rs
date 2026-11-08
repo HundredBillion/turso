@@ -3465,6 +3465,12 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
     ) -> Result<Arc<Connection>> {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.shared_mvcc_runtime.is_some()
+            && (pager.holds_read_lock() || pager.holds_write_lock())
+        {
+            return Err(LimboError::Busy);
+        }
         let conn = self.new_connection(
             is_mvcc_bootstrap_connection,
             pager,

@@ -109,6 +109,14 @@ impl SharedRefresh {
         options: SharedBeginOptions,
     ) -> IOResultOr<TxID> {
         let mut loaded = return_if_io!(self.poll(store, connection));
+        if let Some(runtime) = store.shared_runtime.get() {
+            runtime.certify_database_pager(
+                &connection.get_source_database(options.database_id),
+                &options.pager,
+                None,
+                loaded.guard()?,
+            )?;
+        }
         let snapshot = loaded.guard_mut()?.register_snapshot()?;
         let checkpoint_read_guard =
             store.try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin()?;

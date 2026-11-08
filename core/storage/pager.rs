@@ -1612,10 +1612,20 @@ impl SharedPagerState {
     }
 }
 
+#[cfg(all(host_shared_wal, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedPagerGeneration {
+    pub database_id: crate::io::FileId,
+    pub generation: u64,
+    pub checkpoint_timestamp: u64,
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
 pub struct Pager {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_generation: Mutex<Option<SharedPagerGeneration>>,
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
@@ -1958,6 +1968,8 @@ impl Pager {
             RwLock::new(AllocatePage1State::Done)
         };
         Ok(Self {
+            #[cfg(all(host_shared_wal, unix))]
+            shared_generation: Mutex::new(None),
             db_file,
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
@@ -5519,6 +5531,16 @@ impl Pager {
     #[cfg(test)]
     pub fn test_evict_all_unpinned_clean(&self) {
         self.page_cache.write().test_evict_all_unpinned_clean();
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn ensure_shared_generation(&self, generation: SharedPagerGeneration) -> Result<()> {
+        let mut current = self.shared_generation.lock();
+        if *current != Some(generation) {
+            self.reset_shared_generation()?;
+            *current = Some(generation);
+        }
+        Ok(())
     }
 
     /// Detach reads from the previous shared generation under the caller's

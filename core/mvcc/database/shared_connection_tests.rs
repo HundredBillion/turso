@@ -237,6 +237,37 @@ fn shared_connection_native_initial_open_waits_for_completed_header_backend_rele
         .unwrap();
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_connection_native_active_helper_keeps_outer_transaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let database = crate::Database::open(
+        io,
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    )
+    .unwrap();
+    let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+    connection.execute("BEGIN CONCURRENT").unwrap();
+    connection.execute("SELECT value FROM preserved").unwrap();
+    let pager = connection.get_pager();
+    let outer = connection.get_mv_tx();
+    assert!(pager.holds_read_lock());
+    assert!(
+        matches!(
+            database._connect_with_pager_and_default_cache_size(false, pager.clone(), None, 10),
+            Err(LimboError::Busy)
+        ),
+        "private helper reused an active outer pager"
+    );
+    assert!(pager.holds_read_lock());
+    assert_eq!(connection.get_mv_tx(), outer);
+    connection.execute("SELECT value FROM preserved").unwrap();
+    connection.execute("ROLLBACK").unwrap();
+}
+
 struct HeldMainRead {
     file: Arc<dyn File>,
     offset: u64,

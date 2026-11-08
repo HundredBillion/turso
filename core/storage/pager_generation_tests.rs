@@ -293,3 +293,101 @@ fn shared_generation_reset_reloads_header_without_changing_layout() {
     assert_eq!(pager.usable_space(), usable);
     conn.execute("SELECT * FROM t").unwrap();
 }
+
+#[cfg(all(host_shared_wal, unix))]
+#[test]
+fn shared_generation_tag_resets_only_when_physical_identity_changes() {
+    let source = SharedPagerGeneration {
+        database_id: crate::io::FileId { dev: 1, ino: 2 },
+        generation: 3,
+        checkpoint_timestamp: 4,
+    };
+    for target in [
+        SharedPagerGeneration {
+            database_id: crate::io::FileId { dev: 1, ino: 9 },
+            ..source
+        },
+        SharedPagerGeneration {
+            generation: 9,
+            ..source
+        },
+        SharedPagerGeneration {
+            checkpoint_timestamp: 9,
+            ..source
+        },
+    ] {
+        let (pager, file) = fixture();
+        pager.ensure_shared_generation(source).unwrap();
+        let (old, completion) = read(&pager);
+        let (position, backend) = file.reads.lock().remove(0);
+        drop(file.inner.pread(position, backend).unwrap());
+        assert!(completion.unwrap().finished());
+        pager.ensure_shared_generation(source).unwrap();
+        let (same, completion) = read(&pager);
+        assert!(completion.is_none());
+        assert!(
+            Arc::ptr_eq(&old, &same),
+            "same physical identity reset the pager"
+        );
+        pager.ensure_shared_generation(target).unwrap();
+        let (new, _) = read(&pager);
+        assert!(
+            !Arc::ptr_eq(&old, &new),
+            "changed physical identity retained cached page"
+        );
+    }
+}
+
+#[cfg(all(host_shared_wal, unix))]
+#[test]
+fn shared_generation_tag_preserves_active_pager_aliases() {
+    use crate::storage::wal::{WalFile, WalFileShared};
+    let source = SharedPagerGeneration {
+        database_id: crate::io::FileId { dev: 1, ino: 2 },
+        generation: 3,
+        checkpoint_timestamp: 4,
+    };
+    let target = SharedPagerGeneration {
+        generation: 5,
+        ..source
+    };
+    let (mut pager, file) = fixture();
+    let shared = WalFileShared::new_shared(
+        pager
+            .io
+            .open_file("generation-alias.wal", OpenFlags::Create, false)
+            .unwrap(),
+    )
+    .unwrap();
+    let last = shared.read().last_checksum_and_max_frame();
+    pager.wal = Some(Arc::new(WalFile::new(
+        pager.io.clone(),
+        shared,
+        last,
+        pager.buffer_pool.clone(),
+    )));
+    let pager = Arc::new(pager);
+    let alias = pager.clone();
+    pager.ensure_shared_generation(source).unwrap();
+    pager.begin_read_tx().unwrap();
+    let (old, completion) = read(&pager);
+    let (position, backend) = file.reads.lock().remove(0);
+    drop(file.inner.pread(position, backend).unwrap());
+    assert!(completion.unwrap().finished());
+    alias.ensure_shared_generation(source).unwrap();
+    assert!(
+        matches!(
+            alias.ensure_shared_generation(target),
+            Err(LimboError::Busy)
+        ),
+        "generation change reset a pager with an active outer reader"
+    );
+    assert!(pager.holds_read_lock());
+    let (same, completion) = read(&pager);
+    assert!(completion.is_none());
+    assert!(Arc::ptr_eq(&old, &same));
+    pager.end_read_tx();
+    alias.ensure_shared_generation(target).unwrap();
+    let (new, _) = read(&pager);
+    assert!(!Arc::ptr_eq(&old, &new));
+}

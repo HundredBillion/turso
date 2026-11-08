@@ -1,5 +1,6 @@
 use super::*;
-use crate::mvcc::database::SharedOpenState;
+use crate::mvcc::database::{SharedMvccRuntime, SharedOpenState};
+use crate::storage::pager::SharedPagerGeneration;
 
 pub(super) struct SharedConnectState {
     database: Weak<Database>,
@@ -9,7 +10,7 @@ pub(super) struct SharedConnectState {
     context: Option<ConnectionContext>,
     pager: Option<Arc<Pager>>,
     connection: Option<Arc<Connection>>,
-    generation_validated: bool,
+    captured_generation: Option<SharedPagerGeneration>,
 }
 
 impl SharedConnectState {
@@ -38,7 +39,7 @@ impl SharedConnectState {
             context: Some(context),
             pager: None,
             connection: None,
-            generation_validated: false,
+            captured_generation: None,
         })
     }
 
@@ -50,9 +51,8 @@ impl SharedConnectState {
             .into());
         }
         return_if_io!(self.open.poll_manifest());
-        if !self.generation_validated {
-            self.open.validate_connection_generation()?;
-            self.generation_validated = true;
+        if self.captured_generation.is_none() {
+            self.captured_generation = Some(self.open.capture_connection_generation()?);
         }
         if self.pager.is_none() {
             self.pager = Some(Arc::new(return_if_io!(database._init_nonblock(
@@ -77,6 +77,7 @@ impl SharedConnectState {
         return_if_io!(self.open.finish_connection(
             database.get_mv_store().as_ref().ok_or(LimboError::Busy)?,
             self.connection.as_ref().unwrap(),
+            self.captured_generation.unwrap(),
         ));
         Ok(IOResult::Done(self.connection.take().unwrap()))
     }
@@ -85,5 +86,25 @@ impl SharedConnectState {
 impl Drop for SharedConnectState {
     fn drop(&mut self) {
         self.init.cancel();
+    }
+}
+
+impl Database {
+    pub(crate) fn validate_shared_pager_owner(
+        &self,
+        pager: &Pager,
+        runtime: &SharedMvccRuntime,
+    ) -> Result<()> {
+        if !pager.uses_shared_state(&self.pager_state)
+            || !self
+                .shared_mvcc_runtime
+                .as_ref()
+                .is_some_and(|owner| std::ptr::eq(owner.as_ref(), runtime))
+        {
+            return Err(LimboError::InvalidArgument(
+                "pager belongs to another shared database".into(),
+            ));
+        }
+        Ok(())
     }
 }

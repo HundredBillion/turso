@@ -1,3 +1,6 @@
+#[path = "shared_pager_generation.rs"]
+mod shared_pager_generation;
+
 #[path = "shared_checkpoint.rs"]
 mod shared_checkpoint;
 
@@ -271,27 +274,18 @@ impl SharedOpenState {
         }
     }
 
-    pub(crate) fn validate_connection_generation(&self) -> Result<()> {
-        let record = self.loaded.as_ref().ok_or(LimboError::Busy)?.record();
-        let identity = self
-            .runtime
-            .replay
-            .lock()
-            .as_ref()
-            .ok_or(LimboError::Busy)?
-            .identity()?;
-        if record.database_id() != self.runtime.database_id
-            || record.log_generation() != identity.database.generation
-        {
-            return Err(LimboError::Busy);
-        }
-        Ok(())
+    pub(crate) fn capture_connection_generation(
+        &self,
+    ) -> Result<crate::storage::pager::SharedPagerGeneration> {
+        self.runtime
+            .captured_pager_generation(self.loaded.as_ref().ok_or(LimboError::Busy)?.record())
     }
 
     pub(crate) fn finish_connection<C: LogicalClock, A: ConcurrentAllocator>(
         &mut self,
         store: &MvStore<C, A>,
         connection: &Arc<Connection>,
+        captured: crate::storage::pager::SharedPagerGeneration,
     ) -> IOResultOr<()> {
         if !self.connection_refreshed {
             if self.refresh.is_none() {
@@ -313,6 +307,8 @@ impl SharedOpenState {
                 guard.retirement_completion(),
             )));
         }
+        self.runtime
+            .certify_current_pager(connection, Some(captured), guard)?;
         self.loaded.take().unwrap().into_guard()?.finish()?;
         self.bindings.clear();
         self.admission = None;
@@ -560,7 +556,9 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                                 .into());
                             }
                             if loaded.guard().incarnation_ready()? {
-                                loaded.into_guard().finish()?;
+                                let guard = loaded.into_guard();
+                                runtime.certify_current_pager(connection, None, &guard)?;
+                                guard.finish()?;
                             } else {
                                 state.ids_mirror = Some(loaded.mirror_current_witness()?);
                             }
@@ -570,6 +568,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                             state.ids_mirror = None;
                             let (mut guard, maximum) = proof.into_guard_and_max_owner_epoch();
                             guard.reconcile_incarnation(maximum.unwrap_or(0))?;
+                            runtime.certify_current_pager(connection, None, &guard)?;
                             guard.finish()?;
                         }
                         open.bindings.clear();

@@ -27,11 +27,11 @@
 
 **Interfaces:** Shared-only yielding constructor state acquires a read-pinning SharedOpenState before `_init_nonblock`. Existing ordinary `_connect` and `connect_async` behavior stays unchanged. Initial shared Database open also uses read pins before raw-header I/O. State drop retains actual backend authority through pending completion captures.
 
-- [ ] Add native bounded-connect-during-pause regression through existing connection APIs; observe RED without constructor admission.
-- [ ] Add shared-only cooperative constructor state and capture the selected manifest generation before any header read.
-- [ ] Use GuardedFile read-pin bindings only for initial shared open and constructors; retain existing ordinary fresh-transaction binding policy.
-- [ ] Verify pending initial-open and new-connection header cancellation before callback and after callback/before retirement. Competing authority must remain Busy until retirement; retry succeeds afterward.
-- [ ] Add focused causal removal of read pinning, observe the exact early-authority-release failure, restore and verify.
+- [x] Add native bounded-connect-during-pause regression through existing connection APIs; observe RED without constructor admission.
+- [x] Add shared-only cooperative constructor state and capture the selected manifest generation before any header read.
+- [x] Use GuardedFile read-pin bindings only for initial shared open and constructors; retain existing ordinary fresh-transaction binding policy.
+- [x] Verify pending initial-open and new-connection header cancellation before callback and after callback/before retirement. Competing authority must remain Busy until retirement; retry succeeds afterward.
+- [x] Add focused causal removal of read pinning, observe the exact early-authority-release failure, restore and verify.
 
 ### Task 2: Pager-owned physical generation
 
