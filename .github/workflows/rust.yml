@@ -1,54 +1,101 @@
-name: Shared commit cap reset preservation validation
+name: Checkpoint recovery native read cancellation and unlock controls
 on:
   workflow_dispatch:
 permissions:
   contents: read
-env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-  RUST_BACKTRACE: "1"
 jobs:
-  vdbe:
+  native-recovery:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b8e78c330c71401b5a58266119ac1c05e2db9907
+          ref: 143ccda087f9612cf9418674a4e2e08f98a9ac07
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: fork-mvcc-authority
-          cache-on-failure: true
-      - name: Record source and native environment
+          shared-key: recovery-native-143ccda
+      - name: Record exact source and native environment
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b8e78c330c71401b5a58266119ac1c05e2db9907
+          test "$(git rev-parse HEAD)" = 143ccda087f9612cf9418674a4e2e08f98a9ac07
           test "$(id -u)" -ne 0
           stat -f -c 'workspace filesystem: %T (%t)' .
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
           rustc -Vv | tee rustc.txt
-      - name: Shared cap preservation and admission
+      - name: Native recovery entry and IO behavior
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 --nocapture 2>&1 | tee cap-green.log
-          grep -q '5 passed; 0 failed' cap-green.log
-      - name: Native snapshot publication and recovery
+          set -o pipefail
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry-green.log
+          grep -q '3 passed; 0 failed' entry-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee io-green.log
+          grep -q '2 passed; 0 failed' io-green.log
+      - name: Removing manifest read pin must expose authority reuse
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_commit_native_preserves_snapshots -- --ignored --test-threads=1 --nocapture 2>&1 | tee snapshot.log
-          grep -q '1 passed; 0 failed' snapshot.log
-      - name: Ordinary abandoned commit cleanup
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path('core/mvcc/commit_manifest.rs')
+          text = p.read_text()
+          start = text.index('impl ManifestLoad {')
+          end = text.index('pub(super) struct LoadedManifest', start)
+          block = text[start:end]
+          old = 'let pin = pin_authority(&self.ownership)?;'
+          assert block.count(old) == 1
+          block = block.replace(old, 'let pin: Option<IoPin> = None;')
+          p.write_text(text[:start] + block + text[end:])
+          PYCONTROL
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_cancel_retains_authority_until_manifest_read_retires -- --ignored --test-threads=1 --nocapture 2>&1 | tee pin-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' pin-red.log
+          grep -q 'cancelled manifest read released authority before backend retirement (phase 2)' pin-red.log
+          git checkout 143ccda087f9612cf9418674a4e2e08f98a9ac07 -- core/mvcc/commit_manifest.rs
+      - name: Removing slot-unlock poisoning must expose authority reuse
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api abandoned -- --test-threads=1 2>&1 | tee abandoned.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-      - name: Preserve exact source and controls
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path('core/mvcc/shared_authority.rs')
+          text = p.read_text()
+          start = text.index('pub(super) fn ensure_no_snapshot_locks')
+          end = text.index('fn visit_live_registrations', start)
+          block = text[start:end]
+          old = 'self.authority.poisoned.store(true, Ordering::Release);'
+          assert block.count(old) == 1
+          block = block.replace(old, '')
+          p.write_text(text[:start] + block + text[end:])
+          PYCONTROL
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_slot_unlock_error_poison_prevents_authority_reuse -- --ignored --test-threads=1 --nocapture 2>&1 | tee poison-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' poison-red.log
+          grep -q 'slot unlock failure allowed authority reuse' poison-red.log
+          git checkout 143ccda087f9612cf9418674a4e2e08f98a9ac07 -- core/mvcc/shared_authority.rs
+      - name: Restore exact source and verify again
+        run: |
+          set -o pipefail
+          git diff --exit-code
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored-green.log
+          grep -q '2 passed; 0 failed' restored-green.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
+      - name: Preserve evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-commit-cap-green
+          name: recovery-io-143ccda
           path: |
             source.txt
             rustc.txt
-            *.log
-          retention-days: 14
+            *-green.log
+            *-red.log
+            clippy.log
