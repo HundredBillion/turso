@@ -67,6 +67,24 @@ impl SharedOpenState {
         database_id: usize,
         captured: Option<SharedPagerGeneration>,
     ) -> IOResultOr<()> {
+        let database = connection.get_source_database(database_id);
+        database.validate_shared_runtime(&self.runtime)?;
+        let owner = database
+            .get_mv_store()
+            .as_ref()
+            .cloned()
+            .ok_or(LimboError::Busy)?;
+        if Arc::as_ptr(&owner).cast::<()>() != (store as *const MvStore<C, A>).cast::<()>()
+            || !store
+                .shared_runtime
+                .get()
+                .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
+        {
+            return Err(LimboError::InvalidArgument(
+                "current-prefix Store belongs to another database".into(),
+            )
+            .into());
+        }
         if let Some(saved) = &self.current.connection {
             if !saved.ptr_eq(&Arc::downgrade(connection))
                 || self.current.database_id != Some(database_id)
@@ -83,7 +101,6 @@ impl SharedOpenState {
         if self.connection_refreshed {
             return Ok(IOResult::Done(()));
         }
-        let database = connection.get_source_database(database_id);
         let pager = connection.get_pager_from_database_index(&database_id)?;
         if !self.current.replayed {
             if self.refresh.is_none() {
@@ -242,5 +259,79 @@ mod tests {
         let fresh = database.connect(crate::ConnectOpts::new()).unwrap();
         fresh.execute("SELECT value FROM preserved").unwrap();
         assert!(runtime.replay.lock().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume() {
+        let directory_a = tempfile::tempdir().unwrap();
+        let directory_b = tempfile::tempdir().unwrap();
+        let (path_a, limit) = shared_runtime_fixture(directory_a.path());
+        let (path_b, _) = shared_runtime_fixture(directory_b.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let open_database = |path: &Path| {
+            crate::Database::open(
+                io.clone(),
+                path.to_str().unwrap(),
+                crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                    .with_shared_mvcc_for_test(limit),
+            )
+            .unwrap()
+        };
+        let database_a = open_database(&path_a);
+        let database_b = open_database(&path_b);
+        let connection_a = database_a.connect(crate::ConnectOpts::new()).unwrap();
+        let connection_b = database_b.connect(crate::ConnectOpts::new()).unwrap();
+        connection_a
+            .execute("UPDATE preserved SET value='A logical prefix' WHERE id=1")
+            .unwrap();
+        let store_a = database_a.get_mv_store().as_ref().unwrap().clone();
+        let store_b = database_b.get_mv_store().as_ref().unwrap().clone();
+        let runtime_a = store_a.shared_runtime.get().unwrap();
+        let runtime_b = store_b.shared_runtime.get().unwrap();
+        let roots_b = store_b.table_id_to_rootpage.load_full();
+        let frontier_b = store_b.last_committed_tx_ts.load(Ordering::Acquire);
+        let schema_b = database_b.schema.lock().clone();
+        let replay_b = runtime_b.replay.lock().as_ref().unwrap().clone();
+        let mut open = runtime_a.begin_open().unwrap();
+        io.block(|| open.poll_manifest()).unwrap();
+        for (store, connection) in [(&store_b, &connection_a), (&store_a, &connection_b)] {
+            assert!(matches!(
+                io.block(|| open.poll_current_prefix(store, connection, MAIN_DB_ID, None)),
+                Err(LimboError::InvalidArgument(_))
+            ));
+            assert!(open.refresh.is_none());
+            assert!(open.loaded.is_some());
+            assert!(open.current.connection.is_none());
+            assert!(Arc::ptr_eq(
+                &roots_b,
+                &store_b.table_id_to_rootpage.load_full()
+            ));
+            assert_eq!(
+                frontier_b,
+                store_b.last_committed_tx_ts.load(Ordering::Acquire)
+            );
+            assert!(Arc::ptr_eq(&schema_b, &database_b.schema.lock()));
+            assert!(Arc::ptr_eq(
+                &replay_b,
+                runtime_b.replay.lock().as_ref().unwrap()
+            ));
+        }
+        io.block(|| open.poll_current_prefix(&store_a, &connection_a, MAIN_DB_ID, None))
+            .unwrap();
+        assert!(open.connection_refreshed);
+        assert!(matches!(
+            io.block(|| open.poll_current_prefix(&store_b, &connection_a, MAIN_DB_ID, None)),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        assert!(Arc::ptr_eq(
+            &roots_b,
+            &store_b.table_id_to_rootpage.load_full()
+        ));
+        assert_eq!(
+            frontier_b,
+            store_b.last_committed_tx_ts.load(Ordering::Acquire)
+        );
+        open.finish_current_prefix().unwrap();
     }
 }
