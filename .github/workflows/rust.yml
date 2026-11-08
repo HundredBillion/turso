@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c90713853ee2d49b9f637de7c60e7495ba9d3c1f
+          ref: f73f414c4fcd23ea4ee75188972ded4268352fac
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = c90713853ee2d49b9f637de7c60e7495ba9d3c1f
+          test "$(git rev-parse HEAD)" = f73f414c4fcd23ea4ee75188972ded4268352fac
           cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
           grep -q '3 passed; 0 failed' physical-owner-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
