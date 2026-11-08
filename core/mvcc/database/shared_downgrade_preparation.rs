@@ -744,8 +744,23 @@ mod tests {
         let connection = db.connect(crate::ConnectOpts::new()).unwrap();
         connection.execute("SELECT value FROM preserved").unwrap();
         assert_child_excluded(&fixture.path);
+        let old_main = Arc::downgrade(&fixture.runtime.files.main);
+        let old_runtime = Arc::downgrade(&fixture.runtime);
+        let old_database = Arc::downgrade(&fixture.connection.db);
         drop(fixture.connection);
         drop(fixture.runtime);
+        assert!(
+            old_database.upgrade().is_none(),
+            "old shared database did not retire"
+        );
+        assert!(
+            old_runtime.upgrade().is_none(),
+            "old shared runtime did not retire"
+        );
+        assert!(
+            old_main.upgrade().is_none(),
+            "old native main handle did not retire"
+        );
         assert_child_excluded(&fixture.path);
         connection.execute("SELECT value FROM preserved").unwrap();
     }
