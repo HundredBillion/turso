@@ -26,6 +26,8 @@
 
 `CheckpointStateMachine::maybe_stage_mvcc_metadata_write` stages `persistent_tx_ts_max` in the same pager transaction as all selected rows, indexes, schema/root changes and sequence compaction. `CommitPagerTxn` commits that transaction before `CheckpointWal` begins. WAL recovery must therefore establish a committed physical image before the metadata timestamp is interpreted; an arbitrary timestamp between source and acknowledged target is not completion evidence.
 
+Here FULL materialization means engine `SyncMode::Full`; on Linux, `Pager::get_sync_type` returns `FileSyncType::Fsync`, and both file-sync variants invoke regular fsync. Manifest publication explicitly uses `FileSyncType::FullFsync` at both barriers.
+
 `WalFile::checkpoint_inner` fixes the committed WAL frame range under checkpoint/write locks and FULL-syncs it before any backfill. `CheckpointStateMachine::SyncDbFile` syncs main before WAL truncation. Shared materialization skips logical-log truncation; acknowledged source history remains until the later completed/finalized/install protocol authorizes reclamation.
 
 A genuine crash can leave:

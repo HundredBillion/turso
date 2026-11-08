@@ -354,16 +354,17 @@ impl File for CrashFile {
     fn sync(&self, completion: Completion, kind: FileSyncType) -> Result<Completion> {
         let complete = self.inner.sync(completion, kind)?;
         assert!(complete.succeeded(), "fixture uses synchronous native I/O");
-        if kind == FileSyncType::FullFsync {
-            match self.role {
-                FileRole::Manifest if self.control.last_manifest_intent.load(Ordering::Acquire) => {
-                    self.control.intent_syncs.fetch_add(1, Ordering::AcqRel);
-                }
-                FileRole::Wal => {
-                    self.control.wal_syncs.fetch_add(1, Ordering::AcqRel);
-                }
-                _ => {}
+        match self.role {
+            FileRole::Manifest
+                if kind == FileSyncType::FullFsync
+                    && self.control.last_manifest_intent.load(Ordering::Acquire) =>
+            {
+                self.control.intent_syncs.fetch_add(1, Ordering::AcqRel);
             }
+            FileRole::Wal => {
+                self.control.wal_syncs.fetch_add(1, Ordering::AcqRel);
+            }
+            _ => {}
         }
         Ok(complete)
     }
