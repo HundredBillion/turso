@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 725139ac8faa902df0a770ceb000b2b9e2461ab3
+          ref: ac54d17ef3a9942085df75d2b554faa4ada810f6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,24 +28,18 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 725139ac8faa902df0a770ceb000b2b9e2461ab3
+          test "$(git rev-parse HEAD)" = ac54d17ef3a9942085df75d2b554faa4ada810f6
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Merged live marker controls
-        run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --skip old_handle_close --test-threads=1 --nocapture 2>&1 | tee marker-merged.log
-          grep -q '^test result: ok. 3 passed; 0 failed;' marker-merged.log
-      - name: Observe old-handle lock exclusion
+      - name: Missing WAL creation expected RED
         run: |
           set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_old_handle_close_preserves_ordinary_lock -- --ignored --test-threads=1 --nocapture 2>&1 | tee old-handle-probe.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation-red.log
           code=${PIPESTATUS[0]}
           set -e
-          echo "$code" > lock-probe-status.txt
-          test "$code" = 0 -o "$code" = 101
-          summary=$(sed -n '/^test result:/p' old-handle-probe.log | tail -n1)
-          echo "$summary" > lock-probe-summary.txt
-          echo "$summary" | grep -Eq '(1 passed; 0 failed|0 passed; 1 failed)'
+          test "$code" = 101
+          grep -q '^test result: FAILED. 0 passed; 1 failed;' creation-red.log
+          grep -q 'genuine installed checkpoint must durably create its missing basename WAL' creation-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
