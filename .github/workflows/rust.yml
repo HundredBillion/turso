@@ -1,4 +1,4 @@
-name: Intent recovery source Store ownership GREEN
+name: Source Store cap GREEN and retained-Store lifetime RED
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ab727898f4d9ab4e34ece36a628424d73692ad53
+          ref: 29124b98cf043376b70f4be114b33f40a1ad30fc
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ab727898f4d9ab4e34ece36a628424d73692ad53
+          test "$(git rev-parse HEAD)" = 29124b98cf043376b70f4be114b33f40a1ad30fc
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
@@ -37,7 +37,7 @@ jobs:
           grep -q '5 passed; 0 failed' merged-committed-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-precommit-green.log
           grep -q '4 passed; 0 failed' merged-precommit-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owned-store-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --skip retained_store_clone --test-threads=1 --nocapture 2>&1 | tee owned-store-green.log
           grep -q '5 passed; 0 failed' owned-store-green.log
           python3 - <<'PATCH'
           p='core/mvcc/database/shared_checkpoint_intent_store.rs'
@@ -57,8 +57,16 @@ jobs:
           test "$code" -ne 0
           grep -q '0 passed; 1 failed' owner-lease-red.log
           grep -q 'original guard error released native authority before Store destruction' owner-lease-red.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owned-store-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --skip retained_store_clone --test-threads=1 --nocapture 2>&1 | tee owned-store-restored-green.log
           grep -q '5 passed; 0 failed' owned-store-restored-green.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_retained_store_clone_keeps_native_authority -- --ignored --test-threads=1 --nocapture > actual-store-clone-red.log 2>&1
+          code=$?
+          set -e
+          cat actual-store-clone-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' actual-store-clone-red.log
+          grep -q 'owner drop released native authority while a real Store clone survived' actual-store-clone-red.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
