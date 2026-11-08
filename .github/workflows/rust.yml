@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b2d326dcabb59db6d30206ac6fd26fb00c3072dd
+          ref: 166269aa38031fa55457178b880883d868941282
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -33,7 +33,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "b2d326dcabb59db6d30206ac6fd26fb00c3072dd"
+          test "$(git rev-parse HEAD)" = "166269aa38031fa55457178b880883d868941282"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -138,6 +138,7 @@ jobs:
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee core.log
           grep -Eq '[1-9][0-9]* passed; 0 failed' core.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          cargo clippy --locked -p turso_core -p turso_sqlite3 -p turso_sdk_kit --all-targets --features turso_core/conn_raw_api,turso_core/bench,turso_core/io_uring -- -D warnings 2>&1 | tee all-targets-lint.log
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
@@ -152,7 +153,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b2d326dcabb59db6d30206ac6fd26fb00c3072dd
+          ref: 166269aa38031fa55457178b880883d868941282
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -179,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b2d326dcabb59db6d30206ac6fd26fb00c3072dd
+          ref: 166269aa38031fa55457178b880883d868941282
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -193,7 +194,7 @@ jobs:
           php -l bindings/c/tests/php_workers/worker.php
       - name: Exact source and supervisor controls
         run: |
-          test "$(git rev-parse HEAD)" = "b2d326dcabb59db6d30206ac6fd26fb00c3072dd"
+          test "$(git rev-parse HEAD)" = "166269aa38031fa55457178b880883d868941282"
           python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py' 2>&1 | tee supervisor.log
           python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output pdo-results/sqlite-control 2>&1 | tee sqlite-pdo.log
       - name: Build and attest actual Turso PDO library
