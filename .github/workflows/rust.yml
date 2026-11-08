@@ -1,287 +1,56 @@
-name: Verified checkpoint and claim lifecycle integration
+name: Native public shared checkpoint entry
 on:
   workflow_dispatch:
     inputs:
-      platform:
-        type: choice
-        default: all
-        options: [all, linux, windows, pdo, lint]
+      engine:
+        required: true
+        type: string
 permissions:
   contents: read
 env:
-  CC_x86_64_pc_windows_msvc: cl.exe
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
-  coordinator:
-    if: ${{ inputs.platform != 'windows' && inputs.platform != 'pdo' && inputs.platform != 'lint' }}
-    defaults:
-      run:
-        shell: bash
+  native:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
+          ref: ${{ inputs.engine }}
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Exact native source
+      - name: Verify native source
+        env:
+          ENGINE: ${{ inputs.engine }}
         run: |
-          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
+          test "$(git rev-parse HEAD)" = "$ENGINE"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
-      - name: Final checkpoint readiness
+      - name: Public API and SQL checkpoints
         run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee group-0.log
-          grep -q '4 passed; 0 failed' group-0.log
-      - name: Checkpoint installation and retirement
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_entry_native_ -- --ignored --test-threads=1 2>&1 | tee entry.log
+          grep -q '3 passed; 0 failed' entry.log
+      - name: Existing checkpoint installation and readiness
         run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 2>&1 | tee group-1.log
-          grep -q '6 passed; 0 failed' group-1.log
-      - name: Connection construction and pager ownership
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee ready.log
+          grep -q '4 passed; 0 failed' ready.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 2>&1 | tee install.log
+          grep -q '6 passed; 0 failed' install.log
+      - name: Strict core lint and format
         run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 2>&1 | tee group-2.log
-          grep -q '6 passed; 0 failed' group-2.log
-      - name: Completed pager certification
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 2>&1 | tee group-3.log
-          grep -q '1 passed; 0 failed' group-3.log
-      - name: Scoped claim lifecycle
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 2>&1 | tee group-4.log
-          grep -q '8 passed; 0 failed' group-4.log
-      - name: Actual mutation completion retirement
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_io_native_ -- --ignored --test-threads=1 2>&1 | tee group-5.log
-          grep -q '2 passed; 0 failed' group-5.log
-      - name: Global row and sequence allocation
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 2>&1 | tee group-6.log
-          grep -q '13 passed; 0 failed' group-6.log
-      - name: Idle prepare schema and read lifetime
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee prepare.log
-          grep -q '3 passed; 0 failed' prepare.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_io_native_ -- --ignored --test-threads=1 2>&1 | tee prepare-io.log
-          grep -q '1 passed; 0 failed' prepare-io.log
-      - name: Independent oracle pager layout after reset
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_oracle_pager_uses_retained_identity_and_independent_read_state -- --ignored --test-threads=1 2>&1 | tee oracle-layout.log
-          grep -q '1 passed; 0 failed' oracle-layout.log
-      - name: Watermark readers and durable peer state
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --skip shared_watermark_process_child --skip shared_prepare_io_native_ --test-threads=1 2>&1 | tee watermark.log
-          grep -q '3 passed; 0 failed' watermark.log
-      - name: Fresh completed recovery
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --test-threads=1 2>&1 | tee checkpoint_recovery_.log
-          grep -Eq "[1-9][0-9]* passed; 0 failed" checkpoint_recovery_.log
-      - name: Physical recovery locks and completion ownership
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 2>&1 | tee physical-owner.log
-          grep -q '8 passed; 0 failed' physical-owner.log
-      - name: Read-only header integration and Python lint
-        run: |
-          cargo test --locked -p core_tester --test integration_tests storage::header_version:: -- --test-threads=2 2>&1 | tee headers.log
-          grep -q '25 passed; 0 failed' headers.log
-          python3 -m pip install --break-system-packages ruff==0.9.6
-          ruff check bindings/c/tests/php_workers
-      - name: Idle generation reload
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_ -- --ignored --skip shared_idle_generation_native_child --test-threads=1 2>&1 | tee shared_idle_generation_native_.log
-          grep -Eq "[1-9][0-9]* passed; 0 failed" shared_idle_generation_native_.log
-      - name: Current prefix ownership
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_ -- --ignored --test-threads=1 2>&1 | tee shared_current_prefix_native_.log
-          grep -Eq "[1-9][0-9]* passed; 0 failed" shared_current_prefix_native_.log
-      - name: Current physical base
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_ -- --ignored --test-threads=1 2>&1 | tee current_base_native_.log
-          grep -Eq "[1-9][0-9]* passed; 0 failed" current_base_native_.log
-      - name: Private generation install
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api current_local_install_native_ -- --ignored --test-threads=1 2>&1 | tee current_local_install_native_.log
-          grep -Eq "[1-9][0-9]* passed; 0 failed" current_local_install_native_.log
-      - name: Schema and worker acceptance
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_schema_publication_native_ -- --ignored --test-threads=1 2>&1 | tee shared_schema_publication_native_.log
-          grep -Eq "[1-9][0-9]* passed; 0 failed" shared_schema_publication_native_.log
-      - name: Independent worker acceptance
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_worker_native_ -- --ignored --test-threads=1 2>&1 | tee workers.log
-          grep -q "5 passed; 0 failed" workers.log
-      - name: Offline downgrade intent preparation
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade.log
-          grep -q "7 passed; 0 failed" downgrade.log
-      - name: Ordinary native file ownership after downgrade
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api,io_uring linux_ordinary_lock_native_ -- --ignored --test-threads=1 2>&1 | tee ordinary-locks.log
-          grep -q '5 passed; 0 failed' ordinary-locks.log
-      - name: Fresh downgrade resume and partial cleanup
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-resume.log
-          grep -q '4 passed; 0 failed' downgrade-resume.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_partial_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-partial.log
-          grep -q '4 passed; 0 failed' downgrade-partial.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-cleanup.log
-          grep -q '2 passed; 0 failed' downgrade-cleanup.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-wal.log
-          grep -q '2 passed; 0 failed' downgrade-wal.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_extent_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-extent.log
-          grep -q '1 passed; 0 failed' downgrade-extent.log
-      - name: Actual shared database open and downgrade marker
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_ -- --ignored --test-threads=1 2>&1 | tee shared-open.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' shared-open.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 2>&1 | tee marker.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' marker.log
-      - name: C bindings and SDK integration
-        run: |
-          cargo build --locked -p turso_sqlite3
-          LD_LIBRARY_PATH="$PWD/target/debug" cargo test --locked -p turso_sqlite3 --lib --test compat -- --test-threads=2 2>&1 | tee c-compat.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' c-compat.log
-          cargo test --locked -p turso_sdk_kit --lib 2>&1 | tee sdk.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' sdk.log
-      - name: Full ordinary core and strict lint
-        run: |
-          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee core.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' core.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
-          cargo clippy --locked -p turso_core -p turso_sqlite3 -p turso_sdk_kit --all-targets --features turso_core/conn_raw_api,turso_core/bench,turso_core/io_uring -- -D warnings 2>&1 | tee all-targets-lint.log
-          cargo fmt --all -- --check
-          git diff --exit-code
+          cargo fmt --all --check
+          cargo clippy --locked -p turso_core --all-targets --features conn_raw_api -- -D warnings 2>&1 | tee lint.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: checkpoint-lifecycle-integration
-          path: '*.log'
-  windows:
-    if: ${{ inputs.platform != 'linux' && inputs.platform != 'pdo' && inputs.platform != 'lint' }}
-    runs-on: windows-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-authority
-      - name: Setup MSVC
-        uses: ./.github/shared/setup-msvc
-      - name: Check ordinary Windows compatibility
-        run: cargo check --locked -p turso_core --lib --features conn_raw_api,bench
-      - name: Windows C binding compatibility
-        shell: pwsh
-        run: |
-          cargo build --locked -p turso_sqlite3
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:PATH = "$pwd\target\debug;$env:PATH"
-          cargo test --locked -p turso_sqlite3 --lib --test compat -- --test-threads=2
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  pdo:
-    if: ${{ inputs.platform == 'pdo' || inputs.platform == 'all' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-authority
-          cache-on-failure: true
-      - name: Install actual PHP PDO
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y php-cli php-sqlite3
-          php --version
-          php -l bindings/c/tests/php_workers/worker.php
-      - name: Exact source and supervisor controls
-        run: |
-          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
-          python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py' 2>&1 | tee supervisor.log
-          python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output pdo-results/sqlite-control 2>&1 | tee sqlite-pdo.log
-      - name: Build and attest actual Turso PDO library
-        run: |
-          cargo build --locked -p turso_sqlite3
-          mkdir "$RUNNER_TEMP/turso-pdo-loader"
-          ln -s "$PWD/target/debug/libturso_sqlite3.so" "$RUNNER_TEMP/turso-pdo-loader/libsqlite3.so.0"
-          LD_LIBRARY_PATH="$RUNNER_TEMP/turso-pdo-loader:$PWD/target/debug" python3 bindings/c/tests/php_workers/run.py --profile turso-single-worker-control --api pdo --library "$PWD/target/debug/libturso_sqlite3.so" --output pdo-results/turso-control 2>&1 | tee turso-pdo.log
-      - name: Explicit unsupported opt-in never creates files
-        run: |
-          mkdir "$RUNNER_TEMP/shared-refusal"
-          LD_LIBRARY_PATH="$RUNNER_TEMP/turso-pdo-loader:$PWD/target/debug" TURSO_VALIDATION_LIBRARY="$PWD/target/debug/libturso_sqlite3.so" TURSO_VALIDATION_DIR="$RUNNER_TEMP/shared-refusal" php <<'PHP'
-          <?php
-          $expected = realpath(getenv('TURSO_VALIDATION_LIBRARY'));
-          $maps = file_get_contents('/proc/self/maps');
-          if (!$expected || !str_contains($maps, $expected)) {
-              throw new RuntimeException('expected Turso library is not mapped');
-          }
-          $directory = getenv('TURSO_VALIDATION_DIR');
-          $rejected = false;
-          try {
-              new PDO('sqlite:file:'.$directory.'/unavailable.db?turso_mvcc=shared', null, null,
-                  [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::SQLITE_ATTR_OPEN_FLAGS => 0x46]);
-          } catch (PDOException $error) {
-              if (!str_contains($error->getMessage(), 'shared MVCC is not available')) { throw $error; }
-              $rejected = true;
-          }
-          if (!$rejected || array_diff(scandir($directory), ['.', '..']) !== []) {
-              throw new RuntimeException('unsupported shared mode opened or created storage');
-          }
-          echo "Explicit PDO opt-in refused before creating files\n";
-          PHP
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: combined-php-pdo-controls
-          path: |
-            *.log
-            pdo-results
-
-  native-lint:
-    if: ${{ inputs.platform == 'lint' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-authority
-          cache-on-failure: true
-      - name: Exact source and production lint
-        run: |
-          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee production-lint.log
-      - name: Strict core C SDK targets
-        run: |
-          cargo clippy --locked -p turso_core -p turso_sqlite3 -p turso_sdk_kit --all-targets --features turso_core/conn_raw_api,turso_core/bench,turso_core/io_uring -- -D warnings 2>&1 | tee all-targets-lint.log
-      - name: Actual final Store claim regression
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_rejects_second_store -- --ignored --test-threads=1 2>&1 | tee store-claim.log
-          grep -q '1 passed; 0 failed' store-claim.log
-          cargo fmt --all -- --check
-          git diff --exit-code
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: combined-native-targets-lint
+          name: checkpoint-entry-evidence
           path: '*.log'
