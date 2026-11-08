@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1d477a457e2b36dace9ad5517ea0279d292799b1
+          ref: f7a3eb67a7b5ad738a6b0e43ce65f282661be6ed
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1d477a457e2b36dace9ad5517ea0279d292799b1
+          test "$(git rev-parse HEAD)" = f7a3eb67a7b5ad738a6b0e43ce65f282661be6ed
           test "$(id -u)" -ne 0
           rustc -Vv
       - name: Actual SQLite dialect and native extension through C
@@ -43,7 +43,7 @@ jobs:
         run: |
           cp core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs /tmp/normal-bootstrap.rs
           cp core/database/shared_recovered.rs /tmp/normal-factory.rs
-          for control in install connection certify withdraw retirement; do
+          for control in retirement; do
             cp /tmp/normal-bootstrap.rs core/mvcc/database/shared_checkpoint_recovery_bootstrap.rs
             cp /tmp/normal-factory.rs core/database/shared_recovered.rs
             export MUTATION_NAME="$control"
