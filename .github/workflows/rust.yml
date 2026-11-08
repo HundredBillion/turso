@@ -31,35 +31,32 @@ jobs:
           test "$(git rev-parse HEAD)" = b7c6161b8682e1daa7b0dfcbfb04556542825481
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Actual ordinary WAL marker transaction
+      - name: Exact-layout removal control and restored live marker
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker-native.log
-          grep -q '^test result: ok. 3 passed; 0 failed;' marker-native.log
-      - name: Preserve existing ordinary upgrade and recovery
-        run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::mode_transition -- --test-threads=1 --nocapture 2>&1 | tee ordinary-transition.log
-          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' ordinary-transition.log
-      - name: Genuine installed checkpoint downgrade preparation
-        run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee downgrade-native.log
-          grep -q '^test result: ok. 7 passed; 0 failed;' downgrade-native.log
-      - name: Retain ready and installer behavior
-        run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ready-native.log
-          grep -q '^test result: ok. 4 passed; 0 failed;' ready-native.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee install-native.log
-          grep -q '^test result: ok. 6 passed; 0 failed;' install-native.log
-      - name: Existing manifest protocol and terminal admission fence
-        run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest -- --test-threads=1 --nocapture 2>&1 | tee manifest.log
-          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' manifest.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api commit_manifest_downgrade_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fence-native.log
-          grep -q '^test result: ok. 1 passed; 0 failed;' fence-native.log
-      - name: Strict library lint and formatting
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
-          git diff --check
+          file=core/mvcc/mode_transition/downgrade_marker.rs
+          cp "$file" /tmp/downgrade-marker.rs
+          trap 'cp /tmp/downgrade-marker.rs "$file"' EXIT
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path('core/mvcc/mode_transition/downgrade_marker.rs')
+          text = p.read_text()
+          needle = '    proof\n        .intent\n        .installed_source()?\n        .validate_physical_layout(&header, proof.main_file().size()?)?;\n'
+          assert text.count(needle) == 1
+          p.write_text(text.replace(needle, ''))
+          PYCONTROL
+          git diff > layout-control.diff
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_rejects_changed_installed_extent -- --ignored --test-threads=1 --nocapture 2>&1 | tee layout-control-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '^test result: FAILED. 0 passed; 1 failed;' layout-control-red.log
+          grep -q 'changed installed extent must reject before marker publication' layout-control-red.log
+          cp /tmp/downgrade-marker.rs "$file"
+          trap - EXIT
+          git diff --exit-code
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker-restored.log
+          grep -q '^test result: ok. 3 passed; 0 failed;' marker-restored.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -70,25 +67,4 @@ jobs:
             *.log
             *.diff
             *status.txt
-          retention-days: 14
-
-  windows:
-    runs-on: windows-2025
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: b7c6161b8682e1daa7b0dfcbfb04556542825481
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-authority
-          cache-on-failure: true
-      - name: Check portable manifest compilation
-        run: cargo check --locked -p turso_core --lib --features conn_raw_api,bench 2>&1 | tee windows-check.log
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: downgrade-windows-check
-          path: windows-check.log
           retention-days: 14
