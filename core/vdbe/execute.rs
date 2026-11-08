@@ -22482,7 +22482,7 @@ mod shared_begin_tests {
             // One payload and credited reservations fit; two payloads plus the
             // structural ID minimum cannot fit, even before framing overhead.
             let cap = 192 * 1024;
-            assert!(2 * 90_000 + crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES > cap);
+            assert!(2 * 90_000 + 6 * 4096 > cap);
             let f = Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(cap));
             f.connection
                 .execute(format!(
@@ -22563,7 +22563,7 @@ mod shared_begin_tests {
             // One payload and credited reservations fit; two payloads plus the
             // structural ID minimum cannot fit, even before framing overhead.
             let cap = 192 * 1024;
-            assert!(2 * 90_000 + crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES > cap);
+            assert!(2 * 90_000 + 6 * 4096 > cap);
             let f = Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(cap));
             f.connection
                 .execute(format!(
