@@ -52,7 +52,9 @@ impl SharedConnectState {
         }
         return_if_io!(self.open.poll_manifest());
         if self.captured_generation.is_none() {
-            self.captured_generation = Some(self.open.capture_connection_generation()?);
+            self.captured_generation = Some(return_if_io!(self
+                .open
+                .capture_connection_generation(database)));
         }
         if self.pager.is_none() {
             self.pager = Some(Arc::new(return_if_io!(database._init_nonblock(
@@ -103,6 +105,39 @@ impl Database {
         {
             return Err(LimboError::InvalidArgument(
                 "pager belongs to another shared database".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Database {
+    pub(crate) fn validate_shared_runtime(&self, runtime: &SharedMvccRuntime) -> Result<()> {
+        if !self
+            .shared_mvcc_runtime
+            .as_ref()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), runtime))
+        {
+            return Err(LimboError::InvalidArgument(
+                "database belongs to another shared runtime".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_shared_base_layout(
+        &self,
+        runtime: &SharedMvccRuntime,
+        header: &DatabaseHeader,
+    ) -> Result<()> {
+        self.validate_shared_runtime(runtime)?;
+        if self.pager_state.page_size() != Some(header.page_size)
+            || !header
+                .page_size
+                .has_valid_reserved_space(header.reserved_space)
+        {
+            return Err(LimboError::Corrupt(
+                "selected physical base has an incompatible local page layout".into(),
             ));
         }
         Ok(())

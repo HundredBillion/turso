@@ -28,6 +28,17 @@ impl ReadPinnedFile {
         PublicationLease::pin(&lease)?;
         Ok(Arc::new(Self { inner, lease }))
     }
+
+    /// Physical inspection must retain ownership without trusting an unrecovered mapped prefix.
+    pub(super) fn new_for_checkpoint_recovery(
+        inner: Arc<dyn File>,
+        guard: &AuthorityGuard,
+    ) -> Result<Arc<Self>> {
+        guard.ensure_no_snapshot_locks()?;
+        let lease = guard.io_lease();
+        PublicationLease::pin(&lease)?;
+        Ok(Arc::new(Self { inner, lease }))
+    }
 }
 impl File for ReadPinnedFile {
     fn file_id(&self) -> Result<Option<FileId>> {

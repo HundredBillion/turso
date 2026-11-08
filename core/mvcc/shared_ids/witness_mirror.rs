@@ -99,3 +99,33 @@ impl MirroredIds {
         (self.loaded.guard, self.maximum_owner_epoch)
     }
 }
+
+impl MirroredIds {
+    pub(super) fn finalize_recovered_checkpoint(
+        mut self,
+        proof: crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof,
+        captured_maximum: Option<u64>,
+    ) -> Result<super::checkpoint_prepare::finalize::IdCheckpointFinalize> {
+        if self.maximum_owner_epoch != captured_maximum
+            || self.loaded.max_owner_epoch()? != captured_maximum
+            || proof.source_identity().is_some()
+            || proof.target_identity() != self.loaded.identity()
+            || proof.source_database() != self.loaded.pending_checkpoint_source()
+            || !proof.matches_lease(self.loaded.guard())
+            || self.loaded.guard().published()? != proof.target_identity().prefix
+            || proof.materialized_floor() >= 0
+            || proof.materialized_floor() == i64::MIN
+            || self.loaded.selected_logical_floor() > proof.materialized_floor()
+        {
+            return Err(invalid("mirrored recovered ID witness differs"));
+        }
+        self.loaded.guard.ensure_no_snapshot_locks()?;
+        if !self.loaded.guard.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        self.loaded
+            .guard
+            .reconcile_incarnation(self.maximum_owner_epoch.unwrap_or(0))?;
+        self.loaded.finalize_recovered_checkpoint(proof)
+    }
+}

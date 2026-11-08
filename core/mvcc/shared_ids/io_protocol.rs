@@ -1,5 +1,11 @@
+#[path = "current_generation.rs"]
+pub(in crate::mvcc) mod current_generation;
+
 #[path = "checkpoint_prepare.rs"]
 pub(in crate::mvcc) mod checkpoint_prepare;
+
+#[path = "checkpoint_recovery.rs"]
+pub(in crate::mvcc) mod checkpoint_recovery;
 
 #[path = "witness_mirror.rs"]
 pub(in crate::mvcc) mod witness_mirror;
@@ -78,16 +84,22 @@ impl SharedIds {
         guard: AuthorityGuard,
         identity: RecoveryIdentity,
     ) -> Result<IdLoad> {
-        use crate::io::File;
         if guard.published()? != identity.prefix {
             return Err(invalid(
                 "ID journal oracle prefix differs from publication authority",
             ));
         }
-        if identity.database.generation == 0
-            || identity.database.checkpoint_timestamp > identity.prefix.committed_timestamp
-        {
-            return Err(invalid("ID journal recovery identity is inconsistent"));
+        self.start_load(guard, IdLoadTarget::Known(identity))
+    }
+
+    fn start_load(self: &Arc<Self>, guard: AuthorityGuard, target: IdLoadTarget) -> Result<IdLoad> {
+        use crate::io::File;
+        if let IdLoadTarget::Known(identity) = &target {
+            if identity.database.generation == 0
+                || identity.database.checkpoint_timestamp > identity.prefix.committed_timestamp
+            {
+                return Err(invalid("ID journal recovery identity is inconsistent"));
+            }
         }
         if self.selector.size()? != (2 * PAGE_SIZE) as u64 {
             return Err(corrupt("invalid published ID selector length"));
@@ -101,7 +113,7 @@ impl SharedIds {
         data[0].try_reserve_exact(2 * PAGE_SIZE)?;
         Ok(IdLoad {
             files: self.clone(),
-            identity,
+            target,
             ownership: Arc::new(Mutex::new(Some(guard))),
             bindings: Some(bindings),
             data,
@@ -121,9 +133,55 @@ struct PendingRead {
     count: Arc<AtomicI32>,
 }
 
+enum IdLoadTarget {
+    Known(RecoveryIdentity),
+    Current {
+        generation: u64,
+        prefix: crate::mvcc::shared_authority::PublishedPrefix,
+    },
+}
+
+impl IdLoadTarget {
+    fn prefix(&self) -> crate::mvcc::shared_authority::PublishedPrefix {
+        match self {
+            Self::Known(identity) => identity.prefix,
+            Self::Current { prefix, .. } => *prefix,
+        }
+    }
+
+    fn resolve_current(&mut self, selector: IdSelector) -> Result<()> {
+        if let Self::Current { generation, prefix } = self {
+            if selector.prepared.is_some() {
+                return Err(invalid(
+                    "current generation IDs require completed finalization",
+                ));
+            }
+            if selector.active.database.generation != *generation
+                || selector.active.database.checkpoint_timestamp > prefix.committed_timestamp
+            {
+                return Err(corrupt(
+                    "active IDs do not match the selected current generation",
+                ));
+            }
+            *self = Self::Known(RecoveryIdentity {
+                database: selector.active.database,
+                prefix: *prefix,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolved(&self) -> Result<RecoveryIdentity> {
+        match self {
+            Self::Known(identity) => Ok(*identity),
+            Self::Current { .. } => Err(invalid("current ID base has not been inspected")),
+        }
+    }
+}
+
 pub(in crate::mvcc) struct IdLoad {
     files: Arc<SharedIds>,
-    identity: RecoveryIdentity,
+    target: IdLoadTarget,
     ownership: Arc<Mutex<Option<AuthorityGuard>>>,
     bindings: Option<[FileBinding; 3]>,
     data: [Vec<u8>; 3],
@@ -404,12 +462,13 @@ impl IdLoad {
                 self.data[self.index].extend_from_slice(&read.buffer.as_slice()[..count as usize]);
             }
             if self.index == 3 {
+                let identity = self.target.resolved()?;
                 if self.selected.is_none() {
                     let selected = select(
                         [&self.data[0][..PAGE_SIZE], &self.data[0][PAGE_SIZE..]],
                         [&self.data[1], &self.data[2]],
                         self.files.database_id,
-                        self.identity.database,
+                        identity.database,
                     )?;
                     self.replayed =
                         Some(replay_selected(selected, [&self.data[1], &self.data[2]])?);
@@ -429,7 +488,7 @@ impl IdLoad {
                     files: self.files.clone(),
                     guard: self.ownership.lock().take().unwrap(),
                     bindings: self.bindings.take().unwrap(),
-                    identity: self.identity,
+                    identity,
                     selection: self.selected.take().unwrap(),
                     state: self.replayed.take().unwrap(),
                     banks: [
@@ -477,6 +536,7 @@ impl IdLoad {
             [&self.data[0][..PAGE_SIZE], &self.data[0][PAGE_SIZE..]],
             self.files.database_id,
         )?;
+        self.target.resolve_current(selector)?;
         for reference in [Some(selector.active), selector.prepared]
             .into_iter()
             .flatten()
@@ -493,7 +553,7 @@ impl IdLoad {
         let required = self
             .expected
             .iter()
-            .try_fold(self.identity.prefix.end_offset, |total, size| {
+            .try_fold(self.target.prefix().end_offset, |total, size| {
                 total.checked_add(*size as u64)
             })
             .ok_or(LimboError::TooBig)?;
@@ -3147,5 +3207,150 @@ mod tests {
             panic!("backend retirement must unblock load");
         };
         loaded.guard.finish().unwrap();
+    }
+    fn current_manifest(
+        f: &Fixture,
+        generation: u64,
+    ) -> (Arc<TestFile>, crate::mvcc::commit_manifest::LoadedManifest) {
+        use crate::mvcc::commit_manifest::{ManifestLoad, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+        let prefix = PublishedPrefix {
+            committed_timestamp: 37,
+            end_offset: 128,
+            running_crc: 29,
+        };
+        drop(f.authority.try_acquire().unwrap());
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(prefix).unwrap();
+        let record = ManifestRecord::new(2, f.files.database_id, generation, 7, prefix).unwrap();
+        let mut bytes = vec![0; 2 * SLOT_SIZE];
+        for slot in [0, SLOT_SIZE] {
+            bytes[slot..slot + RECORD_SIZE].copy_from_slice(&record.encode());
+        }
+        let file = TestFile::new(15, bytes);
+        let mut load = ManifestLoad::new(file.clone(), guard, f.files.database_id).unwrap();
+        let IOResult::Done(loaded) = load.poll().unwrap() else {
+            panic!("synchronous manifest");
+        };
+        (file, loaded)
+    }
+
+    #[test]
+    fn id_current_base_uses_active_physical_timestamp_and_preserves_readers() {
+        use crate::mvcc::commit_manifest::ManifestLoad;
+        let f = fixture();
+        let registration = registration(&f);
+        let (manifest_file, manifest) = current_manifest(&f, f.identity.database.generation);
+        let snapshots = manifest.guard().unwrap().live_registrations().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let prefix = manifest.record().prefix();
+        let before = [&f.selector, &f.bank, &f.unused].map(|file| file.bytes.lock().clone());
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        let IOResult::Done(inspected) = inspection.poll().unwrap() else {
+            panic!("synchronous ID inspection");
+        };
+        let (base, guard) = inspected.suspend();
+        assert_eq!(base.identity().database, f.identity.database);
+        assert_eq!(base.identity().prefix, prefix);
+        assert!(prefix.committed_timestamp > base.identity().database.checkpoint_timestamp);
+        assert_eq!(base.logical_floor(), -100);
+        assert_eq!(guard.live_registrations().unwrap(), snapshots);
+        let mut reselect =
+            ManifestLoad::new(manifest_file.clone(), guard, f.files.database_id).unwrap();
+        let IOResult::Done(selected) = reselect.poll().unwrap() else {
+            panic!("synchronous reselection");
+        };
+        base.validate_selection(&selected).unwrap();
+        selected.into_guard().unwrap().finish().unwrap();
+        let mut replacement = ManifestLoad::new(
+            manifest_file,
+            f.authority.try_acquire().unwrap(),
+            f.files.database_id,
+        )
+        .unwrap();
+        let IOResult::Done(selected) = replacement.poll().unwrap() else {
+            panic!("synchronous replacement lease");
+        };
+        assert!(base.validate_selection(&selected).is_err());
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.bytes.lock().clone()),
+            before
+        );
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
+        selected.into_guard().unwrap().finish().unwrap();
+        drop(registration);
+    }
+
+    #[test]
+    fn id_current_base_rejects_a_different_selected_generation() {
+        let f = fixture();
+        let (_, manifest) = current_manifest(&f, f.identity.database.generation + 1);
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        assert!(matches!(inspection.poll(), Err(LimboError::Corrupt(_))));
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn id_current_base_requires_finalized_active_ids() {
+        let f = fixture();
+        let bytes = f.selector.bytes.lock().clone();
+        let (mut selector, _) = select_witness(
+            [&bytes[..PAGE_SIZE], &bytes[PAGE_SIZE..]],
+            f.files.database_id,
+        )
+        .unwrap();
+        let active = selector.active;
+        selector.prepared = Some(BankRef {
+            bank: 1 - active.bank,
+            bank_generation: active.bank_generation + 1,
+            database: DatabaseGeneration {
+                generation: active.database.generation + 1,
+                ..active.database
+            },
+            ..active
+        });
+        let encoded = selector.encode().unwrap();
+        let mut image = encoded.to_vec();
+        image.extend_from_slice(&encoded);
+        *f.selector.bytes.lock() = image;
+        let (_, manifest) = current_manifest(&f, active.database.generation + 1);
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        assert!(matches!(
+            inspection.poll(),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn id_current_base_cancellation_keeps_the_backend_authority() {
+        let f = fixture();
+        let (_, manifest) = current_manifest(&f, f.identity.database.generation);
+        f.selector.delayed.store(true, Ordering::Release);
+        let mut inspection = f.files.inspect_current_base(manifest).unwrap();
+        let IOResult::IO(waiter) = inspection.poll().unwrap() else {
+            panic!("delayed selector");
+        };
+        drop(waiter);
+        drop(inspection);
+        assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+        f.selector.complete_pending(true);
+        assert!(matches!(f.authority.try_acquire(), Err(LimboError::Busy)));
+        f.selector.retire();
+        let guard = f.authority.try_acquire().unwrap();
+        assert!(guard.requires_recovery());
+        assert!(guard.published().is_err());
+        assert_eq!(
+            [&f.selector, &f.bank, &f.unused].map(|file| file.mutations.load(Ordering::Acquire)),
+            [0, 0, 0]
+        );
     }
 }

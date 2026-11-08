@@ -15,6 +15,23 @@ pub(crate) struct SharedPhysicalConnection {
 
 #[allow(dead_code)]
 impl SharedPhysicalConnection {
+    pub(crate) fn new_with_retained_file(
+        io: Arc<dyn IO>,
+        path: String,
+        options: OpenOptions,
+        file: Arc<dyn crate::File>,
+    ) -> Result<Self> {
+        if options.storage.is_some()
+            || options.readonly_storage.is_some()
+            || options.durable_storage.is_some()
+        {
+            return Err(LimboError::InvalidArgument(
+                "physical reader requires retained runtime storage".into(),
+            ));
+        }
+        Self::new(io, path, options.storage(Arc::new(DatabaseFile::new(file))))
+    }
+
     pub(crate) fn new(io: Arc<dyn IO>, path: String, options: OpenOptions) -> Result<Self> {
         if path.is_empty() || is_memory_like(&path) {
             return Err(LimboError::InvalidArgument(

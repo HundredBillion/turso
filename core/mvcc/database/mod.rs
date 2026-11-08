@@ -97,6 +97,8 @@ pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[allow(unused_imports)]
 pub(in crate::mvcc) use shared_runtime::InstalledDowngradeSource;
 #[cfg(all(host_shared_wal, unix))]
+pub(in crate::mvcc) use shared_runtime::RecoveryCompletionEvidence;
+#[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
     SharedBeginState, SharedBootstrapState, SharedIdRequest, SharedIdResult, SharedIdState,

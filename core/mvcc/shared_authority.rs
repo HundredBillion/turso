@@ -294,6 +294,32 @@ impl SharedMvccAuthority {
         })
     }
 
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(in crate::mvcc) fn recovery_state_for_test(&self) -> Result<(u64, bool, u64)> {
+        let ready = match self.load(INCARNATION_READY_OFFSET) {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "invalid shared incarnation readiness".into(),
+                ))
+            }
+        };
+        Ok((
+            self.load(EPOCH_OFFSET),
+            ready,
+            self.load(NEXT_TIMESTAMP_OFFSET),
+        ))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(in crate::mvcc) fn recovery_image_epoch_for_test(image: &[u8]) -> Result<u64> {
+        let bytes = image
+            .get(EPOCH_OFFSET..EPOCH_OFFSET + 8)
+            .ok_or_else(|| LimboError::Corrupt("short shared coordination image".into()))?;
+        Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
+    }
+
     fn initialize(&self, database_id: FileId, history_limit: u64) {
         for offset in (8..MAP_LEN).step_by(8) {
             self.store(offset, 0);
@@ -390,6 +416,41 @@ impl AuthorityGuard {
         self.store_prefix(prefix)?;
         self.recovery_required = false;
         Ok(())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(super) fn recover_completed_checkpoint(
+        &mut self,
+        proof: &super::commit_manifest::checkpoint_publication::CompletedCheckpointProof,
+    ) -> Result<()> {
+        let target = proof.target_identity();
+        if proof.source_identity().is_some()
+            || !proof.matches_lease(self)
+            || target.database.generation == 0
+            || target.prefix.end_offset != 0
+            || target.prefix.running_crc != 0
+            || target.database.checkpoint_timestamp != target.prefix.committed_timestamp
+            || proof.materialized_floor() >= 0
+            || proof.materialized_floor() == i64::MIN
+        {
+            return Err(LimboError::InvalidArgument(
+                "recovered checkpoint authority proof differs".into(),
+            ));
+        }
+        self.ensure_no_snapshot_locks()?;
+        PublicationLease::pin(&self.io_lease())?;
+        if !self.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        if self.requires_recovery() {
+            self.recover(target.prefix)
+        } else if self.published()? == target.prefix {
+            Ok(())
+        } else {
+            Err(LimboError::InvalidArgument(
+                "recovered checkpoint target differs from published authority".into(),
+            ))
+        }
     }
 
     pub(super) fn publish_committed(
@@ -546,6 +607,36 @@ impl AuthorityGuard {
             oldest = Some(oldest.map_or(timestamp, |old: u64| old.min(timestamp)));
         })?;
         Ok(oldest)
+    }
+
+    /// Recovery checks native ownership before mapped snapshot timestamps can be trusted.
+    pub(super) fn ensure_no_snapshot_locks(&self) -> Result<()> {
+        if self.authority.poisoned.load(Ordering::Acquire) {
+            return Err(LimboError::InvalidArgument(
+                "shared MVCC authority lost lock ownership".into(),
+            ));
+        }
+        let slots = self.authority.local_slots.lock();
+        for (slot, locally_owned) in slots.iter().enumerate() {
+            if *locally_owned
+                || !self.authority.file.shared_wal_try_lock_byte(
+                    SLOT_LOCK_START + slot as u64,
+                    true,
+                    LOCK_KIND,
+                )?
+            {
+                return Err(LimboError::Busy);
+            }
+            if let Err(error) = self
+                .authority
+                .file
+                .shared_wal_unlock_byte(SLOT_LOCK_START + slot as u64, LOCK_KIND)
+            {
+                self.authority.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn visit_live_registrations(&self, mut visit: impl FnMut(u64, u64)) -> Result<()> {
@@ -886,6 +977,9 @@ mod tests {
         let mut guard = reopened.try_acquire().unwrap();
         assert!(guard.requires_recovery());
         assert!(guard.published().is_err());
+        guard.ensure_no_snapshot_locks().unwrap();
+        assert!(guard.requires_recovery());
+        assert!(guard.published().is_err());
         let recovered = PublishedPrefix {
             committed_timestamp: 9,
             end_offset: 128,
@@ -908,6 +1002,10 @@ mod tests {
         initialize(&authority);
         let mut child = spawn(&path, "snapshot");
         let mut guard = authority.try_acquire().unwrap();
+        assert!(matches!(
+            guard.ensure_no_snapshot_locks(),
+            Err(LimboError::Busy)
+        ));
         let child_timestamp = guard.oldest_snapshot().unwrap().unwrap();
         let parent = guard.register_snapshot().unwrap();
         assert!(parent.begin_timestamp > child_timestamp);
@@ -927,6 +1025,10 @@ mod tests {
         child.kill();
         let guard = authority.try_acquire().unwrap();
         assert!(!guard.requires_recovery());
+        assert!(matches!(
+            guard.ensure_no_snapshot_locks(),
+            Err(LimboError::Busy)
+        ));
         assert_eq!(
             guard.oldest_snapshot().unwrap(),
             Some(parent.begin_timestamp)
@@ -936,6 +1038,7 @@ mod tests {
             vec![(parent.epoch, parent.begin_timestamp)]
         );
         drop(parent);
+        guard.ensure_no_snapshot_locks().unwrap();
         assert_eq!(guard.oldest_snapshot().unwrap(), None);
         assert!(guard.live_registrations().unwrap().is_empty());
         guard.finish().unwrap();
