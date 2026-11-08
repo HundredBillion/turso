@@ -35,6 +35,14 @@ pub(crate) enum SharedIdResult {
 #[derive(Default)]
 pub(crate) struct SharedIdState {
     pending: Option<PendingId>,
+    // Releasing journal claims is only half of rollback. Keep publication
+    // ownership until the caller has also undone its local versions and schema.
+    released: Option<(
+        TxID,
+        SharedIdRequest,
+        Weak<Connection>,
+        crate::mvcc::shared_authority::AuthorityGuard,
+    )>,
 }
 
 struct PendingId {
@@ -56,8 +64,15 @@ impl Debug for SharedIdState {
     }
 }
 impl SharedIdState {
+    pub(crate) fn finish_release(&mut self) -> Result<()> {
+        if let Some((_, _, _, guard)) = self.released.take() {
+            guard.finish()?;
+        }
+        Ok(())
+    }
     pub(crate) fn reset(&mut self) {
         self.pending = None;
+        self.released = None;
     }
 }
 
@@ -122,6 +137,25 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     begin: registration.begin_timestamp,
                 }
             };
+            if let Some((saved_tx, saved_request, saved_connection, _)) = &state.released {
+                if *saved_tx != tx_id
+                    || *saved_request != request
+                    || !saved_connection
+                        .upgrade()
+                        .is_some_and(|saved| Arc::ptr_eq(&saved, connection))
+                {
+                    return Err(LimboError::Busy.into());
+                }
+                return Ok(IOResult::Done(SharedIdResult::Released));
+            }
+            if let SharedIdRequest::ReleaseAfter { next_ordinal } = request {
+                let tx = self.txs.get(&tx_id).ok_or(LimboError::Busy)?;
+                let mut pending = tx.value().shared_pending_release.lock();
+                if pending.is_some_and(|boundary| next_ordinal > boundary) {
+                    return Err(LimboError::Busy.into());
+                }
+                *pending = Some(next_ordinal);
+            }
             if let Some(pending) = &state.pending {
                 if !pending
                     .connection
@@ -262,11 +296,18 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     )
                 }
             };
-            outcome.guard.finish()?;
+            if matches!(value, SharedIdResult::Released) {
+                state.released = Some((tx_id, request, Arc::downgrade(connection), outcome.guard));
+            } else {
+                outcome.guard.finish()?;
+            }
             Ok(IOResult::Done(value))
         })();
         if !matches!(&result, Ok(IOResult::IO(_))) {
-            state.reset();
+            state.pending = None;
+            if result.is_err() {
+                state.released = None;
+            }
         }
         result
     }
@@ -283,5 +324,21 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
             SavepointKind::Named { name: found, .. } if found == name)
             })
             .and_then(|frame| frame.shared_id_boundary)
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn shared_id_cleanup_pending(&self, tx_id: TxID) -> bool {
+        self.txs
+            .get(&tx_id)
+            .is_some_and(|tx| tx.value().shared_pending_release.lock().is_some())
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn finish_shared_local_rollback(&self, tx_id: TxID) {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value().shared_pending_release.lock().take();
+        }
     }
 }

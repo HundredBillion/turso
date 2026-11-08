@@ -1128,6 +1128,8 @@ pub struct ProgramState {
     #[cfg(all(host_shared_wal, unix))]
     pub(crate) shared_id: crate::mvcc::database::SharedIdState,
     #[cfg(all(host_shared_wal, unix))]
+    shared_named_rollback: Option<(String, crate::mvcc::database::TxID, u64)>,
+    #[cfg(all(host_shared_wal, unix))]
     pub(crate) shared_watermark: crate::mvcc::database::SharedSequenceWatermarkState,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
@@ -1317,6 +1319,8 @@ impl ProgramState {
             #[cfg(all(host_shared_wal, unix))]
             shared_id: Default::default(),
             #[cfg(all(host_shared_wal, unix))]
+            shared_named_rollback: None,
+            #[cfg(all(host_shared_wal, unix))]
             shared_watermark: Default::default(),
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
@@ -1419,6 +1423,7 @@ impl ProgramState {
         #[cfg(all(host_shared_wal, unix))]
         {
             self.shared_id.reset();
+            self.shared_named_rollback = None;
             self.shared_watermark.reset();
         }
     }
@@ -2606,7 +2611,29 @@ impl Program {
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
+        #[cfg(all(host_shared_wal, unix))]
+        let cleanup_blocks_step = !self.connection.is_nested_stmt()
+            && state.shared_named_rollback.is_none()
+            && !self.insns.iter().any(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::AutoCommit { rollback: true, .. }
+                        | Insn::Savepoint {
+                            op: insn::SavepointOp::RollbackTo,
+                            ..
+                        }
+                )
+            })
+            && self.connection.mv_store().as_ref().is_some_and(|store| {
+                self.connection
+                    .get_mv_tx_id()
+                    .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+            });
+        #[cfg(not(all(host_shared_wal, unix)))]
+        let cleanup_blocks_step = false;
+        let result = if cleanup_blocks_step {
+            ProgramStep::Error(Box::new(LimboError::Busy))
+        } else if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
@@ -3607,7 +3634,36 @@ impl Program {
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         state.reset_shared_begin();
+        #[cfg(all(host_shared_wal, unix))]
+        if let Err(error) =
+            execute::finish_abandoned_shared_named_rollback(state, &self.connection, pager)
+        {
+            capture_abort_error(
+                &mut abort_error,
+                error,
+                "Failed to finish shared named rollback",
+            );
+        }
         state.reset_shared_id();
+        #[cfg(all(host_shared_wal, unix))]
+        if let Some(store) = self
+            .connection
+            .mv_store()
+            .as_ref()
+            .filter(|store| store.is_shared())
+        {
+            if self
+                .connection
+                .get_mv_tx_id()
+                .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+            {
+                capture_abort_error(
+                    &mut abort_error,
+                    LimboError::Busy,
+                    "Shared ID rollback is not locally complete",
+                );
+            }
+        }
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.

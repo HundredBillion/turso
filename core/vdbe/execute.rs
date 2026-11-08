@@ -4279,17 +4279,19 @@ pub(crate) enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
     AfterSharedRowClaim,
+    AfterSharedScopeRelease,
 }
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
-    const POINT_COUNT: u8 = 3;
+    const POINT_COUNT: u8 = 4;
 
     fn ordinal(self) -> u8 {
         match self {
             TransactionYieldPoint::BeforeStart => 0,
             TransactionYieldPoint::BeforeMvccBegin => 1,
             TransactionYieldPoint::AfterSharedRowClaim => 2,
+            TransactionYieldPoint::AfterSharedScopeRelease => 3,
         }
     }
 }
@@ -4642,6 +4644,16 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let mut started_secondary_tx = false;
+                #[cfg(all(host_shared_wal, unix))]
+                if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+                    if !conn.is_nested_stmt()
+                        && conn
+                            .get_mv_tx_id_for_db(*db)
+                            .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+                    {
+                        return Err(LimboError::Busy.into());
+                    }
+                }
                 conn.check_database_storage(*db)?;
                 if write {
                     conn.ensure_database_writable(*db)?;
@@ -5284,6 +5296,17 @@ pub fn op_auto_commit(
     let conn = program.connection.clone();
     let fk_on = conn.foreign_keys_enabled();
     let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
+    #[cfg(all(host_shared_wal, unix))]
+    if !*rollback {
+        if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
+            if conn
+                .get_mv_tx_id()
+                .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+            {
+                return Err(LimboError::Busy.into());
+            }
+        }
+    }
 
     // Drive any multi-step commit/rollback that's already in progress.
     // This handles main DB commits (Committing), attached DB commits
@@ -5739,7 +5762,12 @@ pub fn op_savepoint(
             #[cfg(all(host_shared_wal, unix))]
             if let Some(store) = mv_store.as_ref().filter(|store| store.is_shared()) {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
-                    if let Some(next_ordinal) = store.shared_named_id_boundary(tx_id, name) {
+                    let boundary = store.shared_named_id_boundary(tx_id, name);
+                    if boundary.is_none() && store.shared_id_cleanup_pending(tx_id) {
+                        return Err(LimboError::Busy.into());
+                    }
+                    if let Some(next_ordinal) = boundary {
+                        state.shared_named_rollback = Some((name.clone(), tx_id, next_ordinal));
                         return_if_io!(
                             state,
                             store.shared_id_nonblock(
@@ -5753,77 +5781,98 @@ pub fn op_savepoint(
                                 &mut state.shared_id,
                             )
                         );
+                        #[cfg(any(test, injected_yields))]
+                        if let Some(IOResult::IO(io)) =
+                            crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                conn.yield_injector().as_ref(),
+                                0,
+                                tx_id,
+                                TransactionYieldPoint::AfterSharedScopeRelease,
+                            )
+                        {
+                            return Ok(state.suspend_on_io(io));
+                        }
                     }
                 }
             }
-            let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
-                match conn.get_mv_tx_id() {
-                    Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
-                    None => None,
-                }
-            } else {
-                pager.rollback_to_named_savepoint(name)?
-            };
-
-            let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
-                mark_unlikely();
-                return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
-            };
-            let frame_info = conn.rollback_named_savepoint_frame(name);
-            mirror_named_savepoint_to_active_non_main_databases(
-                &conn,
-                SavepointMirror::Rollback(name),
-            )?;
-            conn.fk_deferred_violations
-                .store(deferred_fk_snapshot, Ordering::Release);
-
-            // Restore all in-memory schemas (main, temp, attached) from the
-            // frame's snapshot. The mirror call above rolled back on-disk
-            // pages for temp and attached pagers; main DB pages are rolled
-            // back by `pager.rollback_to_named_savepoint`. Without this
-            // restore, the in-memory schemas would keep DDL that the disk-
-            // level rollback just undid.
-            //
-            // The main-DB snapshot replaces an older code path that
-            // reparsed `sqlite_schema` from disk here. That path blocked
-            // on cursor I/O (and, with sequences, on `prepare_internal +
-            // run_with_row_callback` driving `pager.io.step` synchronously)
-            // — both vdbe async-contract violations. The snapshot is cheap
-            // (`Arc<Schema>` clone at SAVEPOINT begin) and carries the full
-            // schema including the sequences map, so the restore is
-            // consistent across tables / indexes / sequences without any
-            // I/O.
-            if let Some(info) = frame_info {
-                *conn.schema.write() = info.main_schema_snapshot;
-                if let Some(temp_db) = conn.temp.database.read().as_ref() {
-                    match info.temp_schema_snapshot {
-                        Some(snap) => *temp_db.db.schema.lock() = snap,
-                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
-                    }
-                }
-                *conn.database_schemas().write() = info.staged_schema_snapshot;
-                conn.bump_prepare_context_generation();
-                if let (Some(hooks), Some(memo)) = (conn.hooks(), &info.hooks_memo) {
-                    hooks.rolled_back_to_savepoint(&conn, memo);
-                }
-            }
-
-            // Invalidate cached schema cookies on ALL pagers whose pages may
-            // have been rolled back. Next header read repopulates them from
-            // the restored on-disk pages — which now match the in-memory
-            // snapshot we just installed.
-            conn.with_all_attached_pagers_with_index(|pagers| {
-                for (_db_id, attached_pager) in pagers {
-                    attached_pager.set_schema_cookie(None);
-                }
-            });
-            pager.set_schema_cookie(None);
-            conn.index_methods_on_savepoint_rolled_back();
+            rollback_named_savepoint_locally(&conn, pager, name)?;
+            #[cfg(all(host_shared_wal, unix))]
+            finish_shared_named_rollback(state, &conn)?;
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
     }
+}
+
+fn rollback_named_savepoint_locally(
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    name: &str,
+) -> Result<()> {
+    let mv_store = conn.mv_store();
+    let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
+        match conn.get_mv_tx_id() {
+            Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
+            None => None,
+        }
+    } else {
+        pager.rollback_to_named_savepoint(name)?
+    };
+
+    let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
+        mark_unlikely();
+        return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+    };
+    let frame_info = conn.rollback_named_savepoint_frame(name);
+    mirror_named_savepoint_to_active_non_main_databases(conn, SavepointMirror::Rollback(name))?;
+    conn.fk_deferred_violations
+        .store(deferred_fk_snapshot, Ordering::Release);
+
+    // Restore all in-memory schemas (main, temp, attached) from the
+    // frame's snapshot. The mirror call above rolled back on-disk
+    // pages for temp and attached pagers; main DB pages are rolled
+    // back by `pager.rollback_to_named_savepoint`. Without this
+    // restore, the in-memory schemas would keep DDL that the disk-
+    // level rollback just undid.
+    //
+    // The main-DB snapshot replaces an older code path that
+    // reparsed `sqlite_schema` from disk here. That path blocked
+    // on cursor I/O (and, with sequences, on `prepare_internal +
+    // run_with_row_callback` driving `pager.io.step` synchronously)
+    // — both vdbe async-contract violations. The snapshot is cheap
+    // (`Arc<Schema>` clone at SAVEPOINT begin) and carries the full
+    // schema including the sequences map, so the restore is
+    // consistent across tables / indexes / sequences without any
+    // I/O.
+    if let Some(info) = frame_info {
+        *conn.schema.write() = info.main_schema_snapshot;
+        if let Some(temp_db) = conn.temp.database.read().as_ref() {
+            match info.temp_schema_snapshot {
+                Some(snap) => *temp_db.db.schema.lock() = snap,
+                None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
+            }
+        }
+        *conn.database_schemas().write() = info.staged_schema_snapshot;
+        conn.bump_prepare_context_generation();
+        if let (Some(hooks), Some(memo)) = (conn.hooks(), &info.hooks_memo) {
+            hooks.rolled_back_to_savepoint(conn, memo);
+        }
+    }
+
+    // Invalidate cached schema cookies on ALL pagers whose pages may
+    // have been rolled back. Next header read repopulates them from
+    // the restored on-disk pages — which now match the in-memory
+    // snapshot we just installed.
+    conn.with_all_attached_pagers_with_index(|pagers| {
+        for (_db_id, attached_pager) in pagers {
+            attached_pager.set_schema_cookie(None);
+        }
+    });
+    pager.set_schema_cookie(None);
+    conn.index_methods_on_savepoint_rolled_back();
+
+    Ok(())
 }
 
 fn release_commit_insn() -> Insn {
@@ -22599,4 +22648,43 @@ mod shared_begin_tests {
         assert!(f.connection.get_mv_tx().is_none());
         assert!(!f.connection.pager.load().holds_read_lock());
     }
+}
+
+#[cfg(all(host_shared_wal, unix))]
+fn finish_shared_named_rollback(state: &mut ProgramState, conn: &Arc<Connection>) -> Result<()> {
+    state.shared_id.finish_release()?;
+    if let Some((_, tx_id, _)) = state.shared_named_rollback.take() {
+        if let Some(store) = conn.mv_store().as_ref() {
+            store.finish_shared_local_rollback(tx_id);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(host_shared_wal, unix))]
+pub(super) fn finish_abandoned_shared_named_rollback(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+) -> Result<()> {
+    use crate::IOExt;
+    let Some((name, tx_id, next_ordinal)) = state.shared_named_rollback.clone() else {
+        return Ok(());
+    };
+    let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
+    if conn.get_mv_tx_id() != Some(tx_id) {
+        return Err(LimboError::Busy);
+    }
+    pager.io.block(|| {
+        store.shared_id_nonblock(
+            conn,
+            pager.clone(),
+            tx_id,
+            crate::MAIN_DB_ID,
+            crate::mvcc::database::SharedIdRequest::ReleaseAfter { next_ordinal },
+            &mut state.shared_id,
+        )
+    })?;
+    rollback_named_savepoint_locally(conn, pager, &name)?;
+    finish_shared_named_rollback(state, conn)
 }

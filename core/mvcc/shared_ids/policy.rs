@@ -178,7 +178,15 @@ impl IdOperation {
                 },
                 Stage::Evaluating(loaded) => {
                     self.check_identity(&loaded)?;
-                    if self.scope_boundary.is_none() {
+                    if self.scope_boundary.is_none()
+                        && matches!(
+                            self.action,
+                            IdAction::ReserveRow { .. }
+                                | IdAction::ClaimExplicitRow { .. }
+                                | IdAction::ClaimSequence { .. }
+                                | IdAction::ReserveLogicalTable { .. }
+                        )
+                    {
                         if let Some(owner) = action_owner(self.action) {
                             self.scope_boundary = Some(SavepointMark {
                                 owner,

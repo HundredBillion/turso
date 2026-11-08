@@ -770,3 +770,91 @@ fn shared_id_lifecycle_native_reset_releases_only_scoped_claims() {
 fn shared_id_lifecycle_native_drop_releases_only_scoped_claims() {
     abandoned_claim_releases_scope(false);
 }
+
+#[derive(Debug)]
+struct AfterScopeReleaseYield(std::sync::atomic::AtomicBool);
+impl crate::mvcc::yield_points::YieldInjector for AfterScopeReleaseYield {
+    fn should_yield(&self, _: u64, _: u64, point: crate::mvcc::yield_points::YieldPoint) -> bool {
+        use crate::mvcc::yield_hooks::YieldPointMarker;
+        point == super::execute::TransactionYieldPoint::AfterSharedScopeRelease.point()
+            && self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_cancel_after_release_requires_local_undo() {
+    for reset in [true, false] {
+        let (_directory, first, second) = pair();
+        first.execute("BEGIN CONCURRENT").unwrap();
+        first
+            .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+            .unwrap();
+        first.execute("SAVEPOINT scope").unwrap();
+        first
+            .execute("INSERT INTO preserved(id,value) VALUES(77,'scoped')")
+            .unwrap();
+        let outer = first.get_mv_tx_id_for_db(0).unwrap();
+        let snapshot = first.mv_store().as_ref().unwrap().read_snapshot_ts(outer);
+        let mut reader = first
+            .prepare("SELECT id FROM preserved ORDER BY id")
+            .unwrap();
+        assert!(matches!(reader.step().unwrap(), crate::StepResult::Row));
+        first.set_yield_injector(Some(Arc::new(AfterScopeReleaseYield(
+            std::sync::atomic::AtomicBool::new(true),
+        ))));
+        let mut statement = first.prepare("ROLLBACK TO scope").unwrap();
+        let mut parked = false;
+        for _ in 0..10000 {
+            match statement.step().unwrap() {
+                crate::StepResult::Yield => {
+                    parked = true;
+                    break;
+                }
+                crate::StepResult::IO => statement.get_pager().io.step().unwrap(),
+                other => panic!("expected scope release boundary, got {other:?}"),
+            }
+        }
+        assert!(parked);
+        first.set_yield_injector(None);
+        assert!(
+            matches!(reader.step(), Err(crate::LimboError::Busy)),
+            "resumed reader bypassed pending rollback"
+        );
+        drop(reader);
+        assert!(
+            matches!(first.execute("COMMIT"), Err(crate::LimboError::Busy)),
+            "commit bypassed pending rollback"
+        );
+        assert!(
+            matches!(
+                second.execute("INSERT INTO preserved(id,value) VALUES(77,'peer')"),
+                Err(crate::LimboError::Busy)
+            ),
+            "publication authority retired before local undo"
+        );
+        if reset {
+            statement.reset().unwrap();
+        }
+        drop(statement);
+        second
+            .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+            .unwrap();
+
+        assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+        assert_eq!(
+            first.mv_store().as_ref().unwrap().read_snapshot_ts(outer),
+            snapshot
+        );
+        assert_eq!(
+            integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+            [66]
+        );
+        first.execute("RELEASE scope").unwrap();
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            integers(&second, "SELECT id FROM preserved WHERE id>=66"),
+            [66, 77]
+        );
+    }
+}
