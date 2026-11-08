@@ -538,3 +538,46 @@ fn checkpoint_recovery_wal_precommit_native_recovers_source_without_discarding_l
         }
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_wal_precommit_native_rejects_non_source_main_without_writes() {
+    let fixture = IntentCrashFixture::new(CrashPoint::MainSyncedBeforeWalTruncate, 1);
+    let wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.runtime.files.namespace.join("physical-wal"))
+        .unwrap();
+    wal.set_len(32).unwrap();
+    wal.sync_all().unwrap();
+    let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
+    let record = selected.manifest.record();
+    assert_ne!(
+        record
+            .checkpoint_intent()
+            .unwrap()
+            .source_checkpoint_timestamp,
+        record.prefix().committed_timestamp
+    );
+    let mut mirror = selected.begin_intent_mirror().unwrap();
+    let intent = fixture.io.block(|| mirror.poll()).unwrap();
+    let before: Vec<_> = fixture
+        .durable_before
+        .iter()
+        .map(|(path, _)| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let mut recovery = intent
+        .begin_physical_wal_recovery(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
+        .unwrap();
+    let error = match fixture.io.block(|| recovery.poll()) {
+        Ok(_) => panic!("nonempty uncommitted WAL accepted a main outside exact source"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, LimboError::Corrupt(message) if message.contains("uncommitted physical WAL requires the exact source main"))
+    );
+    for (path, bytes) in before {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert!(fixture.runtime.replay.lock().is_none());
+}

@@ -244,6 +244,7 @@ pub(in crate::mvcc) struct CheckpointPhysicalWalRecovery {
     scanned: Option<Arc<RwLock<WalFileShared>>>,
     commit_read: Option<CommitRead>,
     commit_pages: Option<u32>,
+    nonempty_uncommitted: bool,
     opening: Option<SharedPhysicalConnection>,
     reader: Option<Arc<Connection>>,
     read: PhysicalBaseReadState,
@@ -284,6 +285,7 @@ impl CheckpointPhysicalWalRecovery {
             scanned: None,
             commit_read: None,
             commit_pages: None,
+            nonempty_uncommitted: false,
             opening: None,
             reader: None,
             read: Default::default(),
@@ -372,9 +374,9 @@ impl CheckpointPhysicalWalRecovery {
                     let header = *wal.metadata.wal_header.lock();
                     let max = wal.metadata.max_frame.load(Ordering::Acquire);
                     let size = self.runtime.files.physical_wal.size()?;
-                    if size != 0
-                        && (max == 0
-                            || !matches!(header.magic, WAL_MAGIC_LE | WAL_MAGIC_BE)
+                    self.nonempty_uncommitted = size != 0 && max == 0;
+                    if max > 0
+                        && (!matches!(header.magic, WAL_MAGIC_LE | WAL_MAGIC_BE)
                             || header.file_format != 3007000
                             || crate::PageSize::new(header.page_size).is_none())
                     {
@@ -471,6 +473,22 @@ impl CheckpointPhysicalWalRecovery {
                         self.runtime.files.main.size()?,
                         self.commit_pages,
                     )?;
+                    if self.nonempty_uncommitted
+                        && parts.persistent_timestamp
+                            != self
+                                .evidence
+                                .as_ref()
+                                .unwrap()
+                                .record
+                                .checkpoint_intent()
+                                .unwrap()
+                                .source_checkpoint_timestamp
+                    {
+                        return Err(LimboError::Corrupt(
+                            "uncommitted physical WAL requires the exact source main".into(),
+                        )
+                        .into());
+                    }
                     self.pager = Some(self.reader.as_ref().unwrap().get_pager());
                     self.reader = None;
                     self.expected = Some(parts);

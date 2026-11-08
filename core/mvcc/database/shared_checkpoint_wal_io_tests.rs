@@ -360,7 +360,10 @@ fn checkpoint_recovery_wal_io_native_every_operation_error_and_short_write_retri
             drop(recovery);
             assert!(control.held.lock().is_none());
             let mut retry = start(&fixture);
+            control.arm(Fault::None);
             let output = fixture.io.block(|| retry.poll()).unwrap();
+            control.armed.store(false, Ordering::Release);
+            assert_full_main_sync_before_wal_discard(&control.events.lock());
             verify_output(&fixture, &output);
         }
     }
@@ -440,8 +443,69 @@ fn checkpoint_recovery_wal_io_native_cancel_before_callback_and_before_retiremen
             drop(held);
             control.armed.store(false, Ordering::Release);
             let mut retry = start(&fixture);
+            control.arm(Fault::None);
             let output = fixture.io.block(|| retry.poll()).unwrap();
+            control.armed.store(false, Ordering::Release);
+            assert_full_main_sync_before_wal_discard(&control.events.lock());
             verify_output(&fixture, &output);
         }
+    }
+}
+
+fn assert_full_main_sync_before_wal_discard(events: &[Event]) {
+    let sync = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                Event(
+                    Role::Main,
+                    Operation::Sync(FileSyncType::Fsync | FileSyncType::FullFsync)
+                )
+            )
+        })
+        .expect("recovery did not fully sync actual main");
+    let truncate = events
+        .iter()
+        .position(|event| matches!(event, Event(Role::Wal, Operation::Truncate(0))))
+        .expect("recovery did not truncate actual WAL");
+    assert!(
+        sync < truncate,
+        "WAL discarded before actual main FULL barrier: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&Event(
+            Role::Coordination,
+            Operation::Sync(FileSyncType::FullFsync)
+        ))
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_wal_precommit_native_full_main_sync_precedes_discard() {
+    for point in [
+        CrashPoint::BeforeWalHeader,
+        CrashPoint::TornWalHeader,
+        CrashPoint::BeforeWalFrame,
+        CrashPoint::TornWalFrame,
+        CrashPoint::BeforeWalCommit,
+    ] {
+        let control = Control::new();
+        let fixture = IntentCrashFixture::with_parent_io(point, 1, |path| control.io(path));
+        let mut recovery = start(&fixture);
+        control.arm(Fault::None);
+        let output = fixture.io.block(|| recovery.poll()).unwrap();
+        control.armed.store(false, Ordering::Release);
+        let events = control.events.lock().clone();
+        eprintln!("PRECOMMIT_FULL_MAIN_BARRIER {point:?} {events:?}");
+        assert_full_main_sync_before_wal_discard(&events);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event(Role::Main, Operation::Write(_)))));
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+        assert!(output.guard().requires_recovery());
+        assert!(output.guard().published().is_err());
     }
 }
