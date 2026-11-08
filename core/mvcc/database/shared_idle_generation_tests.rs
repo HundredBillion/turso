@@ -212,14 +212,25 @@ fn shared_idle_generation_native_child() {
                     .record()
                     .prefix()
                     .committed_timestamp;
-                let waiter = match open
-                    .poll_current_prefix(&store, &connection, crate::MAIN_DB_ID, None)
-                    .unwrap()
-                {
-                    IOResult::IO(waiter) => waiter,
-                    IOResult::Done(()) => panic!("reload bypassed delayed logical read"),
+                let (waiter, held) = {
+                    let mut attempts = 0;
+                    loop {
+                        attempts += 1;
+                        assert!(attempts < 1000, "reload did not reach delayed logical read");
+                        match open
+                            .poll_current_prefix(&store, &connection, crate::MAIN_DB_ID, None)
+                            .unwrap()
+                        {
+                            IOResult::IO(waiter) => {
+                                if let Some(held) = control.try_take_pending() {
+                                    break (waiter, held);
+                                }
+                                waiter.wait(io.as_ref()).unwrap();
+                            }
+                            IOResult::Done(()) => panic!("reload bypassed delayed logical read"),
+                        }
+                    }
                 };
-                let held = control.take_pending();
                 let partial = store.last_committed_tx_ts.load(Ordering::Acquire);
                 let base = store.durable_txid_max.load(Ordering::Acquire);
                 assert!(

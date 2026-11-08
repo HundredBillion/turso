@@ -467,10 +467,11 @@ impl ConnectionIoControl {
             Ordering::Release,
         );
     }
+    pub(super) fn try_take_pending(&self) -> Option<HeldMainRead> {
+        self.pending_read.lock().take()
+    }
     pub(super) fn take_pending(&self) -> HeldMainRead {
-        self.pending_read
-            .lock()
-            .take()
+        self.try_take_pending()
             .expect("expected delayed native read")
     }
 }
