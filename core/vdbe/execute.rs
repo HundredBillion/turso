@@ -22326,6 +22326,7 @@ mod shared_begin_tests {
     struct Fixture {
         connection: Arc<Connection>,
         authority_file: Arc<dyn File>,
+        namespace: std::path::PathBuf,
         _directory: tempfile::TempDir,
     }
 
@@ -22369,7 +22370,11 @@ mod shared_begin_tests {
                 _directory: directory,
                 connection,
                 authority_file,
+                namespace: authority.parent().unwrap().to_path_buf(),
             }
+        }
+        fn committed_bytes(&self) -> [Vec<u8>; 2] {
+            ["manifest", "logical"].map(|name| std::fs::read(self.namespace.join(name)).unwrap())
         }
         fn hold_publication(&self) {
             assert!(self
@@ -22474,14 +22479,18 @@ mod shared_begin_tests {
     #[test]
     fn shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop() {
         for reset in [true, false] {
-            let f =
-                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(192 * 1024));
+            // One payload and credited reservations fit; two payloads plus the
+            // structural ID minimum cannot fit, even before framing overhead.
+            let cap = 192 * 1024;
+            assert!(2 * 90_000 + crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES > cap);
+            let f = Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(cap));
             f.connection
                 .execute(format!(
                     "UPDATE preserved SET value='{}'",
                     "a".repeat(90_000)
                 ))
                 .unwrap();
+            let committed = f.committed_bytes();
             f.connection.execute("BEGIN CONCURRENT").unwrap();
             f.connection
                 .execute(format!(
@@ -22497,6 +22506,11 @@ mod shared_begin_tests {
                     commit.run_with_row_callback(|_| Ok(())),
                     Err(LimboError::Busy)
                 ));
+                assert_eq!(
+                    f.committed_bytes(),
+                    committed,
+                    "cap rejection modified published bytes"
+                );
             }
             if reset {
                 commit.reset().unwrap();
@@ -22546,14 +22560,18 @@ mod shared_begin_tests {
     #[test]
     fn shared_vdbe_release_cap_busy_retains_named_savepoints_on_reset_or_drop() {
         for reset in [true, false] {
-            let f =
-                Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(192 * 1024));
+            // One payload and credited reservations fit; two payloads plus the
+            // structural ID minimum cannot fit, even before framing overhead.
+            let cap = 192 * 1024;
+            assert!(2 * 90_000 + crate::mvcc::shared_ids::MIN_ID_BUDGET_BYTES > cap);
+            let f = Fixture::with_io_and_limit(Arc::new(PlatformIO::new().unwrap()), Some(cap));
             f.connection
                 .execute(format!(
                     "UPDATE preserved SET value='{}'",
                     "a".repeat(90_000)
                 ))
                 .unwrap();
+            let committed = f.committed_bytes();
             f.connection.execute("SAVEPOINT held").unwrap();
             f.connection
                 .execute(format!(
@@ -22579,6 +22597,11 @@ mod shared_begin_tests {
                     Err(LimboError::Busy)
                 ));
                 assert_eq!(names(), ["held", "nested"]);
+                assert_eq!(
+                    f.committed_bytes(),
+                    committed,
+                    "cap rejection modified published bytes"
+                );
             }
             if reset {
                 release.reset().unwrap();
