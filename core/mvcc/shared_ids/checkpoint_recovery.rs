@@ -129,3 +129,99 @@ impl RecoveryTargetIdLoad {
         }))
     }
 }
+
+use super::checkpoint_prepare::finalize::{FinalizedIds, IdCheckpointFinalize};
+use super::witness_mirror::IdWitnessMirror;
+use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
+
+pub(in crate::mvcc) struct RecoveredIdFinalization {
+    mirror: Option<IdWitnessMirror>,
+    finalizer: Option<IdCheckpointFinalize>,
+    proof: Option<CompletedCheckpointProof>,
+    captured_maximum: Option<u64>,
+    finished: bool,
+}
+
+impl SuspendedRecoveryIds {
+    pub(in crate::mvcc) fn begin_finalize(
+        self,
+        guard: AuthorityGuard,
+        proof: CompletedCheckpointProof,
+        captured_maximum: Option<u64>,
+    ) -> Result<RecoveredIdFinalization> {
+        if proof.source_identity().is_some()
+            || proof.target_identity() != self.identity
+            || proof.source_database() != self.source_database
+            || !proof.matches_lease(&guard)
+            || guard.published()? != self.identity.prefix
+            || proof.materialized_floor() >= 0
+            || proof.materialized_floor() == i64::MIN
+        {
+            return Err(invalid("recovered ID finalization proof differs"));
+        }
+        guard.ensure_no_snapshot_locks()?;
+        if !guard.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        let loaded = self.ids.rejoin_source(guard)?;
+        if loaded.max_owner_epoch()? != captured_maximum {
+            return Err(invalid("recovered ID epoch witness differs"));
+        }
+        if loaded.selected_logical_floor() > proof.materialized_floor() {
+            return Err(invalid("recovered ID floor does not cover physical target"));
+        }
+        let ready = loaded.guard.incarnation_ready()?;
+        Ok(if ready {
+            RecoveredIdFinalization {
+                mirror: None,
+                finalizer: Some(loaded.finalize_recovered_checkpoint(proof)?),
+                proof: None,
+                captured_maximum,
+                finished: false,
+            }
+        } else {
+            RecoveredIdFinalization {
+                mirror: Some(loaded.mirror_current_witness()?),
+                finalizer: None,
+                proof: Some(proof),
+                captured_maximum,
+                finished: false,
+            }
+        })
+    }
+}
+impl RecoveredIdFinalization {
+    pub(in crate::mvcc) fn poll(&mut self) -> Result<IOResult<FinalizedIds>> {
+        let result = self.poll_inner();
+        if result.is_err() {
+            self.mirror = None;
+            self.finalizer = None;
+            self.proof = None;
+            self.finished = true;
+        }
+        result
+    }
+    fn poll_inner(&mut self) -> Result<IOResult<FinalizedIds>> {
+        if self.finished {
+            return Err(invalid("recovered ID finalization has ended"));
+        }
+        if let Some(mirror) = self.mirror.as_mut() {
+            let mirrored = match mirror.poll()? {
+                IOResult::IO(waiter) => return Ok(IOResult::IO(waiter)),
+                IOResult::Done(mirrored) => mirrored,
+            };
+            self.mirror = None;
+            self.finalizer = Some(mirrored.finalize_recovered_checkpoint(
+                self.proof.take().unwrap(),
+                self.captured_maximum,
+            )?);
+        }
+        let finalized = match self.finalizer.as_mut().unwrap().poll()? {
+            IOResult::IO(waiter) => return Ok(IOResult::IO(waiter)),
+            IOResult::Done(finalized) => finalized,
+        };
+        self.finalizer = None;
+        self.finished = true;
+        Ok(IOResult::Done(finalized))
+    }
+}

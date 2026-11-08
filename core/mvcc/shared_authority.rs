@@ -418,6 +418,41 @@ impl AuthorityGuard {
         Ok(())
     }
 
+    #[cfg(all(host_shared_wal, unix))]
+    pub(super) fn recover_completed_checkpoint(
+        &mut self,
+        proof: &super::commit_manifest::checkpoint_publication::CompletedCheckpointProof,
+    ) -> Result<()> {
+        let target = proof.target_identity();
+        if proof.source_identity().is_some()
+            || !proof.matches_lease(self)
+            || target.database.generation == 0
+            || target.prefix.end_offset != 0
+            || target.prefix.running_crc != 0
+            || target.database.checkpoint_timestamp != target.prefix.committed_timestamp
+            || proof.materialized_floor() >= 0
+            || proof.materialized_floor() == i64::MIN
+        {
+            return Err(LimboError::InvalidArgument(
+                "recovered checkpoint authority proof differs".into(),
+            ));
+        }
+        self.ensure_no_snapshot_locks()?;
+        PublicationLease::pin(&self.io_lease())?;
+        if !self.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        if self.requires_recovery() {
+            self.recover(target.prefix)
+        } else if self.published()? == target.prefix {
+            Ok(())
+        } else {
+            Err(LimboError::InvalidArgument(
+                "recovered checkpoint target differs from published authority".into(),
+            ))
+        }
+    }
+
     pub(super) fn publish_committed(
         &mut self,
         durable: &super::commit_manifest::DurableManifest,
