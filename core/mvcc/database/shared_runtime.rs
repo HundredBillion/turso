@@ -10,6 +10,7 @@ mod shared_pager_generation;
 
 #[path = "shared_checkpoint.rs"]
 mod shared_checkpoint;
+pub(in crate::mvcc) use shared_checkpoint::InstalledDowngradeSource;
 
 #[path = "shared_checkpoint_recovery.rs"]
 mod shared_checkpoint_recovery;

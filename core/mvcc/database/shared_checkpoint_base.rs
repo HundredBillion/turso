@@ -5,6 +5,7 @@ use crate::database::shared_physical::SharedPhysicalConnection;
 use crate::mvcc::database::shared_bootstrap::{PhysicalBaseParts, PhysicalBaseReadState};
 use crate::mvcc::read_pinned_file::ReadPinnedFile;
 use crate::storage::database::DatabaseFile;
+pub(in crate::mvcc) use shared_checkpoint_install::InstalledDowngradeSource;
 
 pub(in crate::mvcc) struct VerifiedPhysicalBase {
     parts: PhysicalBaseParts,
