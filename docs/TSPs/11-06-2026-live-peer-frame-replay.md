@@ -120,3 +120,23 @@ frontier, retaining the pending frame for retry.
 This is a private live-import repair. Ordinary startup recovery keeps its existing
 post-replay descriptor-loading path. It does not add prepare-time peer refresh,
 checkpoint recovery, or public shared-mode activation.
+
+## Refresh before compiling an idle connection's SQL
+
+An idle connection must import peer DDL before resolving table and sequence names.
+Refresh root statements before compilation when no transaction or schema bootstrap
+is active. Internal helpers keep their caller's authority and schema; active
+transactions retain their established snapshot. Use the existing bounded manifest
+reader and atomic peer-frame installer under checkpoint admission and publication
+authority, without registering a transaction merely to prepare SQL. The public
+prepare API is synchronous, so it drives the existing yielding reader through the
+connection's I/O backend. It must await backend retirement before finishing
+authority. Generation changes still require the separate physical-base reload.
+
+Native counterexamples at `0d95c591d` (run `42478695225`) reproduce both missing
+sequence and missing table errors when the second connection prepares immediately
+after peer DDL, without an intervening transaction to trigger replay. The older
+test with an intervening SELECT passes on the same source. The new implementation
+must additionally preserve active snapshots, avoid recursive internal preparation,
+reject preparation while a checkpoint pauses admission, and retain authority over
+delayed physical reads.

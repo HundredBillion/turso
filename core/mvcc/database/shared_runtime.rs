@@ -264,6 +264,29 @@ impl SharedOpenState {
 }
 
 impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
+    pub(crate) fn refresh_shared_schema_for_prepare(
+        &self,
+        connection: &Arc<Connection>,
+    ) -> Result<()> {
+        use crate::IOExt;
+        let Some(runtime) = self.shared_runtime.get() else {
+            return Ok(());
+        };
+        let io = connection.get_pager().io.clone();
+        let mut open = runtime.begin_open()?;
+        if connection.get_mv_tx().is_some() {
+            return Ok(());
+        }
+        io.block(|| open.poll_manifest())?;
+        let replay = runtime.replay.lock().clone().ok_or_else(|| {
+            LimboError::InvalidArgument("shared runtime has not completed bootstrap".into())
+        })?;
+        let mut refresh = replay.refresh(open.loaded.take().unwrap(), runtime.logical.clone())?;
+        let loaded = io.block(|| refresh.poll(self, connection))?;
+        loaded.into_guard()?.finish()?;
+        Ok(())
+    }
+
     pub(crate) fn attach_shared_runtime(&self, runtime: Arc<SharedMvccRuntime>) -> Result<()> {
         let expected: Arc<dyn crate::mvcc::persistent_storage::DurableStorage> = runtime.storage();
         if !Arc::ptr_eq(&self.storage, &expected) || self.experimental_mvcc_passive_checkpoint {
