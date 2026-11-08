@@ -1,4 +1,4 @@
-name: Private shared generation installation validation
+name: Additional shared ID opcode acceptance
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ebadc550a26e8e0fbcc8c808d9f3a4a82d75702c
+          ref: 5e332ad964527f2696ed0a852fd09fafb378ed0b
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,21 +24,17 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = ebadc550a26e8e0fbcc8c808d9f3a4a82d75702c
+          test "$(git rev-parse HEAD)" = 5e332ad964527f2696ed0a852fd09fafb378ed0b
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Preparation and pager controls
+      - name: AUTOINCREMENT updated key and replacement
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload_ -- --test-threads=1 --nocapture 2>&1 | tee preparation.log
-          grep -q '3 passed; 0 failed' preparation.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reset_ -- --test-threads=1 --nocapture 2>&1 | tee pager.log
-          grep -q '7 passed; 0 failed' pager.log
-      - name: Genuine completed-proof native installation and rejection
-        run: |
-          set -o pipefail
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_reload_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee generation-native.log
-          grep -q '2 passed; 0 failed' generation-native.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run
+          for selector in shared_id_opcode_native_autoincrement_ shared_id_opcode_native_updated_key_ shared_id_opcode_native_replace_; do
+            timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
+            grep -q '1 passed; 0 failed' "$selector.log"
+          done
       - name: Strict library lint
         run: |
           set -o pipefail
@@ -46,7 +42,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-generation-installation
+          name: shared-id-additional-acceptance
           path: |
             source.txt
             rustc.txt
