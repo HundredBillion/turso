@@ -3097,6 +3097,9 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
 
     assert_integrity_ok(&conn);
 
+    drop(mvcc_store);
+    drop(sibling);
+    drop(conn);
     db.restart();
     let conn = db.connect();
     assert_integrity_ok(&conn);
@@ -3180,6 +3183,9 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(rows[1][0].as_int().unwrap(), 2);
 
+    drop(checkpoint_sm);
+    drop(pager);
+    drop(mvcc_store);
     drop(sibling);
     drop(conn);
     db.restart();
@@ -3226,7 +3232,7 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
 fn test_bootstrap_recovers_committed_wal_without_log_file() {
     // A Passive checkpoint truncates the logical log to 0 but leaves the WAL non-empty,
     // so reopen sees NoLog + committed WAL — the normal steady state, not corruption.
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
     let db_path = db.path.as_ref().unwrap().clone();
     {
         let conn = db.connect();
@@ -3237,7 +3243,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
         advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
     }
 
-    remove_file_from_database_registry(&db_path);
+    force_close_for_artifact_tamper(&mut db);
 
     let log_path = std::path::Path::new(&db_path).with_extension("db-log");
     std::fs::remove_file(&log_path).unwrap();
@@ -3267,7 +3273,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
 /// header is missing" back when FULL kept the WAL while truncating the logical log.
 #[test]
 fn test_full_checkpoint_reopen_recovers_truncate_mode() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
         let conn = db.connect();
@@ -3277,7 +3283,7 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
         conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
     }
 
-    remove_file_from_database_registry(&db_path);
+    force_close_for_artifact_tamper(&mut db);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path, Arc::new(EngineDialect))
@@ -3362,7 +3368,7 @@ fn test_checkpoint_snapshot_ts_clamps_below_inflight_preparing() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
     {
@@ -3375,9 +3381,8 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
         advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
     }
 
+    force_close_for_artifact_tamper(&mut db);
     overwrite_log_header_byte(&db_path, 0, 0x00);
-
-    remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
@@ -3398,7 +3403,7 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
         let conn = db.connect();
@@ -3407,6 +3412,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
         conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
     }
 
+    force_close_for_artifact_tamper(&mut db);
     overwrite_log_header_byte(&db_path, 0, 0x00);
 
     {
@@ -3414,8 +3420,6 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
         let _ = std::fs::remove_file(&wal_path);
         overwrite_file_with_junk(&wal_path, 0, 0x00);
     }
-
-    remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
@@ -3470,7 +3474,7 @@ fn test_bootstrap_handles_committed_wal_when_log_truncated() {
 /// Why this matters: Recovery must preserve availability by discarding invalid WAL tail bytes instead of failing startup.
 #[test]
 fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
     {
@@ -3482,8 +3486,8 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
         advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
     }
 
+    force_close_for_artifact_tamper(&mut db);
     rewrite_wal_frames_as_non_commit(&wal_path);
-    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 =
         Database::open_file(io, &db_path, Arc::new(EngineDialect)).expect("open should succeed");
@@ -16517,6 +16521,7 @@ fn test_schema_frame_recovery_drop_index_with_remaining_index_matrix() {
         assert_eq!(&rows[0][0].to_string(), "ok");
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         conn.close().unwrap();
+        drop(conn);
 
         db.restart();
         let conn = db.connect();
@@ -16888,11 +16893,13 @@ fn test_close_persists_drop_table() {
         .unwrap();
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     conn.close().unwrap();
+    drop(conn);
 
     // Session 2: drop table (no explicit checkpoint, rely on close)
     let conn = db.connect();
     conn.execute("DROP TABLE todrop").unwrap();
     conn.close().unwrap();
+    drop(conn);
 
     // Session 3: reopen — table must be gone
     db.restart();
@@ -16984,11 +16991,13 @@ fn test_close_persists_drop_index() {
         .unwrap();
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     conn.close().unwrap();
+    drop(conn);
 
     // Session 2: drop index (no explicit checkpoint, rely on close)
     let conn = db.connect();
     conn.execute("DROP INDEX idx_tdropidx_val").unwrap();
     conn.close().unwrap();
+    drop(conn);
 
     // Session 3: reopen - index must be gone and integrity check must pass
     db.restart();
@@ -19825,6 +19834,7 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_table() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 
     conn.close().unwrap();
+    drop(conn);
     db.restart();
 
     let conn = db.connect();
@@ -19890,6 +19900,7 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 
     conn.close().unwrap();
+    drop(conn);
     db.restart();
 
     let conn = db.connect();
@@ -22597,6 +22608,7 @@ fn test_descending_sequence_compaction() {
 
     // Close and restart the database
     conn.close().unwrap();
+    drop(conn);
     db.restart();
     let conn = db.connect();
 
