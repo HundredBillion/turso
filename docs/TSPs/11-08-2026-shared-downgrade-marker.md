@@ -254,3 +254,29 @@ for fresh resume. Run42503731841 observed the intended missing-operation failure
 (0 passed/1 failed). The replacement implementation is under verification and
 must not be treated as a completed downgrade until recovery and cleanup fault
 controls pass.
+
+### Subprocess evidence correction
+
+The earlier old-handle probe result42503446343 is **not accepted lock evidence**:
+its `--exact` child selector retained the `turso_core::` crate prefix, while the
+Rust test harness exposes names without that prefix. A zero-selected child could
+exit successfully. Source3351513 strips the prefix in both new downgrade child
+controllers and requires the lock child's actual one-test successful summary.
+Source71f7 adds a deliberate child failure control that the supervisor must reject.
+The initial actual-crash suite failed because its child exited before IPC readiness;
+it did not establish a protocol failure. Corrected child-count/IPC runs are pending.
+Other helpers and unrelated evidence are not invalidated by this local finding.
+
+### Approved cleanup-only view
+
+Partial cleanup has its own capability, not a marker-capable or fabricated ID
+proof. It requires native main exclusion, actual ordinary-WAL header and aligned
+physical extent, an empty identity-matched basename WAL, and the surviving
+terminal manifest's main/WAL identities. A separate forced-Syscall read-only raw
+view retains this capability and checks the materialized singleton timestamp
+against the terminal record before any unlink. No writable marker API, runtime
+Ready publication, ID reconstruction, or old-log replay is available. Close the
+actual view before unlinking; FULL-sync main first because observed marker bytes
+after process death alone do not establish durable completion. If terminal
+manifest is already gone, only an empty expected namespace and absent ordinary
+log qualify for idempotent directory removal. Unknown entries fail before unlink.
