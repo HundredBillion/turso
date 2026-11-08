@@ -4,20 +4,20 @@
 
 **Goal:** Turn a genuinely recovered, finalized and reclaimed NORMAL checkpoint into one private Database/Store/Pager and reopen admission only after their metadata, schema, append state and generation are certified together.
 
-**Architecture:** Consume ReclaimedRecoveredCheckpoint into a single owning bootstrap state. Its linear Store reservation constructs exactly one Store; a private Database factory initializes retained main/WAL storage under the original proof/authority/pause and requires that same sealed source on every poll. Install the prepared physical base and identical schema/replay context, certify the actual final connection's Pager, then publish replay and finish authority before releasing admission and returning a usable connection.
+**Architecture:** Consume ReclaimedRecoveredCheckpoint into a single owning bootstrap state. Its linear Store reservation constructs exactly one Store from the actual captured configuration; a private Database factory initializes retained main/WAL storage under the original proof/authority/pause and requires that same sealed source on every poll. Install the prepared physical base and identical schema/replay context, certify the actual final connection's Pager, then publish replay and finish authority before releasing admission and returning a usable connection.
 
 **Tech Stack:** Rust 1.88; existing retained-file factories, PreparedGenerationReload, PhysicalBaseParts, SharedReplayContext, CompletedCheckpointProof, FinalizedIds, GuardedFile read bindings and pager generation certification.
 
 ## Global Constraints
 
 - Preserve reclaim release `194546230` on its branch. Initial design base `0f539e9f8fc6f06d49540640d027d980a4cb596b` combines that release with independently verified integrated runtime `fa22532749e2c20839ad12b678fc8985d9b83fa6` (native joint `42492094119` SUCCESS). The sole merge conflict preserved both sets of shared_runtime child declarations; union libcheck, generation2 and IDs78/1ignored plus format passed locally.
-- Before production implementation, integrate the parent's verified six-PR union and update this plan/ledger to its exact source. That union moves private fields into DatabaseSharedState and removes read-only promotion. Modify only the new unique shared state before wrapping/cloning it; do not revive promotion or ReadonlyStorage.
+- Before production implementation, integrate the parent's six-PR union `8f71b5525766e4a070f6397a09d24946794f8cd9` and update this plan/ledger to the exact merged source. Its local full core2832/C131+19/SDK43 checks passed; joint native validation is pending, so existing parent/recovery cohorts must pass natively on the merged source before Store production. That union moves private fields into DatabaseSharedState and removes read-only promotion. Modify only the new unique shared state before wrapping/cloning it; do not revive promotion or ReadonlyStorage.
 - Parent reviews this complete written seam before production. Existing user-approved #7 recovery protocol applies; no additional user design permission is required for its implementation.
 - Only a sealed source-identity-free NORMAL completed proof with finalized target IDs, empty retained WAL, reclaimed logical file and exact empty append state is accepted. Intent/nonempty-WAL recovery and terminal downgrade are separate owners.
 - The original native authority lease and admission pause remain continuous through construction, I/O retirement, metadata installation, Pager certification and authority.finish. Never drop/reacquire the guard or manufacture a proof from timestamps/source generation.
 - Runtime replay remains None until all fallible physical construction, retirement and local installation checks pass. No Database, Store or writable connection is returned before the actual finish boundary.
 - Store attachment is one-shot per Runtime. Repeated polls retain the same actual Store and Database. Cancellation after attachment never frees the Runtime's permanent claim; retry requires dropping all old owners and genuinely reopening/recovering a new Runtime.
-- This private completion path uses the existing SQLite/PDO EngineDialect and default embedded database configuration, deriving read-only permission from the original Runtime open rather than a new caller assertion. It performs no WAL-to-MVCC conversion, AUTOINCREMENT migration, bootstrap metadata writes or PRAGMA journal_mode change. The proof already certifies an existing materialized MVCC database. Public URI/PDO activation remains disabled until the complete crash-acceptance package passes.
+- This private completion path preserves the actual validated dialect and supported OpenOptions used by physical inspection: C/PDO uses SqliteDialect, while existing EngineDialect callers retain EngineDialect. Derive read-only permission from the original Runtime open rather than a new caller assertion; never replace the actual dialect/options with defaults. It performs no WAL-to-MVCC conversion, AUTOINCREMENT migration, bootstrap metadata writes or PRAGMA journal_mode change. The proof already certifies an existing materialized MVCC database. Public URI/PDO activation remains disabled until the complete crash-acceptance package passes.
 - Coordinate core/database.rs changes with the downgrade owner and root. Keep new factory logic in its own child. Do not merge validation workflow commits into product. Reuse existing build targets, jobs2, pinned Rust1.88, debug/incremental off; explicit Bash/pipefail for Linux validation.
 
 ## Ownership and interfaces
@@ -33,7 +33,7 @@ impl RecoveryBootstrap {
 }
 ```
 
-RecoveryBootstrap privately owns RecoveryBootstrapEvidence and RecoveredDatabaseFactory. RecoveryBootstrapEvidence is crate-visible solely to let the Database child consume validated facts; its fields and constructors stay private. It retains runtime, the actual Store, physical parts/header/schema, the genuine finalized IDs/proof/guard, selected normal manifest record, prepared roots/replay, original connection Weak identity once captured, main/WAL checkpoint bindings, and admission pause. No generic LoadedIds or constructor permitting arbitrary proof/parts is added.
+RecoveryBootstrap privately owns RecoveryBootstrapEvidence and RecoveredDatabaseFactory. RecoveryBootstrapEvidence is crate-visible solely to let the Database child consume validated facts; its fields and constructors stay private. It retains runtime, the actual Store, original RecoveryOpenConfig Arc, physical parts/header/schema, the genuine finalized IDs/proof/guard, selected normal manifest record, prepared roots/replay, original connection Weak identity once captured, main/WAL checkpoint bindings, and admission pause. No generic LoadedIds or constructor permitting arbitrary proof/parts is added.
 
 RecoveredDatabaseReady is sealed until authority.finish succeeds. Only then does its consuming accessor return the actual `Arc<Database>` and `Arc<Connection>`. The private Database is not inserted into the public registry by this prototype; public activation must connect this owner to the normal registry/open lifecycle rather than publish another entry point.
 
@@ -46,7 +46,27 @@ pub(super) fn construct_store(
 ) -> Result<Arc<crate::MvStore>>;
 ```
 
-It allocates a fresh Store using actual runtime.storage, the supplied default Database allocator and MvccClock, with passive checkpointing disabled. It retains the reservation while allocation may fail. Under the existing claim mutex, it validates Reserved, attaches this newly created, never-exposed Store to the actual Runtime, transitions to Attached and disarms the token before its destructor runs. No fallible operation follows a successful attachment before the token is disarmed. Failure before attachment drops the unused Store before releasing the reservation. No arbitrary preexisting Store is accepted. Preserve same-Store ordinary attach idempotence.
+It allocates a fresh Store using actual runtime.storage, the captured actual Database allocator and MvccClock, with passive checkpointing disabled. It retains the reservation while allocation may fail. Under the existing claim mutex, it validates Reserved, attaches this newly created, never-exposed Store to the actual Runtime, transitions to Attached and disarms the token before its destructor runs. No fallible operation follows a successful attachment before the token is disarmed. Failure before attachment drops the unused Store before releasing the reservation. No arbitrary preexisting Store is accepted. Preserve same-Store ordinary attach idempotence.
+
+Original open configuration is captured once at the real physical reader boundary, not supplied again at bootstrap:
+
+```rust
+pub(crate) struct RecoveryOpenConfig { /* private captured OpenOptions */ }
+impl RecoveryOpenConfig {
+    pub(crate) fn capture(options: crate::OpenOptions) -> Result<Arc<Self>>;
+    pub(crate) fn open_physical(
+        &self,
+        io: Arc<dyn crate::IO>,
+        path: String,
+        file: Arc<dyn crate::File>,
+    ) -> Result<crate::database::shared_physical::SharedPhysicalConnection>;
+    pub(crate) fn store_allocator(&self) -> crate::alloc::DynAllocator;
+}
+```
+
+The config lives in database/shared_recovered.rs so private OpenOptions fields remain encapsulated. Capture rejects external main/durable storage, arbitrary WAL-path overrides, encryption/page codecs, and incompatible multiprocess-WAL/passive-checkpoint configurations already excluded by this protocol. It retains the exact dialect Arc, db_opts, allocators and native extensions; open_physical uses a clone of these same validated options before the existing factory injects the retained read-pinned file. Original filesystem flags do not reopen or create files: actual retained-file identity and immutable Runtime read-only mode govern the private view.
+
+Add a private config Arc to RecoveryPhysicalRead and sealed InspectedRecoveryBase, propagate it through InspectedRecoveryIds, RecoveredCheckpointConfirmation, FinalizedRecoveredCheckpoint and ReclaimedRecoveredCheckpoint, then consume it into RecoveryBootstrapEvidence. No raw config or replacement setter escapes these owners. The factory captures its exact Arc identity and checks it on every resume in addition to Store/lease/Runtime identity. Existing no-config callers still explicitly supply their chosen OpenOptions at begin_physical_read; neither C/PDO nor another dialect is silently substituted. Source/witness/ID/publication proofs are unchanged.
 
 Runtime retains the original read-only open mode as an immutable private field initialized by open_existing; factory flags and final connection permission derive from this field. This does not make a read-only source writable. Coordination sidecars remain writable as already approved; read-only user SQL remains enforced.
 
@@ -66,7 +86,7 @@ impl RecoveredDatabaseFactory {
 }
 ```
 
-The factory never returns an intermediate Connection or Database and has no raw-file-only constructor. It captures the original source Runtime/Store/lease identity and rejects a different source on every resume. Its fields retain one raw/Arc Database, one InitState, retained-WAL builder, one Pager and one final normal connection across I/O. It does not call ordinary begin_open/connect admission, which must remain Busy while the recovery pause is held. It does not call ordinary MVCC bootstrap, which would reacquire authority or run migration SQL.
+The factory never returns an intermediate Connection or Database and has no raw-file-only constructor. It captures the original source Runtime/Store/config/lease identity and rejects a different source on every resume. Its fields retain one raw/Arc Database, one InitState, retained-WAL builder, one Pager and one final normal connection across I/O. It does not call ordinary begin_open/connect admission, which must remain Busy while the recovery pause is held. It does not call ordinary MVCC bootstrap, which would reacquire authority or run migration SQL.
 
 PhysicalBaseParts already contains the actual parsed schema, sequence descriptors, table-valued functions, type rows and physical base timestamp from the read-only collector. Use its exact schema Arc for both Database and Connection and for the prepared replay context. Do not reparse into a second unbound schema or fabricate default descriptors. Native acceptance includes sequences and AUTOINCREMENT to verify this claim; any missing read-only catalog initialization must be completed under the retained source before Ready, never hidden by prematurely releasing admission or enabling mutation bootstrap.
 
@@ -78,7 +98,7 @@ Consume genuine reclaimed cap
   -> allocate and permanently attach exactly one Store
   -> preflight physical root map and replay context using that Store and actual selected record
   -> bind retained main and physical-WAL reads to original authority
-  -> construct unique private Database state with actual runtime/storage/Store
+  -> construct unique private Database state with actual runtime/storage/Store and captured dialect/options
   -> build empty retained WAL; initialize its one private Pager (yielding)
   -> validate actual header bytes/layout/extent, exact Store/Runtime/native aliases, retire all IO
   -> install prepared Store metadata and identical captured schema Arc in DB/connection
@@ -100,14 +120,15 @@ Capture the final connection Weak identity when installation begins and require 
 
 Authority.finish consumes the original guard, but the source owner retains the pause until the factory has packaged the ready result and performed all cleanup. If finish fails, withdraw replay before any pause release. Any earlier error/drop leaves replay None. Drop private Connection/Pager/init state before dropping Store/finalized guard and finally pause; physical backend pins retain authority after callback until actual retirement. A discarded attached Store never makes the old Runtime fresh again.
 
-## Task 1: One actual Store and full bootstrap counterexample
+## Task 1: Actual open configuration, one Store and full bootstrap counterexample
 
 **Blocked by:** Parent approval, exact verified six-PR integration and updated source layout audit.
 
-**Files:** shared_store_claim.rs, shared_runtime.rs, new bootstrap child and native bootstrap tests; TSP/ledger.
+**Files:** shared_store_claim.rs, shared_runtime.rs, new bootstrap child, original-config carriage through sealed recovery owners and native bootstrap tests; TSP/ledger.
 
-**Interfaces:** Exact begin_bootstrap/poll/result types above, initially returning `InvalidArgument("normal recovered database bootstrap is not implemented")` after genuine reclamation. Add immutable original-readonly Runtime state and the consuming reservation constructor.
+**Interfaces:** Exact begin_bootstrap/poll/result types above, initially returning `InvalidArgument("normal recovered database bootstrap is not implemented")` after genuine reclamation. Add immutable original-readonly Runtime state, actual configuration carriage and the consuming reservation constructor.
 
+- [ ] First carry the captured configuration through the genuine existing recovery chain without creating a Store. Test exact dialect Arc, db_opts/native-extension/allocator preservation, rejected replacement/config overrides, and unchanged manifest/ID proof identities. Run both actual SqliteDialect (C/PDO) and existing EngineDialect paths, plus all existing native parent/recovery cohorts on the merged source before Store production. Do not label an EngineDialect-only fixture as PDO acceptance.
 - [ ] Extend the genuine fresh-process fixture: drop every old Database/Store/proof/Runtime/I/O holder, restore only actual earlier coordination image as already approved, strictly reopen, confirm/finalize/reclaim, then invoke full bootstrap and require post-recovery SELECT/UPDATE/commit plus fresh peer reopen. Run actual native 0/1 RED at the missing bootstrap diagnostic after existing recovery cohorts pass.
 - [ ] Add consuming reservation tests proving exactly one actual Store pointer survives repeated polls; another ordinary attachment is rejected, same-Store attachment remains idempotent, allocation failure releases only an uncommitted reservation, and dropping an attached construction never permits a replacement Store on the same Runtime.
 - [ ] Implement permanent attach/disarm using the existing runtime claim mutex. No arbitrary Store/proof constructor or LoadedIds escape. Run native ownership positives, existing attachment/thread tests, strict lint/format and independent source review before the dependent constructor work.
@@ -120,7 +141,7 @@ Authority.finish consumes the original guard, but the source owner retains the p
 
 **Interfaces:** Source-gated factory new/poll/finish above; no intermediate Connection accessor or public activation.
 
-- [ ] Write yielding constructor tests using actual retained main/WAL and DeferredIo-style callback/physical-retirement controls. While main header or page-one I/O is held, ordinary prepare/begin/checkpoint and competing publication remain Busy. Resume with foreign Runtime/Store/lease evidence must reject before another read.
+- [ ] Write yielding constructor tests using actual retained main/WAL and the exact captured physical-reader config and DeferredIo-style callback/physical-retirement controls. While main header or page-one I/O is held, ordinary prepare/begin/checkpoint and competing publication remain Busy. Resume with foreign Runtime/Store/lease evidence must reject before another read.
 - [ ] Implement one private DatabaseSharedState with actual retained runtime.main, runtime.storage, original read-only mode, the one claimed Store and actual retained WAL. Use Arc::get_mut only before sharing the new state. Drive BuildSharedWal and _init_nonblock; retain the same objects across yields. No basename or public registry/open route.
 - [ ] Validate actual header bytes and all source aliases/layout before installing metadata; await backend retirement. On cancellation end the private pager read transaction and drop private views before the authority/pause owner. Add tests for callbacks retaining backend authority after the whole constructor is dropped; retry requires genuinely reopening a new Runtime after retirement.
 - [ ] Run native constructor positives/foreign-owner/failure/cancellation controls plus existing normal shared-connection and pager-generation cohorts, strict lint and Windows cfg checks for every new host+unix seam. Obtain independent source review.
