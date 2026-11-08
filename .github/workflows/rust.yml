@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6b91c7382df98c429a12b88fab89f84805c0066a
+          ref: 93bd5b10d2ea953a272b64e4c9d72a5109023520
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,7 +23,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 6b91c7382df98c429a12b88fab89f84805c0066a
+          test "$(git rev-parse HEAD)" = 93bd5b10d2ea953a272b64e4c9d72a5109023520
           rustc -Vv | tee rustc.txt
       - name: Idle old process and new constructor reload current generation
         run: |
@@ -31,6 +31,8 @@ jobs:
           grep -q '1 passed; 0 failed' idle-process-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-cancel-green.log
           grep -q '1 passed; 0 failed' idle-cancel-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-error-green.log
+          grep -q '1 passed; 0 failed' finish-error-green.log
       - name: Current base evidence and existing ID protocol
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api id_current_base_ -- --test-threads=1 --nocapture 2>&1 | tee current-base-green.log
@@ -41,6 +43,7 @@ jobs:
           grep -q '2 passed; 0 failed' local-install-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_ -- --include-ignored --test-threads=1 2>&1 | tee generation-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee id-protocol-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=2 2>&1 | tee mvcc-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
