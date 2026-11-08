@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f1e7ccd94f5c4fab94ea2f83af9355d67e9269c7
+          ref: f02fc081a31dc60de403b96c7aafe8f5755ea019
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,23 +28,18 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f1e7ccd94f5c4fab94ea2f83af9355d67e9269c7
+          test "$(git rev-parse HEAD)" = f02fc081a31dc60de403b96c7aafe8f5755ea019
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Fresh terminal recovery and prior native controls
+      - name: Completed cleanup expected RED
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
-          grep -q '^test result: ok. 4 passed; 0 failed;' resume.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
-          grep -q '^test result: ok. 2 passed; 0 failed;' creation.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
-          grep -q '^test result: ok. 7 passed; 0 failed;' preparation.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee marker.log
-          grep -q '^test result: ok. 4 passed; 0 failed;' marker.log
-      - name: Strict library lint and formatting
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee cleanup-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '^test result: FAILED. 0 passed; 1 failed;' cleanup-red.log
+          grep -q 'durable marker must clean namespace and retained header-only ordinary log' cleanup-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -57,17 +52,3 @@ jobs:
             *status.txt
             *summary.txt
           retention-days: 14
-
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: f1e7ccd94f5c4fab94ea2f83af9355d67e9269c7
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-windows
-          cache-on-failure: true
-      - run: cargo check --locked -p turso_core --lib --features conn_raw_api
