@@ -68,6 +68,7 @@ pub(crate) struct SharedMvccRuntime {
     ids: Arc<SharedIds>,
     replay: Mutex<Option<Arc<SharedReplayContext>>>,
     database_id: FileId,
+    original_readonly: bool,
     wal_path: PathBuf,
 }
 
@@ -182,6 +183,7 @@ impl SharedMvccRuntime {
             ids,
             replay: Mutex::new(None),
             database_id,
+            original_readonly: readonly,
             wal_path,
         }))
     }
