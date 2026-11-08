@@ -152,20 +152,20 @@ assert!(recovered.guard().published().is_err());
 
 **Interfaces:** Consume the actual selected intent and continuous guard/pause; produce only `RecoveredCheckpointIntent` after both mirrors and backend retirement.
 
-- [ ] Replace the explicit missing error with fresh actual-file selection, sealed native/lease evidence, existing publication loop and final association checks described above. Keep normal constructors, replay, materializer and completed-confirmation guards untouched.
-- [ ] Require exactly two new writes and two FULL syncs in the parent recovery operation; decode both durable slots and compare their complete records with the original selection. Assert sequence, source/target generations, source timestamp, salt and acknowledged prefix remain unchanged.
-- [ ] Assert main, WAL, logical log and ID bytes remain unchanged, the original recovery flag is not cleared, runtime replay remains absent, and actual ordinary opens cannot admit the intent. Keep the returned owner alive while checking admission and competing authority are `Busy`.
-- [ ] Reject normal records, same-byte nonnative manifest substitutions, replacement leases and actual manifest changes between selection and fresh reload before any manifest write. Restore the original actual intent after corrupt-selection injection and verify a fresh retry.
-- [ ] Inject error/short-write at each of the two writes and error at each FULL sync. Re-select on retry and preserve at least one valid original intent throughout the opposite-slot-first sequence.
-- [ ] Cancel at fresh manifest read, first write/sync and second write/sync, before callback and after callback but before backend Arc release. Both competing authority and functional admission remain `Busy` until actual backend release; no completed proof, physical mutation or readiness is produced.
-- [ ] Add causal controls for accepting a same-byte memory manifest, skipping the second fresh FULL-sync mirror, and returning before completion retirement. Verify each intended assertion fails, restore exact source and rerun.
+- [x] Replace the explicit missing error with fresh actual-file selection, sealed native/lease evidence, existing publication loop and final association checks described above. Keep normal constructors, replay, materializer and completed-confirmation guards untouched.
+- [x] Require exactly two new writes and two FULL syncs in the parent recovery operation; decode both durable slots and compare their complete records with the original selection. Assert sequence, source/target generations, source timestamp, salt and acknowledged prefix remain unchanged.
+- [x] Assert main, WAL, logical log and ID bytes remain unchanged, the original recovery flag is not cleared, runtime replay remains absent, and actual ordinary opens cannot admit the intent. Keep the returned owner alive while checking admission and competing authority are `Busy`.
+- [x] Reject normal records, same-byte nonnative manifest substitutions, replacement leases and actual manifest changes between selection and fresh reload before any manifest write. Restore the original actual intent after corrupt-selection injection and verify a fresh retry.
+- [x] Inject error/short-write at each of the two writes and error at each FULL sync. Re-select on retry and preserve at least one valid original intent throughout the opposite-slot-first sequence.
+- [x] Cancel at fresh manifest read, first write/sync and second write/sync, before callback and after callback but before backend Arc release. Both competing authority and functional admission remain `Busy` until actual backend release; no completed proof, physical mutation or readiness is produced.
+- [x] Add causal controls for accepting a same-byte memory manifest, skipping the second fresh FULL-sync mirror, and returning before completion retirement. Verify each intended assertion fails, restore exact source and rerun.
 
 ## Task 3: Narrow verification, review and handoff
 
 **Blocked by:** Tasks 1–2.
 
-- [ ] Run the native fixture/mirror tests on an exact pinned source with explicit Bash and `set -euo pipefail`; preserve source SHA, raw parent summaries, actual RED/control logs and restored results. Use unquoted artifact globs inside YAML block paths.
-- [ ] Run existing `checkpoint_recovery_entry_native_`, recovery physical inspection and completed-confirmation selectors to prove the intent slice does not broaden normal completion. Run manifest publication/codec and authority suites, then strict library Clippy and formatting.
+- [x] Run the native fixture/mirror tests on an exact pinned source with explicit Bash and `set -euo pipefail`; preserve source SHA, raw parent summaries, actual RED/control logs and restored results. Use unquoted artifact globs inside YAML block paths.
+- [x] Run existing `checkpoint_recovery_entry_native_`, recovery physical inspection and completed-confirmation selectors to prove the intent slice does not broaden normal completion. Run manifest publication/codec and authority suites, then strict library Clippy and formatting.
 - [ ] Confirm Windows compilation with the new seam fully Unix-gated. Obtain independent source review and push the verified private component.
 - [ ] Hand off the sealed actual mirrored-intent owner for a separately reviewed physical-WAL recovery plan. Its next stage must validate actual committed WAL/main state and reconcile physical coordination before main-only inspection; it may not infer completion from timestamps or bypass existing completed-ID preparation/finalization.
 
@@ -179,3 +179,14 @@ assert!(recovered.guard().published().is_err());
 - **A new selected record under the same guard:** reject a changed full record before writes. Never publish a newly constructed normal record to make a normal-only reader accept it.
 
 No new business-domain term or hard-to-reverse disk decision is introduced. The existing checkpoint intent, materialization and completion distinctions remain the domain model. The parent's review of this seam is the design hardening gate; no separate user approval is needed within the already approved protocol.
+
+
+## Verification evidence
+
+Engine `28f55174b3ec300d137734ced23e5793448960ce` passed [native and Windows validation](https://github.com/HundredBillion/turso/actions/runs/42496250878). The workflow uses Rust1.88, two build jobs, explicit Bash and `set -euo pipefail`; its validation-only branch is excluded from product integration.
+
+The actual final Linux parent summaries are: intent9 passed; restored recovery24 passed; manifest31 passed/4 ignored; authority15 passed; full core2900 passed/143 ignored. All report zero failures. Strict library Clippy (`bench,conn_raw_api`), formatting and source integrity passed. Windows library checking with the same features also passed.
+
+Three removals each produced the intended zero-pass/one-failure result: accepting a copied memory manifest, observing only one write/FULL sync, and returning an owner before backend retirement at operation3. Restoring the exact source preceded the24-test recovery run. The genuine missing-implementation RED is separately recorded by run42493100112 on `ed4502bee2ca597eb13045edc8dd65d5fc866f4a`; earlier compile and fixture framing failures are not counted as behavior RED.
+
+Raw source pins, parent summaries, removal-control logs and run archives are retained in `.local/issue-resolution/interrupted-intent-mirroring/`, including artifact13624265407 under `final-28f/`. Independent final source review and the next-stage handoff remain explicit completion gates above.
