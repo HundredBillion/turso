@@ -39,11 +39,10 @@ impl Default for Control {
 }
 impl Control {
     fn arm(&self, namespace: &Path) {
-        for name in ["manifest"] {
-            self.durable
-                .lock()
-                .insert(name.into(), std::fs::read(namespace.join(name)).unwrap());
-        }
+        self.durable.lock().insert(
+            "manifest".into(),
+            std::fs::read(namespace.join("manifest")).unwrap(),
+        );
         self.armed.store(true, Ordering::Release);
     }
     fn perform(&self, pending: &Pending) -> Result<Completion> {

@@ -1,5 +1,7 @@
 use crate::EngineDialect;
-use std::collections::{HashMap, HashSet};
+#[cfg(feature = "fts")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::io::{MemoryIO, PlatformIO, IO};
 use crate::mvcc::cursor::CursorYieldPoint;

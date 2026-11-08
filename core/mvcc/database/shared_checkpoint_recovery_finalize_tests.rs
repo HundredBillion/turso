@@ -358,15 +358,15 @@ impl Fixture {
     }
     fn reconfirm(&self) -> RecoveredCheckpointConfirmation {
         let mut opening = self.runtime.begin_checkpoint_recovery().unwrap();
-        let selected = self.io.block(|| Ok(opening.poll()?)).unwrap();
+        let selected = self.io.block(|| opening.poll()).unwrap();
         let mut physical = selected
             .begin_physical_read(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
             .unwrap();
-        let physical = self.io.block(|| Ok(physical.poll()?)).unwrap();
+        let physical = self.io.block(|| physical.poll()).unwrap();
         let mut loading = physical.begin_id_inspection().unwrap();
-        let inspected = self.io.block(|| Ok(loading.poll()?)).unwrap();
+        let inspected = self.io.block(|| loading.poll()).unwrap();
         let mut confirming = inspected.begin_confirmation().unwrap();
-        self.io.block(|| Ok(confirming.poll()?)).unwrap()
+        self.io.block(|| confirming.poll()).unwrap()
     }
 }
 fn fresh_fixture(target_only: bool) -> Fixture {
@@ -451,16 +451,16 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         );
     }
     let mut opening = runtime.begin_checkpoint_recovery().unwrap();
-    let selected = io.block(|| Ok(opening.poll()?)).unwrap();
+    let selected = io.block(|| opening.poll()).unwrap();
     let mut physical = selected
         .begin_physical_read(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
         .unwrap();
-    let physical = io.block(|| Ok(physical.poll()?)).unwrap();
+    let physical = io.block(|| physical.poll()).unwrap();
     let mut loading = physical.begin_id_inspection().unwrap();
-    let inspected = io.block(|| Ok(loading.poll()?)).unwrap();
+    let inspected = io.block(|| loading.poll()).unwrap();
     assert_eq!(inspected.ids.max_owner_epoch(), old_maximum);
     let mut confirming = inspected.begin_confirmation().unwrap();
-    let confirmed = io.block(|| Ok(confirming.poll()?)).unwrap();
+    let confirmed = io.block(|| confirming.poll()).unwrap();
     assert_eq!(confirmed.proof().source_identity(), None);
     assert_eq!(confirmed.proof().target_identity(), target);
     assert_eq!(confirmed.max_owner_epoch(), old_maximum);
@@ -508,7 +508,7 @@ fn ready_fixture(target_only: bool) -> Fixture {
     let maximum = inspected.ids.max_owner_epoch();
     let target = inspected.ids.identity();
     let mut confirming = inspected.begin_confirmation().unwrap();
-    let confirmed = io.block(|| Ok(confirming.poll()?)).unwrap();
+    let confirmed = io.block(|| confirming.poll()).unwrap();
     let paths = [
         old.path.clone(),
         old.namespace.join("manifest"),
@@ -593,7 +593,7 @@ fn to_delay(fixture: &Fixture, state: &mut RecoveryIdFinalizationState, boundary
 fn checkpoint_recovery_finalize_native_fresh_incarnation_preserves_epoch_without_admission() {
     let mut fixture = fresh_fixture(false);
     let mut state = fixture.start(usize::MAX, false, usize::MAX);
-    let finalized = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+    let finalized = fixture.io.block(|| state.poll()).unwrap();
     assert_finalized(&fixture, &finalized);
 }
 
@@ -619,7 +619,7 @@ fn checkpoint_recovery_finalize_native_ready_and_finalized_targets_stay_unadmitt
             );
         }
         let mut state = fixture.start(usize::MAX, false, usize::MAX);
-        let finalized = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+        let finalized = fixture.io.block(|| state.poll()).unwrap();
         assert_finalized(&fixture, &finalized);
     }
 }
@@ -791,7 +791,7 @@ fn checkpoint_recovery_finalize_native_failures_restore_durable_ids_and_retry() 
             eprintln!("recovered ID failure {boundary}/{callback_error}");
             let mut fixture = fresh_fixture(false);
             let mut state = fixture.start(boundary, callback_error, usize::MAX);
-            let error = match fixture.io.block(|| Ok(state.poll()?)) {
+            let error = match fixture.io.block(|| state.poll()) {
                 Err(error) => error,
                 Ok(_) => {
                     panic!("recovered IDs escaped failed mutation {boundary}/{callback_error}")
@@ -818,7 +818,7 @@ fn checkpoint_recovery_finalize_native_failures_restore_durable_ids_and_retry() 
                 usize::MAX,
             );
             let mut retry = confirmed.begin_id_finalization().unwrap();
-            let finalized = fixture.io.block(|| Ok(retry.poll()?)).unwrap();
+            let finalized = fixture.io.block(|| retry.poll()).unwrap();
             assert_eq!(
                 finalized.guard().published().unwrap(),
                 fixture.target.prefix
@@ -910,7 +910,7 @@ fn checkpoint_recovery_finalize_native_witness_and_final_bank_wait_for_physical_
         ));
         fixture.trace.retire();
         fixture.io.wait_for_completion(waiter.0).unwrap();
-        let finalized = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+        let finalized = fixture.io.block(|| state.poll()).unwrap();
         assert_finalized(&fixture, &finalized);
     }
 }
