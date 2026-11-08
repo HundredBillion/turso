@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 60f1cf7fd95e7225f61c314caee8f322d1fcd313
+          ref: 6abf3c5618ee5e6715916bce648ef9b6378fc4cf
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,12 +28,24 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 60f1cf7fd95e7225f61c314caee8f322d1fcd313
+          test "$(git rev-parse HEAD)" = 6abf3c5618ee5e6715916bce648ef9b6378fc4cf
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Exact Linux test lint diagnostics
         run: |
           cargo clippy --locked -p turso_core --lib --tests --features conn_raw_api,bench,io_uring --message-format=json -- -D warnings > test-clippy.json 2> test-clippy.log
+      - name: Independent empty test harness diagnostic
+        if: always()
+        run: |
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          Path('/tmp/empty_harness.rs').write_text(''.join(f'#[test] fn empty_{i}() {{}}\n' for i in range(3076)))
+          PYCONTROL
+          set +e
+          clippy-driver --test /tmp/empty_harness.rs --edition=2021 --crate-name empty_harness --emit=metadata -o /tmp/empty_harness.rmeta --error-format=json -D clippy::large_stack_frames 2> empty-harness.json
+          code=$?
+          set -e
+          printf '%s\n' "$code" > empty-harness-status.txt
       - name: Strict production library lint
         if: always()
         run: |
@@ -48,6 +60,7 @@ jobs:
             rustc.txt
             *.log
             test-clippy.json
+            empty-harness.json
             *.diff
             *status.txt
             *summary.txt
