@@ -1,6 +1,6 @@
 use super::{downgrade_files::DowngradeFiles, downgrade_marker, OfflinePrerequisite};
 use crate::mvcc::checkpoint_gate::{CheckpointAdmissionGate, CheckpointPause};
-use crate::mvcc::commit_manifest::{ManifestLoad, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+use crate::mvcc::commit_manifest::{ManifestLoad, ManifestRecord, SLOT_SIZE};
 use crate::mvcc::guarded_file::GuardedFile;
 use crate::mvcc::shared_authority::{AuthorityGuard, SharedMvccAuthority};
 use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::SuspendedRecoveryIds;
@@ -16,6 +16,7 @@ use std::path::Path;
 pub(super) struct RecoveredDowngradeSource {
     pub(super) files: DowngradeFiles,
     pub(super) record: ManifestRecord,
+    selected_slot: usize,
     guard: AuthorityGuard,
     header: DatabaseHeader,
     bytes: u64,
@@ -65,6 +66,10 @@ impl RecoveredDowngradeSource {
             return Err(invalid(
                 "downgrade recovery requires the recorded terminal WAL",
             ));
+        }
+        let (selected_slot, selected) = files.selected_manifest_slot()?;
+        if selected != record {
+            return Err(invalid("terminal manifest selection changed"));
         }
         let guard = loaded.into_guard()?;
         let physical = MappedSharedWalCoordination::open_existing(&io, &files.files[3].path, 64)?
@@ -140,6 +145,7 @@ impl RecoveredDowngradeSource {
         let result = Self {
             files,
             record,
+            selected_slot,
             guard,
             header,
             bytes,
@@ -182,18 +188,13 @@ impl RecoveredDowngradeSource {
         let bytes = self.record.encode();
         let file = &self.files.files[0].file;
         // All I/O uses retained synchronous native aliases under continuous ownership.
-        for offset in [0, SLOT_SIZE] {
-            let mut existing = [0; RECORD_SIZE];
-            file.read_exact_at(&mut existing, offset as u64)
+        for slot in [1 - self.selected_slot, self.selected_slot] {
+            file.write_all_at(&bytes, (slot * SLOT_SIZE) as u64)
                 .map_err(super::fs_error)?;
-            if existing != bytes {
-                file.write_all_at(&bytes, offset as u64)
-                    .map_err(super::fs_error)?;
-                file.sync_all().map_err(super::fs_error)?;
-                #[cfg(test)]
-                self.mirror_syncs
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            file.sync_all().map_err(super::fs_error)?;
+            #[cfg(test)]
+            self.mirror_syncs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         self.files.require_mirrored(self.record)
     }

@@ -302,6 +302,11 @@ impl DowngradeFiles {
         self.wal_io.clone()
     }
     pub(super) fn selected_manifest(&self) -> Result<crate::mvcc::commit_manifest::ManifestRecord> {
+        Ok(self.selected_manifest_slot()?.1)
+    }
+    pub(super) fn selected_manifest_slot(
+        &self,
+    ) -> Result<(usize, crate::mvcc::commit_manifest::ManifestRecord)> {
         use crate::mvcc::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
         if self.files[0].file.metadata().map_err(fs_error)?.len() != (2 * SLOT_SIZE) as u64 {
             return Err(invalid("downgrade manifest length changed"));
@@ -315,7 +320,7 @@ impl DowngradeFiles {
                 .map_err(fs_error)?;
             *record = ManifestRecord::decode(&bytes)?;
         }
-        Ok(select_latest(records, self.main.id)?.1)
+        select_latest(records, self.main.id)
     }
     pub(in crate::mvcc) fn require_mirrored(
         &self,
