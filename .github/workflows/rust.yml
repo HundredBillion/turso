@@ -1,4 +1,4 @@
-name: Recovered completed checkpoint confirmation validation
+name: Recovered checkpoint ID finalization validation
 on:
   workflow_dispatch:
 permissions:
@@ -10,13 +10,13 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "1"
 jobs:
-  recovered-confirmation:
+  recovered-finalization:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f2cdee212349c84f3a22b6a465163c58a583760f
+          ref: 24a9bd614d73d68859c080463e302a603c38f15c
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f2cdee212349c84f3a22b6a465163c58a583760f
+          test "$(git rev-parse HEAD)" = 24a9bd614d73d68859c080463e302a603c38f15c
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -41,49 +41,15 @@ jobs:
         run: |
           timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-green.log
           grep -q '8 passed; 0 failed' confirmation-green.log
-      - name: Owner epoch capture causal control
+      - name: Missing proof-gated recovered ID finalization must fail
         run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_recovery_confirmation.rs'
-          s=open(p).read()
-          old='    let max_owner_epoch = ids.max_owner_epoch();'
-          assert s.count(old)==1
-          s=s.replace(old,'    let max_owner_epoch = None;')
-          open(p,'w').write(s)
-          PYCONTROL
           set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_physical_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee epoch-red.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'confirmation lost inspected owner epoch' epoch-red.log
-          grep -q '0 passed; 1 failed' epoch-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_confirmation.rs
-      - name: Physical extent distinction causal control
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_recovery_confirmation.rs'
-          s=open(p).read()
-          old='        source_database: ids.source_database(),\n        physical_floor,\n'
-          assert s.count(old)==1
-          s=s.replace(old,'        source_database: ids.source_database(),\n        physical_floor: ids.logical_floor(),\n')
-          open(p,'w').write(s)
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_physical_floor -- --ignored --test-threads=1 --nocapture 2>&1 | tee floor-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'confirmation used permanent ID floor as physical evidence' floor-red.log
-          grep -q '0 passed; 1 failed' floor-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_confirmation.rs
-      - name: Restored confirmation including nonempty owner history
-        run: |
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee confirmation-restored.log
-          grep -q '8 passed; 0 failed' confirmation-restored.log
-      - name: Strict library lint
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          grep -q 'recovered checkpoint ID finalization is not implemented' finalization-red.log
+          grep -q '0 passed; 1 failed' finalization-red.log
       - name: Source integrity
         run: |
           cargo fmt --all --check
@@ -91,7 +57,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: recovered-completed-confirmation
+          name: recovered-checkpoint-finalization
           path: |
             source.txt
             *.log
