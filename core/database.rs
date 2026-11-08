@@ -646,6 +646,8 @@ pub struct OpenDbAsyncState {
     #[cfg(all(host_shared_wal, unix))]
     offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
     #[cfg(all(host_shared_wal, unix))]
+    offline_downgrade: Option<Arc<mvcc::PreparedDowngradeMarker>>,
+    #[cfg(all(host_shared_wal, unix))]
     shared_request: Option<SharedOpenRequest>,
     #[cfg(all(host_shared_wal, unix))]
     shared_open: Option<mvcc::database::SharedOpenState>,
@@ -683,6 +685,8 @@ impl OpenDbAsyncState {
             shared_runtime: None,
             #[cfg(all(host_shared_wal, unix))]
             offline_marker_recovery: None,
+            #[cfg(all(host_shared_wal, unix))]
+            offline_downgrade: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_request: None,
             #[cfg(all(host_shared_wal, unix))]
@@ -792,6 +796,8 @@ pub struct Database<
     shared_mvcc_runtime: Option<Arc<mvcc::database::SharedMvccRuntime>>,
     #[cfg(all(host_shared_wal, unix))]
     offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
+    #[cfg(all(host_shared_wal, unix))]
+    offline_downgrade: Option<Arc<mvcc::PreparedDowngradeMarker>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
@@ -1010,6 +1016,8 @@ impl Database {
             shared_mvcc_runtime: None,
             #[cfg(all(host_shared_wal, unix))]
             offline_marker_recovery: None,
+            #[cfg(all(host_shared_wal, unix))]
+            offline_downgrade: None,
         };
 
         db.register_global_builtin_extensions()
@@ -1506,6 +1514,44 @@ impl Database {
         if wal_id != Some(proof.ordinary_wal_id()) {
             return Err(LimboError::InvalidArgument(
                 "offline recovery WAL identity changed".into(),
+            ));
+        }
+        proof.revalidate()?;
+        Ok(db)
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(crate) fn open_offline_downgrade(
+        proof: Arc<mvcc::PreparedDowngradeMarker>,
+    ) -> Result<Arc<Self>> {
+        proof.revalidate()?;
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new()?);
+        let path = proof
+            .path()
+            .to_str()
+            .ok_or_else(|| LimboError::InvalidArgument("downgrade path must be UTF-8".into()))?;
+        let file = proof.main_file();
+        if file.file_id()? != Some(proof.database_id()) {
+            return Err(LimboError::InvalidArgument(
+                "downgrade main identity changed".into(),
+            ));
+        }
+        let options = OpenOptions::new(Arc::new(crate::dialect::EngineDialect))
+            .flags(OpenFlags::NoLock)
+            .storage(Arc::new(storage::database::DatabaseFile::new(file)));
+        let mut state = OpenDbAsyncState::new();
+        state.offline_downgrade = Some(proof.clone());
+        let db = io.block(|| Self::do_open_async(&mut state, io.clone(), path, &options))?;
+        let wal = db
+            .shared_wal
+            .read()
+            .runtime
+            .file
+            .clone()
+            .ok_or_else(|| LimboError::Corrupt("downgrade WAL is missing".into()))?;
+        if !Arc::ptr_eq(&wal, &proof.wal_file()) || wal.file_id()? != Some(proof.wal_id()) {
+            return Err(LimboError::InvalidArgument(
+                "downgrade WAL alias changed".into(),
             ));
         }
         proof.revalidate()?;
@@ -2015,6 +2061,7 @@ impl Database {
                         db.shared_mvcc_runtime.clone_from(&state.shared_runtime);
                         db.offline_marker_recovery
                             .clone_from(&state.offline_marker_recovery);
+                        db.offline_downgrade.clone_from(&state.offline_downgrade);
                     }
                     db.writer_readiness
                         .lock()
@@ -2805,6 +2852,15 @@ impl Database {
                         }
 
                         #[cfg(all(host_shared_wal, unix))]
+                        if self.offline_downgrade.is_some() {
+                            return if matches!(raw.0, 254 | 2) {
+                                Ok(Version::Wal)
+                            } else {
+                                Err(raw.0)
+                            };
+                        }
+
+                        #[cfg(all(host_shared_wal, unix))]
                         if self.shared_mvcc_runtime.is_some() {
                             return if raw.0 == mvcc::database::SHARED_MVCC_VERSION {
                                 Ok(Version::Mvcc)
@@ -2927,8 +2983,9 @@ impl Database {
                     // recovery and is reconciled in MvStore::bootstrap().
                     let reject_log_in_wal = !open_mv_store && log_exists;
                     #[cfg(all(host_shared_wal, unix))]
-                    let reject_log_in_wal =
-                        reject_log_in_wal && self.offline_marker_recovery.is_none();
+                    let reject_log_in_wal = reject_log_in_wal
+                        && self.offline_marker_recovery.is_none()
+                        && self.offline_downgrade.is_none();
                     if reject_log_in_wal {
                         return Err(LimboError::Corrupt(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
@@ -3026,6 +3083,17 @@ impl Database {
                                     *driver = Some(storage::wal::OpenSharedWal::Build(
                                         storage::sqlite3_ondisk::BuildSharedWal::begin(
                                             &runtime.physical_wal_file(),
+                                        )?,
+                                    ));
+                                }
+                            }
+                            #[cfg(unix)]
+                            if let Some(proof) = self.offline_downgrade.as_ref() {
+                                if driver.is_none() {
+                                    proof.revalidate()?;
+                                    *driver = Some(storage::wal::OpenSharedWal::Build(
+                                        storage::sqlite3_ondisk::BuildSharedWal::begin(
+                                            &proof.wal_file(),
                                         )?,
                                     ));
                                 }

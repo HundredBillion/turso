@@ -48,6 +48,8 @@ pub(in crate::mvcc) struct DowngradeFiles {
     log_path: PathBuf,
     log: Option<RetainedFile>,
     manifest: Arc<dyn IoFile>,
+    main_io: Arc<dyn IoFile>,
+    wal_io: Arc<dyn IoFile>,
 }
 impl DowngradeFiles {
     pub(in crate::mvcc) fn open(path: &Path, expected: &SharedMvccFiles) -> Result<Self> {
@@ -128,6 +130,11 @@ impl DowngradeFiles {
         if manifest.file_id()? != Some(files[0].id) {
             return Err(invalid("downgrade manifest alias identity changed"));
         }
+        let main_io = io.open_file(main.path.to_str().unwrap(), OpenFlags::NoLock, false)?;
+        let wal_io = io.open_file(wal.path.to_str().unwrap(), OpenFlags::NoLock, false)?;
+        if main_io.file_id()? != Some(main.id) || wal_io.file_id()? != Some(wal.id) {
+            return Err(invalid("downgrade content alias identity changed"));
+        }
         let retained = Self {
             main,
             wal,
@@ -137,14 +144,30 @@ impl DowngradeFiles {
             log_path,
             log,
             manifest,
+            main_io,
+            wal_io,
         };
         retained.revalidate()?;
         Ok(retained)
     }
     pub(in crate::mvcc) fn revalidate(&self) -> Result<()> {
+        self.revalidate_inner(false)
+    }
+    pub(in crate::mvcc) fn revalidate_marker(&self) -> Result<()> {
+        self.revalidate_inner(true)
+    }
+    fn revalidate_inner(&self, marker_stage: bool) -> Result<()> {
         self.main.revalidate()?;
         self.wal.revalidate()?;
-        require_marker(&self.main.file, SHARED_MVCC_VERSION)?;
+        if marker_stage {
+            let marker = super::read_marker(&self.main.file)?;
+            if !matches!(marker, SHARED_MVCC_VERSION | 2) {
+                return Err(invalid("downgrade marker changed unexpectedly"));
+            }
+            require_marker(&self.main.file, marker)?;
+        } else {
+            require_marker(&self.main.file, SHARED_MVCC_VERSION)?;
+        }
         let metadata = std::fs::symlink_metadata(&self.namespace).map_err(fs_error)?;
         if !metadata.is_dir()
             || identity(&self.namespace_file)?
@@ -159,7 +182,9 @@ impl DowngradeFiles {
             file.revalidate()?;
         }
         if self.manifest.file_id()? != Some(self.files[0].id)
-            || self.wal.file.metadata().map_err(fs_error)?.len() != 0
+            || self.main_io.file_id()? != Some(self.main.id)
+            || self.wal_io.file_id()? != Some(self.wal.id)
+            || (!marker_stage && self.wal.file.metadata().map_err(fs_error)?.len() != 0)
             || self.files[1].file.metadata().map_err(fs_error)?.len() != 0
             || self.files[2].file.metadata().map_err(fs_error)?.len() != 0
         {
@@ -177,6 +202,35 @@ impl DowngradeFiles {
             LogHeader::validate_header_only_file(&bytes)?;
         } else {
             require_absent(&self.log_path)?;
+        }
+        Ok(())
+    }
+    pub(in crate::mvcc) fn path(&self) -> &Path {
+        &self.main.path
+    }
+    pub(in crate::mvcc) fn main_file(&self) -> Arc<dyn IoFile> {
+        self.main_io.clone()
+    }
+    pub(in crate::mvcc) fn wal_file(&self) -> Arc<dyn IoFile> {
+        self.wal_io.clone()
+    }
+    pub(in crate::mvcc) fn require_mirrored(
+        &self,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+    ) -> Result<()> {
+        use crate::mvcc::commit_manifest::{ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+        if self.files[0].file.metadata().map_err(fs_error)?.len() != (2 * SLOT_SIZE) as u64 {
+            return Err(invalid("downgrade manifest length changed"));
+        }
+        for offset in [0, SLOT_SIZE] {
+            let mut bytes = [0; RECORD_SIZE];
+            self.files[0]
+                .file
+                .read_exact_at(&mut bytes, offset as u64)
+                .map_err(fs_error)?;
+            if ManifestRecord::decode(&bytes)? != Some(record) {
+                return Err(invalid("downgrade terminal intent is not mirrored"));
+            }
         }
         Ok(())
     }
