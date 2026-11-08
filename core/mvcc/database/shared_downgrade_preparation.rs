@@ -668,6 +668,11 @@ mod tests {
     #[test]
     #[ignore = "native subprocess lock-probe helper"]
     fn shared_downgrade_lock_child() {
+        assert_ne!(
+            std::env::var("TURSO_DOWNGRADE_LOCK_FAIL").as_deref(),
+            Ok("1"),
+            "deliberate child failure control"
+        );
         let path = std::env::var("TURSO_DOWNGRADE_LOCK_PATH").unwrap();
         let io = crate::io::SyscallIO::new().unwrap();
         let result = crate::IO::open_file(&io, &path, crate::OpenFlags::None, false);
@@ -677,6 +682,9 @@ mod tests {
         );
     }
     fn assert_child_excluded(path: &std::path::Path) {
+        assert_child_excluded_with_failure(path, false);
+    }
+    fn assert_child_excluded_with_failure(path: &std::path::Path, fail: bool) {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -692,6 +700,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("TURSO_DOWNGRADE_LOCK_PATH", path)
+            .env("TURSO_DOWNGRADE_LOCK_FAIL", if fail { "1" } else { "0" })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1321,5 +1330,18 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, ["materialized shared row"]);
         }
+    }
+    #[test]
+    #[ignore = "requires native Linux subprocess support"]
+    fn shared_downgrade_marker_native_child_failure_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unused-control.db");
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_child_excluded_with_failure(&path, true);
+        }));
+        assert!(
+            rejected.is_err(),
+            "supervisor accepted deliberately failing child"
+        );
     }
 }
