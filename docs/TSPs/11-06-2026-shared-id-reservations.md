@@ -786,7 +786,7 @@ then answers this case before unrelated dead-owner cleanup, so an existing claim
 can be used even at the retained-byte cap. New reservations still perform cleanup
 and enforce their ordinary budget/conflict checks.
 
-Savepoint release removes claims at or after its mark. A released value receives
+Rollback-to releases claims at or after its mark. A released value receives
 a new monotone ordinal when claimed again; a claim predating the mark keeps its
 original ID. Retired owners remain invalid. Cross-owner row conflicts and existing
 cross-owner sequence/CYCLE semantics are unchanged. The codec still accepts old
@@ -898,3 +898,97 @@ shared ATTACH, transaction-wide savepoint claim release, checkpoint/recovery
 integration, and public PHP process acceptance are not established by this reader
 milestone. The separate peer-schema descriptor fix must still be integrated and
 validated with this branch.
+
+### Scoped rollback and abandoned statements (2026-11-08)
+
+Actual native counterexamples on the watermark/peer-schema union returned success
+from `ROLLBACK TO` after undoing local rows, but a peer still received BUSY when
+claiming those IDs. Failed multirow statements, reset and Drop had the same leak.
+Run42434329574 reproduced all four independently while checking that earlier
+claims, the outer transaction identity and its snapshot remained intact.
+
+Reservation policy now captures the selected journal's next owner ordinal before
+an append or the same-owner idempotence shortcut. The runtime records that boundary
+on currently unmarked transaction savepoints. A repeated claim therefore keeps its
+earlier ordinal; it does not become owned by a newer savepoint. Cleanup actions do
+not capture reservation marks, so retrying retirement of an already-retired owner
+remains a no-op. SQL `RELEASE` keeps the changes and their claims; `ROLLBACK TO`
+uses `ReleaseAfter` and retains the named frame for another rollback.
+
+Durable ID release and local undo are one publication critical section. Returning
+the publication guard immediately after the journal append would let a peer claim
+and commit a row while the old local version was still present. The release result
+therefore retains the actual authority guard through version undo, schema/frame
+restoration and bookkeeping. A transaction fence blocks other new/resumed programs
+and COMMIT while this work is incomplete. The fence mutex spans native unlock and
+success-only clearing, so another scope cannot have its fence accidentally cleared.
+
+Reset/Drop finishes the captured typed rollback continuation, not the SQL text.
+Shared explicit write statements get a local statement scope even when ordinary
+single-row analysis would omit one: a durable reservation can precede the first
+local row mutation. An in-flight reservation is drained before that scope is
+released. Publication ownership remains held through the local statement undo.
+A failed cleanup does not acknowledge release; the transaction remains fenced.
+
+An autonomous sequence inner commit needs the same ownership ordering. The first
+physical manifest-write cancellation test failed because the inner commit still
+owned publication while outer-scope cleanup tried to acquire it. Shared cleanup now
+finishes an already-started inner commit state machine, then drops it before any
+rollbackability decision, restoring the saved outer transaction only afterward.
+This observes sticky durability even after a failed poll. It does not run nextval
+or any other SQL again, and it uses the pending database's actual pager.
+
+Evidence before budget integration:
+
+- Exact9698edf3f, run42435846654: native lifecycle7, global ID opcodes13, ordinary
+  named-savepoint1, policy12 and strict library lint passed. Local ordinary
+  statement lifecycle41 and sequence32 passed.
+- Exact8eaf4c05a, run42477790527: 12 real deferred ID-bank write/sync/truncate
+  reservation/named-reset/drop cases passed. Autonomous manifest-write reset was
+  a real BUSY failure, not an acknowledged successful cancellation.
+- Exact202f692b6, run42478189818: those 12 cases plus four actual autonomous
+  manifest-write/sync reset/drop cases passed. The controller retains the backend
+  Completion beyond callback, verifies peers remain excluded and cleanup has not
+  acknowledged, then retires it. The outer snapshot/prior claim survive, the peer
+  can acquire the released row, and the autonomous committed sequence value remains.
+
+The cleanup-credit union feff5190c passes local full core2810/40ignored. Final
+source2fb0d40f040dcd5c0c340880070d198c6634ff66 passed hosted run42479545684:
+lifecycle8, physical cancellation2 (16 cases), global IDs13, watermark identity1,
+watermark deferred-I/O1, watermark subprocess1, peer refresh-then-prepare1,
+COMMIT/RELEASE VDBE6, shared IDs75/3ignored, descriptor replay4, and strict library
+lint. Original budget1c79786e4 is an ancestor through merge02932db1b.
+
+The first combined run42478570321 exposed an obsolete128KiB cap fixture: cleanup
+credits made the second UPDATE reservation fail before the intended COMMIT test.
+The two fixtures now use192KiB and assert the exact metadata/frame inequalities,
+unchanged published manifest/log bytes after BUSY, retained local writes/savepoint,
+and successful rollback. A validation-only negative control removes commit cap
+preflight: the explicit COMMIT test fails its expected-BUSY assertion (0pass/1fail).
+Restoring the exact source passes all six VDBE cases and leaves the source clean.
+Raw evidence is retained in artifact `shared-id-lifecycle-budget-union` on
+https://github.com/HundredBillion/turso/actions/runs/42479545684.
+
+This validates the lifecycle branch, not its later checkpoint/pager union. That
+union's run42479473704 exposed two sequence-watermark failures after generation
+certification cleared a source pager layout memo. Source9c019ad35 fixes that seam:
+the independent read-pinned oracle copies the source transform configuration,
+reads its own header asynchronously when the memo is absent, and validates page
+size, reserved-space bounds and checksum mode before constructing a cursor. The
+request is captured before that read; the caller's pager/snapshot is unchanged.
+
+Run42480677435 passes factory1, lifecycle8, physical cancellation2 (16cases),
+IDs13, watermark identity1/deferred-I/O1 (30cases)/process1, peerprepare1, VDBE6,
+IDs75/3ignored, descriptors4 and strictliblint. Restoring the old source-memo
+requirement makes the reset-memo factory test fail (0pass/1fail); restoring the
+source passes1. The first factory run42480446821 exposed an old fixture assumption
+that connect populated the memo; the fixture now performs an actual table read
+before its populated-layout half, then explicitly resets for its uncached half.
+Evidence artifact `shared-sequence-oracle-layout` is attached to
+https://github.com/HundredBillion/turso/actions/runs/42480677435.
+The verified lifecycle milestone is merged through3c80d5744; its only runtime
+addition to the tested layout source is the separately validated2fb step-guard
+short-circuit ordering.
+Immediate idle-peer compilation after new DDL is also a separate tracked gate.
+Successful physical retirement tests do not establish arbitrary injected-I/O-error
+recovery or full shared-mode release readiness. Public activation remains off.

@@ -50,3 +50,43 @@ Before using this maximum, bootstrap must write and FULL-sync the selected ID wi
 Cancellation or failure before the mirrored proof leaves admission disabled and recovery required. Successful reconciliation changes only coordination metadata; read-only database contents remain unchanged. Subsequent processes joining a live reconciled authority do not change its incarnation. The proof assumes the existing failure model of checksum-detected torn writes and successful FULL-sync durability; it does not treat process-kill tests as power-loss evidence.
 
 Every bootstrap validates the selected ID journal, including processes joining an already reconciled live authority. Readiness only controls incarnation reconciliation; it is not a substitute for durable metadata validation. A prepared checkpoint generation requires coordinator recovery before admission, even when the completed manifest is already durable and an idle participant kept the authority alive across the coordinator's death. Matching finalized state on a live incarnation needs no selector writes.
+
+## Overlapping schema publication audit (2026-11-08)
+
+Issue7 requires coordinated schema publication; this audit found no source-backed
+requirement for a separate global DDL-exclusive lock. The existing commit path
+refreshes peers under publication authority before validating the transaction.
+Peer schema installation advances `last_committed_schema_change_ts`; preparation
+rejects a write whose snapshot predates that timestamp, including a transaction
+that changed its own schema header.
+
+Test-only source `f448a526c9b7c367c272bc2870b43c34a4d59724`, based on composite
+`2049aa8457f1368c9b14b50ecfa2b2bc98039d62`, adds native coverage in
+`core/vdbe/shared_schema_publication_tests.rs`. Three parent tests cover16 cases:
+CREATE TABLE and CREATE SEQUENCE, same versus different names, both commit orders,
+and independent stores versus real independent worker processes. Both workers
+acknowledge BEGIN, a snapshot read and staged CREATE before either may commit.
+Table cases also stage distinct marker data. The controller records each actual
+COMMIT acknowledgement without SQL retry and verifies exact catalog counts, no
+duplicate names, acknowledged data/sequence start values, and rejected-object
+absence through existing peers, a fresh peer and reopen. Worker replies and exit
+handling have bounded deadlines.
+
+Run https://github.com/HundredBillion/turso/actions/runs/42482021571 passed all
+three tests:16 first-commit acknowledgements and16 `SchemaConflict` responses for
+the second commit. This includes different-name DDL: current validation is
+conservative rather than merging concurrent schema transactions. First table-only
+run42481656583 independently passed8 cases.
+
+A validation-only control disabled **only** the `schema_updated` rejection in
+commit preparation. Both different-name commits then acknowledged, but a later
+catalog/data verification failed with `no such table: created_b` (0passed/1failed).
+Restoring the exact source passed all3 parent tests again; strict library Clippy
+passed and the workflow confirmed a clean source tree. The control demonstrates
+the existing check's necessity; it is not a defect present in the tested product
+source. Artifact `shared-schema-publication-audit` retains logs, source identity,
+toolchain and the one-line control diff.
+
+No engine behavior, ordinary-mode path or public activation changed. This is
+bounded CREATE/publication evidence, not coverage of every ALTER/DROP/index DDL,
+DDL crash recovery, arbitrary I/O failure, or the complete PHP release gate.

@@ -8040,6 +8040,8 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         peer_conflicted: AtomicBool::new(false),
         #[cfg(host_shared_wal)]
         shared_snapshot: None,
+        #[cfg(all(host_shared_wal, unix))]
+        shared_pending_release: Mutex::new(None),
         before_mutation_lock: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
@@ -9835,6 +9837,8 @@ fn transaction_display() {
         peer_conflicted: AtomicBool::new(false),
         #[cfg(host_shared_wal)]
         shared_snapshot: None,
+        #[cfg(all(host_shared_wal, unix))]
+        shared_pending_release: Mutex::new(None),
         before_mutation_lock: Mutex::new(None),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),

@@ -904,6 +904,8 @@ enum SavepointKind {
 /// Tracks row/index version deltas created inside a single savepoint scope.
 #[derive(Debug, Default)]
 pub struct Savepoint {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_id_boundary: Option<u64>,
     kind: SavepointKind,
     deferred_fk_violations: isize,
     header: DatabaseHeader,
@@ -1043,6 +1045,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     begin_ts: u64,
     #[cfg(host_shared_wal)]
     shared_snapshot: Option<Box<Mutex<Option<super::shared_authority::SnapshotRegistration>>>>,
+    // Blocks ordinary work if durable ID release outlives its local undo.
+    #[cfg(all(host_shared_wal, unix))]
+    shared_pending_release: Mutex<Option<u64>>,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
@@ -1126,6 +1131,8 @@ impl<A: RowVersionAllocator> Transaction<A> {
             peer_conflicted: AtomicBool::new(false),
             #[cfg(host_shared_wal)]
             shared_snapshot: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_pending_release: Mutex::new(None),
             #[cfg(test)]
             before_mutation_lock: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
@@ -1135,6 +1142,10 @@ impl<A: RowVersionAllocator> Transaction<A> {
     }
 
     fn ensure_peer_unconflicted(&self) -> Result<()> {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.shared_pending_release.lock().is_some() {
+            return Err(LimboError::Busy);
+        }
         if self.peer_conflicted.load(Ordering::Acquire) {
             return Err(LimboError::WriteWriteConflict);
         }
@@ -7867,7 +7878,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for savepoint in rolledback_savepoints.into_iter().rev() {
             self.rollback_savepoint_changes(tx_id, savepoint);
         }
-
         Ok(Some(deferred_fk_violations))
     }
 
