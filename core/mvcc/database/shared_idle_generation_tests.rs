@@ -222,12 +222,12 @@ fn durable_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     visit(root, root, &mut files);
     files
 }
-struct IdleGenerationChild {
+pub(super) struct IdleGenerationChild {
     child: Child,
     output: Receiver<std::io::Result<String>>,
 }
 impl IdleGenerationChild {
-    fn spawn(path: &Path, limit: u64, role: &str) -> Self {
+    pub(super) fn spawn(path: &Path, limit: u64, role: &str) -> Self {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "mvcc::database::shared_runtime::shared_idle_generation_tests::shared_idle_generation_native_child", "--ignored", "--nocapture", "--test-threads=1"])
             .env("TURSO_IDLE_GENERATION_PATH", path)
@@ -245,12 +245,12 @@ impl IdleGenerationChild {
         });
         Self { child, output }
     }
-    fn send(&mut self, command: &str) {
+    pub(super) fn send(&mut self, command: &str) {
         let stdin = self.child.stdin.as_mut().unwrap();
         writeln!(stdin, "{command}").unwrap();
         stdin.flush().unwrap();
     }
-    fn receive(&self) -> String {
+    pub(super) fn receive(&self) -> String {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let line = self
@@ -263,7 +263,7 @@ impl IdleGenerationChild {
             }
         }
     }
-    fn wait(&mut self) -> std::process::ExitStatus {
+    pub(super) fn wait(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {

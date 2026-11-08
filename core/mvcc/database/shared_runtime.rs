@@ -1,5 +1,6 @@
 #[path = "shared_current_base.rs"]
 mod shared_current_base;
+pub(in crate::mvcc) use shared_current_base::CurrentBaseEvidence;
 
 #[path = "shared_pager_generation.rs"]
 mod shared_pager_generation;
