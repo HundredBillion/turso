@@ -206,6 +206,7 @@ mod tests {
         let authority_path = namespace.join("authority");
         let old_metadata = std::fs::metadata(&authority_path).unwrap();
         assert_eq!(old_metadata.len(), earlier.len() as u64);
+        let earlier_epoch = SharedMvccAuthority::recovery_image_epoch_for_test(&earlier).unwrap();
         let old_id = (old_metadata.dev(), old_metadata.ino());
         let mut restore = std::fs::OpenOptions::new()
             .write(true)
@@ -254,6 +255,11 @@ mod tests {
         ));
         let (epoch, ready, next_timestamp) =
             runtime.files.authority.recovery_state_for_test().unwrap();
+        assert_eq!(
+            epoch,
+            earlier_epoch + 1,
+            "fresh open did not reacquire exclusive lifetime ownership"
+        );
         assert!(!ready, "fixture retained an old authority incarnation");
         assert!(
             epoch <= old_maximum,

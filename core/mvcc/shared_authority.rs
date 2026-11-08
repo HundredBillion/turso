@@ -312,6 +312,14 @@ impl SharedMvccAuthority {
         ))
     }
 
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(in crate::mvcc) fn recovery_image_epoch_for_test(image: &[u8]) -> Result<u64> {
+        let bytes = image
+            .get(EPOCH_OFFSET..EPOCH_OFFSET + 8)
+            .ok_or_else(|| LimboError::Corrupt("short shared coordination image".into()))?;
+        Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
+    }
+
     fn initialize(&self, database_id: FileId, history_limit: u64) {
         for offset in (8..MAP_LEN).step_by(8) {
             self.store(offset, 0);
