@@ -672,4 +672,81 @@ mod tests {
             assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
         }
     }
+    #[test]
+    #[ignore = "native subprocess lock-probe helper"]
+    fn shared_downgrade_lock_child() {
+        let path = std::env::var("TURSO_DOWNGRADE_LOCK_PATH").unwrap();
+        let io = crate::io::SyscallIO::new().unwrap();
+        let result = crate::IO::open_file(&io, &path, crate::OpenFlags::None, false);
+        assert!(
+            matches!(result, Err(LimboError::LockingError(_))),
+            "ordinary owner must still exclude the child after old descriptors close"
+        );
+    }
+    fn assert_child_excluded(path: &std::path::Path) {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                &format!("{}::shared_downgrade_lock_child", module_path!()),
+                "--nocapture",
+            ])
+            .env("TURSO_DOWNGRADE_LOCK_PATH", path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("lock probe exceeded its deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child lock probe failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_marker_native_old_handle_close_preserves_ordinary_lock() {
+        let mut fixture = installed_fixture();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        let marker = crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent).unwrap();
+        drop(marker);
+        drop(preparing);
+        let db = Database::open(
+            fixture.io.clone(),
+            fixture.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        connection.execute("SELECT value FROM preserved").unwrap();
+        assert_child_excluded(&fixture.path);
+        drop(fixture.connection);
+        drop(fixture.runtime);
+        assert_child_excluded(&fixture.path);
+        connection.execute("SELECT value FROM preserved").unwrap();
+    }
 }

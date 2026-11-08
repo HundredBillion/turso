@@ -212,3 +212,19 @@ old same-process main descriptors can remain owned by external runtime Arcs afte
 the capability drops; their later closure and ordinary POSIX-lock exclusion need
 an explicit lifecycle test before operator exposure. This is an unverified source
 concern, not a new policy requirement or a claim that the tested marker failed.
+
+## Approved continuation interface
+
+Root approved the continuation after the verified live marker slice. The private
+capability will distinguish Live(MirroredDowngradeIntent) from a separately sealed
+RecoveredTerminal source. RecoveredTerminal validates the selected terminal
+record, actual main/WAL identities, physical metadata and read-only finalized IDs
+with no pending selector; it does not require or fabricate normal published/Ready
+mapped state. It retains the same continuously held authority and admission pause.
+Only then may a surviving terminal copy be mirrored and an effective254 marker be
+committed; effective2 follows checkpoint/recovery without another marker commit.
+Partial-cleanup mode is separate, marker2-only, and cannot enter marker/replay or
+recreate IDs. Missing-WAL creation remains genuine-Live-only and durable before
+intent. A bounded real child-lock probe runs before any policy choice for old
+same-process descriptors. Dependencyfa225 was merged without production conflicts;
+review11554 transferred the narrow pending-selector accessor hunk to this task.
