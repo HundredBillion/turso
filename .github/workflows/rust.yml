@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 073e3565aaf0a2258a0dfff8a15e2db76b83c5c4
+          ref: 7b7c4798969766fca0ae66c42dc1e82e29ee584a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,9 +27,32 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 073e3565aaf0a2258a0dfff8a15e2db76b83c5c4
+          test "$(git rev-parse HEAD)" = 7b7c4798969766fca0ae66c42dc1e82e29ee584a
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-wal-green.log
-          grep -q '4 passed; 0 failed' physical-wal-green.log
+          grep -q '5 passed; 0 failed' physical-wal-green.log
+          python3 - <<'PATCH'
+          import re
+          text=open('physical-wal-green.log').read()
+          roots=set(map(int,re.findall(r'ACK_DATA_ROOT=(\d+)',text)))
+          assert len(roots)==1 and min(roots)>1,roots
+          root=roots.pop()
+          p='core/storage/wal.rs'
+          s=open(p).read(); old='                    // sort by frame_id for read locality'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,f'                    to_checkpoint.retain(|(page, _)| *page != {root});\n'+old))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_restores_committed_image_without_completion_or_admission -- --ignored --test-threads=1 --nocapture > required-data-page-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/storage/wal.rs
+          cat required-data-page-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' required-data-page-red.log
+          grep -q 'PHYSICAL_RECOVERY_UNADMITTED_OUTPUT' required-data-page-red.log
+          grep -q 'recovered data row differs from acknowledged value' required-data-page-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-wal-restored-green.log
+          grep -q '5 passed; 0 failed' physical-wal-restored-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-regression-green.log
           grep -q '8 passed; 0 failed' physical-owner-regression-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-regression-green.log
