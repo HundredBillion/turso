@@ -190,23 +190,43 @@ impl OrdinaryOfflineBackend {
         let path = path.canonicalize().map_err(fs_error)?;
         super::require_path_identity(&path, database_id)?;
         let marker = super::read_marker(&native)?;
-        if marker != 255 {
+        if !matches!(marker, 1 | 2 | 255) {
             return Err(LimboError::InvalidArgument(
-                "offline backend initially requires ordinary MVCC mode".into(),
+                "offline upgrade requires ordinary DELETE, WAL, or MVCC mode".into(),
             ));
         }
         super::require_marker(&native, marker)?;
+        // Reject a prepared transition before converting an ordinary marker: its
+        // explicit resume operation owns the surviving namespace.
+        let namespace = super::namespace_for(&path, database_id)?;
+        for forbidden in [
+            namespace,
+            PathBuf::from(format!("{}-journal", path_string(&path)?)),
+            PathBuf::from(format!("{}-tshm", path_string(&path)?)),
+        ] {
+            match std::fs::symlink_metadata(&forbidden) {
+                Ok(_) => {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "offline upgrade refuses an existing namespace or unsupported journal: {}",
+                        forbidden.display()
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(fs_error(error)),
+            }
+        }
         let mut retained = vec![native];
         let mut identities = vec![database_id];
         let wal_path = PathBuf::from(format!("{}-wal", path_string(&path)?));
         let log_path = path.with_extension("db-log");
-        let tshm_path = PathBuf::from(format!("{}-tshm", path_string(&path)?));
-        if tshm_path.try_exists().map_err(fs_error)? {
-            return Err(LimboError::InvalidArgument(
-                "offline upgrade does not support multiprocess WAL coordination".into(),
-            ));
-        }
-        for sidecar in [&wal_path, &log_path] {
+        let shm_path = PathBuf::from(format!("{}-shm", path_string(&path)?));
+        let mut missing = Vec::new();
+        for sidecar in [&wal_path, &log_path, &shm_path] {
+            if *sidecar == path {
+                return Err(LimboError::InvalidArgument(
+                    "ordinary database must not alias its sidecars".into(),
+                ));
+            }
             match std::fs::symlink_metadata(sidecar) {
                 Ok(_) => {
                     let file = open_native(sidecar)?;
@@ -214,13 +234,49 @@ impl OrdinaryOfflineBackend {
                     if id.dev != database_id.dev || identities.contains(&id) {
                         return Err(LimboError::InvalidArgument("ordinary sidecars must have distinct identities on the database device".into()));
                     }
+                    if marker != 255
+                        && *sidecar == log_path
+                        && file.metadata().map_err(fs_error)?.len() != 0
+                    {
+                        return Err(LimboError::InvalidArgument(
+                            "ordinary SQLite upgrade refuses a nonempty logical log".into(),
+                        ));
+                    }
                     identities.push(id);
                     retained.push(file);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if *sidecar != shm_path {
+                        missing.push(sidecar.clone());
+                    }
+                }
                 Err(error) => return Err(fs_error(error)),
             }
         }
+        // All existing paths are validated before creating either sidecar. Never
+        // truncate an acknowledged SQLite WAL or replace its shared-memory file.
+        for sidecar in missing {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&sidecar)
+                .map_err(fs_error)?;
+            let id = identity(&file)?;
+            if id.dev != database_id.dev || identities.contains(&id) {
+                return Err(LimboError::InvalidArgument(
+                    "created sidecar identity is invalid".into(),
+                ));
+            }
+            file.sync_all().map_err(fs_error)?;
+            identities.push(id);
+            retained.push(file);
+        }
+        super::sync_directory(path.parent().ok_or_else(|| {
+            LimboError::InvalidArgument("database needs a parent directory".into())
+        })?)?;
         let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new()?);
         let main = io.open_file(path_string(&path)?, OpenFlags::NoLock, false)?;
         if main.file_id()? != Some(database_id) {
@@ -229,6 +285,9 @@ impl OrdinaryOfflineBackend {
             ));
         }
         let connection = open_connection(&path, io, main.clone())?;
+        if marker != 255 {
+            connection.execute("PRAGMA journal_mode=mvcc")?;
+        }
         Ok(Self {
             path,
             connection,

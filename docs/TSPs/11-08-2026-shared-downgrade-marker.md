@@ -406,4 +406,4 @@ errors after entering marker completion report that ordinary WAL may already be
 published and recovery or cleanup remains incomplete. The existing actual
 three-phase marker SIGKILL and ten-phase cleanup SIGKILL tests exercise these
 operation entries, with namespace/log removal and ordinary payload reopening as
-postconditions. Dispatcher validation is pending.
+postconditions. Exact-source run 42512918309 passed native resume4/partial4/cleanup2/creation2/extent1/marker5, strict Linux library/tests lint and Windows compilation. Removing cleanup from each dispatcher arm caused its actual SIGKILL parent to fail (exit101, zero passed/one failed); restored marker and partial-cleanup parents passed. These are process-death tests, not power-loss simulation.

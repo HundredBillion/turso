@@ -45,6 +45,33 @@ use turso_sqlite::SqliteDialect;
 #[command(name = "Turso")]
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
+    #[arg(
+        long,
+        group = "shared_mode",
+        conflicts_with = "shared_mvcc_offline",
+        help = "Open an existing native shared-MVCC database; never upgrade implicitly"
+    )]
+    pub shared_mvcc: bool,
+    #[arg(long, value_enum, group = "shared_mode", requires = "all_older_workers_stopped", conflicts_with_all = ["sql", "readonly", "shared_mvcc"], help = "Perform one explicit offline shared-MVCC operation")]
+    pub shared_mvcc_offline: Option<crate::shared_mvcc::Operation>,
+    #[arg(
+        long,
+        requires = "shared_mvcc_offline",
+        help = "Acknowledge that all older workers have stopped"
+    )]
+    pub all_older_workers_stopped: bool,
+    #[arg(
+        long,
+        requires = "shared_mode",
+        help = "Shared history budget in bytes; must match the stored limit (default 67108864)"
+    )]
+    pub shared_mvcc_history_limit: Option<u64>,
+    #[arg(
+        long,
+        requires = "shared_mvcc_offline",
+        help = "Exclusive staging path for publish-new only"
+    )]
+    pub shared_mvcc_staging: Option<PathBuf>,
     #[clap(index = 1, help = "SQLite database file", default_value = ":memory:")]
     pub database: Option<PathBuf>,
     #[clap(index = 2, help = "Optional SQL command to execute")]
@@ -245,8 +272,18 @@ struct DbPage<'a> {
 }
 
 impl Limbo {
+    #[allow(dead_code)]
     pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
-        let mut opts = Opts::parse();
+        Self::from_opts(Opts::parse())
+    }
+
+    pub fn from_opts(mut opts: Opts) -> anyhow::Result<(Self, WorkerGuard)> {
+        crate::shared_mvcc::validate(&opts)?;
+        if opts.shared_mvcc_offline.is_some() {
+            return Err(anyhow!(
+                "offline operations must run before opening a shell connection"
+            ));
+        }
         let guard = Self::init_tracing(&opts)?;
 
         let db_file = opts
@@ -269,7 +306,9 @@ impl Limbo {
 
         let db_file = normalize_db_path(db_file);
 
-        let (io, conn) = if db_file.starts_with("file:") {
+        let (io, conn) = if opts.shared_mvcc {
+            crate::shared_mvcc::open(&db_file, &opts, db_opts.turso_cli())?
+        } else if db_file.starts_with("file:") {
             Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
         } else {
             let flags = open_flags(opts.readonly);

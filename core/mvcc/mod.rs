@@ -45,7 +45,7 @@ pub mod database;
 mod guarded_file;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(dead_code)]
-mod mode_transition;
+pub(crate) mod mode_transition;
 #[cfg(all(host_shared_wal, unix))]
 pub(crate) use mode_transition::downgrade_cleanup::PreparedDowngradeCleanup;
 #[cfg(all(host_shared_wal, unix))]

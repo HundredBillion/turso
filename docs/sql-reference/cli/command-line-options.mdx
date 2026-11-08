@@ -117,6 +117,90 @@ tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
 # Error: Resource is read-only
 ```
 
+### Explicit shared MVCC operations
+
+Shared MVCC is an explicit mode with a different database marker. These initial
+operators require 64-bit Linux, native ext-family storage, and open-file-description
+(OFD) locking. They use native filesystem paths, not `file:` URIs. Ordinary opens
+do not upgrade files and reject the shared marker. C/PDO shared URI support is not
+enabled by these CLI flags.
+
+| Flag | Description |
+|------|-------------|
+| `--shared-mvcc` | Open an already initialized shared database; never create its missing files or metadata |
+| `--shared-mvcc-offline <OPERATION>` | Perform one explicit offline transition and exit |
+| `--all-older-workers-stopped` | Required acknowledgement that all older workers have stopped before an offline transition |
+| `--shared-mvcc-history-limit <BYTES>` | Shared history budget, default `67108864`; later opens must use the initialized value |
+| `--shared-mvcc-staging <PATH>` | Separate staging path for `publish-new` |
+
+Stop all older workers before using an offline operation. Current participants
+are checked by the protocol too: a live transaction may cause `BUSY`; it is not
+evicted and its SQL is not replayed. The history budget includes logical records,
+ID claims and their cleanup space. The structural minimum of 32768 bytes does
+not guarantee that a write fits.
+
+Upgrade an existing ordinary SQLite DELETE/WAL or Turso MVCC database:
+
+```bash
+tursodb data.db --shared-mvcc-offline upgrade-existing --all-older-workers-stopped
+```
+
+The operator retains native exclusion while recovering an existing SQLite WAL,
+materializing data and publishing the shared marker. It does not replace an
+acknowledged WAL with an empty file. An existing rollback journal, transition
+namespace, or foreign nonempty logical log is rejected before conversion.
+Recover a hot rollback journal with SQLite before retrying this operation.
+
+Publish a new database without replacing an existing destination:
+
+```bash
+tursodb data.db --shared-mvcc-offline publish-new --shared-mvcc-staging staging.db --all-older-workers-stopped
+```
+
+Open an already initialized shared database, optionally read-only:
+
+```bash
+tursodb data.db --shared-mvcc 'SELECT * FROM items;'
+tursodb data.db --shared-mvcc --readonly 'SELECT * FROM items;'
+```
+
+Return to ordinary WAL after stopping older workers:
+
+```bash
+tursodb data.db --shared-mvcc-offline downgrade-existing --all-older-workers-stopped
+```
+
+Downgrade performs an actual shared checkpoint, publishes terminal transition
+metadata, commits the ordinary marker through a WAL transaction and FULL
+checkpoint on the same main inode, then removes obsolete transition files.
+Success includes cleanup; the database is not copied or replaced.
+
+Interrupted transitions require the matching recovery operation:
+
+| Operation | Required existing state |
+|-----------|-------------------------|
+| `resume-prepared-marker` | Prepared upgrade metadata and its original database identity |
+| `resume-downgrade-marker` | Valid terminal downgrade intent and the original retained files, including the basename WAL |
+| `resume-downgrade-cleanup` | Already checkpointed ordinary WAL main file, with validated surviving transition metadata |
+
+For example:
+
+```bash
+tursodb data.db --shared-mvcc-offline resume-downgrade-cleanup --all-older-workers-stopped
+```
+
+Unknown, missing or replaced transition files cause an error; recovery does not
+fabricate metadata. An error can occur after a marker is durably committed.
+Preserve the files and follow the diagnostic rather than repeating initialization.
+Offline operations cannot be combined with SQL or read-only mode. Shared and
+offline modes also reject custom VFS, encryption, server modes and experimental
+shell options before opening a normal shell connection.
+
+On 64-bit Linux, ordinary locked opens also require kernel/filesystem OFD support;
+unsupported locking returns `LockingError`, without a weaker-lock fallback.
+Read-only and explicitly unlocked native handles do not acquire that main-file
+lock. High-level cached views still share their existing database ownership.
+
 ### `--mcp`
 
 Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
