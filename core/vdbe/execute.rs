@@ -21232,6 +21232,44 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     }
 }
 
+#[cfg(all(host_shared_wal, unix))]
+fn finish_shared_named_rollback(state: &mut ProgramState, conn: &Arc<Connection>) -> Result<()> {
+    if let Some((_, tx_id, _)) = state.shared_named_rollback.as_ref() {
+        let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
+        store.finish_shared_local_rollback(*tx_id, &mut state.shared_id)?;
+        state.shared_named_rollback = None;
+    }
+    Ok(())
+}
+
+#[cfg(all(host_shared_wal, unix))]
+pub(super) fn finish_abandoned_shared_named_rollback(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+) -> Result<()> {
+    use crate::IOExt;
+    let Some((name, tx_id, next_ordinal)) = state.shared_named_rollback.clone() else {
+        return Ok(());
+    };
+    let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
+    if conn.get_mv_tx_id() != Some(tx_id) {
+        return Err(LimboError::Busy);
+    }
+    pager.io.block(|| {
+        store.shared_id_nonblock(
+            conn,
+            pager.clone(),
+            tx_id,
+            crate::MAIN_DB_ID,
+            crate::mvcc::database::SharedIdRequest::ReleaseAfter { next_ordinal },
+            &mut state.shared_id,
+        )
+    })?;
+    rollback_named_savepoint_locally(conn, pager, &name)?;
+    finish_shared_named_rollback(state, conn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -22706,42 +22744,4 @@ mod shared_begin_tests {
         assert!(f.connection.get_mv_tx().is_none());
         assert!(!f.connection.pager.load().holds_read_lock());
     }
-}
-
-#[cfg(all(host_shared_wal, unix))]
-fn finish_shared_named_rollback(state: &mut ProgramState, conn: &Arc<Connection>) -> Result<()> {
-    if let Some((_, tx_id, _)) = state.shared_named_rollback.as_ref() {
-        let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
-        store.finish_shared_local_rollback(*tx_id, &mut state.shared_id)?;
-        state.shared_named_rollback = None;
-    }
-    Ok(())
-}
-
-#[cfg(all(host_shared_wal, unix))]
-pub(super) fn finish_abandoned_shared_named_rollback(
-    state: &mut ProgramState,
-    conn: &Arc<Connection>,
-    pager: &Arc<Pager>,
-) -> Result<()> {
-    use crate::IOExt;
-    let Some((name, tx_id, next_ordinal)) = state.shared_named_rollback.clone() else {
-        return Ok(());
-    };
-    let store = conn.mv_store().as_ref().ok_or(LimboError::Busy)?.clone();
-    if conn.get_mv_tx_id() != Some(tx_id) {
-        return Err(LimboError::Busy);
-    }
-    pager.io.block(|| {
-        store.shared_id_nonblock(
-            conn,
-            pager.clone(),
-            tx_id,
-            crate::MAIN_DB_ID,
-            crate::mvcc::database::SharedIdRequest::ReleaseAfter { next_ordinal },
-            &mut state.shared_id,
-        )
-    })?;
-    rollback_named_savepoint_locally(conn, pager, &name)?;
-    finish_shared_named_rollback(state, conn)
 }

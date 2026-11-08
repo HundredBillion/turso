@@ -121,81 +121,6 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mvcc::database::tests::MvccTestDb;
-    use crate::schema::BTreeTable;
-    use crate::storage::sqlite3_ondisk::RawVersion;
-
-    fn header() -> DatabaseHeader {
-        let mut header = DatabaseHeader::default();
-        header.database_size = 42.into();
-        header.read_version = RawVersion(SHARED_MVCC_VERSION);
-        header.write_version = header.read_version;
-        header
-    }
-
-    fn schema(root: i64) -> Schema {
-        let mut schema = Schema::new();
-        let table =
-            BTreeTable::from_sql("CREATE TABLE reloaded(id INTEGER PRIMARY KEY)", root).unwrap();
-        schema.insert_table(
-            NamespaceId::ROOT,
-            "reloaded".into(),
-            Arc::new(Table::BTree(Arc::new(table))),
-        );
-        schema
-    }
-
-    #[test]
-    fn shared_generation_reload_prepares_complete_canonical_map_without_publication() {
-        let db = MvccTestDb::new();
-        let store = &db.mvcc_store;
-        store.insert_table_id_to_rootpage(MVTableId::from(-90), Some(42));
-        let previous = store.table_id_to_rootpage.load_full();
-        let prepared = store
-            .prepare_generation_reload(header(), &schema(7), 100)
-            .unwrap();
-        assert!(Arc::ptr_eq(&previous, &prepared.source_roots));
-        assert_eq!(prepared.roots.len(), 2);
-        assert_eq!(
-            prepared
-                .roots
-                .get(&MVTableId::from(-7))
-                .unwrap()
-                .value()
-                .root_page,
-            Some(7)
-        );
-        assert!(prepared.roots.get(&MVTableId::from(-90)).is_none());
-        assert_eq!(prepared.logical_floor, -90);
-        assert_eq!(prepared.checkpoint_timestamp, 100);
-        assert!(Arc::ptr_eq(
-            &previous,
-            &store.table_id_to_rootpage.load_full()
-        ));
-        assert_eq!(store.current_root_page(&MVTableId::from(-90)), Some(42));
-    }
-
-    #[test]
-    fn shared_generation_reload_rejects_nonphysical_or_duplicate_roots_without_publication() {
-        let db = MvccTestDb::new();
-        let store = &db.mvcc_store;
-        let previous = store.table_id_to_rootpage.load_full();
-        for root in [-7, 0, 43, 1] {
-            assert!(matches!(
-                store.prepare_generation_reload(header(), &schema(root), 100),
-                Err(LimboError::Corrupt(_))
-            ));
-            assert!(Arc::ptr_eq(
-                &previous,
-                &store.table_id_to_rootpage.load_full()
-            ));
-        }
-    }
-}
-
 impl<A: ConcurrentAllocator> PreparedGenerationReload<A> {
     pub(in crate::mvcc) fn install<C: LogicalClock>(
         self,
@@ -482,5 +407,80 @@ fn shared_generation_reload_native_rejects_stale_or_busy_preparation() {
             store.blocking_checkpoint_lock.unlock();
         }
         drop(pending);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mvcc::database::tests::MvccTestDb;
+    use crate::schema::BTreeTable;
+    use crate::storage::sqlite3_ondisk::RawVersion;
+
+    fn header() -> DatabaseHeader {
+        let mut header = DatabaseHeader::default();
+        header.database_size = 42.into();
+        header.read_version = RawVersion(SHARED_MVCC_VERSION);
+        header.write_version = header.read_version;
+        header
+    }
+
+    fn schema(root: i64) -> Schema {
+        let mut schema = Schema::new();
+        let table =
+            BTreeTable::from_sql("CREATE TABLE reloaded(id INTEGER PRIMARY KEY)", root).unwrap();
+        schema.insert_table(
+            NamespaceId::ROOT,
+            "reloaded".into(),
+            Arc::new(Table::BTree(Arc::new(table))),
+        );
+        schema
+    }
+
+    #[test]
+    fn shared_generation_reload_prepares_complete_canonical_map_without_publication() {
+        let db = MvccTestDb::new();
+        let store = &db.mvcc_store;
+        store.insert_table_id_to_rootpage(MVTableId::from(-90), Some(42));
+        let previous = store.table_id_to_rootpage.load_full();
+        let prepared = store
+            .prepare_generation_reload(header(), &schema(7), 100)
+            .unwrap();
+        assert!(Arc::ptr_eq(&previous, &prepared.source_roots));
+        assert_eq!(prepared.roots.len(), 2);
+        assert_eq!(
+            prepared
+                .roots
+                .get(&MVTableId::from(-7))
+                .unwrap()
+                .value()
+                .root_page,
+            Some(7)
+        );
+        assert!(prepared.roots.get(&MVTableId::from(-90)).is_none());
+        assert_eq!(prepared.logical_floor, -90);
+        assert_eq!(prepared.checkpoint_timestamp, 100);
+        assert!(Arc::ptr_eq(
+            &previous,
+            &store.table_id_to_rootpage.load_full()
+        ));
+        assert_eq!(store.current_root_page(&MVTableId::from(-90)), Some(42));
+    }
+
+    #[test]
+    fn shared_generation_reload_rejects_nonphysical_or_duplicate_roots_without_publication() {
+        let db = MvccTestDb::new();
+        let store = &db.mvcc_store;
+        let previous = store.table_id_to_rootpage.load_full();
+        for root in [-7, 0, 43, 1] {
+            assert!(matches!(
+                store.prepare_generation_reload(header(), &schema(root), 100),
+                Err(LimboError::Corrupt(_))
+            ));
+            assert!(Arc::ptr_eq(
+                &previous,
+                &store.table_id_to_rootpage.load_full()
+            ));
+        }
     }
 }

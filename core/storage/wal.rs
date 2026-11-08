@@ -7044,7 +7044,7 @@ pub mod test {
             "ordinary instance must not inherit scoped override"
         );
         let wrong = Arc::new(IdentityReadProbe {
-            inner: base.clone(),
+            inner: base,
             id: crate::io::FileId { dev: 1, ino: 20 },
             reads: AtomicUsize::new(0),
         });

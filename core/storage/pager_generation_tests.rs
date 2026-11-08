@@ -40,7 +40,7 @@ fn fixture() -> (Pager, Arc<DelayedReadFile>) {
     });
     let buf = Arc::new(Buffer::new_temporary(4096));
     buf.as_mut_slice().fill(17);
-    let _ = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+    drop(file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap());
     let pool = BufferPool::begin_init(&io, 4096 * 128);
     pool.finalize_with_page_size(4096).unwrap();
     let shared = Arc::new(SharedPagerState::new(None));
@@ -75,17 +75,18 @@ fn shared_generation_reset_excludes_delayed_old_read() {
         "new generation reused old in-flight page"
     );
     let (pos, c) = file.reads.lock().remove(1);
-    let _ = file.inner.pread(pos, c).unwrap();
+    drop(file.inner.pread(pos, c).unwrap());
     assert!(new_completion.unwrap().finished());
     assert_eq!(new.get_contents().as_ptr()[0], 17);
     let buf = Arc::new(Buffer::new_temporary(4096));
     buf.as_mut_slice().fill(29);
-    let _ = file
-        .inner
-        .pwrite(0, buf, Completion::new_write(|_| {}))
-        .unwrap();
+    drop(
+        file.inner
+            .pwrite(0, buf, Completion::new_write(|_| {}))
+            .unwrap(),
+    );
     let (pos, c) = file.reads.lock().remove(0);
-    let _ = file.inner.pread(pos, c).unwrap();
+    drop(file.inner.pread(pos, c).unwrap());
     assert_eq!(old.get_contents().as_ptr()[0], 29);
     let (again, c) = read(&pager);
     assert!(c.is_none());
@@ -202,7 +203,7 @@ fn shared_generation_reset_retains_detached_loaded_buffers_and_cache_settings() 
     let (pager, file) = fixture();
     let (old, _) = read(&pager);
     let (pos, c) = file.reads.lock().remove(0);
-    let _ = file.inner.pread(pos, c).unwrap();
+    drop(file.inner.pread(pos, c).unwrap());
     pager.open_subjournal().unwrap();
     pager.set_spill_enabled(false);
     pager.reset_shared_generation().unwrap();
@@ -218,7 +219,7 @@ fn shared_generation_reset_rejects_untracked_dirty_cached_page() {
     let (pager, file) = fixture();
     let (old, _) = read(&pager);
     let (pos, c) = file.reads.lock().remove(0);
-    let _ = file.inner.pread(pos, c).unwrap();
+    drop(file.inner.pread(pos, c).unwrap());
     old.set_dirty();
     assert!(pager.dirty_pages.read().is_empty());
     assert!(pager.reset_shared_generation().is_err());
