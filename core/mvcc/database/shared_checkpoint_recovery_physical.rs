@@ -6,8 +6,14 @@ use crate::mvcc::read_pinned_file::ReadPinnedFile;
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct InspectedRecoveryBase {
-    pub parts: PhysicalBaseParts,
-    pub selection: CheckpointRecoverySelection,
+    parts: PhysicalBaseParts,
+    selection: CheckpointRecoverySelection,
+}
+
+impl InspectedRecoveryBase {
+    pub(in crate::mvcc) fn into_parts(self) -> (PhysicalBaseParts, CheckpointRecoverySelection) {
+        (self.parts, self.selection)
+    }
 }
 
 #[allow(dead_code)]

@@ -81,12 +81,20 @@ impl SharedIds {
         guard: AuthorityGuard,
         identity: RecoveryIdentity,
     ) -> Result<IdLoad> {
-        use crate::io::File;
         if guard.published()? != identity.prefix {
             return Err(invalid(
                 "ID journal oracle prefix differs from publication authority",
             ));
         }
+        self.start_load(guard, identity)
+    }
+
+    fn start_load(
+        self: &Arc<Self>,
+        guard: AuthorityGuard,
+        identity: RecoveryIdentity,
+    ) -> Result<IdLoad> {
+        use crate::io::File;
         if identity.database.generation == 0
             || identity.database.checkpoint_timestamp > identity.prefix.committed_timestamp
         {

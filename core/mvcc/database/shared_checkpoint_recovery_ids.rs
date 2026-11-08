@@ -3,36 +3,97 @@ use super::*;
 use crate::mvcc::checkpoint_gate::CheckpointPause;
 use crate::mvcc::commit_manifest::ManifestRecord;
 use crate::mvcc::database::shared_bootstrap::PhysicalBaseParts;
-use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::UnrecoveredIds;
+use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::{
+    RecoveryTargetIdLoad, UnrecoveredIds,
+};
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct InspectedRecoveryIds {
-    pub runtime: Arc<SharedMvccRuntime>,
-    pub parts: PhysicalBaseParts,
-    pub record: ManifestRecord,
-    pub pause: CheckpointPause,
-    pub ids: UnrecoveredIds,
+    runtime: Arc<SharedMvccRuntime>,
+    parts: PhysicalBaseParts,
+    record: ManifestRecord,
+    pause: CheckpointPause,
+    ids: UnrecoveredIds,
 }
 
 #[allow(dead_code)]
-pub(in crate::mvcc) struct RecoveryIdInspection;
+pub(in crate::mvcc) struct RecoveryIdInspection {
+    runtime: Arc<SharedMvccRuntime>,
+    parts: Option<PhysicalBaseParts>,
+    record: ManifestRecord,
+    pause: Option<CheckpointPause>,
+    load: Option<RecoveryTargetIdLoad>,
+}
 
 impl InspectedRecoveryBase {
     #[allow(dead_code)]
     pub(in crate::mvcc) fn begin_id_inspection(self) -> Result<RecoveryIdInspection> {
-        Err(LimboError::InvalidArgument(
-            "completed checkpoint ID inspection is not implemented".into(),
-        ))
+        let (parts, selection) = self.into_parts();
+        let record = selection.manifest.record();
+        let prefix = record.prefix();
+        if record.requires_recovery()
+            || prefix.end_offset != 0
+            || prefix.running_crc != 0
+            || record.log_salt() != 0
+            || parts.persistent_timestamp != prefix.committed_timestamp
+        {
+            return Err(LimboError::InvalidArgument(
+                "ID inspection requires the selected completed checkpoint".into(),
+            ));
+        }
+        let bytes = selection.runtime.files.main.size()?;
+        let physical_floor = i64::try_from(bytes / u64::from(parts.header.page_size.get()))
+            .ok()
+            .and_then(i64::checked_neg)
+            .filter(|floor| *floor != i64::MIN)
+            .ok_or(LimboError::DatabaseFull)?;
+        let identity = RecoveryIdentity {
+            database: DatabaseGeneration {
+                generation: record.log_generation(),
+                checkpoint_timestamp: parts.persistent_timestamp,
+            },
+            prefix,
+        };
+        let load = selection.runtime.ids.inspect_completed_target(
+            selection.manifest.into_guard()?,
+            identity,
+            physical_floor,
+        )?;
+        Ok(RecoveryIdInspection {
+            runtime: selection.runtime,
+            parts: Some(parts),
+            record,
+            pause: Some(selection.pause),
+            load: Some(load),
+        })
     }
 }
 
 #[allow(dead_code)]
 impl RecoveryIdInspection {
     pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<InspectedRecoveryIds> {
-        Err(LimboError::InvalidArgument(
-            "completed checkpoint ID inspection is not implemented".into(),
-        )
-        .into())
+        let result = self.poll_inner();
+        if result.is_err() {
+            self.load = None;
+            self.parts = None;
+            self.pause = None;
+        }
+        result
+    }
+
+    fn poll_inner(&mut self) -> IOResultOr<InspectedRecoveryIds> {
+        let load = self.load.as_mut().ok_or_else(|| {
+            LimboError::InvalidArgument("recovery ID inspection has ended".into())
+        })?;
+        let ids = return_if_io!(load.poll());
+        self.load = None;
+        Ok(IOResult::Done(InspectedRecoveryIds {
+            runtime: self.runtime.clone(),
+            parts: self.parts.take().unwrap(),
+            record: self.record,
+            pause: self.pause.take().unwrap(),
+            ids,
+        }))
     }
 }
 
