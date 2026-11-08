@@ -632,6 +632,9 @@ fn shared_id_lifecycle_native_rollback_to_releases_only_scoped_claims() {
     let snapshot = store.read_snapshot_ts(outer);
     first.execute("SAVEPOINT scope").unwrap();
     first
+        .execute("UPDATE preserved SET id=66,value='changed' WHERE id=66")
+        .unwrap();
+    first
         .execute("INSERT INTO preserved(id,value) VALUES(77,'scoped')")
         .unwrap();
     first.execute("SAVEPOINT nested").unwrap();
@@ -646,6 +649,10 @@ fn shared_id_lifecycle_native_rollback_to_releases_only_scoped_claims() {
         integers(&first, "SELECT id FROM preserved WHERE id>=66"),
         [66]
     );
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'reclaimed')")
+        .unwrap();
+    first.execute("ROLLBACK TO scope").unwrap();
     let error = second
         .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
         .unwrap_err();
@@ -933,3 +940,24 @@ fn shared_id_lifecycle_native_named_rollback_preserves_earlier_sequence_claim() 
 
 #[path = "shared_id_lifecycle_io_tests.rs"]
 mod shared_id_lifecycle_io_tests;
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_empty_scopes_do_not_create_journal_owners() {
+    let (_directory, first, second) = pair();
+    first.execute("SAVEPOINT empty").unwrap();
+    first.execute("SAVEPOINT nested").unwrap();
+    first.execute("ROLLBACK TO nested").unwrap();
+    first.execute("RELEASE nested").unwrap();
+    first.execute("ROLLBACK TO empty").unwrap();
+    first.execute("RELEASE empty").unwrap();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first.execute("SAVEPOINT empty").unwrap();
+    first.execute("ROLLBACK TO empty").unwrap();
+    first.execute("RELEASE empty").unwrap();
+    first.execute("COMMIT").unwrap();
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .unwrap();
+    assert_eq!(integers(&first, "SELECT count(*) FROM preserved"), [2]);
+}
