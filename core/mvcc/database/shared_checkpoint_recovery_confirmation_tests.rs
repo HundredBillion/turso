@@ -340,14 +340,15 @@ impl crate::IO for ControlledIo {
         self.inner.step()
     }
 }
-struct FaultFixture {
-    _directory: tempfile::TempDir,
-    io: Arc<dyn crate::IO>,
-    runtime: Arc<SharedMvccRuntime>,
-    path: PathBuf,
-    namespace: PathBuf,
+pub(super) struct FaultFixture {
+    pub(super) _directory: tempfile::TempDir,
+    pub(super) io: Arc<dyn crate::IO>,
+    pub(super) runtime: Arc<SharedMvccRuntime>,
+    pub(super) path: PathBuf,
+    pub(super) namespace: PathBuf,
     control: Arc<Control>,
-    inspected: Option<InspectedRecoveryIds>,
+    pub(super) inspected: Option<InspectedRecoveryIds>,
+    pub(super) earlier_coordination: Vec<u8>,
     record: ManifestRecord,
 }
 fn inspect(fixture: &FaultFixture) -> InspectedRecoveryIds {
@@ -363,13 +364,32 @@ fn inspect(fixture: &FaultFixture) -> InspectedRecoveryIds {
 fn fault_fixture(target_only: bool) -> FaultFixture {
     fault_fixture_with_seed(target_only, false)
 }
-fn fault_fixture_with_seed(target_only: bool, seed_owner: bool) -> FaultFixture {
+pub(super) fn fault_fixture_with_seed(target_only: bool, seed_owner: bool) -> FaultFixture {
+    fault_fixture_with_seed_and_io(target_only, seed_owner, |io| io)
+}
+pub(super) fn fault_fixture_with_seed_and_io(
+    target_only: bool,
+    seed_owner: bool,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> FaultFixture {
     let control = Arc::new(Control::default());
+    let earlier = Arc::new(Mutex::new(Vec::new()));
     let fixture = shared_prepared_checkpoint_fixture(|path| {
+        if seed_owner {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path).unwrap();
+            let id = FileId {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            };
+            let namespace = crate::mvcc::mode_transition::namespace_for(path, id).unwrap();
+            *earlier.lock() = std::fs::read(namespace.join("authority")).unwrap();
+        }
         let io: Arc<dyn crate::IO> = Arc::new(ControlledIo {
             inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
             control: control.clone(),
         });
+        let io = decorate(io);
         if seed_owner {
             let database = crate::Database::open(
                 io.clone(),
@@ -450,6 +470,7 @@ fn fault_fixture_with_seed(target_only: bool, seed_owner: bool) -> FaultFixture 
         namespace: fixture.namespace,
         control,
         inspected: None,
+        earlier_coordination: earlier.lock().clone(),
         record: ManifestRecord::decode(
             &std::fs::read(&manifest_path).unwrap()[SLOT_SIZE..SLOT_SIZE + RECORD_SIZE],
         )

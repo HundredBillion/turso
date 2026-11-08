@@ -294,6 +294,32 @@ impl SharedMvccAuthority {
         })
     }
 
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(in crate::mvcc) fn recovery_state_for_test(&self) -> Result<(u64, bool, u64)> {
+        let ready = match self.load(INCARNATION_READY_OFFSET) {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "invalid shared incarnation readiness".into(),
+                ))
+            }
+        };
+        Ok((
+            self.load(EPOCH_OFFSET),
+            ready,
+            self.load(NEXT_TIMESTAMP_OFFSET),
+        ))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+    pub(in crate::mvcc) fn recovery_image_epoch_for_test(image: &[u8]) -> Result<u64> {
+        let bytes = image
+            .get(EPOCH_OFFSET..EPOCH_OFFSET + 8)
+            .ok_or_else(|| LimboError::Corrupt("short shared coordination image".into()))?;
+        Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
+    }
+
     fn initialize(&self, database_id: FileId, history_limit: u64) {
         for offset in (8..MAP_LEN).step_by(8) {
             self.store(offset, 0);
@@ -390,6 +416,41 @@ impl AuthorityGuard {
         self.store_prefix(prefix)?;
         self.recovery_required = false;
         Ok(())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    pub(super) fn recover_completed_checkpoint(
+        &mut self,
+        proof: &super::commit_manifest::checkpoint_publication::CompletedCheckpointProof,
+    ) -> Result<()> {
+        let target = proof.target_identity();
+        if proof.source_identity().is_some()
+            || !proof.matches_lease(self)
+            || target.database.generation == 0
+            || target.prefix.end_offset != 0
+            || target.prefix.running_crc != 0
+            || target.database.checkpoint_timestamp != target.prefix.committed_timestamp
+            || proof.materialized_floor() >= 0
+            || proof.materialized_floor() == i64::MIN
+        {
+            return Err(LimboError::InvalidArgument(
+                "recovered checkpoint authority proof differs".into(),
+            ));
+        }
+        self.ensure_no_snapshot_locks()?;
+        PublicationLease::pin(&self.io_lease())?;
+        if !self.io_retired() {
+            return Err(LimboError::Busy);
+        }
+        if self.requires_recovery() {
+            self.recover(target.prefix)
+        } else if self.published()? == target.prefix {
+            Ok(())
+        } else {
+            Err(LimboError::InvalidArgument(
+                "recovered checkpoint target differs from published authority".into(),
+            ))
+        }
     }
 
     pub(super) fn publish_committed(
