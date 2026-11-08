@@ -101,7 +101,7 @@ pub(crate) struct SharedOpenState {
 
 #[derive(Default)]
 pub(crate) struct SharedBeginState {
-    open: Option<SharedOpenState>,
+    open: Option<Box<SharedOpenState>>,
     request: Option<BeginRequest>,
 }
 
@@ -459,7 +459,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
                     .into());
                 }
             } else {
-                state.open = Some(runtime.begin_open()?);
+                state.open = Some(Box::new(runtime.begin_open()?));
                 state.request = Some(BeginRequest {
                     connection: Arc::downgrade(connection),
                     pager: pager.clone(),
