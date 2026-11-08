@@ -2,7 +2,7 @@ pub(super) mod downgrade_cleanup;
 pub(super) mod downgrade_files;
 pub(super) mod downgrade_marker;
 pub(super) mod downgrade_resume;
-pub(super) mod operation;
+pub(crate) mod operation;
 mod ordinary;
 pub(super) mod recovery;
 #[cfg(test)]
@@ -32,7 +32,7 @@ pub(super) trait OfflineBackend {
 }
 
 /// This is an operator prerequisite, not a fact that database locking can establish.
-pub(super) enum OfflinePrerequisite {
+pub(crate) enum OfflinePrerequisite {
     AllOlderWorkersStopped,
 }
 
