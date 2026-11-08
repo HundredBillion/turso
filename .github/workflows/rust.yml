@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5cfac258f821af44fa9dcbd3befa375341d8d121
+          ref: 9698edf3f031439d201008dda4c685310756ae81
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,20 +24,20 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5cfac258f821af44fa9dcbd3befa375341d8d121
+          test "$(git rev-parse HEAD)" = 9698edf3f031439d201008dda4c685310756ae81
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee build.log
-      - name: Named scoped rollback
+      - name: Native scoped ID lifecycle
         run: |
           set -o pipefail
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_rollback_to_releases_only_scoped_claims -- --ignored --test-threads=1 --nocapture 2>&1 | tee named-green.log
-          grep -q '1 passed; 0 failed' named-green.log
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_cancel_after_release_requires_local_undo -- --ignored --test-threads=1 --nocapture 2>&1 | tee cancel-green.log
-          grep -q '1 passed; 0 failed' cancel-green.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee lifecycle.log
+          grep -q '7 passed; 0 failed' lifecycle.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-native.log
+          grep -q '13 passed; 0 failed' ids-native.log
       - name: Existing named rollback and ID policy
         run: |
           set -o pipefail
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-retained-release
+          name: shared-id-statement-release
           path: |
             source.txt
             rustc.txt
