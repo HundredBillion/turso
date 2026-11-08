@@ -38,7 +38,7 @@ fn run_idle_generation_case(role: &str) {
     let store = fixture.database.get_mv_store().as_ref().unwrap().clone();
     let runtime = store.shared_runtime.get().unwrap().clone();
     let mut finalizer = fixture.ids.finalize(fixture.guard, fixture.proof).unwrap();
-    let finalized = fixture.io.block(|| finalizer.poll()).unwrap();
+    let finalized = fixture.io.block(|| Ok(finalizer.poll()?)).unwrap();
     let published = PublishedSharedCheckpoint {
         finalized,
         pause: fixture.pause,
