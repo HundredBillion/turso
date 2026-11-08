@@ -34,7 +34,7 @@ pub(crate) enum SharedIdResult {
 
 #[derive(Default)]
 pub(crate) struct SharedIdState {
-    pending: Option<PendingId>,
+    pending: Option<Box<PendingId>>,
     // Releasing journal claims is only half of rollback. Keep publication
     // ownership until the caller has also undone its local versions and schema.
     released: Option<(
@@ -207,7 +207,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     .into());
                 }
             } else {
-                state.pending = Some(PendingId {
+                state.pending = Some(Box::new(PendingId {
                     connection: Arc::downgrade(connection),
                     pager,
                     runtime: runtime.clone(),
@@ -217,7 +217,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     owner,
                     refresh: Some(SharedTransactionCommit::new(runtime.clone())?),
                     operation: None,
-                });
+                }));
             }
             let pending = state.pending.as_mut().unwrap();
             if pending.operation.is_none() {

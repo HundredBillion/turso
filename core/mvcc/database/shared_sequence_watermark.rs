@@ -7,7 +7,7 @@ use crate::mvcc::shared_ids::policy::{
 
 #[derive(Default)]
 pub(crate) struct SharedSequenceWatermarkState {
-    pending: Option<PendingWatermark>,
+    pending: Option<Box<PendingWatermark>>,
 }
 struct PendingWatermark {
     connection: Weak<Connection>,
@@ -78,7 +78,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     .into());
                 }
             } else {
-                state.pending = Some(PendingWatermark {
+                state.pending = Some(Box::new(PendingWatermark {
                     connection: Arc::downgrade(connection),
                     runtime: runtime.clone(),
                     root,
@@ -89,7 +89,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     domain: None,
                     boundary: None,
                     operation: None,
-                });
+                }));
             }
             let pending = state.pending.as_mut().unwrap();
             if pending.operation.is_none() {
