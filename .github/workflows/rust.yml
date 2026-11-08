@@ -1,4 +1,4 @@
-name: Source Store cap GREEN and retained-Store lifetime RED
+name: Actual source Store lifetime GREEN
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 29124b98cf043376b70f4be114b33f40a1ad30fc
+          ref: a6da7aa8654cde26c8a4ebc8863381a963f0d537
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 29124b98cf043376b70f4be114b33f40a1ad30fc
+          test "$(git rev-parse HEAD)" = a6da7aa8654cde26c8a4ebc8863381a963f0d537
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
@@ -37,36 +37,31 @@ jobs:
           grep -q '5 passed; 0 failed' merged-committed-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-precommit-green.log
           grep -q '4 passed; 0 failed' merged-precommit-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --skip retained_store_clone --test-threads=1 --nocapture 2>&1 | tee owned-store-green.log
-          grep -q '5 passed; 0 failed' owned-store-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee actual-store-green.log
+          grep -q '6 passed; 0 failed' actual-store-green.log
           python3 - <<'PATCH'
           p='core/mvcc/database/shared_checkpoint_intent_store.rs'
           s=open(p).read()
-          old='    authority_owner: Arc<PublicationLease>,\n'; assert s.count(old)==1; s=s.replace(old,'')
-          old='            authority_owner,\n'; assert s.count(old)==1; s=s.replace(old,'')
-          old='            || !Arc::ptr_eq(\n                &self.authority_owner,\n                &self.lease.upgrade().ok_or(LimboError::Busy)?,\n            )\n'
-          assert s.count(old)==1; s=s.replace(old,'')
+          pairs=[('    lease: Arc<PublicationLease>,','    lease: Weak<PublicationLease>,'),('            lease: authority_owner,','            lease: Arc::downgrade(&authority_owner),'),('        Weak::ptr_eq(&Arc::downgrade(&self.lease), lease)','        Weak::ptr_eq(&self.lease, lease)')]
+          for old,new in pairs:
+              assert s.count(old)==1,(old,s.count(old))
+              s=s.replace(old,new)
           open(p,'w').write(s)
           PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_callee_error_drops_store_before_native_authority -- --ignored --test-threads=1 --nocapture > owner-lease-red.log 2>&1
-          code=$?
-          set -e
+          for selector in callee_error_drops_store_before_native_authority retained_store_clone_keeps_native_authority; do
+            set +e
+            cargo test --locked -p turso_core --lib --features conn_raw_api "intent_source_store_native_$selector" -- --ignored --test-threads=1 --nocapture > "$selector-red.log" 2>&1
+            code=$?
+            set -e
+            cat "$selector-red.log"
+            test "$code" -ne 0
+            grep -q '0 passed; 1 failed' "$selector-red.log"
+          done
+          grep -q 'original guard error released native authority before Store destruction' callee_error_drops_store_before_native_authority-red.log
+          grep -q 'owner drop released native authority while a real Store clone survived' retained_store_clone_keeps_native_authority-red.log
           git restore core/mvcc/database/shared_checkpoint_intent_store.rs
-          cat owner-lease-red.log
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' owner-lease-red.log
-          grep -q 'original guard error released native authority before Store destruction' owner-lease-red.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --skip retained_store_clone --test-threads=1 --nocapture 2>&1 | tee owned-store-restored-green.log
-          grep -q '5 passed; 0 failed' owned-store-restored-green.log
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_retained_store_clone_keeps_native_authority -- --ignored --test-threads=1 --nocapture > actual-store-clone-red.log 2>&1
-          code=$?
-          set -e
-          cat actual-store-clone-red.log
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' actual-store-clone-red.log
-          grep -q 'owner drop released native authority while a real Store clone survived' actual-store-clone-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee actual-store-restored-green.log
+          grep -q '6 passed; 0 failed' actual-store-restored-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
@@ -76,4 +71,33 @@ jobs:
           name: committed-physical-wal-green
           path: |
             *.txt
+            *.log
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a6da7aa8654cde26c8a4ebc8863381a963f0d537
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Windows library boundary check
+        run: |
+          set -euo pipefail
+          rustc --version
+          git rev-parse HEAD | tee source.txt
+          test "$(git rev-parse HEAD)" = a6da7aa8654cde26c8a4ebc8863381a963f0d537
+          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-check.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-store-windows
+          path: |
+            source.txt
             *.log
