@@ -99,7 +99,7 @@ def crash_cases(test_binary, directory, run):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True, type=Path)
-    parser.add_argument('--case', choices=['no-write', 'roundtrip', 'new', 'busy', 'crash', 'stock', 'close'], required=True)
+    parser.add_argument('--case', choices=['no-write', 'roundtrip', 'new', 'busy', 'crash', 'stock', 'stock-delete', 'stock-wal', 'close'], required=True)
     parser.add_argument('--test-binary', type=Path)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
@@ -150,14 +150,20 @@ def main():
                 assert not Path(str(stage) + '-wal').exists()
                 assert not stage.with_suffix('.db-log').exists()
             else:
-                if args.case == 'stock':
+                if args.case in ('stock', 'stock-delete', 'stock-wal'):
                     with sqlite3.connect(path) as stock:
                         stock.executescript("CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); CREATE UNIQUE INDEX preserved_value ON preserved(value); INSERT INTO preserved VALUES(1,'before'); CREATE TABLE typed(i INTEGER, r REAL, t TEXT, b BLOB, z); CREATE INDEX typed_text ON typed(t);")
                         stock.execute('INSERT INTO typed VALUES(?,?,?,?,?)', (-17, 1.25, 'héllo', b'\x00\xff', None))
                         stock.commit()
                         schema = stock.execute("SELECT name,sql FROM sqlite_schema WHERE name IN ('preserved','preserved_value','typed','typed_text') ORDER BY name").fetchall()
                     stock.close()
-                    run(path, sql='PRAGMA journal_mode=mvcc;')
+                    if args.case == 'stock':
+                        run(path, sql='PRAGMA journal_mode=mvcc;')
+                    elif args.case == 'stock-wal':
+                        with sqlite3.connect(path) as stock:
+                            assert stock.execute('PRAGMA journal_mode=WAL').fetchone() == ('wal',)
+                        stock.close()
+                    assert path.read_bytes()[18:20] == bytes([255, 255] if args.case == 'stock' else [2, 2] if args.case == 'stock-wal' else [1, 1])
                 else:
                     run(path, sql="PRAGMA journal_mode=mvcc; CREATE TABLE preserved(id INTEGER PRIMARY KEY, value TEXT); CREATE UNIQUE INDEX preserved_value ON preserved(value); INSERT INTO preserved VALUES(1,'before');")
                 inode = path.stat().st_ino
@@ -219,7 +225,7 @@ def main():
             assert not path.with_suffix('.db-log').exists()
             assert run(path, sql='SELECT id,value FROM preserved ORDER BY id').stdout.strip() == '1|after\n2|peer'
             assert run(path, sql='PRAGMA integrity_check').stdout.strip() == 'ok'
-            if args.case == 'stock':
+            if args.case in ('stock', 'stock-delete', 'stock-wal'):
                 with sqlite3.connect(path) as stock:
                     assert stock.execute('SELECT i,r,t,b,z FROM typed INDEXED BY typed_text').fetchall() == [(-17, 1.25, 'héllo', b'\x00\xff', None)]
                     assert stock.execute("SELECT name,sql FROM sqlite_schema WHERE name IN ('preserved','preserved_value','typed','typed_text') ORDER BY name").fetchall() == schema
