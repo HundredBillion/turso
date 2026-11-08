@@ -9,6 +9,12 @@ pub(in crate::mvcc) enum OfflineOperation<'a> {
     ResumePreparedMarker {
         path: &'a Path,
     },
+    ResumeDowngradeMarker {
+        path: &'a Path,
+    },
+    ResumeDowngradeCleanup {
+        path: &'a Path,
+    },
     PublishNew {
         staging: &'a Path,
         destination: &'a Path,
@@ -37,6 +43,12 @@ pub(in crate::mvcc) fn execute_offline(
         }
         OfflineOperation::ResumePreparedMarker { path } => {
             resume_prepared_marker(path, history_limit, prerequisite)
+        }
+        OfflineOperation::ResumeDowngradeMarker { path } => {
+            super::downgrade_resume::resume_marker(path, history_limit, prerequisite)?.cleanup()
+        }
+        OfflineOperation::ResumeDowngradeCleanup { path } => {
+            super::downgrade_cleanup::resume_cleanup(path, prerequisite)
         }
         OfflineOperation::PublishNew {
             staging,

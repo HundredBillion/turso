@@ -212,7 +212,12 @@ pub(in crate::mvcc) fn resume_marker(
     history_limit: u64,
     _: OfflinePrerequisite,
 ) -> Result<downgrade_marker::CompletedDowngradeMarker> {
-    downgrade_marker::commit_recovered(RecoveredDowngradeSource::open(path, history_limit)?)
+    let source = RecoveredDowngradeSource::open(path, history_limit)?;
+    downgrade_marker::commit_recovered(source).map_err(|error| {
+        invalid(&format!(
+            "ordinary WAL may already be published; downgrade marker recovery or cleanup remains incomplete: {error}"
+        ))
+    })
 }
 fn invalid(message: &str) -> LimboError {
     LimboError::InvalidArgument(message.into())

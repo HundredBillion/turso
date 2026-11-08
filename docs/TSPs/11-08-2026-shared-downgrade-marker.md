@@ -332,7 +332,8 @@ also passed. Downloaded logs are retained under
 `.local/issue-resolution/downgrade-partial-cd5` in the root checkout. These results
 do not clear the separately confirmed ordinary lock lifetime defect.
 
-The OFD prototype also changes ordinary Linux64 opens on kernels older than 3.15
+The OFD prototype also changes ordinary native Linux64 Syscall/Uring opens on
+kernels older than 3.15
 or filesystems/kernels that reject OFD locking: those opens now fail with the
 existing locking-error result instead of silently using process-scoped locks.
 This affects ordinary mode, not only the already-OFD-dependent shared mode.
@@ -344,3 +345,65 @@ to test that error path; another test retains a duplicated descriptor to require
 ownership until the final native descriptor closes. The final compatibility decision must account for that older-kernel
 tradeoff. Non-Linux Unix and Linux32 retain the existing implementation. We do not
 add a fallback that would reintroduce the demonstrated alias-close loss.
+
+### Broader ordinary ownership validation remains a gate
+
+Run 42508495510 verified the original ordinary-lock two-parent suite, actual Uring
+parent, and all five marker parents (including the corrected old-handle-close
+counterexample). Its test-lint step failed on native fixture warnings; it was not
+a wholly green release. Source 2f455 subsequently removes Linux64 explicit Drop
+unlocking. A disposable child denies the actual OFD syscall with EOPNOTSUPP and
+checks a normal open error plus safe NoLock/read-only destruction. Restoring the
+old Drop produced the required failure; restoring the candidate passed. A second
+test retains a duplicated descriptor to keep ownership until its final close.
+
+The first full ordinary run 42509335725 was **not accepted**: 2785 passed, 115
+failed, 173 ignored. Existing restart fixtures evicted the registry and reopened
+before releasing their old Database; several raw WAL-coordination fixtures also
+requested two exclusive ordinary handles instead of explicit cooperating handles.
+The bounded first repair fda7b28 drops the fixture's old owner before reopen,
+uses the normal resolver for codec cache tests, and sets NoLock only in eight
+explicit shared-WAL coordinator fixtures. Run 42510713011 then passed 57 codec tests,
+16 shared-WAL tests and 41 SDK tests, with 487 MVCC tests passing and 14 still failing. Each remaining
+failure was traced to a retained closed connection, completed state machine,
+pager/store, or artifact fixture owner. Source 62a62c explicitly retires those
+objects. Run 42511287821 passed 2899 core tests with one remaining failure: the
+logical-log fuzz fixture retained the previous pager across restart and used it
+with the new store. Source 2d826 corrects that fixture to obtain the new
+connection's pager. Exact-source run 42512200110 passed the full core suite
+with conn_raw_api,bench,io_uring (2902 passed, zero failed, 174 ignored), SDK41,
+actual native ordinary ownership5 (including Uring), marker5, strict Linux
+library/tests Clippy and formatting, plus Windows compilation. The marker log
+includes the deliberately failing child used to verify supervisor rejection; its
+final parent summary is five passed and zero failed. Root's combined six-PR
+integration remains a separate gate. No production lock was weakened and no test
+copies/replaces the database to avoid exclusion.
+
+Linux test-lint cleanup is separately released as 6ada01704 (tree-identical to
+15196c7, validated by run 42510494682). All non-harness warnings are fixed. Rust 1.88's
+large_stack_frames lint reproduces on a standalone crate with 3076 empty tests,
+allocating 541416 bytes for the generated libtest harness. The exception is scoped
+to cfg(test); the workspace threshold and non-test denial remain unchanged. An
+injected oversized non-test engine function was rejected at its actual core/lib.rs
+span, and restored production lint passed. This explicitly relaxes that one lint
+for test builds, not for production engine builds.
+
+The strengthened exclusion applies to independently opened raw native handles
+in the same process. High-level cached Database opens still share their existing
+owner and are tested separately by the SDK and cached RW/RO/hardlink controls.
+The change does not promise compatibility with ordinary locked opens on systems
+without OFD support. NoLock/ReadOnly behavior is not used as a blanket escape
+for restart tests: previous owners must actually retire before a new owner opens.
+
+### Explicit downgrade recovery dispatch
+
+The private operation selector adds ResumeDowngradeMarker and
+ResumeDowngradeCleanup. Marker recovery consumes the completed marker capability
+through cleanup before returning success; cleanup recovery accepts only the
+existing marker2-only capability. Neither operation creates fresh downgrade
+authority from a pathname. Source-proof rejection keeps its original diagnostic;
+errors after entering marker completion report that ordinary WAL may already be
+published and recovery or cleanup remains incomplete. The existing actual
+three-phase marker SIGKILL and ten-phase cleanup SIGKILL tests exercise these
+operation entries, with namespace/log removal and ordinary payload reopening as
+postconditions. Dispatcher validation is pending.
