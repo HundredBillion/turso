@@ -749,4 +749,37 @@ mod tests {
         assert_child_excluded(&fixture.path);
         connection.execute("SELECT value FROM preserved").unwrap();
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_creation_native_missing_wal_is_created_before_intent() {
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture = installed_fixture();
+        let wal = PathBuf::from(format!("{}-wal", fixture.path.display()));
+        std::fs::remove_file(&wal).unwrap();
+        let before = unchanged_files(&fixture);
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .expect("genuine installed checkpoint must durably create its missing basename WAL");
+        assert_unchanged(&before);
+        let metadata = std::fs::symlink_metadata(&wal).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        let expected = crate::io::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        assert_eq!(
+            intent.record().downgrade_intent().unwrap().basename_wal_id,
+            expected
+        );
+        assert_eq!(std::fs::metadata(&wal).unwrap().ino(), expected.ino);
+    }
 }
