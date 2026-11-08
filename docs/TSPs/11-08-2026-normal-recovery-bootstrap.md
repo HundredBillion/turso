@@ -43,7 +43,7 @@ Store construction extends SharedStoreReservation with one consuming operation:
 pub(super) fn construct_store(
     self,
     allocator: crate::alloc::DynAllocator,
-) -> Result<Arc<crate::mvcc::MvStore>>;
+) -> Result<Arc<crate::MvStore>>;
 ```
 
 It allocates a fresh Store using actual runtime.storage, the supplied default Database allocator and MvccClock, with passive checkpointing disabled. It retains the reservation while allocation may fail. Under the existing claim mutex, it validates Reserved, attaches this newly created, never-exposed Store to the actual Runtime, transitions to Attached and disarms the token before its destructor runs. No fallible operation follows a successful attachment before the token is disarmed. Failure before attachment drops the unused Store before releasing the reservation. No arbitrary preexisting Store is accepted. Preserve same-Store ordinary attach idempotence.
