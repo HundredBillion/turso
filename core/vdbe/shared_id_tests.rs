@@ -618,3 +618,49 @@ mod shared_watermark_io_tests;
 
 #[path = "shared_watermark_process_tests.rs"]
 mod shared_watermark_process_tests;
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_rollback_to_releases_only_scoped_claims() {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let snapshot = store.read_snapshot_ts(outer);
+    first.execute("SAVEPOINT scope").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'scoped')")
+        .unwrap();
+    first.execute("SAVEPOINT nested").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(88,'nested')")
+        .unwrap();
+    first.execute("RELEASE nested").unwrap();
+    first.execute("ROLLBACK TO scope").unwrap();
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    let error = second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::LimboError::Busy),
+        "prior claim lost: {error:?}"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer'),(88,'peer')")
+        .expect("ROLLBACK TO acknowledged but retained scoped ID claims");
+    // The named frame remains usable, and its earlier outer claim is still live.
+    first.execute("ROLLBACK TO scope").unwrap();
+    first.execute("RELEASE scope").unwrap();
+    first.execute("ROLLBACK").unwrap();
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap();
+}
