@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: bb6973f6fba28aa2b6e2f3e71993be1e45eb6272
+          ref: cddbf1f0eac28bc2a8b449a32cbb2809087f2938
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = bb6973f6fba28aa2b6e2f3e71993be1e45eb6272
+          test "$(git rev-parse HEAD)" = cddbf1f0eac28bc2a8b449a32cbb2809087f2938
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_crash_fixtures_keep_acknowledged_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee crash-fixture-green.log
           grep -q '1 passed; 0 failed' crash-fixture-green.log
       - name: Mirror actual intent without readiness
@@ -35,13 +35,15 @@ jobs:
           set -euo pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_mirrors_actual_crashed_selection -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-mirror-green.log
           grep -q '1 passed; 0 failed' intent-mirror-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_two_full_syncs_before_owner -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-full-sync-green.log
+          grep -q '1 passed; 0 failed' intent-full-sync-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: interrupted-intent-mirror-green-bb6973f6f
+          name: interrupted-intent-mirror-green-cddbf1f0e
           path: |
             source.txt
             *.log
