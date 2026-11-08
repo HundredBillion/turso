@@ -33,4 +33,10 @@
 
 ## Acceptance evidence
 
-Exact runtime7a8717eee3c664433230789fe00f0ffc507f82ba passed native Linux run42520469060: allfourAPI/SQLmodes and bounded/readonly/reader refusal controls3, existingReady4 andinstallation6; strict productionlib andalltargetsClippy withconn_raw_api,bench,io_uring, andfmt. Baselinebff42519852274 selected3andfailed3 for missingmirroredintent; expandedc2 baseline42520262278 selected3andfailedonlySQLPASSIVE attranslation. Independentperformancepeerreviewaccepted thetypedlifetime/resultlockchain andthe7-linefollowup. Ordinary C/PDOactivationremainsdisabled.
+Native Linux run [42520469060](https://github.com/HundredBillion/turso/actions/runs/42520469060) passed on exact runtime commit `7a8717eee3c664433230789fe00f0ffc507f82ba`:
+
+- Three entry tests covering all four API and SQL checkpoint modes, bounded requests, read-only access, and preservation of live readers after BUSY.
+- Four existing Ready tests and six installation tests.
+- Strict Clippy for the production library and all targets with `conn_raw_api,bench,io_uring`, plus formatting.
+
+The first baseline, run 42519852274 on `bff85abeb`, selected three tests and failed all three because the public paths lacked mirrored intent. The expanded baseline, run 42520262278 on `c2da24455`, selected three tests and failed only SQL PASSIVE at translation. Independent review accepted the ownership chain and result lock timing, identified the PASSIVE omission, and accepted its seven-line correction. Public C/PDO activation remains disabled.
