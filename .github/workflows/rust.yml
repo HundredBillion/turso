@@ -1,4 +1,4 @@
-name: Physical WAL full crash-class targeted GREEN
+name: Physical WAL recovery final crash-class validation
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c957a99599d35f3c8facedd1d7e2416103ed651b
+          ref: 041025a05417521b847948c8eeef74591449ceb3
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = c957a99599d35f3c8facedd1d7e2416103ed651b
+          test "$(git rev-parse HEAD)" = 041025a05417521b847948c8eeef74591449ceb3
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee precommit-green.log
           grep -q '4 passed; 0 failed' precommit-green.log
           test "$(grep -c PRECOMMIT_SOURCE_UNCHANGED precommit-green.log)" = 10
@@ -35,29 +35,37 @@ jobs:
           test "$(grep -c PRECOMMIT_FULL_MAIN_BARRIER precommit-green.log)" = 5
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-io-green.log
           grep -q '2 passed; 0 failed' physical-io-green.log
+          test "$(grep -c PHYSICAL_IO_CASE physical-io-green.log)" = 32
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee committed-green.log
           grep -q '5 passed; 0 failed' committed-green.log
           python3 - <<'PATCH'
           p='core/mvcc/database/shared_checkpoint_recovery_wal.rs'
-          s=open(p).read(); old='                    self.physical.as_ref().unwrap().install_empty(&evidence)?;'
-          assert s.count(old)==1
-          open(p,'w').write(s.replace(old,''))
+          s=open(p).read(); a=s.index('                    if self.nonempty_uncommitted\n'); b=s.index('                    self.pager =',a)
+          open(p,'w').write(s[:a]+s[b:])
           PATCH
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_stale_odd_map_recovers_before_fresh_readonly_peer -- --ignored --test-threads=1 --nocapture > derived-repair-red.log 2>&1
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_rejects_non_source_main_without_writes -- --ignored --test-threads=1 --nocapture > exact-source-gate-red.log 2>&1
           code=$?
           set -e
           git restore core/mvcc/database/shared_checkpoint_recovery_wal.rs
-          cat derived-repair-red.log
+          cat exact-source-gate-red.log
           test "$code" -ne 0
-          grep -q '0 passed; 1 failed' derived-repair-red.log
-          grep -q 'fresh peer cannot use an odd derived map' derived-repair-red.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee committed-restored-green.log
-          grep -q '5 passed; 0 failed' committed-restored-green.log
+          grep -q '0 passed; 1 failed' exact-source-gate-red.log
+          grep -q 'nonempty uncommitted WAL accepted a main outside exact source' exact-source-gate-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee precommit-restored-green.log
+          grep -q '4 passed; 0 failed' precommit-restored-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owner-green.log
           grep -q '8 passed; 0 failed' owner-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-green.log
           grep -q '9 passed; 0 failed' intent-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee full-core.log
+          python3 - <<'CHECK'
+          import re
+          s=open('full-core.log').read()
+          rows=re.findall(r'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored',s)
+          assert rows and rows[-1]==('2900','0','164'),rows[-3:]
+          print('FINAL_CORE_PARENT',rows[-1])
+          CHECK
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
@@ -65,6 +73,35 @@ jobs:
         if: always()
         with:
           name: committed-physical-wal-green
+          path: |
+            source.txt
+            *.log
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 041025a05417521b847948c8eeef74591449ceb3
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Windows library boundary check
+        run: |
+          set -euo pipefail
+          rustc --version
+          git rev-parse HEAD | tee source.txt
+          test "$(git rev-parse HEAD)" = 041025a05417521b847948c8eeef74591449ceb3
+          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-check.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: physical-wal-windows
           path: |
             source.txt
             *.log
