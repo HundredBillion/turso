@@ -46,9 +46,9 @@ jobs:
           python3 - <<'PYCONTROL'
           p='core/mvcc/database/shared_checkpoint_recovery_confirmation.rs'
           s=open(p).read()
-          old='        let max_owner_epoch = ids.max_owner_epoch();'
+          old='    let max_owner_epoch = ids.max_owner_epoch();'
           assert s.count(old)==1
-          s=s.replace(old,'        let max_owner_epoch = None;')
+          s=s.replace(old,'    let max_owner_epoch = None;')
           open(p,'w').write(s)
           PYCONTROL
           set +e
