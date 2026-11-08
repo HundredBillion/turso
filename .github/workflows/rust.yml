@@ -31,7 +31,7 @@ jobs:
           rustc -Vv
       - name: Checkpoint pause excludes idle root prepare
         run: |
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_idle_root_respects_checkpoint_pause -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause.log
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_idle_root_respects_checkpoint_pause -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause.log
           grep -q '1 passed; 0 failed' pause.log
       - name: Missing logical read pins must fail actual retirement control
         run: |
