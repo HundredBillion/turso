@@ -1,4 +1,4 @@
-name: Physical WAL exclusion RED
+name: Physical WAL exclusion GREEN
 on:
   workflow_dispatch:
 permissions:
@@ -7,7 +7,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  physical-owner-red:
+  physical-owner-green:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -18,30 +18,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 3148fa59eb316c332b59f5c00fc0459ef3a08a65
+          ref: f8d116cd1b2f83f0588f4d7b39c9713f1fd11674
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Missing physical exclusion behavior
+      - name: Actual physical exclusion behavior
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 3148fa59eb316c332b59f5c00fc0459ef3a08a65
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_owns_all_slots_until_drop -- --ignored --test-threads=1 --nocapture > physical-owner-red.log 2>&1
-          code=$?
-          set -e
-          cat physical-owner-red.log
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' physical-owner-red.log
-          grep -q 'physical WAL recovery exclusion is not implemented' physical-owner-red.log
+          test "$(git rev-parse HEAD)" = f8d116cd1b2f83f0588f4d7b39c9713f1fd11674
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_owns_all_slots_until_drop -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
+          grep -q '1 passed; 0 failed' physical-owner-green.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: physical-owner-red
+          name: physical-owner-green
           path: |
             source.txt
             *.log
