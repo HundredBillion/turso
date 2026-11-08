@@ -1,101 +1,58 @@
-name: Shared downgrade preparation
+name: Explicit offline operator
 on:
   workflow_dispatch:
 permissions:
   contents: read
-env:
-  CARGO_TERM_COLOR: never
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
 defaults:
   run:
     shell: bash
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
 jobs:
-  schema:
+  cli:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 237a662edea1287bc287fbd85bfb7085544f1859
+          ref: ab55ac39096114d78cafdc7d8fc670e0c8f2b275
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Record exact source and filesystem
+      - name: Exact non-test executable
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 237a662edea1287bc287fbd85bfb7085544f1859
+          test "$(git rev-parse HEAD)" = ab55ac39096114d78cafdc7d8fc670e0c8f2b275
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Actual process recovery dispatcher
+          cargo build --locked -p turso_cli --bin tursodb 2>&1 | tee build.log
+          sha256sum target/debug/tursodb | tee binary-sha256.txt
+          target/debug/tursodb --version | tee version.txt
+          ldd target/debug/tursodb | tee libraries.txt
+      - name: Reject before mutation
         run: |
-          for pair in resume:4 partial:4 cleanup:2 creation:2 extent:1 marker:5; do
-            kind="${pair%:*}"; count="${pair#*:}"
-            timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,bench,io_uring "shared_downgrade_${kind}_native_" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$kind.log"
-            grep '^test result:' "$kind.log" | tail -1 | grep -q "^test result: ok. $count passed; 0 failed;"
-          done
-      - name: Causal control omits dispatcher cleanup
+          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case no-write 2>&1 | tee no-write.log
+          grep -q '"result": "passed"' no-write.log
+      - name: Genuine closed-worker downgrade expected RED
         run: |
-          cp core/mvcc/mode_transition/operation.rs /tmp/operation.good.rs
-          python3 - <<'PYCONTROL'
-          from pathlib import Path
-          p=Path('core/mvcc/mode_transition/operation.rs')
-          s=p.read_text()
-          old='super::downgrade_resume::resume_marker(path, history_limit, prerequisite)?.cleanup()'
-          assert s.count(old)==1
-          s=s.replace(old,'let _completed = super::downgrade_resume::resume_marker(path, history_limit, prerequisite)?; Ok(())')
-          old='super::downgrade_cleanup::resume_cleanup(path, prerequisite)'
-          assert s.count(old)==1
-          s=s.replace(old,'let _ = (path, prerequisite); Ok(())')
-          p.write_text(s)
-          PYCONTROL
-          git diff > omitted-cleanup.diff
-          for kind in resume partial; do
-            set +e
-            timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,bench,io_uring "shared_downgrade_${kind}_native_sigkill_" -- --ignored --test-threads=1 --nocapture > "control-$kind.log" 2>&1
-            status=$?
-            set -e
-            echo "$status" > "control-$kind-status.txt"
-            test "$status" -eq 101
-            grep '^test result:' "control-$kind.log" | tail -1 | grep -q '^test result: FAILED. 0 passed; 1 failed;'
-          done
-          cp /tmp/operation.good.rs core/mvcc/mode_transition/operation.rs
-          git diff --exit-code
-          for kind in resume partial; do
-            timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api,bench,io_uring "shared_downgrade_${kind}_native_sigkill_" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "restored-$kind.log"
-            grep '^test result:' "restored-$kind.log" | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
-          done
-      - name: Strict library lint and formatting
-        run: |
-          cargo clippy --locked -p turso_core --lib --tests --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
+          set +e
+          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case roundtrip > roundtrip.log 2>&1
+          status=$?
+          set -e
+          echo "$status" | tee roundtrip-status.txt
+          test "$status" -eq 1
+          grep -q 'offline downgrade orchestration is not implemented' roundtrip.log
+          grep -q '1|after' roundtrip.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-downgrade-preparation
+          name: shared-offline-operator
           path: |
-            source.txt
-            rustc.txt
             *.log
-            *.diff
-            *status.txt
-            *summary.txt
+            *.txt
           retention-days: 14
-
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 237a662edea1287bc287fbd85bfb7085544f1859
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-windows
-          cache-on-failure: true
-      - run: cargo check --locked -p turso_core --lib --features conn_raw_api
