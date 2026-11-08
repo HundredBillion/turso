@@ -58,7 +58,9 @@ PHP's SQLite3 class rewrites database URIs and does not provide this opt-in.
 write access. Unsupported backends fail explicitly.
 
 `PRAGMA turso_mvcc_mode` reports `shared` only for an actual shared store,
-`private` for ordinary MVCC, and `off` otherwise. It cannot change database mode.
+`private` for ordinary MVCC, and `off` otherwise, as observed when the statement
+is prepared. Prepare a new statement after changing ordinary journal mode.
+Shared mode changes require an offline operation. The pragma cannot change mode.
 Explicit checkpoints use the globally quiescent shared protocol and return BUSY
 while participants retain transactions, preserving existing readers.
 

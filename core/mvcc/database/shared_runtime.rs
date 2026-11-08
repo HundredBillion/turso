@@ -428,7 +428,20 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
             return Ok(());
         };
         let io = connection.get_pager().io.clone();
-        let mut open = runtime.begin_open()?;
+        let mut busy = crate::busy::BusyHandlerState::new(io.current_time_monotonic());
+        let mut open = loop {
+            match runtime.begin_open() {
+                Ok(open) => break open,
+                Err(LimboError::Busy) => {
+                    let now = io.current_time_monotonic();
+                    if !busy.invoke(&connection.get_busy_handler(), now) {
+                        return Err(LimboError::Busy);
+                    }
+                    io.sleep(busy.get_delay(now));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if connection.get_mv_tx().is_some() {
             return Ok(());
         }

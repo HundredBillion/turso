@@ -653,8 +653,9 @@ PRAGMA turso_mvcc_mode;
 ```
 
 The result is `shared` for explicitly initialized shared MVCC, `private` for
-ordinary MVCC, or `off` when MVCC is disabled. This informational pragma is
-read-only. Changing an existing database into shared mode requires the explicit
+ordinary MVCC, or `off` when MVCC is disabled, as observed when the statement is
+prepared. Prepare a new statement after changing ordinary journal mode. This
+informational pragma is read-only. Changing an existing database into shared mode requires the explicit
 offline upgrade with all older workers stopped.
 
 <Info>
