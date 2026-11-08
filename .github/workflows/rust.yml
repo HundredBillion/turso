@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 981efd91f6c70aecbeb7ff5e4bcbfcdc9d111d48
+          ref: 75abe7acfb7b27ba78b8aa156c43c25a7fa6fcb6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,29 +24,29 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 981efd91f6c70aecbeb7ff5e4bcbfcdc9d111d48
+          test "$(git rev-parse HEAD)" = 75abe7acfb7b27ba78b8aa156c43c25a7fa6fcb6
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee build.log
-      - name: Expected scoped rollback regression
+      - name: Named scoped rollback
         run: |
           set -o pipefail
-          set +e
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee lifecycle-red.log
-          code=${PIPESTATUS[0]}
-          set -e
-          test "$code" = 101
-          grep -q '0 passed; 4 failed' lifecycle-red.log
-          grep -q 'ROLLBACK TO acknowledged but retained scoped ID claims' lifecycle-red.log
-          grep -q 'failed statement rolled back but retained scoped ID claim' lifecycle-red.log
-          grep -q 'abandoned statement retained its scoped ID claim' lifecycle-red.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_rollback_to_releases_only_scoped_claims -- --ignored --test-threads=1 --nocapture 2>&1 | tee named-green.log
+          grep -q '1 passed; 0 failed' named-green.log
+      - name: Existing named rollback and ID policy
+        run: |
+          set -o pipefail
+          cargo test --locked -p turso_core --lib --features conn_raw_api named_savepoint 2>&1 | tee named-regressions.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api id_policy_ 2>&1 | tee policy.log
+          grep -q '12 passed; 0 failed' policy.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-lifecycle-red
+          name: shared-id-named-release
           path: |
             source.txt
             rustc.txt
