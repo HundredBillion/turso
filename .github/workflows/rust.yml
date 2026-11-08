@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -33,7 +33,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "57e1589300ee76f4e9b5b550d8729e40d5c91dfe"
+          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -120,6 +120,22 @@ jobs:
         run: |
           timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade.log
           grep -q "7 passed; 0 failed" downgrade.log
+      - name: Ordinary native file ownership after downgrade
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api,io_uring linux_ordinary_lock_native_ -- --ignored --test-threads=1 2>&1 | tee ordinary-locks.log
+          grep -q '5 passed; 0 failed' ordinary-locks.log
+      - name: Fresh downgrade resume and partial cleanup
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-resume.log
+          grep -q '4 passed; 0 failed' downgrade-resume.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_partial_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-partial.log
+          grep -q '4 passed; 0 failed' downgrade-partial.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-cleanup.log
+          grep -q '2 passed; 0 failed' downgrade-cleanup.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-wal.log
+          grep -q '2 passed; 0 failed' downgrade-wal.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_extent_native_ -- --ignored --test-threads=1 2>&1 | tee downgrade-extent.log
+          grep -q '1 passed; 0 failed' downgrade-extent.log
       - name: Actual shared database open and downgrade marker
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_open_native_ -- --ignored --test-threads=1 2>&1 | tee shared-open.log
@@ -153,7 +169,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -180,7 +196,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -194,7 +210,7 @@ jobs:
           php -l bindings/c/tests/php_workers/worker.php
       - name: Exact source and supervisor controls
         run: |
-          test "$(git rev-parse HEAD)" = "57e1589300ee76f4e9b5b550d8729e40d5c91dfe"
+          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
           python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py' 2>&1 | tee supervisor.log
           python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output pdo-results/sqlite-control 2>&1 | tee sqlite-pdo.log
       - name: Build and attest actual Turso PDO library
@@ -245,7 +261,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 57e1589300ee76f4e9b5b550d8729e40d5c91dfe
+          ref: 45c4ded4a3d364f9ba9b45dcad34fcb80516c248
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -253,7 +269,7 @@ jobs:
           cache-on-failure: true
       - name: Exact source and production lint
         run: |
-          test "$(git rev-parse HEAD)" = "57e1589300ee76f4e9b5b550d8729e40d5c91dfe"
+          test "$(git rev-parse HEAD)" = "45c4ded4a3d364f9ba9b45dcad34fcb80516c248"
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee production-lint.log
       - name: Strict core C SDK targets
         run: |
