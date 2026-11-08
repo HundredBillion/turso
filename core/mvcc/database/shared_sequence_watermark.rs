@@ -1,6 +1,6 @@
 use super::*;
 use crate::mvcc::database::shared_id_oracle::SharedIdOracle;
-use crate::mvcc::shared_ids::journal::Domain;
+use crate::mvcc::shared_ids::journal::{Domain, Owner};
 use crate::mvcc::shared_ids::policy::{
     CommittedIdOracle, IdAction, IdFact, IdOperation, IdQuery, IdResult,
 };
@@ -131,11 +131,41 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                         descending: pending.sequence.increment_by < 0
                     }
                 ));
-                let IdFact::SequenceState(row) = fact else {
+                let IdFact::SequenceState { committed, row } = fact else {
                     return Err(LimboError::InternalError(
                         "watermark oracle returned another fact".into(),
                     )
                     .into());
+                };
+                let provisional_owner = if committed {
+                    None
+                } else {
+                    let tx_id = connection
+                        .get_mv_tx_id_for_db(0)
+                        .ok_or(LimboError::SchemaUpdated)?;
+                    let tx = self.txs.get(&tx_id).ok_or(LimboError::SchemaUpdated)?;
+                    tx.value().ensure_peer_unconflicted()?;
+                    if tx.value().state.load() != TransactionState::Active
+                        || !tx
+                            .value()
+                            .created_table_ids
+                            .lock()
+                            .iter()
+                            .any(|table| i64::from(*table) == domain.table)
+                    {
+                        return Err(LimboError::SchemaUpdated.into());
+                    }
+                    let registration = tx
+                        .value()
+                        .shared_snapshot
+                        .as_ref()
+                        .ok_or(LimboError::SchemaUpdated)?
+                        .lock();
+                    let registration = registration.as_ref().ok_or(LimboError::SchemaUpdated)?;
+                    Some(Owner {
+                        epoch: registration.epoch,
+                        begin: registration.begin_timestamp,
+                    })
                 };
                 pending.boundary = row.map(|(value, called)| {
                     first_unsafe_sequence_watermark(&pending.sequence, value, called)
@@ -146,7 +176,10 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     identity,
                     pending.oracle.take().unwrap(),
                     connection.db.io.clone(),
-                    IdAction::LowestLiveSequenceClaim { domain },
+                    IdAction::LowestLiveSequenceClaim {
+                        domain,
+                        provisional_owner,
+                    },
                 )?);
             }
             let outcome = return_if_io!(pending.operation.as_mut().unwrap().poll());

@@ -55,6 +55,7 @@ pub(in crate::mvcc) enum IdAction {
     /// Numeric minimum of live claims, not a complete or chronological scan boundary.
     LowestLiveSequenceClaim {
         domain: Domain,
+        provisional_owner: Option<Owner>,
     },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +73,10 @@ pub(in crate::mvcc) enum IdFact {
     },
     RowExists(bool),
     LogicalFloor(i64),
-    SequenceState(Option<(i64, bool)>),
+    SequenceState {
+        committed: bool,
+        row: Option<(i64, bool)>,
+    },
 }
 pub(in crate::mvcc) trait CommittedIdOracle: Send {
     fn identity(&self) -> RecoveryIdentity;
@@ -490,7 +494,19 @@ fn evaluate(loaded: &LoadedIds, action: IdAction, live: &[(u64, u64)]) -> Result
                 Decision::Return(IdResult::Released)
             }
         }
-        IdAction::LowestLiveSequenceClaim { domain } => {
+        IdAction::LowestLiveSequenceClaim {
+            domain,
+            provisional_owner,
+        } => {
+            if let Some(owner) = provisional_owner {
+                if !loaded.state.claims(owner).any(|(_, claim)| {
+                    claim.key == ClaimKey::LogicalTable && claim.value == domain.table
+                }) {
+                    return Err(invalid(
+                        "provisional sequence has no matching logical table reservation",
+                    ));
+                }
+            }
             let watermark = loaded
                 .state
                 .active_owners()
@@ -542,7 +558,9 @@ fn action_owner(action: IdAction) -> Option<Owner> {
         | IdAction::Savepoint { owner }
         | IdAction::ReleaseOwner { owner } => Some(owner),
         IdAction::ReleaseAfter { mark } => Some(mark.owner),
-        IdAction::LowestLiveSequenceClaim { .. } => None,
+        IdAction::LowestLiveSequenceClaim {
+            provisional_owner, ..
+        } => provisional_owner,
     }
 }
 
@@ -559,9 +577,8 @@ fn validate_action(action: IdAction, generation: u64) -> Result<()> {
         IdAction::ReserveRow { domain, .. } | IdAction::ClaimExplicitRow { domain, .. } => {
             Some((domain, false))
         }
-        IdAction::ClaimSequence { domain, .. } | IdAction::LowestLiveSequenceClaim { domain } => {
-            Some((domain, true))
-        }
+        IdAction::ClaimSequence { domain, .. }
+        | IdAction::LowestLiveSequenceClaim { domain, .. } => Some((domain, true)),
         _ => None,
     };
     if let Some((domain, sequence)) = domain {

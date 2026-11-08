@@ -503,30 +503,53 @@ fn shared_id_opcode_native_provisional_table_accepts_inserts_before_commit() {
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_id_opcode_native_provisional_sequence_watermark_before_commit() {
-    let (_directory, first, _) = pair();
-    first.execute("BEGIN CONCURRENT").unwrap();
-    first
-        .execute("CREATE SEQUENCE provisional_sequence START 5 INCREMENT 2")
-        .unwrap();
-    let outer = first.get_mv_tx_id_for_db(0).unwrap();
-    assert_eq!(
-        integers(&first, "SELECT nextval('provisional_sequence')"),
-        [5]
-    );
-    assert_eq!(
-        integers(
-            &first,
-            "SELECT sequence_watermark_experimental('provisional_sequence')"
-        ),
-        [5]
-    );
-    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
-    first.execute("COMMIT").unwrap();
-    assert_eq!(
-        integers(
-            &first,
-            "SELECT sequence_watermark_experimental('provisional_sequence')"
-        ),
-        [7]
-    );
+    for outcome in ["COMMIT", "ROLLBACK"] {
+        let (_directory, first, _) = pair();
+        first.execute("BEGIN CONCURRENT").unwrap();
+        first
+            .execute("CREATE SEQUENCE provisional_sequence START 5 INCREMENT 2")
+            .unwrap();
+        let outer = first.get_mv_tx_id_for_db(0).unwrap();
+        let mut empty = first
+            .prepare("SELECT sequence_watermark_experimental('provisional_sequence')")
+            .unwrap();
+        let mut rows = 0;
+        empty
+            .run_with_row_callback(|row| {
+                assert!(matches!(row.get_values().next(), Some(crate::Value::Null)));
+                rows += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        drop(empty);
+        assert_eq!(
+            integers(&first, "SELECT nextval('provisional_sequence')"),
+            [5]
+        );
+        assert_eq!(
+            integers(
+                &first,
+                "SELECT sequence_watermark_experimental('provisional_sequence')"
+            ),
+            [5]
+        );
+        assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+        first.execute(outcome).unwrap();
+        if outcome == "COMMIT" {
+            assert_eq!(
+                integers(
+                    &first,
+                    "SELECT sequence_watermark_experimental('provisional_sequence')"
+                ),
+                [7]
+            );
+        } else {
+            assert!(first
+                .execute("SELECT sequence_watermark_experimental('provisional_sequence')")
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist"));
+        }
+    }
 }

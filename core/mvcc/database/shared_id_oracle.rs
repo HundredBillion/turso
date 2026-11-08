@@ -172,7 +172,10 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                 Phase::SequenceRecord => {
                     let value = return_if_io!(cursor.rowid());
                     let Some(value) = value else {
-                        return Ok(self.done(IdFact::SequenceState(None)));
+                        return Ok(self.done(IdFact::SequenceState {
+                            committed: true,
+                            row: None,
+                        }));
                     };
                     let Some(record) = return_if_io!(cursor.record()) else {
                         return Err(LimboError::Corrupt(
@@ -188,7 +191,10 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                             ))
                         }
                     };
-                    return Ok(self.done(IdFact::SequenceState(Some((value, called)))));
+                    return Ok(self.done(IdFact::SequenceState {
+                        committed: true,
+                        row: Some((value, called)),
+                    }));
                 }
                 Phase::Rowid => {
                     let maximum = return_if_io!(cursor.rowid());
@@ -225,7 +231,10 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                                 autoincrement_floor: 0,
                             },
                             IdQuery::RowExists { .. } => IdFact::RowExists(false),
-                            IdQuery::SequenceState { .. } => return Err(LimboError::SchemaUpdated),
+                            IdQuery::SequenceState { .. } => IdFact::SequenceState {
+                                committed: false,
+                                row: None,
+                            },
                         };
                         return Ok(self.done(fact));
                     };
