@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6abf3c5618ee5e6715916bce648ef9b6378fc4cf
+          ref: 15196c7e8a1479de8f6035447c3c83486d5db276
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 6abf3c5618ee5e6715916bce648ef9b6378fc4cf
+          test "$(git rev-parse HEAD)" = 15196c7e8a1479de8f6035447c3c83486d5db276
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Exact Linux test lint diagnostics
@@ -51,6 +51,30 @@ jobs:
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee library-clippy.log
           cargo fmt --all --check
+      - name: Oversized production engine function causal control
+        run: |
+          cp core/lib.rs /tmp/accepted-lib.rs
+          trap 'cp /tmp/accepted-lib.rs core/lib.rs' EXIT
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path('core/lib.rs')
+          p.write_text(p.read_text() + '\npub fn validation_oversized_engine_frame() { let bytes = [0_u8; 600_000]; std::hint::black_box(bytes); }\n')
+          PYCONTROL
+          set +e
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring --message-format=json -- -D warnings > engine-control.json 2> engine-control.log
+          code=$?
+          set -e
+          test "$code" -ne 0
+          python3 - <<'PYCONTROL'
+          import json
+          from pathlib import Path
+          messages = [json.loads(line) for line in Path('engine-control.json').read_text().splitlines() if line.startswith('{')]
+          messages = [m['message'] for m in messages if m.get('reason') == 'compiler-message']
+          assert any((m.get('code') or {}).get('code') == 'clippy::large_stack_frames' and any(s['file_name'] == 'core/lib.rs' and s['is_primary'] for s in m['spans']) for m in messages)
+          PYCONTROL
+          cp /tmp/accepted-lib.rs core/lib.rs
+          git diff --exit-code
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee engine-restored.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -61,6 +85,7 @@ jobs:
             *.log
             test-clippy.json
             empty-harness.json
+            engine-control.json
             *.diff
             *status.txt
             *summary.txt
