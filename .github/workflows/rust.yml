@@ -1,4 +1,4 @@
-name: Physical WAL I/O owner GREEN
+name: Committed physical WAL recovery RED
 on:
   workflow_dispatch:
 permissions:
@@ -7,7 +7,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  physical-owner-green:
+  physical-wal-red:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -18,108 +18,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
+          ref: 2c0ff89aff3359f652952bbb372d1b8362e9130f
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Causal native ownership controls and exact restored source
+      - name: Genuine committed WAL fixtures then missing recovery
         run: |
           set -euo pipefail
-          uname -a | tee environment.txt
-          stat -f -c '%T %t' /tmp "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a environment.txt
-          rustc --version | tee -a environment.txt
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
-          python3 - <<'PATCH'
-          p='core/storage/shared_wal_recovery.rs'
-          s=open(p).read(); old='            || local.reader_locks.iter().any(|count| *count != 0)\n'
-          assert s.count(old)==1
-          open(p,'w').write(s.replace(old,''))
-          PATCH
+          test "$(git rev-parse HEAD)" = 2c0ff89aff3359f652952bbb372d1b8362e9130f
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_crash_fixtures_cover_old_partial_and_synced_main -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-wal-fixtures-green.log
+          grep -q '1 passed; 0 failed' physical-wal-fixtures-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-regression-green.log
+          grep -q '9 passed; 0 failed' intent-regression-green.log
           set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_local_owners_remain_valid_until_release -- --ignored --test-threads=1 --nocapture > local-reader-control-red.log 2>&1
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_restores_committed_image_without_completion_or_admission -- --ignored --test-threads=1 --nocapture > physical-wal-missing-red.log 2>&1
           code=$?
           set -e
-          git restore core/storage/shared_wal_recovery.rs
-          cat local-reader-control-red.log
+          cat physical-wal-missing-red.log
           test "$code" -ne 0
-          grep -q '0 passed; 1 failed' local-reader-control-red.log
-          python3 - <<'PATCH'
-          p='core/mvcc/guarded_file.rs'
-          s=open(p).read(); old='        _physical: slot.physical.clone(),'
-          assert s.count(old)==1
-          open(p,'w').write(s.replace(old,'        _physical: None,'))
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_binding_retains_both_authorities_until_backend_retirement -- --ignored --test-threads=1 --nocapture > physical-capture-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/guarded_file.rs
-          cat physical-capture-control-red.log
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' physical-capture-control-red.log
-          grep -q 'physical reader admitted before backend retirement' physical-capture-control-red.log
-          git diff --exit-code
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-restored-green.log
-          grep -q '8 passed; 0 failed' physical-owner-restored-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee checkpoint-recovery-green.log
-          grep -q '24 passed; 0 failed' checkpoint-recovery-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee full-core-green.log
+          grep -q '0 passed; 1 failed' physical-wal-missing-red.log
+          grep -q 'committed physical WAL recovery is not implemented' physical-wal-missing-red.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: physical-owner-final-1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
+          name: committed-physical-wal-red
           path: |
             source.txt
-            environment.txt
             *.log
-
-  physical-owner-windows:
-    needs: physical-owner-green
-    runs-on: windows-2022
-    timeout-minutes: 30
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_INCREMENTAL: 0
-      CARGO_PROFILE_DEV_DEBUG: 0
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: pager-generation-windows-0b37
-      - name: Check exact Windows library
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
-          python3 - <<'PATCH'
-          p='core/storage/shared_wal_coordination.rs'
-          s=open(p).read(); old='#[path = "shared_wal_recovery.rs"]\nmod recovery;\npub(crate) use recovery::SharedWalRecoveryLocks;'
-          assert s.count(old)==1
-          new='#[cfg(unix)]\n#[path = "shared_wal_recovery.rs"]\nmod recovery;\n#[cfg(unix)]\npub(crate) use recovery::SharedWalRecoveryLocks;'
-          open(p,'w').write(s.replace(old,new))
-          PATCH
-          set +e
-          cargo check --locked -p turso_core --lib --features bench,conn_raw_api > windows-cfg-control-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/storage/shared_wal_coordination.rs
-          cat windows-cfg-control-red.log
-          test "$code" -ne 0
-          grep -q 'E0432' windows-cfg-control-red.log
-          grep -q 'SharedWalRecoveryLocks' windows-cfg-control-red.log
-          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-owner-check.log
-          git diff --exit-code
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: physical-owner-windows-1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
-          path: |
-            windows-owner-check.log
-            windows-cfg-control-red.log
