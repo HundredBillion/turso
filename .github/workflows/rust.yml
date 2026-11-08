@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b6fb3409f18d4a1822da8f10b430489b42df97fd
+          ref: f1e7ccd94f5c4fab94ea2f83af9355d67e9269c7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,13 +28,13 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b6fb3409f18d4a1822da8f10b430489b42df97fd
+          test "$(git rev-parse HEAD)" = f1e7ccd94f5c4fab94ea2f83af9355d67e9269c7
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Fresh terminal recovery and prior native controls
         run: |
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
-          grep -q '^test result: ok. 1 passed; 0 failed;' resume.log
+          grep -q '^test result: ok. 4 passed; 0 failed;' resume.log
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
           grep -q '^test result: ok. 2 passed; 0 failed;' creation.log
           timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
@@ -64,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b6fb3409f18d4a1822da8f10b430489b42df97fd
+          ref: f1e7ccd94f5c4fab94ea2f83af9355d67e9269c7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
