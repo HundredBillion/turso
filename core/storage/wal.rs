@@ -618,6 +618,10 @@ trait WalCoordination: Debug + Send + Sync {
     /// Record a newly appended frame in the backend's page-to-frame lookup state.
     fn cache_frame(&self, page_id: u64, frame_id: u64);
 
+    fn reserve_frames(&self, _last_frame: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
 
@@ -2474,6 +2478,10 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.mark_initialized();
     }
 
+    fn reserve_frames(&self, last_frame: u64) -> Result<()> {
+        self.authority.reserve_frames(last_frame)
+    }
+
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         self.fallback.cache_frame(page_id, frame_id);
         self.authority.record_frame(page_id, frame_id);
@@ -2853,6 +2861,7 @@ pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
     coordination: Arc<dyn WalCoordination>,
+    read_file_override: Option<Arc<dyn File>>,
 
     syncing: Arc<AtomicBool>,
     write_lock_held: AtomicBool,
@@ -3257,6 +3266,35 @@ fn pack_checksum(checksum: (u32, u32)) -> u64 {
 }
 
 impl WalFile {
+    #[cfg(any(all(host_shared_wal, unix), test))]
+    pub(crate) fn with_read_file(mut self, file: Arc<dyn File>) -> Result<Self> {
+        let expected = self.coordination.wal_file()?.file_id()?.ok_or_else(|| {
+            LimboError::InvalidArgument("WAL read override requires retained file identity".into())
+        })?;
+        if file.file_id()? != Some(expected) {
+            return Err(LimboError::InvalidArgument(
+                "WAL read override identity mismatch".into(),
+            ));
+        }
+        self.read_file_override = Some(file);
+        Ok(self)
+    }
+
+    fn read_file(&self) -> Result<Arc<dyn File>> {
+        let actual = self.coordination.wal_file()?;
+        if let Some(file) = &self.read_file_override {
+            let expected = actual.file_id()?.ok_or_else(|| {
+                LimboError::InvalidArgument("WAL read override lost retained file identity".into())
+            })?;
+            if file.file_id()? != Some(expected) {
+                return Err(LimboError::InvalidArgument(
+                    "WAL read override identity changed".into(),
+                ));
+            }
+            return Ok(file.clone());
+        }
+        Ok(actual)
+    }
     fn prepare_transformed_frame(
         buffer_pool: &Arc<BufferPool>,
         wal_header: &WalHeader,
@@ -3769,6 +3807,7 @@ impl Wal for WalFile {
             page.get().id(),
             frame_id
         );
+        let file = self.read_file()?;
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
@@ -3801,7 +3840,6 @@ impl Wal for WalFile {
         });
         // important not to hold shared state locks beyond this point to avoid deadlock with
         // completions that re-enter WAL state while a writer is waiting.
-        let file = self.coordination.wal_file()?;
         begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -3840,6 +3878,7 @@ impl Wal for WalFile {
             );
         }
 
+        let file = self.read_file()?;
         // Lock each target page and pre-allocate its destination buffer so the
         // completion callback only parses headers, decrypts/verifies, and copies.
         let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::with_capacity(count);
@@ -3967,7 +4006,6 @@ impl Wal for WalFile {
         if let Some(group) = group {
             group.add(&c);
         }
-        let file = self.coordination.wal_file()?;
         file.pread(offset, c)
     }
 
@@ -4033,7 +4071,7 @@ impl Wal for WalFile {
             }
             None
         });
-        let file = self.coordination.wal_file()?;
+        let file = self.read_file()?;
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
         Ok(c)
     }
@@ -4109,7 +4147,7 @@ impl Wal for WalFile {
                     None
                 }
             });
-            let file = self.coordination.wal_file()?;
+            let file = self.read_file()?;
             let c = begin_read_wal_frame(
                 file.as_ref(),
                 offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -4129,6 +4167,7 @@ impl Wal for WalFile {
             };
         }
 
+        self.coordination.reserve_frames(frame_id)?;
         // perform actual write
         let offset = self.frame_offset(frame_id);
         let header = self.coordination.wal_header();
@@ -4632,6 +4671,11 @@ impl Wal for WalFile {
             rolling_checksum = (header.checksum_1, header.checksum_2);
         }
 
+        self.coordination.reserve_frames(
+            next_frame_id
+                .checked_add(pages.len() as u64 - 1)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )?;
         let first_frame_id = next_frame_id;
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
@@ -4738,6 +4782,12 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
+        self.coordination.reserve_frames(
+            self.max_frame
+                .load(Ordering::Acquire)
+                .checked_add(pages.len() as u64)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )?;
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         let mut rolling_checksum = if next_frame_id == 1 {
             (header.checksum_1, header.checksum_2)
@@ -4899,6 +4949,7 @@ impl WalFile {
         Self {
             io,
             coordination,
+            read_file_override: None,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
             max_frame: AtomicU64::new(max_frame),
             ongoing_checkpoint: RwLock::new(OngoingCheckpoint {
@@ -5537,7 +5588,7 @@ impl WalFile {
             })
         };
         // schedule read of the page payload
-        let file = self.coordination.wal_file()?;
+        let file = self.read_file()?;
         let c = begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -5840,6 +5891,11 @@ impl WalFileShared {
         db_file: &Arc<dyn DatabaseStorage>,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let snapshot = authority.snapshot();
+        let flags = if flags.contains(crate::OpenFlags::ReadOnly) {
+            flags
+        } else {
+            flags | crate::OpenFlags::Create
+        };
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -5973,6 +6029,11 @@ impl WalFileShared {
         path: &str,
         flags: crate::OpenFlags,
     ) -> Result<OpenSharedWal> {
+        let flags = if flags.contains(crate::OpenFlags::ReadOnly) {
+            flags
+        } else {
+            flags | crate::OpenFlags::Create
+        };
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -6159,11 +6220,15 @@ pub mod test {
         Wal, WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile,
         WalSnapshot, NO_LOCK_HELD,
     };
+    use crate::io::CompletionGroup;
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
-    use crate::sync::{atomic::Ordering, Arc};
+    use crate::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use crate::sync::{Mutex, RwLock};
     use crate::EngineDialect;
     use crate::{
@@ -6883,6 +6948,136 @@ pub mod test {
             Err(LimboError::CompletionError(err)) => err,
             other => panic!("expected completion error, got {other:?}"),
         }
+    }
+
+    struct IdentityReadProbe {
+        inner: Arc<dyn File>,
+        id: crate::io::FileId,
+        reads: AtomicUsize,
+    }
+    impl File for IdentityReadProbe {
+        fn file_id(&self) -> Result<Option<crate::io::FileId>> {
+            Ok(Some(self.id))
+        }
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(&self, pos: u64, buf: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.inner.pwrite(pos, buf, c)
+        }
+        fn sync(&self, c: Completion, kind: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, kind)
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    #[test]
+    fn wal_read_override_covers_all_data_reads_without_changing_peer_readers() {
+        let (io, pool, wal) = make_initialized_memory_wal(512);
+        let expected = append_test_pages(&io, &wal, 512, &[page_with_pattern(2, 0x31, &pool)]);
+        let shared = wal.coordination.shared_wal_state();
+        let id = crate::io::FileId { dev: 1, ino: 19 };
+        let base = Arc::new(IdentityReadProbe {
+            inner: wal.wal_file().unwrap(),
+            id,
+            reads: AtomicUsize::new(0),
+        });
+        shared.write().runtime.file = Some(base.clone());
+        let scoped = Arc::new(IdentityReadProbe {
+            inner: base.clone(),
+            id,
+            reads: AtomicUsize::new(0),
+        });
+        let wal = wal.with_read_file(scoped.clone()).unwrap();
+        io.wait_for_completion(
+            wal.read_frame(1, Arc::new(crate::Page::new(2)), pool.clone(), None)
+                .unwrap(),
+        )
+        .unwrap();
+        io.wait_for_completion(
+            wal.read_frames_batch(
+                1,
+                &[Arc::new(crate::Page::new(2))],
+                pool.clone(),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        io.wait_for_completion(
+            wal.read_frame_raw(
+                1,
+                Arc::new(Buffer::new_temporary(512 + WAL_FRAME_HEADER_SIZE)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        wal.write_frame_raw(pool.clone(), 1, 2, 99, &expected[0], FileSyncType::Fsync)
+            .unwrap();
+        let mut group = CompletionGroup::new(|_| {});
+        let read = wal.issue_wal_read_into_buffer(2, 1, &mut group).unwrap();
+        io.wait_for_completion(group.build()).unwrap();
+        assert!(read.completion.succeeded());
+        assert_eq!(scoped.reads.load(Ordering::Acquire), 5);
+        let peer = make_test_wal_from_shared(shared.clone());
+        io.wait_for_completion(
+            peer.read_frame(1, Arc::new(crate::Page::new(2)), pool, None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            scoped.reads.load(Ordering::Acquire),
+            5,
+            "ordinary instance must not inherit scoped override"
+        );
+        let wrong = Arc::new(IdentityReadProbe {
+            inner: base,
+            id: crate::io::FileId { dev: 1, ino: 20 },
+            reads: AtomicUsize::new(0),
+        });
+        assert!(make_test_wal_from_shared(shared.clone())
+            .with_read_file(wrong.clone())
+            .is_err());
+        shared.write().runtime.file = Some(wrong);
+        let rejected_page = Arc::new(crate::Page::new(2));
+        assert!(wal
+            .read_frame(1, rejected_page.clone(), wal.buffer_pool.clone(), None)
+            .is_err());
+        assert!(!rejected_page.is_locked());
+        assert!(wal
+            .read_frames_batch(
+                1,
+                &[rejected_page.clone()],
+                wal.buffer_pool.clone(),
+                None,
+                None
+            )
+            .is_err());
+        assert!(!rejected_page.is_locked());
+        assert!(wal
+            .read_frame_raw(
+                1,
+                Arc::new(Buffer::new_temporary(512 + WAL_FRAME_HEADER_SIZE))
+            )
+            .is_err());
+        assert_eq!(
+            scoped.reads.load(Ordering::Acquire),
+            5,
+            "identity change must not fall back to unpinned reads"
+        );
     }
 
     #[test]
@@ -8193,10 +8388,18 @@ pub mod test {
         let shm_path = dir.path().join("test.db-tshm");
         let io = shared_wal_test_io();
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
@@ -8485,10 +8688,18 @@ pub mod test {
         let shm_path = dir.path().join("test.db-tshm");
         let io = shared_wal_test_io();
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
@@ -8540,10 +8751,18 @@ pub mod test {
         let shm_path = dir.path().join("test.db-tshm");
         let io = PlatformIO::new().unwrap();
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
@@ -9420,6 +9639,32 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
+    #[cfg_attr(
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
+    )]
+    fn test_open_shared_from_authority_creates_missing_wal_for_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal_path = directory.path().join("existing.db-wal");
+        let shm_path = directory.path().join("existing.db-tshm");
+        let io = shared_wal_test_io();
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert!(!wal_path.exists());
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::None,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(wal_path).unwrap().len(), 0);
+        assert!(!shared.read().is_initialized().unwrap());
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
     fn test_open_shared_from_authority_keeps_zero_length_wal_uninitialized_after_exclusive_reopen()
     {
         let dir = tempfile::tempdir().unwrap();
@@ -9486,7 +9731,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9512,7 +9761,11 @@ pub mod test {
         assert!(authority.try_acquire_writer(authority.owner_record()));
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         let stale = WalSnapshot {
@@ -9563,7 +9816,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9588,7 +9845,11 @@ pub mod test {
         coordination_a.cache_frame(9, 5);
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         set_shared_snapshot(&shared_b, authoritative);
@@ -9641,7 +9902,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9668,7 +9933,11 @@ pub mod test {
         }
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         set_shared_snapshot(&shared_b, authoritative);
@@ -9772,7 +10041,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9797,7 +10070,11 @@ pub mod test {
         coordination_a.cache_frame(9, 5);
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         {
@@ -9957,7 +10234,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = SharedWalCoordinationHeader {
@@ -10001,7 +10282,11 @@ pub mod test {
         authority.install_snapshot(authoritative);
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone());

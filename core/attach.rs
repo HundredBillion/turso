@@ -231,6 +231,7 @@ pub(crate) struct AttachDatabaseInitState {
 
 #[cfg(feature = "fs")]
 pub(crate) struct AttachDatabaseBootstrapState {
+    readonly: bool,
     alias: String,
     db: Arc<Database>,
     pager: Arc<Pager>,
@@ -470,14 +471,15 @@ impl Connection {
                         .with_custom_types(self.db.experimental_custom_types_enabled())
                         .with_index_method(self.db.experimental_index_method_enabled())
                         .with_vacuum(self.db.experimental_vacuum_enabled())
-                        .with_without_rowid(self.db.experimental_without_rowid_enabled());
+                        .with_without_rowid(self.db.experimental_without_rowid_enabled())
+                        .with_multiprocess_wal(self.db.experimental_multiprocess_wal_enabled());
                     let is_memory_db = is_memory_like(path);
                     let io: Arc<dyn IO> = if is_memory_db {
                         Arc::new(MemoryIO::new())
                     } else if self.db.is_in_memory_db() {
                         Database::io_for_path(path)?
                     } else {
-                        self.db.storage_io()
+                        self.db.io.clone()
                     };
                     let main_db_flags = if self.is_readonly(MAIN_DB_ID) {
                         self.db.open_flags | crate::OpenFlags::ReadOnly
@@ -557,6 +559,7 @@ impl Connection {
                         init.db.mv_store.store(Some(mv_store));
                         *state = AttachDatabaseState::Bootstrap(Box::new(
                             AttachDatabaseBootstrapState {
+                                readonly: init.readonly,
                                 alias: init.alias.clone(),
                                 db: init.db.clone(),
                                 pager,
@@ -612,7 +615,7 @@ impl Connection {
                         alias: bootstrap.alias.clone(),
                         db: bootstrap.db.clone(),
                         pager: bootstrap.pager.clone(),
-                        readonly: false,
+                        readonly: bootstrap.readonly,
                     };
                 }
                 AttachDatabaseState::Publish {

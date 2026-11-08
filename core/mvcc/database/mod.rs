@@ -61,11 +61,84 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
+mod persistent_metadata;
+mod sequence_replay;
 #[cfg(not(nightly))]
 mod version_chain;
 pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
+
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_bootstrap;
+#[cfg(host_shared_wal)]
+#[allow(dead_code)]
+mod shared_refresh;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+pub(crate) const SHARED_MVCC_VERSION: u8 = crate::mvcc::mode_transition::SHARED_MVCC_VERSION;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_generation_reload;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_id_oracle;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_oracle;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(dead_code)]
+mod shared_runtime;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
+#[cfg(all(host_shared_wal, unix))]
+pub(in crate::mvcc) use shared_runtime::RecoveryWalEvidence;
+#[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(crate) use shared_runtime::{
+    checkpoint_shared, RecoveredDatabaseReady, RecoveryBootstrapEvidence,
+    RecoveryConstructionPermit, SharedBeginState, SharedBootstrapState, SharedIdRequest,
+    SharedIdResult, SharedIdState, SharedMvccRuntime, SharedOpenState,
+    SharedSequenceWatermarkState,
+};
+#[cfg(all(host_shared_wal, unix))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_runtime::{downgrade_existing, InstalledDowngradeSource};
+#[cfg(all(host_shared_wal, unix))]
+pub(crate) use shared_runtime::{RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence};
+#[cfg(all(host_shared_wal, unix))]
+pub(in crate::mvcc) use shared_runtime::{RecoveryCompletionEvidence, RecoveryIntentEvidence};
+
+#[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
+#[allow(unused_imports)]
+pub(crate) use shared_runtime::{shared_runtime_fixture, shared_runtime_fixture_with_limit};
+
+#[cfg(all(
+    test,
+    host_shared_wal,
+    target_os = "linux",
+    target_pointer_width = "64",
+    not(shuttle)
+))]
+#[allow(unused_imports)]
+pub(in crate::mvcc) use shared_runtime::{
+    shared_completed_checkpoint_fixture, shared_prepared_checkpoint_fixture,
+    SharedCompletedCheckpointFixture, SharedPreparedCheckpointFixture,
+};
+
+#[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
+mod shared_commit_integration_tests;
+
+#[cfg(all(
+    feature = "test_helper",
+    host_shared_wal,
+    target_os = "linux",
+    target_pointer_width = "64",
+    not(shuttle)
+))]
+pub use shared_runtime::recovered_checkpoint_for_test;
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -652,6 +725,7 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
 ) -> i64 {
     mvcc_store
         .table_id_to_rootpage
+        .load()
         .get(&table_id)
         .and_then(|entry| entry.value().root_page)
         .map(|rootpage| rootpage as i64)
@@ -850,6 +924,8 @@ enum SavepointKind {
 /// Tracks row/index version deltas created inside a single savepoint scope.
 #[derive(Debug, Default)]
 pub struct Savepoint {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_id_boundary: Option<u64>,
     kind: SavepointKind,
     deferred_fk_violations: isize,
     header: DatabaseHeader,
@@ -970,6 +1046,14 @@ impl<A: RowVersionAllocator> WriteSet<A> {
     }
 }
 
+enum BeginTimestamp {
+    Local,
+    #[cfg(host_shared_wal)]
+    Shared(super::shared_authority::SnapshotRegistration),
+    #[cfg(host_shared_wal)]
+    SharedOracle(u64),
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
@@ -979,6 +1063,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     tx_id: u64,
     /// The transaction begin timestamp.
     begin_ts: u64,
+    #[cfg(host_shared_wal)]
+    shared_snapshot: Option<Box<Mutex<Option<super::shared_authority::SnapshotRegistration>>>>,
+    // Blocks ordinary work if durable ID release outlives its local undo.
+    #[cfg(all(host_shared_wal, unix))]
+    shared_pending_release: Mutex<Option<u64>>,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
@@ -1003,6 +1092,15 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Flag: a depended-on transaction aborted; this transaction must abort too.
     /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
     abort_now: AtomicBool,
+    /// A peer commit replaced a version this local writer intended to change.
+    peer_conflicted: AtomicBool,
+    #[cfg(test)]
+    before_mutation_lock: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// Transaction IDs that depend on this transaction (notified on commit/abort).
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
@@ -1050,9 +1148,38 @@ impl<A: RowVersionAllocator> Transaction<A> {
             log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
+            peer_conflicted: AtomicBool::new(false),
+            #[cfg(host_shared_wal)]
+            shared_snapshot: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_pending_release: Mutex::new(None),
+            #[cfg(test)]
+            before_mutation_lock: Mutex::new(None),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn ensure_peer_unconflicted(&self) -> Result<()> {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.shared_pending_release.lock().is_some() {
+            return Err(LimboError::Busy);
+        }
+        if self.peer_conflicted.load(Ordering::Acquire) {
+            return Err(LimboError::WriteWriteConflict);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_before_mutation_lock(&self) {
+        let hook = self.before_mutation_lock.lock().take();
+        if let Some((arrived, resume)) = hook {
+            arrived.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap();
         }
     }
 
@@ -1440,6 +1567,12 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     /// (e.g. CREATE INDEX on a multi-million row table) don't monopolize
     /// the executor.
     BuildLogRecord(BuildLogRecordCtx),
+    #[cfg(all(host_shared_wal, unix))]
+    SharedLogicalLog {
+        end_ts: u64,
+    },
+    #[cfg(all(host_shared_wal, unix))]
+    SharedFinalize,
     BeginCommitLogicalLog {
         end_ts: u64,
         log_record: LogRecord,
@@ -1652,6 +1785,12 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     /// Bytes from the in-flight logical-log write. Applied to the writer offset
     /// only after `on_log_write_complete` succeeds.
     pending_log_append_bytes: Option<u64>,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_commit: Option<Box<shared_runtime::SharedTransactionCommit>>,
+    #[cfg(all(host_shared_wal, unix))]
+    shared_preflight_preservable: bool,
+    #[cfg(all(host_shared_wal, unix))]
+    preserve_shared_transaction: bool,
     group_batch: Option<GroupBatch>,
     /// This state machine issued at least one `log_tx` (leader or exclusive).
     wrote_logical_log: bool,
@@ -1768,6 +1907,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pager,
             header,
             pending_log_append_bytes: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_commit: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_preflight_preservable: false,
+            #[cfg(all(host_shared_wal, unix))]
+            preserve_shared_transaction: false,
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
@@ -1787,6 +1932,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             .as_ref()
             .filter(|entry| !entry.is_removed())
             .map(|entry| entry.value())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    fn reset_shared_preflight(&mut self, store: &Arc<MvStore<Clock, A>>, preservable: bool) {
+        self.shared_preflight_preservable = preservable;
+        if let Some(tx) = self.committing_tx(store) {
+            tx.state.store(TransactionState::Active);
+        }
+        self.shared_commit = None;
+        self.state = CommitState::Initial;
     }
 
     fn release_group_claim(&mut self) {
@@ -1843,7 +1998,51 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
+    pub(crate) fn can_preserve_shared_preflight(&self) -> bool {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.shared_preflight_preservable
+                && self.shared_commit.is_none()
+                && self.tx_entry.as_ref().is_some_and(|entry| {
+                    !entry.is_removed()
+                        && entry.value().state.load() == TransactionState::Active
+                        && !entry.value().log_appended.load(Ordering::Acquire)
+                })
+        }
+        #[cfg(not(all(host_shared_wal, unix)))]
+        {
+            false
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn preserve_shared_preflight_on_drop(&mut self) -> bool {
+        if !self.can_preserve_shared_preflight() {
+            return false;
+        }
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.preserve_shared_transaction = true;
+        }
+        true
+    }
+
     fn cleanup_unfinished_commit(&mut self) {
+        #[cfg(all(host_shared_wal, unix))]
+        if self.preserve_shared_transaction && self.can_preserve_shared_preflight() {
+            return;
+        }
+
+        #[cfg(all(host_shared_wal, unix))]
+        if self
+            .shared_commit
+            .as_ref()
+            .is_some_and(|shared| shared.is_durable())
+        {
+            if let Some(tx) = self.committing_tx(&self.mvcc_store) {
+                tx.log_appended.store(true, Ordering::Release);
+            }
+        }
         if !self.is_finalized {
             self.release_group_claim();
             self.cleanup_mvcc_checkpoint_state();
@@ -2460,7 +2659,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             if log_id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                 return log_id;
             }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&log_id.table_id) {
+            if let Some(entry) = mvcc_store.table_id_to_rootpage.load().get(&log_id.table_id) {
                 if let Some(root_page) = entry.value().root_page {
                     log_id.table_id = MVTableId::from(-(root_page as i64));
                 }
@@ -2938,6 +3137,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
                 mvcc_store
                     .table_id_to_rootpage
+                    .load()
                     .get(&table_id)
                     .and_then(|entry| entry.value().root_page)
                     .map(|rootpage| rootpage as i64)
@@ -3085,6 +3285,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
+                #[cfg(all(host_shared_wal, unix))]
+                {
+                    self.shared_preflight_preservable = false;
+                }
+                #[cfg(all(host_shared_wal, unix))]
+                let shared_timestamp = if let Some(runtime) = mvcc_store.shared_runtime.get() {
+                    if self.shared_commit.is_none() {
+                        self.shared_commit = Some(Box::new(
+                            shared_runtime::SharedTransactionCommit::new(runtime.clone())?,
+                        ));
+                    }
+                    match self
+                        .shared_commit
+                        .as_mut()
+                        .unwrap()
+                        .poll_prepare(mvcc_store, &self.connection)
+                        .map_err(|error| *error)?
+                    {
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                        IOResult::Done(timestamp) => Some(timestamp),
+                    }
+                } else {
+                    None
+                };
+                #[cfg(not(all(host_shared_wal, unix)))]
+                let shared_timestamp: Option<u64> = None;
                 let tx = self
                     .committing_tx(mvcc_store)
                     .ok_or(LimboError::TxTerminated)?;
@@ -3096,6 +3322,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         turso_assert_eq!(tx.state, TransactionState::Active);
                     }
                 }
+
+                tx.ensure_peer_unconflicted()?;
+                #[cfg(test)]
+                tx.pause_before_mutation_lock();
 
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
@@ -3118,8 +3348,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
+                let mut peer_conflict = false;
 
-                let end_ts = mvcc_store.get_commit_timestamp(|ts| {
+                let mut publish_preparing = |ts| {
+                    // Import holds this same clock lock through publication. A
+                    // commit may have waited after its initial conflict check.
+                    peer_conflict = tx.peer_conflicted.load(Ordering::Acquire);
                     turso_assert!(
                         ts > tx.begin_ts,
                         "end_ts must be strictly greater than begin_ts"
@@ -3161,7 +3395,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     };
 
                     let header_dirty = tx.header_dirty.load(Ordering::Acquire);
-                    turso_assert!(!header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id), "header_dirty=true implies that tx is exclusive");
+                    turso_assert!(
+                        !header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id),
+                        "header_dirty=true implies that tx is exclusive"
+                    );
                     if our_cookie != global_cookie && !header_dirty {
                         tracing::debug!("cookie mismatch in CommitState::Initial tx({our_cookie}) != global(!{global_cookie})");
                         schema_conflict = true;
@@ -3174,10 +3411,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
-                    if can_commit_tx || read_only {
+                    if !peer_conflict && (can_commit_tx || read_only) {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
-                });
+                };
+                let end_ts = if let Some(timestamp) = shared_timestamp {
+                    mvcc_store
+                        .clock
+                        .publish_observed(timestamp, || -> Result<()> {
+                            publish_preparing(timestamp);
+                            Ok(())
+                        })?;
+                    timestamp
+                } else {
+                    mvcc_store.get_commit_timestamp(publish_preparing)
+                };
+                if peer_conflict {
+                    return Err(LimboError::WriteWriteConflict);
+                }
                 // We allow reads from happening. Exlusive means there is a single writer.
                 if exclusive_conflict && !read_only {
                     return Err(LimboError::WriteWriteConflict);
@@ -3406,6 +3657,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
             CommitState::MarkDirtyKeys { .. } => self.step_mark_dirty_keys(mvcc_store),
             CommitState::BeginCommitLogicalLog { end_ts, .. } => {
+                #[cfg(all(host_shared_wal, unix))]
+                if let Some(shared) = self.shared_commit.as_mut() {
+                    let timestamp = *end_ts;
+                    let CommitState::BeginCommitLogicalLog { log_record, .. } = std::mem::replace(
+                        &mut self.state,
+                        CommitState::SharedLogicalLog { end_ts: timestamp },
+                    ) else {
+                        unreachable!()
+                    };
+                    if let Err(error) = shared.begin_write(log_record) {
+                        self.reset_shared_preflight(mvcc_store, false);
+                        return Err(error);
+                    }
+                    return Ok(TransitionResult::Continue);
+                }
+
                 let is_exclusive = mvcc_store.is_exclusive_tx(&self.tx_id);
                 if !is_exclusive && self.commit_coordinator.group_commit_enabled() {
                     let end_ts = *end_ts;
@@ -3444,6 +3711,47 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 };
                 self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
                 Ok(TransitionResult::Continue)
+            }
+            #[cfg(all(host_shared_wal, unix))]
+            CommitState::SharedLogicalLog { end_ts } => {
+                let end_ts = *end_ts;
+                let shared = self.shared_commit.as_mut().unwrap();
+                let result = shared.poll_write();
+                if result.is_err() && shared.preflight_rejected() {
+                    let error = *result.unwrap_err();
+                    self.reset_shared_preflight(mvcc_store, matches!(error, LimboError::Busy));
+                    return Err(error);
+                }
+                if shared.is_durable() {
+                    if let Some(tx) = self.committing_tx(mvcc_store) {
+                        tx.log_appended.store(true, Ordering::Release);
+                    }
+                    self.wrote_logical_log = true;
+                }
+                match result.map_err(|error| *error)? {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {
+                        self.state = CommitState::EndCommitLogicalLog { end_ts };
+                        Ok(TransitionResult::Continue)
+                    }
+                }
+            }
+            #[cfg(all(host_shared_wal, unix))]
+            CommitState::SharedFinalize => {
+                match self
+                    .shared_commit
+                    .as_mut()
+                    .unwrap()
+                    .poll_finish(mvcc_store, &self.connection)
+                    .map_err(|error| *error)?
+                {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {
+                        self.shared_commit = None;
+                        self.finalize(mvcc_store)?;
+                        Ok(TransitionResult::Done(()))
+                    }
+                }
             }
             CommitState::AwaitGroupCommit { end_ts, ticket } => {
                 self.step_await_group_commit(mvcc_store, *end_ts, *ticket)
@@ -3697,6 +4005,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
+                #[cfg(all(host_shared_wal, unix))]
+                if self.shared_commit.is_some() {
+                    self.state = CommitState::SharedFinalize;
+                    return Ok(TransitionResult::Continue);
+                }
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
@@ -3766,6 +4079,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
     }
 
     fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+        #[cfg(all(host_shared_wal, unix))]
+        if let Some(shared) = self.shared_commit.take() {
+            shared.finish_without_append()?;
+        }
         self.is_finalized = true;
         Ok(())
     }
@@ -4243,6 +4560,35 @@ pub enum RecoverLogicalLogState {
     Done,
 }
 
+fn replay_frame_timestamp(frame: &[ParsedOp]) -> Result<u64> {
+    let timestamp = |op: &ParsedOp| match op {
+        ParsedOp::UpsertTable { commit_ts, .. }
+        | ParsedOp::DeleteTable { commit_ts, .. }
+        | ParsedOp::UpsertIndex { commit_ts, .. }
+        | ParsedOp::DeleteIndex { commit_ts, .. }
+        | ParsedOp::UpdateHeader { commit_ts, .. } => *commit_ts,
+    };
+    let committed = frame
+        .first()
+        .map(timestamp)
+        .ok_or_else(|| LimboError::Corrupt("empty recovery frame".into()))?;
+    if committed > PackedTs::VALUE_MASK || frame.iter().any(|op| timestamp(op) != committed) {
+        return Err(LimboError::Corrupt(
+            "invalid recovery frame timestamps".into(),
+        ));
+    }
+    Ok(committed)
+}
+
+struct PreparedRecoveryFrame {
+    commit_timestamp: u64,
+    decoded_frame: crate::alloc::Vec<StreamingResult>,
+    schema_rows_after: Option<HashMap<i64, ImmutableRecord>>,
+    type_sqls_after: Option<BTreeMap<i64, String>>,
+    schema_after: Option<Arc<Schema>>,
+    index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
+}
+
 /// Accumulated state of the logical-log replay loop, persisted across
 /// `next_frame` IO yields. See [`MvStore::maybe_recover_logical_log`].
 pub struct RecoverCtx {
@@ -4368,6 +4714,8 @@ pub(crate) struct GcDebugSnapshot {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
+    #[cfg(all(host_shared_wal, unix))]
+    shared_runtime: std::sync::OnceLock<Arc<SharedMvccRuntime>>,
     pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
@@ -4382,7 +4730,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// been checkpointed yet have no real root page assigned yet.
     ///
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
-    pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    pub table_id_to_rootpage: arc_swap::ArcSwap<SkipMap<MVTableId, RootEntry, BasicComparator, A>>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4561,6 +4909,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
+    pub(crate) fn is_shared(&self) -> bool {
+        #[cfg(all(host_shared_wal, unix))]
+        {
+            self.shared_runtime.get().is_some()
+        }
+        #[cfg(not(all(host_shared_wal, unix)))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn allocator(&self) -> A {
         self.alloc.clone()
     }
@@ -4630,8 +4989,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
+            #[cfg(all(host_shared_wal, unix))]
+            shared_runtime: std::sync::OnceLock::new(),
             rows: SkipMap::new_in(alloc.clone()),
-            table_id_to_rootpage,
+            table_id_to_rootpage: arc_swap::ArcSwap::from_pointee(table_id_to_rootpage),
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
@@ -4723,6 +5084,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let root_page = root_page as u64;
         self.table_id_to_rootpage
+            .load()
             .iter()
             .filter(|entry| {
                 let e = entry.value();
@@ -4775,9 +5137,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             table_id.into()
         };
-        if minimum <= self.next_table_id.load(Ordering::SeqCst) {
-            self.next_table_id.store(minimum - 1, Ordering::SeqCst);
-        }
+        self.next_table_id.fetch_min(minimum - 1, Ordering::SeqCst);
     }
 
     /// Insert a live `table_id -> root_page` binding (bootstrap/recovery, or an
@@ -4785,18 +5145,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// allocation of a real root page goes through [`Self::record_rootpage_alloc`] instead.
     pub fn insert_table_id_to_rootpage(&self, table_id: MVTableId, root_page: Option<u64>) {
         self.table_id_to_rootpage
+            .load()
             .insert(table_id, RootEntry::live(root_page));
         self.bump_next_table_id_below(table_id, root_page);
     }
 
     pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
-        self.table_id_to_rootpage.remove(table_id);
+        self.table_id_to_rootpage.load().remove(table_id);
         self.table_id_to_last_rowid.write().remove(table_id);
     }
 
     /// The current physical root page of `table_id`, if it is checkpointed and live.
     pub fn current_root_page(&self, table_id: &MVTableId) -> Option<u64> {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .and_then(|entry| entry.value().root_page)
     }
@@ -4813,7 +5175,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         begin_ts: u64,
         materialized_at: WalPos,
     ) {
-        self.table_id_to_rootpage.insert(
+        self.table_id_to_rootpage.load().insert(
             table_id,
             RootEntry {
                 root_page: Some(root_page),
@@ -4827,6 +5189,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // else two live bindings resolve to one page (integrity_check: referenced twice).
         let stale: Vec<(MVTableId, RootEntry)> = self
             .table_id_to_rootpage
+            .load()
             .iter()
             .filter(|entry| {
                 let e = entry.value();
@@ -4836,7 +5199,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .collect();
         for (key, mut entry) in stale {
             entry.end = begin_ts;
-            self.table_id_to_rootpage.insert(key, entry);
+            self.table_id_to_rootpage.load().insert(key, entry);
         }
         self.bump_next_table_id_below(table_id, Some(root_page));
     }
@@ -4846,10 +5209,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// transaction whose read mark reaches that position. Called in the checkpoint's post-commit
     /// publish window. No-op if the entry is gone (e.g. dropped same checkpoint).
     pub fn publish_rootpage_visible(&self, table_id: MVTableId, materialized_at: WalPos) {
-        if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+        if let Some(entry) = self.table_id_to_rootpage.load().get(&table_id) {
             let mut e = *entry.value();
             e.materialized_at = materialized_at;
-            self.table_id_to_rootpage.insert(table_id, e);
+            self.table_id_to_rootpage.load().insert(table_id, e);
         }
     }
 
@@ -4857,10 +5220,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// transaction whose snapshot predates the drop can still resolve the (read-mark-protected)
     /// root page. Reclaimed by [`Self::gc_rootpage_entries`] once `end_ts <= lwm`.
     pub fn retire_rootpage(&self, table_id: MVTableId, end_ts: u64) {
-        if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+        if let Some(entry) = self.table_id_to_rootpage.load().get(&table_id) {
             let mut e = *entry.value();
             e.end = end_ts;
-            self.table_id_to_rootpage.insert(table_id, e);
+            self.table_id_to_rootpage.load().insert(table_id, e);
         }
     }
 
@@ -4870,6 +5233,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn gc_rootpage_entries(&self, lwm: u64) -> usize {
         let stale: Vec<MVTableId> = self
             .table_id_to_rootpage
+            .load()
             .iter()
             .filter(|entry| {
                 let e = entry.value();
@@ -4878,7 +5242,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|entry| *entry.key())
             .collect();
         for key in &stale {
-            self.table_id_to_rootpage.remove(key);
+            self.table_id_to_rootpage.load().remove(key);
             self.table_id_to_last_rowid.write().remove(key);
         }
         stale.len()
@@ -4980,7 +5344,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         // Clears live and retired bindings alike: both reference pre-VACUUM root pages that
         // would alias new objects after root-page reuse.
-        self.table_id_to_rootpage.clear();
+        self.table_id_to_rootpage.load().clear();
         self.table_id_to_last_rowid.write().clear();
         // TODO: vacuum related code, not handling alloc errors for now
         self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
@@ -5034,18 +5398,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Shared validation/normalization for the persistent-tx-ts-max metadata
     /// value used by both the blocking and non-blocking readers.
     fn validate_persistent_tx_ts_max(value: Option<i64>) -> Result<Option<u64>> {
-        let value = value.ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}"
-            ))
-        })?;
-
-        if value < 0 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid MVCC metadata value for {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}: {value}"
-            )));
-        }
-        Ok(Some(value as u64))
+        ReadPersistentTxTsMaxState::validate(value)
     }
 
     /// Non-blocking variant of [`Self::try_read_persistent_tx_ts_max`]: runs the
@@ -5057,54 +5410,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection: &Arc<Connection>,
         st: &mut ReadPersistentTxTsMaxState,
     ) -> IOResultOr<Option<u64>> {
-        loop {
-            match st {
-                ReadPersistentTxTsMaxState::Start => {
-                    let query_result = connection.query(format!(
-                        "SELECT v FROM {MVCC_META_TABLE_NAME}
-                         WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
-                    ));
-                    let maybe_stmt = match query_result {
-                        Ok(stmt) => stmt,
-                        Err(LimboError::ParseError(msg)) if msg.contains("no such table") => {
-                            return Ok(IOResult::Done(None));
-                        }
-                        Err(err) => {
-                            return Err(LimboError::Corrupt(format!(
-                                "Failed to read MVCC metadata table: {err}"
-                            ))
-                            .into());
-                        }
-                    };
-                    match maybe_stmt {
-                        Some(stmt) => {
-                            *st = ReadPersistentTxTsMaxState::Running {
-                                stmt: Box::new(stmt),
-                                value: None,
-                            };
-                        }
-                        // No statement to run — fall through to the missing-row
-                        // error path (matches the blocking variant).
-                        None => {
-                            return Self::validate_persistent_tx_ts_max(None)
-                                .map(IOResult::Done)
-                                .map_err(Into::into);
-                        }
-                    }
-                }
-                ReadPersistentTxTsMaxState::Running { stmt, value } => {
-                    return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        *value = Some(row.get::<i64>(0)?);
-                        Ok(())
-                    }));
-                    let value = *value;
-                    *st = ReadPersistentTxTsMaxState::Start;
-                    return Self::validate_persistent_tx_ts_max(value)
-                        .map(IOResult::Done)
-                        .map_err(Into::into);
-                }
-            }
-        }
+        st.poll(connection)
     }
 
     /// Bootstrap the MV store from the SQLite schema table and logical log.
@@ -5391,6 +5697,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// MVCC table ids are always negative. Their corresponding rootpage entry in sqlite_schema
     /// is the same negative value if the table has not been checkpointed yet. Otherwise, the root page
     /// will be positive and corresponds to the actual physical page.
+    pub(crate) fn recovered_logical_id_floor(&self) -> Result<i64> {
+        let next = self.next_table_id.load(Ordering::SeqCst);
+        if next >= -1 {
+            return Err(LimboError::Corrupt(
+                "invalid recovered logical ID floor".into(),
+            ));
+        }
+        next.checked_add(1).ok_or(LimboError::DatabaseFull)
+    }
+
     pub fn get_next_table_id(&self) -> i64 {
         self.next_table_id.fetch_sub(1, Ordering::SeqCst)
     }
@@ -5438,6 +5754,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
+        #[cfg(test)]
+        tx.pause_before_mutation_lock();
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5458,8 +5777,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Single SkipMap traversal: pass in a fresh Arc; the SkipMap
                 // returns the canonical Arc (ours on miss, an existing one
                 // on hit), which we hand to savepoint tracking.
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions, chain_in_write_set) = self
+                    .insert_index_version_for_writers(
+                        index_id,
+                        sortable_key,
+                        row_version,
+                        [Some(tx), None],
+                    )?;
                 if !chain_in_write_set {
                     tx.add_to_write_set(
                         RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
@@ -5486,7 +5810,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                    self.insert_version_for_writers(id.clone(), row_version, [Some(tx), None])?;
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 tx.record_created_table_version(id.clone(), version_id);
@@ -5519,6 +5843,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5536,8 +5861,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions, chain_in_write_set) = self
+                    .insert_index_version_for_writers(
+                        index_id,
+                        sortable_key,
+                        row_version,
+                        [Some(tx), None],
+                    )?;
                 if !chain_in_write_set {
                     tx.add_to_write_set(
                         RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
@@ -5559,7 +5889,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                    self.insert_version_for_writers(id.clone(), row_version, [Some(tx), None])?;
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -5658,6 +5988,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        tx.ensure_peer_unconflicted()?;
+        #[cfg(test)]
+        tx.pause_before_mutation_lock();
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -5680,6 +6013,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     if !self.index_versions_still_mapped(rows, &arc_key, &row_versions) {
                         continue;
                     }
+                    tx.ensure_peer_unconflicted()?;
                     let chain_in_write_set =
                         chain_has_version_written_by(&locked_row_versions, tx_id);
                     for rv in locked_row_versions.iter_mut().rev() {
@@ -5733,6 +6067,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if !self.table_versions_still_mapped(&id, &row_versions) {
                     continue;
                 }
+                tx.ensure_peer_unconflicted()?;
                 let chain_in_write_set = chain_has_version_written_by(&locked_row_versions, tx_id);
                 for rv in locked_row_versions.iter_mut().rev() {
                     // A transaction cannot delete a version that it cannot see.
@@ -6517,7 +6852,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // header + schema_generation are re-read inside the clock callback below, not captured
             // here, so a passive publish (which swaps global_header + bumps schema_generation under
             // this same clock) cannot interleave between the capture and `txs.insert`.
-            self.get_new_transaction_database_header(&pager);
+            self.get_new_transaction_database_header(&pager)
+                .inspect_err(|_| unlock_checkpoint_guard())?;
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
             let mut schema_stale = false;
@@ -6631,7 +6967,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(existing_tx_id) = maybe_existing_tx_id {
             // Upgrade path: read the (possibly blocking) header now that all
             // locks are held, then apply it to the already-published txn.
-            let header = self.get_new_transaction_database_header(&pager);
+            let header = self
+                .get_new_transaction_database_header(&pager)
+                .inspect_err(|_| handle_err())?;
             // Re-fetch the Ref now that all blocking I/O is done. If the tx
             // vanished between the earlier validation and now (extraordinarily
             // narrow window — only checkpoint can remove a tx and it cannot
@@ -6717,6 +7055,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         checkpoint_read_guard: CheckpointReadLockState,
         portable_logical_changes: bool,
     ) -> Result<TxID> {
+        if self.is_shared() {
+            self.release_unadopted_checkpoint_read_guard(checkpoint_read_guard);
+            return Err(LimboError::InvalidArgument(
+                "shared transactions require coordinated admission".into(),
+            ));
+        }
+        self.begin_tx_at_snapshot(
+            pager,
+            expected_schema_generation,
+            checkpoint_read_guard,
+            portable_logical_changes,
+            BeginTimestamp::Local,
+        )
+    }
+
+    fn begin_tx_at_snapshot(
+        &self,
+        pager: Arc<Pager>,
+        expected_schema_generation: Option<u64>,
+        checkpoint_read_guard: CheckpointReadLockState,
+        portable_logical_changes: bool,
+        snapshot: BeginTimestamp,
+    ) -> Result<TxID> {
         turso_assert!(
             !checkpoint_read_guard.is_held() || !self.experimental_mvcc_passive_checkpoint,
             "passive MVCC begin must not hold the blocking checkpoint read guard"
@@ -6735,7 +7096,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Ensure page 1 / global_header is initialized. The (possibly blocking) init I/O
         // happens here, BEFORE the clock lock; the header value itself is re-read inside the
         // clock callback below so it pairs atomically with begin_ts + schema_generation.
-        self.get_new_transaction_database_header(&pager);
+        self.get_new_transaction_database_header(&pager)
+            .inspect_err(|_| {
+                if !passive {
+                    self.blocking_checkpoint_lock.unlock();
+                }
+            })?;
 
         // Allocate begin_ts and publish the transaction into `txs` atomically
         // under the clock lock. This closes the "begin-publish window": between
@@ -6757,7 +7123,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
         let mut schema_change_unpublished = false;
-        let begin_ts = self.clock.get_timestamp(|ts| {
+        let shared_timestamp = match &snapshot {
+            BeginTimestamp::Local => None,
+            #[cfg(host_shared_wal)]
+            BeginTimestamp::Shared(registration) => Some(registration.begin_timestamp),
+            #[cfg(host_shared_wal)]
+            BeginTimestamp::SharedOracle(timestamp) => Some(*timestamp),
+        };
+        let mut snapshot = Some(snapshot);
+        let mut publish = |ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
             // same clock, so it cannot interleave between this capture and the insert.
@@ -6780,18 +7154,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 schema_change_unpublished = true;
                 return;
             }
-            self.txs.insert(
+            let transaction = Transaction::new(
                 tx_id,
-                Transaction::new(
-                    tx_id,
-                    ts,
-                    header,
-                    read_mark,
-                    schema_generation,
-                    portable_logical_changes,
-                ),
+                ts,
+                header,
+                read_mark,
+                schema_generation,
+                portable_logical_changes,
             );
-        });
+            let transaction = match snapshot.take().expect("snapshot published once") {
+                BeginTimestamp::Local => transaction,
+                #[cfg(host_shared_wal)]
+                BeginTimestamp::SharedOracle(_) => transaction,
+                #[cfg(host_shared_wal)]
+                BeginTimestamp::Shared(registration) => {
+                    let mut transaction = transaction;
+                    transaction.shared_snapshot = Some(Box::new(Mutex::new(Some(registration))));
+                    transaction
+                }
+            };
+            self.txs.insert(tx_id, transaction);
+        };
+        let begin_ts = if let Some(timestamp) = shared_timestamp {
+            self.clock
+                .publish_observed(timestamp, || {
+                    publish(timestamp);
+                    Ok(())
+                })
+                .inspect_err(|_| {
+                    if !passive {
+                        self.blocking_checkpoint_lock.unlock();
+                    }
+                })?;
+            timestamp
+        } else {
+            self.clock.get_timestamp(publish)
+        };
         if schema_stale || schema_change_unpublished {
             if !passive {
                 self.blocking_checkpoint_lock.unlock();
@@ -6861,6 +7259,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.txs.remove(&tx_id);
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
+            }
+            // Removed skip-list entries can outlive logical transaction completion.
+            #[cfg(host_shared_wal)]
+            if let Some(registration) = &tx.shared_snapshot {
+                drop(registration.lock().take());
             }
             return;
         }
@@ -6976,12 +7379,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.remove_tx(tx_id);
     }
 
-    fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
+    /// Fails with [LimboError::Busy] while another connection is allocating
+    /// page 1; callers release what they acquired and return it.
+    fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> Result<DatabaseHeader> {
         if self.global_header.read().is_none() {
-            pager
-                .io
-                .block(|| pager.maybe_allocate_page1())
-                .expect("failed to allocate page1");
+            pager.io.block(|| pager.maybe_allocate_page1())?;
             let header = pager
                 .io
                 .block(|| pager.with_header(|header| *header))
@@ -6992,19 +7394,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 "get_transaction_database_header create: header={:?}",
                 header
             );
-            header
+            Ok(header)
         } else {
             let header = self
                 .global_header
                 .read()
                 .expect("global_header should be initialized");
             // The header could be stored, but not persisted yet
-            pager
-                .io
-                .block(|| pager.maybe_allocate_page1())
-                .expect("failed to allocate page1");
+            pager.io.block(|| pager.maybe_allocate_page1())?;
             tracing::debug!("get_transaction_database_header read: header={:?}", header);
-            header
+            Ok(header)
         }
     }
 
@@ -7269,9 +7668,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
                 return false;
             }
-            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-                version.set_end(None);
-            }
+            version.clear_end_if_owned_by(tx_id);
             true
         });
         (before - versions.len(), restores_rowid)
@@ -7501,7 +7898,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for savepoint in rolledback_savepoints.into_iter().rev() {
             self.rollback_savepoint_changes(tx_id, savepoint);
         }
-
         Ok(Some(deferred_fk_violations))
     }
 
@@ -7576,7 +7972,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 for rv in versions.iter_mut() {
                     if rv.id == version_id {
                         restored_rowid = rollback_restores_rowid(tx_id, rv);
-                        rv.set_end(None);
+                        rv.clear_end_if_owned_by(tx_id);
                         tracing::debug!(
                             "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                             rowid.table_id,
@@ -7598,7 +7994,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
                         if rv.id == version_id {
-                            rv.set_end(None);
+                            rv.clear_end_if_owned_by(tx_id);
                             tracing::debug!(
                                 "rollback_savepoint: restored index version(table_id={}, version_id={})",
                                 table_id,
@@ -8724,11 +9120,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is inserted in the correct order. Returns a reference to the modified version chain,
     /// and whether the chain was already in the write set of the transaction that created
     /// `row_version`.
-    fn insert_version(
+    #[cfg(test)]
+    fn insert_version(&self, id: RowID, row_version: RowVersion) -> Result<(RowVersions<A>, bool)> {
+        let writers = self.version_writers(&row_version)?;
+        self.insert_version_for_writers(
+            id,
+            row_version,
+            [
+                writers[0].as_ref().map(|tx| tx.value()),
+                writers[1].as_ref().map(|tx| tx.value()),
+            ],
+        )
+    }
+
+    fn insert_version_for_writers(
         &self,
         id: RowID,
         row_version: RowVersion,
-    ) -> Result<(RowVersions<A>, bool), TryReserveError> {
+        writers: [Option<&Transaction<A>>; 2],
+    ) -> Result<(RowVersions<A>, bool)> {
         // Retry if GC unlinked this slot while we waited for the write lock.
         loop {
             let row_versions = self.get_or_create_table_row_versions(id.clone())?;
@@ -8736,12 +9146,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.table_versions_still_mapped(&id, &row_versions) {
                 continue;
             }
+            for writer in writers.into_iter().flatten() {
+                writer.ensure_peer_unconflicted()?;
+            }
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
             self.bump_table_rows_epoch();
             return Ok((row_versions, chain_in_write_set));
         }
+    }
+
+    // Resolve transaction references before taking a chain lock. Normal local
+    // writes already retain their transaction and bypass this lookup.
+    fn version_writers(&self, version: &RowVersion) -> Result<[Option<TxEntry<'_, A>>; 2]> {
+        let mut writers = [None, None];
+        for (slot, timestamp) in writers.iter_mut().zip([version.begin(), version.end()]) {
+            if let Some(TxTimestampOrID::TxID(tx_id)) = timestamp {
+                *slot = Some(
+                    self.txs
+                        .get(&tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?,
+                );
+            }
+        }
+        Ok(writers)
     }
 
     /// True if `arc` is still the mapped value for `id`.
@@ -8800,6 +9229,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: Arc<SortableIndexKey>,
         row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>, bool)> {
+        let writers = self.version_writers(&row_version)?;
+        self.insert_index_version_for_writers(
+            index_id,
+            key,
+            row_version,
+            [
+                writers[0].as_ref().map(|tx| tx.value()),
+                writers[1].as_ref().map(|tx| tx.value()),
+            ],
+        )
+    }
+
+    fn insert_index_version_for_writers(
+        &self,
+        index_id: MVTableId,
+        key: Arc<SortableIndexKey>,
+        row_version: RowVersion,
+        writers: [Option<&Transaction<A>>; 2],
+    ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>, bool)> {
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         // Same drain-retry as `insert_version`.
@@ -8812,6 +9260,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let mut versions = row_versions.write();
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
+            }
+            for writer in writers.into_iter().flatten() {
+                writer.ensure_peer_unconflicted()?;
             }
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
@@ -9436,6 +9887,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return None;
             }
             self.table_id_to_rootpage
+                .load()
                 .get(&MVTableId::from(root_page))
                 .filter(|e| e.value().is_live())
                 .and_then(|e| e.value().root_page)
@@ -9470,6 +9922,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return root_page;
         }
         self.table_id_to_rootpage
+            .load()
             .get(&MVTableId::from(root_page))
             .filter(|e| e.value().is_live())
             .and_then(|e| e.value().root_page)
@@ -9557,6 +10010,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // negative root and reports its materialized page as orphaned ("never used").
             let root_page = if root_page < 0 {
                 self.table_id_to_rootpage
+                    .load()
                     .get(&MVTableId::from(root_page))
                     .filter(|e| e.value().is_live())
                     .and_then(|e| e.value().root_page)
@@ -9871,37 +10325,79 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// Replay a single committed logical-log transaction frame into the MVCC
-    /// store. Fully synchronous (the only recovery IO is reading the next frame,
-    /// driven by the caller); operates on accumulators borrowed from `ctx`.
-    ///
-    /// A same-transaction create-then-drop leaves a delete of a sqlite_schema rowid absent from
-    /// the merged state; replay treats that as a legal no-op, not corruption.
-    #[aristo::intent(
-        "Replaying a committed logical-log transaction never aborts with a corruption error",
-        id = "mvcc_recovery_total_on_committed_log",
-        verify = "full"
-    )]
-    fn recover_process_frame(
+    fn validate_recovery_schema_root(&self, bytes: &[u8]) -> Result<(i64, bool)> {
+        let record = ImmutableRecordRef::from_bin_record(bytes);
+        if record.column_count() < 5 {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema row must have at least 5 columns".into(),
+            ));
+        }
+        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema type must be text".into(),
+            ));
+        };
+        let Some(ValueRef::Numeric(Numeric::Integer(root_page))) = record.get_value_opt(3) else {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema root_page must be an integer".into(),
+            ));
+        };
+        let sql = match record.get_value_opt(4) {
+            Some(ValueRef::Text(sql)) => Some(sql.as_str()),
+            _ => None,
+        };
+        let has_btree = match row_type.as_str() {
+            "index" => root_page != 0,
+            "table" => !sql.is_some_and(crate::util::sql_is_create_virtual_table),
+            _ => false,
+        };
+        if has_btree {
+            if root_page == 0 {
+                return Err(LimboError::Corrupt(
+                    "sqlite_schema btree has zero root page".into(),
+                ));
+            }
+            if root_page < 0 {
+                if self
+                    .current_root_page(&MVTableId::from(root_page))
+                    .is_some()
+                {
+                    return Err(LimboError::Corrupt(
+                        "logical root conflicts with an existing physical binding".into(),
+                    ));
+                }
+            } else if self
+                .try_get_table_id_from_root_page_at(root_page, u64::MAX)
+                .is_none()
+            {
+                return Err(LimboError::Corrupt(
+                    "logical log references an unmapped physical root".into(),
+                ));
+            }
+        } else if root_page != 0 {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema object without a btree has a nonzero root page".into(),
+            ));
+        }
+        Ok((root_page, has_btree))
+    }
+
+    fn prepare_recovery_frame(
         &self,
         connection: &Arc<Connection>,
-        ctx: &mut RecoverCtx,
+        ctx: &RecoverCtx,
         frame: Vec<ParsedOp>,
-    ) -> Result<()> {
-        let mut max_commit_ts_seen = ctx.max_commit_ts_seen;
-        let replay_cutoff_ts = ctx.replay_cutoff_ts;
+    ) -> Result<PreparedRecoveryFrame> {
+        let commit_timestamp = replay_frame_timestamp(&frame)?;
+        let incoming_schema_cookie = frame.iter().rev().find_map(|op| match op {
+            ParsedOp::UpdateHeader { header, .. } => Some(header.schema_cookie.get()),
+            _ => None,
+        });
+        let schema_rows = &ctx.schema_rows;
+        let type_sqls = &ctx.type_sqls;
+        let current_schema = ctx.current_schema.clone();
         let cookie = ctx.cookie;
-        let mut schema_rows = std::mem::take(&mut ctx.schema_rows);
-        let mut type_sqls = std::mem::take(&mut ctx.type_sqls);
-        let mut dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
-        let mut current_schema = ctx.current_schema.clone();
-        let mut index_infos = std::mem::take(&mut ctx.index_infos);
-
-        let install_schema = |schema: Arc<Schema>| {
-            *connection.schema.write() = schema.clone();
-            *connection.db.schema.lock() = schema;
-        };
-
+        let mut index_infos = ctx.index_infos.clone();
         let root_page_for_index = |index_id: MVTableId| -> i64 {
             self.current_root_page(&index_id)
                 .map(|value| value as i64)
@@ -9923,416 +10419,412 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             schema.all_indexes().any(|idx| idx.root_page == root_page)
         };
 
-        let parsed_op_commit_ts = |op: &ParsedOp| match op {
-            ParsedOp::UpsertTable { commit_ts, .. }
-            | ParsedOp::DeleteTable { commit_ts, .. }
-            | ParsedOp::UpsertIndex { commit_ts, .. }
-            | ParsedOp::DeleteIndex { commit_ts, .. }
-            | ParsedOp::UpdateHeader { commit_ts, .. } => *commit_ts,
+        // Work out what sqlite_schema will look like after this transaction,
+        // before applying any row/index changes from the transaction.
+        //
+        // Why this is necessary:
+        // - CREATE INDEX can log index-entry inserts in the same frame as the
+        //   sqlite_schema insert for the new index. Those index-entry inserts
+        //   need the post-frame schema.
+        // - DROP INDEX can log DELETE_INDEX entries for b-tree index entries
+        //   that existed before the transaction. Those deletes still need the
+        //   pre-frame schema, because the final schema no longer has idx.
+        // - ALTER TABLE can delete and reinsert the same table's sqlite_schema
+        //   row while also logging table/index DML. Installing the schema after
+        //   only the delete would create an impossible in-between schema:
+        //   sqlite_schema may still contain idx while the table row for t is
+        //   temporarily absent.
+        //
+        // So recovery stages sqlite_schema into `schema_rows_after`, builds a
+        // post-frame Schema from that staged map, and keeps the installed
+        // `current_schema` unchanged until every op in the frame has replayed.
+        // Most transaction frames do not change sqlite_schema, so clone the
+        // schema row map only if this frame actually writes sqlite_schema.
+        let mut schema_rows_after: Option<HashMap<i64, ImmutableRecord>> = None;
+        for parsed_op in &frame {
+            match parsed_op {
+                ParsedOp::UpsertTable {
+                    rowid,
+                    record_bytes,
+                    ..
+                } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
+                    let schema_rows_after =
+                        schema_rows_after.get_or_insert_with(|| (*schema_rows).clone());
+                    self.validate_recovery_schema_root(record_bytes)?;
+                    let record = ImmutableRecordRef::from_bin_record(record_bytes);
+                    let column_count = record.column_count();
+                    if column_count < 5 {
+                        return Err(LimboError::Corrupt(format!(
+                            "sqlite_schema row must have at least 5 columns, got {column_count}",
+                        )));
+                    }
+                    crate::with_mv_store_allocation_site!(SchemaRowPayload, {
+                        schema_rows_after.insert(
+                            rowid.row_id.to_int_or_panic(),
+                            ImmutableRecord::from_bin_record(crate::types::value_blob_from_slice(
+                                record_bytes,
+                            )?),
+                        );
+                    });
+                }
+                ParsedOp::DeleteTable { rowid, .. }
+                    if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
+                {
+                    let schema_rows_after =
+                        schema_rows_after.get_or_insert_with(|| (*schema_rows).clone());
+                    schema_rows_after.remove(&rowid.row_id.to_int_or_panic());
+                }
+                _ => {}
+            }
+        }
+        // CREATE TYPE and DROP TYPE write the types table. The rebuilt
+        // schema needs those types to give indexes their columns' type
+        // orders, so stage the types table the same way.
+        let types_table_id = if connection.experimental_custom_types_enabled() {
+            schema_rows_after
+                .as_ref()
+                .unwrap_or(schema_rows)
+                .values()
+                .find_map(|record| types_table_root_page(&record.as_record_ref()))
+                .map(|root_page| self.get_table_id_from_root_page(root_page))
+        } else {
+            None
         };
-        'frame: {
-            let frame_commit_ts = parsed_op_commit_ts(
-                frame
-                    .first()
-                    .expect("next_frame should not return an empty frame"),
-            );
-            max_commit_ts_seen = max_commit_ts_seen.max(frame_commit_ts);
-            if frame_commit_ts <= replay_cutoff_ts {
-                break 'frame;
-            }
-
-            // Work out what sqlite_schema will look like after this transaction,
-            // before applying any row/index changes from the transaction.
-            //
-            // Why this is necessary:
-            // - CREATE INDEX can log index-entry inserts in the same frame as the
-            //   sqlite_schema insert for the new index. Those index-entry inserts
-            //   need the post-frame schema.
-            // - DROP INDEX can log DELETE_INDEX entries for b-tree index entries
-            //   that existed before the transaction. Those deletes still need the
-            //   pre-frame schema, because the final schema no longer has idx.
-            // - ALTER TABLE can delete and reinsert the same table's sqlite_schema
-            //   row while also logging table/index DML. Installing the schema after
-            //   only the delete would create an impossible in-between schema:
-            //   sqlite_schema may still contain idx while the table row for t is
-            //   temporarily absent.
-            //
-            // So recovery stages sqlite_schema into `schema_rows_after`, builds a
-            // post-frame Schema from that staged map, and keeps the installed
-            // `current_schema` unchanged until every op in the frame has replayed.
-            // Most transaction frames do not change sqlite_schema, so clone the
-            // schema row map only if this frame actually writes sqlite_schema.
-            let mut schema_rows_after: Option<HashMap<i64, ImmutableRecord>> = None;
-            for parsed_op in &frame {
-                match parsed_op {
-                    ParsedOp::UpsertTable {
-                        rowid,
+        let mut type_sqls_after: Option<BTreeMap<i64, String>> = None;
+        for parsed_op in &frame {
+            match parsed_op {
+                ParsedOp::UpsertTable {
+                    rowid,
+                    record_bytes,
+                    ..
+                } if Some(rowid.table_id) == types_table_id => {
+                    let sql = Schema::type_sql_from_record(&ImmutableRecordRef::from_bin_record(
                         record_bytes,
-                        ..
-                    } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
-                        let schema_rows_after =
-                            schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        let record = ImmutableRecordRef::from_bin_record(record_bytes);
-                        let column_count = record.column_count();
-                        if column_count < 5 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {column_count}",
-                            )));
-                        }
-                        crate::with_mv_store_allocation_site!(SchemaRowPayload, {
-                            schema_rows_after.insert(
-                                rowid.row_id.to_int_or_panic(),
-                                ImmutableRecord::from_bin_record(
-                                    crate::types::value_blob_from_slice(record_bytes)?,
-                                ),
-                            );
-                        });
-                    }
-                    ParsedOp::DeleteTable { rowid, .. }
-                        if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
-                    {
-                        let schema_rows_after =
-                            schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        schema_rows_after.remove(&rowid.row_id.to_int_or_panic());
-                    }
-                    _ => {}
+                    ))?;
+                    type_sqls_after
+                        .get_or_insert_with(|| (*type_sqls).clone())
+                        .insert(rowid.row_id.to_int_or_panic(), sql);
                 }
-            }
-            // CREATE TYPE and DROP TYPE write the types table. The rebuilt
-            // schema needs those types to give indexes their columns' type
-            // orders, so stage the types table the same way.
-            let types_table_id = if connection.experimental_custom_types_enabled() {
-                schema_rows_after
-                    .as_ref()
-                    .unwrap_or(&schema_rows)
-                    .values()
-                    .find_map(|record| types_table_root_page(&record.as_record_ref()))
-                    .map(|root_page| self.get_table_id_from_root_page(root_page))
-            } else {
-                None
-            };
-            let mut type_sqls_after: Option<BTreeMap<i64, String>> = None;
-            for parsed_op in &frame {
-                match parsed_op {
-                    ParsedOp::UpsertTable {
-                        rowid,
-                        record_bytes,
-                        ..
-                    } if Some(rowid.table_id) == types_table_id => {
-                        let sql = Schema::type_sql_from_record(
-                            &ImmutableRecordRef::from_bin_record(record_bytes),
-                        )?;
-                        type_sqls_after
-                            .get_or_insert_with(|| type_sqls.clone())
-                            .insert(rowid.row_id.to_int_or_panic(), sql);
-                    }
-                    ParsedOp::DeleteTable { rowid, .. }
-                        if Some(rowid.table_id) == types_table_id =>
-                    {
-                        type_sqls_after
-                            .get_or_insert_with(|| type_sqls.clone())
-                            .remove(&rowid.row_id.to_int_or_panic());
-                    }
-                    _ => {}
+                ParsedOp::DeleteTable { rowid, .. } if Some(rowid.table_id) == types_table_id => {
+                    type_sqls_after
+                        .get_or_insert_with(|| (*type_sqls).clone())
+                        .remove(&rowid.row_id.to_int_or_panic());
                 }
+                _ => {}
             }
-            if type_sqls_after.is_some() && schema_rows_after.is_none() {
-                schema_rows_after = Some(schema_rows.clone());
-            }
-            // schema_rows_after is Some if the frame changes the schema
-            let schema_rows_after = schema_rows_after;
+        }
+        if type_sqls_after.is_some() && schema_rows_after.is_none() {
+            schema_rows_after = Some((*schema_rows).clone());
+        }
+        // schema_rows_after is Some if the frame changes the schema
+        let schema_rows_after = schema_rows_after;
 
-            let schema_after = match schema_rows_after.as_ref() {
-                Some(schema_rows_after) => {
-                    let type_sqls_after = type_sqls_after.as_ref().unwrap_or(&type_sqls);
-                    Some(self.recover_build_schema(
-                        connection,
-                        schema_rows_after,
-                        &type_sqls_after.values().cloned().collect::<Vec<_>>(),
-                        cookie,
-                        &ctx.preserved_table_valued_functions,
-                    )?)
+        let mut schema_after = match schema_rows_after.as_ref() {
+            Some(schema_rows_after) => {
+                let type_sqls_after = type_sqls_after.as_ref().unwrap_or(type_sqls);
+                Some(self.recover_build_schema(
+                    connection,
+                    schema_rows_after,
+                    &type_sqls_after.values().cloned().collect::<Vec<_>>(),
+                    cookie,
+                    &ctx.preserved_table_valued_functions,
+                )?)
+            }
+            None => None,
+        };
+
+        if let Some(cookie) = incoming_schema_cookie {
+            let prepared_cookie = schema_after
+                .as_ref()
+                .unwrap_or(&current_schema)
+                .schema_version;
+            if prepared_cookie != cookie {
+                let schema = schema_after.get_or_insert_with(|| current_schema.clone());
+                Schema::try_make_mut(schema)?.schema_version = cookie;
+            }
+        }
+
+        if schema_rows_after.is_some() {
+            // Cached IndexInfo values are tied to a specific schema. Clear
+            // before decoding a schema-changing frame so this frame chooses
+            // from its own before/after schema pair.
+            index_infos.clear();
+        }
+
+        {
+            let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
+                if schema_rows_after.is_none() {
+                    return false;
                 }
-                None => None,
-            };
-
-            if schema_rows_after.is_some() {
-                // Cached IndexInfo values are tied to a specific schema. Clear
-                // before decoding a schema-changing frame so this frame chooses
-                // from its own before/after schema pair.
-                index_infos.clear();
-            }
-
-            {
-                let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
-                    let Some(schema_after) = schema_after.as_ref() else {
-                        return false;
-                    };
-
-                    match parsed_op {
-                        ParsedOp::UpsertIndex { table_id, .. } => {
-                            let root_page = root_page_for_index(*table_id);
-                            !schema_has_index_root(schema_after, root_page)
-                        }
-                        ParsedOp::DeleteIndex { table_id, .. } => {
-                            let root_page = root_page_for_index(*table_id);
-                            !schema_has_index_root(&current_schema, root_page)
-                        }
-                        _ => false,
-                    }
+                let Some(schema_after) = schema_after.as_ref() else {
+                    return false;
                 };
 
-                let mut get_index_info = |index_id: MVTableId,
-                                          op_kind: IndexOpKind|
-                 -> Result<Arc<IndexInfo>> {
-                    if let Some(index_info) = index_infos.get(&(index_id, op_kind)) {
-                        return Ok(index_info.clone());
+                match parsed_op {
+                    ParsedOp::UpsertIndex { table_id, .. } => {
+                        let root_page = root_page_for_index(*table_id);
+                        !schema_has_index_root(schema_after, root_page)
                     }
+                    ParsedOp::DeleteIndex { table_id, .. } => {
+                        let root_page = root_page_for_index(*table_id);
+                        !schema_has_index_root(&current_schema, root_page)
+                    }
+                    _ => false,
+                }
+            };
 
-                    let root_page = root_page_for_index(index_id);
-                    let before = find_index_info(&current_schema, root_page)?;
-                    let after = schema_after
-                        .as_ref()
-                        .map(|schema| find_index_info(schema, root_page))
-                        .transpose()?
-                        .flatten();
+            let mut get_index_info = |index_id: MVTableId,
+                                      op_kind: IndexOpKind|
+             -> Result<Arc<IndexInfo>> {
+                if let Some(index_info) = index_infos.get(&(index_id, op_kind)) {
+                    return Ok(index_info.clone());
+                }
 
-                    // The logical log tells us whether an index entry is being
-                    // inserted or deleted, but it stores only encoded key bytes
-                    // plus the index root page. The recovery loop below skips
-                    // index ops that cannot affect the final state of this
-                    // frame before those bytes are decoded. For the remaining
-                    // ops, pick the schema view that owns the entry at the
-                    // frame boundary:
-                    //
-                    // - UPSERT_INDEX writes an entry that survives after the
-                    //   transaction. In a schema-changing frame, the index must
-                    //   exist in the post-frame schema.
-                    // - DELETE_INDEX removes an entry that existed before the
-                    //   transaction. In a schema-changing frame, the index must
-                    //   exist in the pre-frame schema.
-                    // - If the frame does not change schema, `current_schema` is
-                    //   both the before and after schema.
-                    let index_info = match op_kind {
-                        IndexOpKind::Upsert if schema_after.is_some() => after,
-                        IndexOpKind::Delete if schema_after.is_some() => before,
+                let root_page = root_page_for_index(index_id);
+                let before = find_index_info(&current_schema, root_page)?;
+                let after = schema_after
+                    .as_ref()
+                    .map(|schema| find_index_info(schema, root_page))
+                    .transpose()?
+                    .flatten();
+
+                // The logical log tells us whether an index entry is being
+                // inserted or deleted, but it stores only encoded key bytes
+                // plus the index root page. The recovery loop below skips
+                // index ops that cannot affect the final state of this
+                // frame before those bytes are decoded. For the remaining
+                // ops, pick the schema view that owns the entry at the
+                // frame boundary:
+                //
+                // - UPSERT_INDEX writes an entry that survives after the
+                //   transaction. In a schema-changing frame, the index must
+                //   exist in the post-frame schema.
+                // - DELETE_INDEX removes an entry that existed before the
+                //   transaction. In a schema-changing frame, the index must
+                //   exist in the pre-frame schema.
+                // - If the frame does not change schema, `current_schema` is
+                //   both the before and after schema.
+                let index_info = match op_kind {
+                        IndexOpKind::Upsert if schema_rows_after.is_some() => after,
+                        IndexOpKind::Delete if schema_rows_after.is_some() => before,
                         IndexOpKind::Upsert | IndexOpKind::Delete => before,
                     }
                     .ok_or_else(|| {
                         let expected_schema = match op_kind {
-                            IndexOpKind::Upsert if schema_after.is_some() => "post-frame",
-                            IndexOpKind::Delete if schema_after.is_some() => "pre-frame",
+                            IndexOpKind::Upsert if schema_rows_after.is_some() => "post-frame",
+                            IndexOpKind::Delete if schema_rows_after.is_some() => "pre-frame",
                             IndexOpKind::Upsert | IndexOpKind::Delete => "current",
                         };
                         LimboError::InternalError(format!(
                             "Index with root page {root_page} not found in {expected_schema} schema while recovering logical log",
                         ))
                     })?;
-                    index_infos.insert((index_id, op_kind), index_info.clone());
-                    Ok(index_info)
-                };
+                index_infos.insert((index_id, op_kind), index_info.clone());
+                Ok(index_info)
+            };
 
-                for parsed_op in frame {
-                    // Some index writes are real while the transaction is
-                    // running, but have no meaning at either durable boundary.
-                    //
-                    // Example: UPDATE a row so it writes a new entry into
-                    // idx_old, then DROP INDEX idx_old before COMMIT. The
-                    // UPSERT_INDEX for idx_old is not part of the database
-                    // after the transaction, and the post-frame schema no
-                    // longer has CREATE INDEX text for idx_old. Decoding it
-                    // against the pre-frame schema would preserve an index
-                    // entry for an index that was dropped. Decoding it against
-                    // the post-frame schema is impossible. The correct action
-                    // is to skip it.
-                    //
-                    // The opposite case is a DELETE_INDEX for an index created
-                    // earlier in the same frame. There was no pre-frame index
-                    // entry in the database file, so that delete also has no
-                    // durable work to do.
-                    if should_skip_index_op(&parsed_op) {
-                        continue;
-                    }
+            // A late decode failure must not install earlier rows from this frame.
+            // Installation below still allocates, so this is not a live-import API.
+            let mut decoded_frame = Vec::try_with_capacity_ext(frame.len())?;
+            for parsed_op in frame {
+                // Some index writes are real while the transaction is
+                // running, but have no meaning at either durable boundary.
+                //
+                // Example: UPDATE a row so it writes a new entry into
+                // idx_old, then DROP INDEX idx_old before COMMIT. The
+                // UPSERT_INDEX for idx_old is not part of the database
+                // after the transaction, and the post-frame schema no
+                // longer has CREATE INDEX text for idx_old. Decoding it
+                // against the pre-frame schema would preserve an index
+                // entry for an index that was dropped. Decoding it against
+                // the post-frame schema is impossible. The correct action
+                // is to skip it.
+                //
+                // The opposite case is a DELETE_INDEX for an index created
+                // earlier in the same frame. There was no pre-frame index
+                // entry in the database file, so that delete also has no
+                // durable work to do.
+                if should_skip_index_op(&parsed_op) {
+                    continue;
+                }
 
-                    let next_rec = ctx.reader.parsed_op_to_streaming_in(
-                        parsed_op,
-                        &mut get_index_info,
-                        self.alloc.clone(),
-                    )?;
+                let next_rec = ctx.reader.parsed_op_to_streaming_in(
+                    parsed_op,
+                    &mut get_index_info,
+                    self.alloc.clone(),
+                )?;
 
-                    tracing::trace!("next_rec {next_rec:?}");
+                decoded_frame.push(next_rec);
+            }
 
-                    match next_rec {
-                        StreamingResult::UpsertTableRow {
-                            row,
-                            rowid,
-                            commit_ts,
-                            btree_resident,
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
-                            if is_schema_row {
-                                let record = ImmutableRecordRef::from_bin_record(row.payload());
-                                let column_count = record.column_count();
-                                if column_count < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {column_count}",
-                                    )));
-                                }
-                                let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type must be text".to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                let val = match record.get_value_opt(3) {
-                                    Some(v) => v,
-                                    None => {
-                                        return Err(LimboError::InternalError(
-                                            "Expected at least 5 columns in sqlite_schema"
-                                                .to_string(),
-                                        ));
-                                    }
-                                };
-                                let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
-                                    val
-                                else {
-                                    panic!("Expected integer value for root page, got {val:?}");
-                                };
-                                let sql = match record.get_value_opt(4) {
-                                    Some(ValueRef::Text(v)) => Some(v.as_str()),
-                                    _ => None,
-                                };
-                                let has_btree = match row_type {
-                                    "index" => root_page != 0,
-                                    "table" => {
-                                        !sql.is_some_and(crate::util::sql_is_create_virtual_table)
-                                    }
-                                    _ => false,
-                                };
-                                if has_btree {
-                                    if root_page == 0 {
-                                        return Err(LimboError::Corrupt(format!(
-                                            "sqlite_schema root_page=0 for btree {row_type}"
-                                        )));
-                                    }
-                                    if root_page < 0 {
-                                        let table_id = self.get_table_id_from_root_page(root_page);
-                                        if let Some(entry) =
-                                            self.table_id_to_rootpage.get(&table_id)
-                                        {
-                                            if let Some(value) = entry.value().root_page {
-                                                panic!(
-                                                    "Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}"
-                                                );
-                                            }
-                                        }
-                                        self.insert_table_id_to_rootpage(table_id, None);
-                                    } else {
-                                        dropped_root_pages.remove(&root_page);
-                                        let table_id = self.get_table_id_from_root_page(root_page);
-                                        let Some(entry) = self.table_id_to_rootpage.get(&table_id)
-                                        else {
-                                            panic!(
-                                                "Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map"
-                                            );
-                                        };
-                                        let Some(value) = entry.value().root_page else {
-                                            panic!(
-                                                "Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map"
-                                            );
-                                        };
-                                        turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
-                                    }
-                                } else if root_page != 0 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
-                                    )));
-                                }
-                                let rowid_int = rowid.row_id.to_int_or_panic();
-                                crate::with_mv_store_allocation_site!(SchemaRowPayload, {
-                                    schema_rows.insert(
-                                        rowid_int,
-                                        ImmutableRecord::from_bin_record(
-                                            crate::types::value_blob_from_slice(row.payload())?,
-                                        ),
-                                    );
-                                });
-                            } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
-                                // Data row references a table_id not yet in the map. This can happen
-                                // with logs written before the schema-first serialization fix: in a
-                                // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
-                                // serialized before the schema INSERT that registers the table_id.
-                                // The schema INSERT (or DELETE) for this table will follow later in
-                                // this transaction frame, so we register the table_id now.
-                                self.insert_table_id_to_rootpage(rowid.table_id, None);
-                            }
+            Ok(PreparedRecoveryFrame {
+                commit_timestamp,
+                decoded_frame,
+                schema_rows_after,
+                type_sqls_after,
+                schema_after,
+                index_infos,
+            })
+        }
+    }
 
-                            let version_id = self.get_version_id();
-                            let row_version = RowVersion {
-                                id: version_id,
-                                begin: crate::mvcc::database::PackedTs::pack(Some(
-                                    TxTimestampOrID::Timestamp(commit_ts),
-                                )),
-                                end: crate::mvcc::database::PackedTs::pack(None),
-                                data: row.data.clone(),
-                                btree_resident,
-                                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                            };
-                            {
-                                let versions =
-                                    self.get_or_create_table_row_versions(rowid.clone())?;
-                                let mut versions = versions.write();
-                                self.insert_version_raw(&mut versions, row_version)?;
-                            }
-                            let allocator = self.get_rowid_allocator(&rowid.table_id);
-                            allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
+    /// Replay a single committed logical-log transaction frame into the MVCC
+    /// store. Fully synchronous (the only recovery IO is reading the next frame,
+    /// driven by the caller); operates on accumulators borrowed from `ctx`.
+    ///
+    /// A same-transaction create-then-drop leaves a delete of a sqlite_schema rowid absent from
+    /// the merged state; replay treats that as a legal no-op, not corruption.
+    #[aristo::intent(
+        "Replaying a committed logical-log transaction never aborts with a corruption error",
+        id = "mvcc_recovery_total_on_committed_log",
+        verify = "full"
+    )]
+    fn recover_process_frame(
+        &self,
+        connection: &Arc<Connection>,
+        ctx: &mut RecoverCtx,
+        frame: Vec<ParsedOp>,
+    ) -> Result<()> {
+        let frame_commit_ts = replay_frame_timestamp(&frame)?;
+        if frame_commit_ts <= ctx.replay_cutoff_ts {
+            ctx.max_commit_ts_seen = ctx.max_commit_ts_seen.max(frame_commit_ts);
+            return Ok(());
+        }
+        let PreparedRecoveryFrame {
+            commit_timestamp,
+            decoded_frame,
+            schema_rows_after,
+            type_sqls_after,
+            schema_after,
+            mut index_infos,
+        } = self.prepare_recovery_frame(connection, ctx, frame)?;
+        let mut max_commit_ts_seen = ctx.max_commit_ts_seen.max(commit_timestamp);
+        let replay_cutoff_ts = ctx.replay_cutoff_ts;
+        let mut schema_rows = std::mem::take(&mut ctx.schema_rows);
+        let mut type_sqls = std::mem::take(&mut ctx.type_sqls);
+        let mut dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
+        let mut current_schema = ctx.current_schema.clone();
+
+        let install_schema = |schema: Arc<Schema>| {
+            *connection.schema.write() = schema.clone();
+            *connection.db.schema.lock() = schema;
+        };
+
+        let replay_result = (|| -> Result<()> {
+            for next_rec in decoded_frame {
+                tracing::trace!("next_rec {next_rec:?}");
+
+                match next_rec {
+                    StreamingResult::UpsertTableRow {
+                        row,
+                        rowid,
+                        commit_ts,
+                        btree_resident,
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
                         }
-                        StreamingResult::DeleteTableRow {
-                            rowid, commit_ts, ..
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
-                                // See comment in UpsertTableRow: old logs may have data rows
-                                // serialized before the schema INSERT that registers the table_id.
-                                self.insert_table_id_to_rootpage(rowid.table_id, None);
-                            }
-                            let tombstone_row = crate::with_mv_store_allocation_site!(
-                                RowPayload,
-                                if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                    let rowid_int = rowid.row_id.to_int_or_panic();
-                                    if let Some(record) = schema_rows.get(&rowid_int) {
-                                        // Preserve the pre-delete sqlite_schema record in recovered
-                                        // tombstones so checkpoint can still recover B-tree identity.
-                                        Row::new_table_row_in(
-                                            rowid.clone(),
-                                            record.as_blob(),
-                                            self.alloc.clone(),
-                                        )?
-                                    } else {
-                                        Row::new_table_row_in(
-                                            rowid.clone(),
-                                            &[],
-                                            self.alloc.clone(),
-                                        )?
+                        let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+                        if is_schema_row {
+                            let (root_page, has_btree) =
+                                self.validate_recovery_schema_root(row.payload())?;
+                            if has_btree {
+                                if root_page < 0 {
+                                    let table_id = MVTableId::from(root_page);
+                                    if self.table_id_to_rootpage.load().get(&table_id).is_none() {
+                                        self.insert_table_id_to_rootpage(table_id, None);
                                     }
+                                } else {
+                                    dropped_root_pages.remove(&root_page);
+                                }
+                            }
+                            let rowid_int = rowid.row_id.to_int_or_panic();
+                            crate::with_mv_store_allocation_site!(SchemaRowPayload, {
+                                schema_rows.insert(
+                                    rowid_int,
+                                    ImmutableRecord::from_bin_record(
+                                        crate::types::value_blob_from_slice(row.payload())?,
+                                    ),
+                                );
+                            });
+                        } else if self
+                            .table_id_to_rootpage
+                            .load()
+                            .get(&rowid.table_id)
+                            .is_none()
+                        {
+                            // Data row references a table_id not yet in the map. This can happen
+                            // with logs written before the schema-first serialization fix: in a
+                            // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
+                            // serialized before the schema INSERT that registers the table_id.
+                            // The schema INSERT (or DELETE) for this table will follow later in
+                            // this transaction frame, so we register the table_id now.
+                            self.insert_table_id_to_rootpage(rowid.table_id, None);
+                        }
+
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: crate::mvcc::database::PackedTs::pack(Some(
+                                TxTimestampOrID::Timestamp(commit_ts),
+                            )),
+                            end: crate::mvcc::database::PackedTs::pack(None),
+                            data: row.data.clone(),
+                            btree_resident,
+                            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                        };
+                        {
+                            let versions = self.get_or_create_table_row_versions(rowid.clone())?;
+                            let mut versions = versions.write();
+                            self.insert_version_raw(&mut versions, row_version)?;
+                        }
+                        let allocator = self.get_rowid_allocator(&rowid.table_id);
+                        allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
+                    }
+                    StreamingResult::DeleteTableRow {
+                        rowid, commit_ts, ..
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        if self
+                            .table_id_to_rootpage
+                            .load()
+                            .get(&rowid.table_id)
+                            .is_none()
+                        {
+                            // See comment in UpsertTableRow: old logs may have data rows
+                            // serialized before the schema INSERT that registers the table_id.
+                            self.insert_table_id_to_rootpage(rowid.table_id, None);
+                        }
+                        let tombstone_row = crate::with_mv_store_allocation_site!(
+                            RowPayload,
+                            if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                let rowid_int = rowid.row_id.to_int_or_panic();
+                                if let Some(record) = schema_rows.get(&rowid_int) {
+                                    // Preserve the pre-delete sqlite_schema record in recovered
+                                    // tombstones so checkpoint can still recover B-tree identity.
+                                    Row::new_table_row_in(
+                                        rowid.clone(),
+                                        record.as_blob(),
+                                        self.alloc.clone(),
+                                    )?
                                 } else {
                                     Row::new_table_row_in(rowid.clone(), &[], self.alloc.clone())?
                                 }
-                            );
-                            if let Some(versions) = self.rows.get(&rowid) {
-                                // Row exists in memory — try to find the current (non-ended) version
-                                // that was committed before this delete, and mark it as ended. If no
-                                // such version exists (e.g. it was already GC'd or this is a B-tree
-                                // resident row not yet in memory), insert a tombstone instead.
-                                let mut versions = versions.value().write();
-                                if let Some(existing) = versions.iter_mut().rev().find(|rv| {
+                            } else {
+                                Row::new_table_row_in(rowid.clone(), &[], self.alloc.clone())?
+                            }
+                        );
+                        if let Some(versions) = self.rows.get(&rowid) {
+                            // Row exists in memory — try to find the current (non-ended) version
+                            // that was committed before this delete, and mark it as ended. If no
+                            // such version exists (e.g. it was already GC'd or this is a B-tree
+                            // resident row not yet in memory), insert a tombstone instead.
+                            let mut versions = versions.value().write();
+                            if let Some(existing) = versions.iter_mut().rev().find(|rv| {
                                     rv.end().is_none()
                                         && matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
                                 }) {
@@ -10356,108 +10848,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
                                 }
-                            } else {
-                                let version_id = self.get_version_id();
-                                let row_version = RowVersion {
-                                    id: version_id,
-                                    begin: crate::mvcc::database::PackedTs::pack(None),
-                                    end: crate::mvcc::database::PackedTs::pack(Some(
-                                        TxTimestampOrID::Timestamp(commit_ts),
-                                    )),
-                                    data: tombstone_row.data,
-                                    // Same invariant as above: no replayed version means the
-                                    // deleted row is already durable in the DB file.
-                                    btree_resident: true,
-                                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                                };
-                                let versions =
-                                    self.get_or_create_table_row_versions(rowid.clone())?;
-                                let mut versions = versions.write();
-                                self.insert_version_raw(&mut versions, row_version)?;
-                            }
-                            if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                let rowid_int = rowid.row_id.to_int_or_panic();
-                                let Some(record) = schema_rows.get(&rowid_int) else {
-                                    // this can happen if a row in sqlite_schema was inserted and then
-                                    // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
-                                    continue;
-                                };
-                                if record.column_count() < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
-                                    )));
-                                }
-                                let (
-                                    ValueRef::Text(row_type),
-                                    ValueRef::Numeric(Numeric::Integer(root_page)),
-                                ) = record.get_two_values(0, 3)?
-                                else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type and root_page must be text and integer"
-                                            .to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                if (row_type == "table" || row_type == "index") && root_page > 0 {
-                                    dropped_root_pages.insert(root_page);
-                                }
-                                schema_rows.remove(&rowid_int);
-                            }
-                        }
-                        StreamingResult::UpsertIndexRow {
-                            row,
-                            rowid,
-                            commit_ts,
-                            btree_resident,
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            let version_id = self.get_version_id();
-                            let row_version = RowVersion {
-                                id: version_id,
-                                begin: crate::mvcc::database::PackedTs::pack(Some(
-                                    TxTimestampOrID::Timestamp(commit_ts),
-                                )),
-                                end: crate::mvcc::database::PackedTs::pack(None),
-                                data: row.data.clone(),
-                                btree_resident,
-                                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                            };
-                            let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
-                                panic!("Index writes must be to a record");
-                            };
-                            self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
-                        }
-                        StreamingResult::DeleteIndexRow {
-                            row,
-                            rowid,
-                            commit_ts,
-                            ..
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
-                                panic!("Index writes must be to a record");
-                            };
-                            let sortable_key =
-                                self.get_or_create_index_key_arc(rowid.table_id, sortable_key)?;
-                            if let Some(index_map) = self.index_rows.get(&rowid.table_id) {
-                                if let Some(versions) = index_map.value().get(&sortable_key) {
-                                    let mut versions = versions.value().write();
-                                    if let Some(existing) = versions.iter_mut().rev().find(|rv| {
-                                rv.end().is_none()
-                                    && matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
-                            }) {
-                                existing.set_end(Some(TxTimestampOrID::Timestamp(commit_ts)));
-                                continue;
-                            }
-                                }
-                            }
+                        } else {
                             let version_id = self.get_version_id();
                             let row_version = RowVersion {
                                 id: version_id,
@@ -10465,30 +10856,129 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 end: crate::mvcc::database::PackedTs::pack(Some(
                                     TxTimestampOrID::Timestamp(commit_ts),
                                 )),
-                                data: row.data.clone(),
-                                // The index entry this delete ends was not replayed, so its
-                                // frame is at or below the durable replay boundary: the entry
-                                // is in the DB file. Mark the tombstone btree-resident so
-                                // checkpoint applies the delete even though the logged flag
-                                // predates the entry becoming durable (e.g. a checkpoint that
-                                // failed after its pager commit).
+                                data: tombstone_row.data,
+                                // Same invariant as above: no replayed version means the
+                                // deleted row is already durable in the DB file.
                                 btree_resident: true,
                                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
-                            self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
+                            let versions = self.get_or_create_table_row_versions(rowid.clone())?;
+                            let mut versions = versions.write();
+                            self.insert_version_raw(&mut versions, row_version)?;
                         }
-                        StreamingResult::UpdateHeader { header, commit_ts } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
+                        if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                            let rowid_int = rowid.row_id.to_int_or_panic();
+                            let Some(record) = schema_rows.get(&rowid_int) else {
+                                // this can happen if a row in sqlite_schema was inserted and then
+                                // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
+                                continue;
+                            };
+                            if record.column_count() < 5 {
+                                return Err(LimboError::Corrupt(format!(
+                                    "sqlite_schema row must have at least 5 columns, got {}",
+                                    record.column_count()
+                                )));
+                            }
+                            let (
+                                ValueRef::Text(row_type),
+                                ValueRef::Numeric(Numeric::Integer(root_page)),
+                            ) = record.get_two_values(0, 3)?
+                            else {
+                                return Err(LimboError::Corrupt(
+                                    "sqlite_schema type and root_page must be text and integer"
+                                        .to_string(),
+                                ));
+                            };
+                            let row_type = row_type.as_str();
+                            if (row_type == "table" || row_type == "index") && root_page > 0 {
+                                dropped_root_pages.insert(root_page);
+                            }
+                            schema_rows.remove(&rowid_int);
+                        }
+                    }
+                    StreamingResult::UpsertIndexRow {
+                        row,
+                        rowid,
+                        commit_ts,
+                        btree_resident,
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: crate::mvcc::database::PackedTs::pack(Some(
+                                TxTimestampOrID::Timestamp(commit_ts),
+                            )),
+                            end: crate::mvcc::database::PackedTs::pack(None),
+                            data: row.data.clone(),
+                            btree_resident,
+                            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                        };
+                        let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
+                            panic!("Index writes must be to a record");
+                        };
+                        self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
+                    }
+                    StreamingResult::DeleteIndexRow {
+                        row,
+                        rowid,
+                        commit_ts,
+                        ..
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
+                            panic!("Index writes must be to a record");
+                        };
+                        let sortable_key =
+                            self.get_or_create_index_key_arc(rowid.table_id, sortable_key)?;
+                        if let Some(index_map) = self.index_rows.get(&rowid.table_id) {
+                            if let Some(versions) = index_map.value().get(&sortable_key) {
+                                let mut versions = versions.value().write();
+                                if let Some(existing) = versions.iter_mut().rev().find(|rv| {
+                                rv.end().is_none()
+                                    && matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
+                            }) {
+                                existing.set_end(Some(TxTimestampOrID::Timestamp(commit_ts)));
                                 continue;
                             }
-                            // Recovery applies only post-boundary header ops; the same value is later
-                            // staged to pager page-1 during checkpoint.
-                            self.global_header.write().replace(header);
+                            }
                         }
-                        StreamingResult::Eof => {
-                            unreachable!("next_frame does not return EOF records");
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: crate::mvcc::database::PackedTs::pack(None),
+                            end: crate::mvcc::database::PackedTs::pack(Some(
+                                TxTimestampOrID::Timestamp(commit_ts),
+                            )),
+                            data: row.data.clone(),
+                            // The index entry this delete ends was not replayed, so its
+                            // frame is at or below the durable replay boundary: the entry
+                            // is in the DB file. Mark the tombstone btree-resident so
+                            // checkpoint applies the delete even though the logged flag
+                            // predates the entry becoming durable (e.g. a checkpoint that
+                            // failed after its pager commit).
+                            btree_resident: true,
+                            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                        };
+                        self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
+                    }
+                    StreamingResult::UpdateHeader { header, commit_ts } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
                         }
+                        // Recovery applies only post-boundary header ops; the same value is later
+                        // staged to pager page-1 during checkpoint.
+                        self.global_header.write().replace(header);
+                    }
+                    StreamingResult::Eof => {
+                        unreachable!("next_frame does not return EOF records");
                     }
                 }
             }
@@ -10511,16 +11001,293 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // pre-frame schema. Do not carry those IndexInfo values into
                 // later frames after current_schema has changed.
                 index_infos.clear();
+            } else if let Some(schema_after) = schema_after {
+                install_schema(schema_after.clone());
+                current_schema = schema_after;
+                index_infos.clear();
             }
-        }
 
-        ctx.max_commit_ts_seen = max_commit_ts_seen;
+            Ok(())
+        })();
+
+        if replay_result.is_ok() {
+            ctx.max_commit_ts_seen = max_commit_ts_seen;
+        }
         ctx.schema_rows = schema_rows;
         ctx.type_sqls = type_sqls;
         ctx.dropped_root_pages = dropped_root_pages;
         ctx.current_schema = current_schema;
         ctx.index_infos = index_infos;
-        Ok(())
+        replay_result
+    }
+
+    // The shared authority must exclude peer commits/checkpoints throughout this
+    // call. Admission uses the same authority before issuing a snapshot timestamp.
+    #[allow(dead_code)]
+    fn install_peer_frame(
+        &self,
+        connection: &Arc<Connection>,
+        ctx: &mut RecoverCtx,
+        prepared: &mut Option<PreparedRecoveryFrame>,
+    ) -> Result<()> {
+        let frame = prepared.as_ref().ok_or_else(|| {
+            LimboError::InvalidArgument("peer frame was already installed".into())
+        })?;
+        let timestamp = frame.commit_timestamp;
+        if timestamp <= ctx.max_commit_ts_seen || timestamp > PackedTs::VALUE_MASK {
+            return Err(LimboError::Corrupt(
+                "non-monotonic live replay frame".into(),
+            ));
+        }
+        // Each request keeps log order. Targets are subsequently deduplicated and
+        // locked by Arc address, independently of the different index comparators.
+        let mut requests: Vec<(Row, bool, bool)> = Vec::new();
+        requests.try_reserve(frame.decoded_frame.len())?;
+        let mut roots = Vec::new();
+        roots.try_reserve(frame.decoded_frame.len().saturating_mul(2))?;
+        let mut header = None;
+        let mut dropped_roots = ctx.dropped_root_pages.clone();
+        for op in &frame.decoded_frame {
+            let (row, delete, resident) = match op {
+                StreamingResult::UpsertTableRow {
+                    row,
+                    btree_resident,
+                    ..
+                } => {
+                    if row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let (root, has_btree) =
+                            self.validate_recovery_schema_root(row.payload())?;
+                        if has_btree && root < 0 {
+                            roots.push(MVTableId::from(root));
+                        }
+                        if has_btree && root > 0 {
+                            dropped_roots.remove(&root);
+                        }
+                    }
+                    (row.clone(), false, *btree_resident)
+                }
+                StreamingResult::UpsertIndexRow {
+                    row,
+                    btree_resident,
+                    ..
+                } => (row.clone(), false, *btree_resident),
+                StreamingResult::DeleteIndexRow { row, .. } => (row.clone(), true, true),
+                StreamingResult::DeleteTableRow { rowid, .. } => {
+                    let prior_in_frame = requests
+                        .iter()
+                        .rev()
+                        .find_map(|(row, delete, _)| (!delete && row.id == *rowid).then_some(row));
+                    let data: &[u8] = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        prior_in_frame
+                            .map(|row| row.payload())
+                            .or_else(|| {
+                                ctx.schema_rows
+                                    .get(&rowid.row_id.to_int_or_panic())
+                                    .map(|record| record.as_blob().as_slice())
+                            })
+                            .unwrap_or(&[])
+                    } else {
+                        &[]
+                    };
+                    if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID && !data.is_empty() {
+                        let (root, has_btree) = self.validate_recovery_schema_root(data)?;
+                        if has_btree && root > 0 {
+                            dropped_roots.insert(root);
+                        }
+                    }
+                    (
+                        Row::new_table_row_in(rowid.clone(), data, self.alloc.clone())?,
+                        true,
+                        true,
+                    )
+                }
+                StreamingResult::UpdateHeader {
+                    header: incoming, ..
+                } => {
+                    header = Some(*incoming);
+                    continue;
+                }
+                StreamingResult::Eof => {
+                    return Err(LimboError::Corrupt("EOF inside live frame".into()))
+                }
+            };
+            roots.push(row.id.table_id);
+            requests.push((row, delete, resident));
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.iter().any(|id| i64::from(*id) == i64::MIN) {
+            return Err(LimboError::Corrupt(
+                "logical table id cannot be lowered".into(),
+            ));
+        }
+        // Global logical-ID reservation must make these sets disjoint. Do not
+        // adopt a mapping which a concurrent local rollback is entitled to remove.
+        for tx in self.txs.iter() {
+            if tx
+                .value()
+                .created_table_ids
+                .lock()
+                .iter()
+                .any(|id| roots.binary_search(id).is_ok())
+            {
+                return Err(LimboError::Corrupt(
+                    "peer frame overlaps a local unpublished table id".into(),
+                ));
+            }
+        }
+        for id in &roots {
+            self.table_id_to_rootpage
+                .load()
+                .try_get_or_insert(*id, RootEntry::live(None))?;
+        }
+        let mut targets = Vec::new();
+        targets.try_reserve(requests.len())?;
+        let mut request_chains = Vec::new();
+        request_chains.try_reserve(requests.len())?;
+        let mut allocators = Vec::new();
+        allocators.try_reserve(requests.len())?;
+        for (row, delete, _) in &mut requests {
+            let chain = match &row.id.row_id {
+                RowKey::Int(rowid) => {
+                    if !*delete {
+                        allocators.push((self.get_rowid_allocator(&row.id.table_id), *rowid));
+                    }
+                    self.get_or_create_table_row_versions(row.id.clone())?
+                }
+                RowKey::Record(key) => {
+                    let index = self.get_or_create_index_rows(row.id.table_id)?;
+                    let entry = self.get_or_create_index_key_entry(index.value(), key.clone())?;
+                    row.id.row_id = RowKey::Record(entry.key().clone());
+                    entry.value().clone()
+                }
+            };
+            request_chains.push(Arc::as_ptr(&chain) as usize);
+            targets.push((row.id.clone(), chain));
+        }
+        targets.sort_unstable_by_key(|(_, chain)| Arc::as_ptr(chain) as usize);
+        targets.dedup_by(|(_, a), (_, b)| Arc::ptr_eq(a, b));
+        let mut dirty_entries = Vec::new();
+        dirty_entries.try_reserve(targets.len())?;
+        for (id, _) in &targets {
+            dirty_entries.push(
+                self.checkpoint_dirty_keys_for(id)
+                    .try_get_or_insert(id.clone(), AtomicU64::new(0))?,
+            );
+        }
+        let schema_after = frame
+            .schema_after
+            .as_ref()
+            .map(|schema| -> Result<_> {
+                let mut schema = crate::alloc::TryClone::try_clone(schema.as_ref())?;
+                schema.dropped_root_pages.clone_from(&dropped_roots);
+                self.prepare_peer_sequence_schema(&mut schema, &ctx.current_schema, frame)?;
+                Ok(Arc::new(schema))
+            })
+            .transpose()?;
+        self.clock.publish_observed(timestamp, || -> Result<()> {
+            for tx in self.txs.iter() {
+                match tx.value().state.load() {
+                    TransactionState::Active if tx.value().begin_ts >= timestamp => {
+                        return Err(LimboError::Corrupt("live snapshot is newer than an unimported peer frame".into()));
+                    }
+                    TransactionState::Preparing(_) | TransactionState::Committed(_) => return Err(LimboError::Busy),
+                    _ => {}
+                }
+            }
+            let mut guards = Vec::new();
+            guards.try_reserve(targets.len())?;
+            for (id, chain) in &targets {
+                let guard = chain.write();
+                let mapped = match &id.row_id {
+                    RowKey::Int(_) => self.table_versions_still_mapped(id, chain),
+                    RowKey::Record(key) => self.index_rows.get(&id.table_id).is_some_and(|index| self.index_versions_still_mapped(index.value(), key, chain)),
+                };
+                if !mapped { return Err(LimboError::Busy); }
+                guards.push(guard);
+            }
+            if dirty_entries.iter().any(|entry| entry.is_removed()) { return Err(LimboError::Busy); }
+            let mut staged = Vec::new();
+            staged.try_reserve(guards.len())?;
+            let mut conflicts = Vec::new();
+            for (index, versions) in guards.iter().enumerate() {
+                let address = Arc::as_ptr(&targets[index].1) as usize;
+                let additions = request_chains.iter().filter(|candidate| **candidate == address).count();
+                let mut copy = <RowVersionChain<A> as TursoVecInExt<RowVersion, A>>::new_in(self.alloc.clone());
+                copy.try_reserve_exact(versions.len().checked_add(additions).ok_or(LimboError::OutOfMemory)?)?;
+                conflicts.try_reserve(versions.len().saturating_mul(2))?;
+                for version in versions.iter() {
+                    copy.push(version.clone());
+                    // SkipMap entries pin lifetime, not a mutex. Retain references
+                    // now so marking conflicts during publication is infallible.
+                    for tag in [version.begin(), version.end()].into_iter().flatten() {
+                        if let TxTimestampOrID::TxID(id) = tag {
+                            if let Some(tx) = self.txs.get(&id) {
+                                if tx.value().state.load() == TransactionState::Active { conflicts.push(tx); }
+                            }
+                        }
+                    }
+                }
+                staged.push(copy);
+            }
+            for ((row, delete, resident), address) in requests.iter().zip(&request_chains) {
+                let target = targets.binary_search_by_key(address, |(_, chain)| Arc::as_ptr(chain) as usize).expect("resolved replay chain");
+                let versions = &mut staged[target];
+                if *delete {
+                    if let Some(existing) = versions.iter_mut().rev().find(|version| {
+                        let begin = matches!(version.begin(), Some(TxTimestampOrID::Timestamp(begin)) if begin <= timestamp)
+                            || (version.begin().is_none() && matches!(version.end(), Some(TxTimestampOrID::TxID(_))));
+                        begin && matches!(version.end(), None | Some(TxTimestampOrID::TxID(_)))
+                    }) {
+                        existing.set_end(Some(TxTimestampOrID::Timestamp(timestamp)));
+                        continue;
+                    }
+                    if versions.iter().any(|version| version.begin().is_none() && version.end() == Some(TxTimestampOrID::Timestamp(timestamp))) { continue; }
+                }
+                let version = RowVersion::new(self.get_version_id(),
+                    (!delete).then_some(TxTimestampOrID::Timestamp(timestamp)),
+                    delete.then_some(TxTimestampOrID::Timestamp(timestamp)), row.data.clone(), *resident);
+                if !delete {
+                    if let Some(existing) = versions.iter_mut().find(|version| version.begin() == Some(TxTimestampOrID::Timestamp(timestamp))) {
+                        *existing = version;
+                        continue;
+                    }
+                }
+                let begin = self.resolve_begin_timestamp(&version.begin());
+                let position = versions.iter().rposition(|v| self.resolve_begin_timestamp(&v.begin()) <= begin).map_or(0, |index| index + 1);
+                versions.insert(position, version);
+            }
+            let added: usize = staged.iter().zip(&guards).map(|(after, before)| after.len() - before.len()).sum();
+            // Everything below is allocation-free. Old snapshots cannot see the
+            // new timestamp, and admission remains locked until metadata agrees.
+            let prepared = prepared.take().expect("validated peer frame remains pending");
+            for tx in conflicts { tx.value().peer_conflicted.store(true, Ordering::Release); }
+            for (guard, replacement) in guards.iter_mut().zip(staged) { **guard = replacement; }
+            for entry in &dirty_entries { entry.value().fetch_max(timestamp, Ordering::AcqRel); }
+            self.live_version_count_approx.fetch_add(added, Ordering::Relaxed);
+            self.bump_table_rows_epoch();
+            self.bump_index_rows_epoch();
+            // Never acquire schema/header locks while holding version-chain locks.
+            drop(guards);
+            for (allocator, rowid) in &allocators { allocator.insert_row_id_maybe_update(*rowid); }
+            for id in &roots { self.bump_next_table_id_below(*id, None); }
+            if let Some(header) = header { self.global_header.write().replace(header); }
+            let schema_changed = schema_after.is_some();
+            if let Some(schema) = schema_after {
+                *connection.schema.write() = schema.clone();
+                *connection.db.schema.lock() = schema.clone();
+                ctx.current_schema = schema;
+                self.last_committed_schema_change_ts.fetch_max(timestamp, Ordering::AcqRel);
+                self.bump_schema_generation();
+            }
+            if let Some(rows) = prepared.schema_rows_after { ctx.schema_rows = rows; }
+            if let Some(types) = prepared.type_sqls_after { ctx.type_sqls = types; }
+            ctx.index_infos = if schema_changed { HashMap::default() } else { prepared.index_infos };
+            ctx.dropped_root_pages = dropped_roots;
+            ctx.max_commit_ts_seen = timestamp;
+            self.last_committed_tx_ts.fetch_max(timestamp, Ordering::AcqRel);
+            Ok(())
+        })
     }
 
     /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
@@ -10600,6 +11367,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // negative root and reports its materialized page as orphaned ("never used").
             let root_page = if root_page < 0 {
                 self.table_id_to_rootpage
+                    .load()
                     .get(&MVTableId::from(root_page))
                     .filter(|e| e.value().is_live())
                     .and_then(|e| e.value().root_page)
@@ -10682,6 +11450,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// transaction reads use [`Self::is_btree_readable_at`].
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .is_some_and(|entry| entry.value().root_page.is_some() && entry.value().is_live())
     }
@@ -10703,6 +11472,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         read_mark: WalPos,
     ) -> bool {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .is_some_and(|entry| {
                 let e = entry.value();
@@ -10739,6 +11509,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// [`RowVersion::materialized_at`] in [`Self::gc_version_chain`], not here.
     fn rootpage_gc_protected(&self, table_id: &MVTableId, min_reader_mark: WalPos) -> bool {
         self.table_id_to_rootpage
+            .load()
             .get(table_id)
             .is_some_and(|e| e.value().materialized_at > min_reader_mark)
     }
@@ -11003,6 +11774,12 @@ impl RowVersion {
         // A delete (or any end change) means the B-tree no longer reflects this version's current
         // state until a checkpoint re-materializes it; the GC must not reclaim it before then.
         self.materialized_at = WalPos::ORIGIN;
+    }
+
+    fn clear_end_if_owned_by(&mut self, tx_id: TxID) {
+        if self.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+            self.set_end(None);
+        }
     }
 
     /// Replace `begin`/`end` references to `tx_id` with the committed
@@ -11379,6 +12156,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Initial => write!(f, "Initial"),
+            #[cfg(all(host_shared_wal, unix))]
+            Self::SharedLogicalLog { end_ts } => f
+                .debug_struct("SharedLogicalLog")
+                .field("end_ts", end_ts)
+                .finish(),
+            #[cfg(all(host_shared_wal, unix))]
+            Self::SharedFinalize => write!(f, "SharedFinalize"),
             Self::Commit { end_ts } => f.debug_struct("Commit").field("end_ts", end_ts).finish(),
             Self::WaitForDependencies { end_ts } => f
                 .debug_struct("WaitForDependencies")

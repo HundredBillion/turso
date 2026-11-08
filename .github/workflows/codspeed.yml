@@ -35,7 +35,7 @@ jobs:
 
   discover:
     name: Discover benchmark shards
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 10
     outputs:
       benchmarks: ${{ steps.benchmarks.outputs.benchmarks }}
@@ -103,7 +103,7 @@ jobs:
 
   build-stable:
     name: "Build benchmarks (stable)"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
@@ -182,7 +182,7 @@ jobs:
   build-nightly:
     name: "Build benchmarks (nightly)"
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
@@ -260,7 +260,7 @@ jobs:
 
   benchmarks-stable:
     name: "Run benchmark (stable, ${{ matrix.shard.name }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs:
       - discover
       - build-stable
@@ -312,15 +312,25 @@ jobs:
         uses: CodSpeedHQ/action@v4.17.0
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
+          CODSPEED_SKIP_UPLOAD: ${{ github.repository == 'HundredBillion/turso' && 'true' || 'false' }}
         with:
           mode: simulation
           # The CodSpeed runner runs this line with `bash -c`, so the quotes
           # keep the filter's regex characters away from the shell.
           run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run ${{ matrix.shard.filter != '' && format('''{0}''', matrix.shard.filter) || '' }} --bench ${{ matrix.shard.bench }}
 
+      - name: Preserve fork benchmark measurements
+        if: github.repository == 'HundredBillion/turso'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-measurements-${{ env.TOOLCHAIN_LABEL }}-${{ strategy.job-index }}
+          path: /tmp/profile.*.out/
+          if-no-files-found: error
+          retention-days: 7
+
   benchmarks-nightly:
     name: "Run benchmark (nightly, ${{ matrix.shard.name }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     needs:
       - discover
       - build-nightly
@@ -372,11 +382,21 @@ jobs:
         uses: CodSpeedHQ/action@v4.17.0
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
+          CODSPEED_SKIP_UPLOAD: ${{ github.repository == 'HundredBillion/turso' && 'true' || 'false' }}
         with:
           mode: simulation
           # The CodSpeed runner runs this line with `bash -c`, so the quotes
           # keep the filter's regex characters away from the shell.
           run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run ${{ matrix.shard.filter != '' && format('''{0}''', matrix.shard.filter) || '' }} --bench ${{ matrix.shard.bench }}
+
+      - name: Preserve fork benchmark measurements
+        if: github.repository == 'HundredBillion/turso'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-measurements-${{ env.TOOLCHAIN_LABEL }}-${{ strategy.job-index }}
+          path: /tmp/profile.*.out/
+          if-no-files-found: error
+          retention-days: 7
 
   # tpc-h:
   #   runs-on: ubuntu-latest

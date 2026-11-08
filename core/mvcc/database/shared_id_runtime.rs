@@ -1,0 +1,396 @@
+use super::*;
+use crate::mvcc::database::shared_id_oracle::SharedIdOracle;
+use crate::mvcc::shared_ids::journal::{Domain, Owner};
+use crate::mvcc::shared_ids::policy::{
+    IdAction, IdOperation, IdResult, SavepointMark, SequenceDurability,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedIdRequest {
+    ReleaseAfter {
+        next_ordinal: u64,
+    },
+    ReserveRow {
+        table_id: i64,
+    },
+    ClaimExplicitRow {
+        table_id: i64,
+        value: i64,
+    },
+    ReserveLogicalTable,
+    ClaimSequence {
+        table_id: i64,
+        value: i64,
+        autonomous: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedIdResult {
+    Value(i64),
+    Claimed,
+    Released,
+}
+
+#[derive(Default)]
+pub(crate) struct SharedIdState {
+    pending: Option<PendingId>,
+    // Releasing journal claims is only half of rollback. Keep publication
+    // ownership until the caller has also undone its local versions and schema.
+    released: Option<(
+        TxID,
+        SharedIdRequest,
+        Weak<Connection>,
+        crate::mvcc::shared_authority::AuthorityGuard,
+    )>,
+}
+
+struct PendingId {
+    connection: Weak<Connection>,
+    pager: Arc<Pager>,
+    runtime: Arc<SharedMvccRuntime>,
+    tx_id: TxID,
+    database_id: usize,
+    request: SharedIdRequest,
+    owner: Owner,
+    refresh: Option<SharedTransactionCommit>,
+    operation: Option<IdOperation>,
+}
+impl Debug for SharedIdState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedIdState")
+            .field("pending", &self.pending.is_some())
+            .finish()
+    }
+}
+impl SharedIdState {
+    // Complete only the already captured reservation, never its SQL opcode.
+    // Scoped rollback then releases even an append whose callback had not retired.
+    pub(crate) fn finish_pending_reservation(&mut self) -> Result<()> {
+        use crate::IOExt;
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        if matches!(pending.request, SharedIdRequest::ReleaseAfter { .. }) {
+            return Err(LimboError::Busy);
+        }
+        let connection = pending.connection.upgrade().ok_or(LimboError::Busy)?;
+        let pager = pending.pager.clone();
+        let tx_id = pending.tx_id;
+        let database_id = pending.database_id;
+        let request = pending.request;
+        let store = connection
+            .mv_store()
+            .as_ref()
+            .ok_or(LimboError::Busy)?
+            .clone();
+        pager.io.block(|| {
+            store.shared_id_nonblock(
+                &connection,
+                pager.clone(),
+                tx_id,
+                database_id,
+                request,
+                self,
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_release(&mut self) -> Result<()> {
+        if let Some((_, _, _, guard)) = self.released.take() {
+            guard.finish()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn reset(&mut self) {
+        self.pending = None;
+        self.released = None;
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shared_id_nonblock(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+        pager: Arc<Pager>,
+        tx_id: TxID,
+        database_id: usize,
+        request: SharedIdRequest,
+        state: &mut SharedIdState,
+    ) -> IOResultOr<SharedIdResult> {
+        let result = (|| {
+            let runtime = self.shared_runtime.get().ok_or_else(|| {
+                LimboError::InvalidArgument("ID reservation requires shared MVCC".into())
+            })?;
+            if database_id != 0 || !Arc::ptr_eq(&pager, &connection.get_pager()) {
+                return Err(LimboError::InvalidArgument(
+                    "shared ID oracle requires the main database pager".into(),
+                )
+                .into());
+            }
+            if !connection.db.get_mv_store().as_ref().is_some_and(|store| {
+                Arc::as_ptr(store).cast::<()>() == Arc::as_ptr(self).cast::<()>()
+            }) {
+                return Err(LimboError::InvalidArgument(
+                    "shared ID store differs from connection".into(),
+                )
+                .into());
+            }
+            if connection.is_readonly(database_id) {
+                return Err(LimboError::ReadOnly.into());
+            }
+            let owner = {
+                let tx = self.txs.get(&tx_id).ok_or_else(|| {
+                    LimboError::InvalidArgument("shared ID requester is no longer active".into())
+                })?;
+                if !matches!(request, SharedIdRequest::ReleaseAfter { .. }) {
+                    tx.value().ensure_peer_unconflicted()?;
+                }
+                if tx.value().state.load() != TransactionState::Active {
+                    return Err(LimboError::InvalidArgument(
+                        "shared ID requester is no longer active".into(),
+                    )
+                    .into());
+                }
+                let registration = tx
+                    .value()
+                    .shared_snapshot
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LimboError::InvalidArgument("ID requester has no shared snapshot".into())
+                    })?
+                    .lock();
+                let registration = registration.as_ref().ok_or_else(|| {
+                    LimboError::InvalidArgument("shared ID requester is no longer active".into())
+                })?;
+                Owner {
+                    epoch: registration.epoch,
+                    begin: registration.begin_timestamp,
+                }
+            };
+            if let Some((saved_tx, saved_request, saved_connection, _)) = &state.released {
+                if *saved_tx != tx_id
+                    || *saved_request != request
+                    || !saved_connection
+                        .upgrade()
+                        .is_some_and(|saved| Arc::ptr_eq(&saved, connection))
+                {
+                    return Err(LimboError::Busy.into());
+                }
+                return Ok(IOResult::Done(SharedIdResult::Released));
+            }
+            if let SharedIdRequest::ReleaseAfter { next_ordinal } = request {
+                let tx = self.txs.get(&tx_id).ok_or(LimboError::Busy)?;
+                let mut pending = tx.value().shared_pending_release.lock();
+                if pending.is_some_and(|boundary| next_ordinal > boundary) {
+                    return Err(LimboError::Busy.into());
+                }
+                *pending = Some(next_ordinal);
+            }
+            if let Some(pending) = &state.pending {
+                if !pending
+                    .connection
+                    .upgrade()
+                    .is_some_and(|saved| Arc::ptr_eq(&saved, connection))
+                    || !Arc::ptr_eq(&pending.pager, &pager)
+                    || !Arc::ptr_eq(&pending.runtime, runtime)
+                    || pending.tx_id != tx_id
+                    || pending.database_id != database_id
+                    || pending.request != request
+                    || pending.owner != owner
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "shared ID request changed across I/O".into(),
+                    )
+                    .into());
+                }
+            } else {
+                state.pending = Some(PendingId {
+                    connection: Arc::downgrade(connection),
+                    pager,
+                    runtime: runtime.clone(),
+                    tx_id,
+                    database_id,
+                    request,
+                    owner,
+                    refresh: Some(SharedTransactionCommit::new(runtime.clone())?),
+                    operation: None,
+                });
+            }
+            let pending = state.pending.as_mut().unwrap();
+            if pending.operation.is_none() {
+                let refresh = pending.refresh.as_mut().unwrap();
+                return_if_io!(refresh.poll_refresh(self, connection, false));
+                let tx = self.txs.get(&tx_id).ok_or_else(|| {
+                    LimboError::InvalidArgument("shared ID requester is no longer active".into())
+                })?;
+                if !matches!(request, SharedIdRequest::ReleaseAfter { .. }) {
+                    tx.value().ensure_peer_unconflicted()?;
+                }
+                if tx.value().state.load() != TransactionState::Active {
+                    return Err(LimboError::InvalidArgument(
+                        "shared ID requester is no longer active".into(),
+                    )
+                    .into());
+                }
+                drop(tx);
+                let replay = runtime.replay.lock().clone().ok_or(LimboError::Busy)?;
+                let identity = replay.identity()?;
+                let loaded = refresh.loaded.take().unwrap();
+                if loaded.record().prefix() != identity.prefix
+                    || loaded.record().log_generation() != identity.database.generation
+                {
+                    return Err(
+                        LimboError::InvalidArgument("ID refresh frontier differs".into()).into(),
+                    );
+                }
+                let domain = |table, sequence| Domain {
+                    generation: identity.database.generation,
+                    table,
+                    sequence,
+                };
+                let action = match request {
+                    SharedIdRequest::ReleaseAfter { next_ordinal } => IdAction::ReleaseAfter {
+                        mark: SavepointMark {
+                            owner,
+                            next_ordinal,
+                        },
+                    },
+                    SharedIdRequest::ReserveRow { table_id } => IdAction::ReserveRow {
+                        owner,
+                        domain: domain(table_id, false),
+                        autoincrement: false,
+                    },
+                    SharedIdRequest::ClaimExplicitRow { table_id, value } => {
+                        IdAction::ClaimExplicitRow {
+                            owner,
+                            domain: domain(table_id, false),
+                            value,
+                        }
+                    }
+                    SharedIdRequest::ReserveLogicalTable => IdAction::ReserveLogicalTable { owner },
+                    SharedIdRequest::ClaimSequence {
+                        table_id,
+                        value,
+                        autonomous,
+                    } => IdAction::ClaimSequence {
+                        owner,
+                        domain: domain(table_id, true),
+                        value,
+                        durability: if autonomous {
+                            SequenceDurability::AutonomousInner
+                        } else {
+                            SequenceDurability::OuterTransaction
+                        },
+                    },
+                };
+                pending.operation = Some(runtime.ids.start(
+                    loaded.into_guard()?,
+                    identity,
+                    Box::new(SharedIdOracle::new(
+                        self.clone(),
+                        connection.clone(),
+                        identity,
+                    )),
+                    connection.db.io.clone(),
+                    action,
+                )?);
+                pending.refresh = None;
+            }
+            let operation = pending.operation.as_mut().unwrap();
+            let result = operation.poll();
+            if !matches!(request, SharedIdRequest::ReleaseAfter { .. }) {
+                if let Some(mark) = operation.scope_boundary() {
+                    let tx = self.txs.get(&tx_id).ok_or(LimboError::Busy)?;
+                    for frame in tx.value().savepoint_stack.write().iter_mut() {
+                        frame.shared_id_boundary.get_or_insert(mark.next_ordinal);
+                    }
+                }
+            }
+            let outcome = return_if_io!(result);
+            let value = match (request, outcome.result) {
+                (SharedIdRequest::ReleaseAfter { .. }, IdResult::Released) => {
+                    SharedIdResult::Released
+                }
+                (
+                    SharedIdRequest::ReserveRow { .. } | SharedIdRequest::ReserveLogicalTable,
+                    IdResult::Reserved { value, .. },
+                ) => SharedIdResult::Value(value),
+                (
+                    SharedIdRequest::ClaimExplicitRow { .. }
+                    | SharedIdRequest::ClaimSequence { .. },
+                    IdResult::Reserved { .. },
+                ) => SharedIdResult::Claimed,
+                _ => {
+                    return Err(
+                        LimboError::InvalidArgument("unexpected shared ID outcome".into()).into(),
+                    )
+                }
+            };
+            if matches!(value, SharedIdResult::Released) {
+                state.released = Some((tx_id, request, Arc::downgrade(connection), outcome.guard));
+            } else {
+                outcome.guard.finish()?;
+            }
+            Ok(IOResult::Done(value))
+        })();
+        if !matches!(&result, Ok(IOResult::IO(_))) {
+            state.pending = None;
+            if result.is_err() {
+                state.released = None;
+            }
+        }
+        result
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn shared_named_id_boundary(&self, tx_id: TxID, name: &str) -> Option<u64> {
+        let tx = self.txs.get(&tx_id)?;
+        let frames = tx.value().savepoint_stack.read();
+        frames
+            .iter()
+            .rfind(|frame| {
+                matches!(&frame.kind,
+            SavepointKind::Named { name: found, .. } if found == name)
+            })
+            .and_then(|frame| frame.shared_id_boundary)
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn shared_id_cleanup_pending(&self, tx_id: TxID) -> bool {
+        self.txs
+            .get(&tx_id)
+            .is_some_and(|tx| tx.value().shared_pending_release.lock().is_some())
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn finish_shared_local_rollback(
+        &self,
+        tx_id: TxID,
+        state: &mut SharedIdState,
+    ) -> Result<()> {
+        let tx = self.txs.get(&tx_id).ok_or(LimboError::Busy)?;
+        let mut pending = tx.value().shared_pending_release.lock();
+        // Do not let another scope install its fence between native unlock and
+        // clearing this scope. Failed unlock retains the original fence.
+        state.finish_release()?;
+        pending.take();
+        Ok(())
+    }
+}
+
+impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> {
+    pub(crate) fn shared_statement_id_boundary(&self, tx_id: TxID) -> Option<u64> {
+        let tx = self.txs.get(&tx_id)?;
+        let frames = tx.value().savepoint_stack.read();
+        frames
+            .last()
+            .filter(|frame| matches!(frame.kind, SavepointKind::Statement))
+            .and_then(|frame| frame.shared_id_boundary)
+    }
+}

@@ -11,6 +11,47 @@ This implementation provides SQLite3 API compatibility for Turso, allowing exist
 3. Maps SQLite operations to equivalent Turso operations
 4. Maintains API compatibility with SQLite
 
+## File access modes
+
+`sqlite3_open_v2` requires READONLY, READWRITE, or READWRITE with CREATE.
+READWRITE without CREATE and URI `mode=rw` require an existing main database
+file; a writable open may create its WAL. With
+`SQLITE_OPEN_URI`, decoded `mode=ro`, `mode=rw`, and `mode=rwc` may narrow the
+requested file access; repeating these modes cannot widen an earlier restriction.
+C opens and SQL ATTACH use the same URI parser.
+`mode=memory` selects writable memory storage, as in SQLite. URI fragments do not
+supply query parameters. Malformed percent escapes remain literal characters,
+while valid escapes are decoded. An empty decoded path opens a private temporary
+database, including `file:`, `file://`, and `file://localhost`. A read-only
+request for temporary storage allows opening and reading but rejects writes to
+its main schema.
+
+A read-only connection stays read-only when it shares an already writable
+database. Opening for writing can fail while the process retains a database
+opened with read-only storage; close those handles before reopening for writing.
+Failed opens return a handle for error inspection and closing when allocation
+succeeds.
+
+## Shared MVCC URI options
+
+The binding reserves `turso_mvcc=shared` and
+`turso_mvcc_history_limit=<positive decimal bytes>` for the planned PHP PDO mode.
+The default history limit is 64 MiB. The limit requires the explicit opt-in;
+duplicate settings, unknown shared-mode options, memory databases and VFS
+overrides are rejected. `mode=ro` is valid configuration, with coordination
+metadata governed separately from read-only database contents.
+
+Shared MVCC activation is not available in this build. An opted-in URI returns
+an error before opening or creating database files; it must never silently open
+an ordinary database. Existing URI options retain their ordinary behavior.
+This parsing support does not establish cross-process transaction support.
+
+## Application functions
+
+`sqlite3_create_function_v2` supports scalar and aggregate callbacks. Incomplete
+or mixed scalar/aggregate callback combinations return `SQLITE_MISUSE`.
+Rejected registrations invoke `xDestroy` once when supplied.
+
 ## Testing Strategy
 
 We employ a dual-testing approach to ensure complete compatibility with SQLite:
@@ -102,4 +143,4 @@ When adding new features or fixing bugs:
 
 ## Status
 
-This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status. 
+This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status.

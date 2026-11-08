@@ -66,7 +66,7 @@ use crate::{
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
-use gencol::compute_virtual_columns;
+use gencol::compute_generated_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
@@ -585,7 +585,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns(
+        compute_generated_columns(
             program,
             &ctx.table.columns_topo_sort()?,
             &dml_ctx,
@@ -761,10 +761,10 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    let types_checked_first = has_before_triggers || insertion.has_generated_columns();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
-            !column.is_virtual_generated() && !has_custom_type(column)
+            !column.is_generated() && !has_custom_type(column)
         })?;
     }
     if let Some(type_check_table) = &maybe_type_check_table {
@@ -797,12 +797,12 @@ pub fn translate_insert(
         });
     }
     emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
-        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+        !column.is_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
-    if insertion.has_virtual_columns() {
+    if insertion.has_generated_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
-        compute_virtual_columns(
+        compute_generated_columns(
             program,
             &ctx.table.columns_topo_sort()?,
             &dml_ctx.with_form(DmlRowForm::Stored),
@@ -827,7 +827,7 @@ pub fn translate_insert(
             &insertion,
             resolver,
             true,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 
@@ -1822,63 +1822,13 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         table_name_reg,
         ..
     } = meta;
-
-    program.emit_insn(Insn::Integer {
-        dest: r_seq,
-        value: 0,
-    });
-    program.emit_insn(Insn::Null {
-        dest: r_seq_rowid,
-        dest_end: None,
-    });
-
-    let loop_start_label = program.allocate_label();
-    let loop_end_label = program.allocate_label();
-    let found_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: seq_cursor_id,
-        pc_if_empty: loop_end_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    let name_col_reg = program.alloc_register();
-    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-    program.emit_insn(Insn::Ne {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
-        target_pc: found_label,
-        flags: CmpInsFlags::default().jump_if_null(),
-        collation: super::collate::CollationSeq::NOCASE,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: name_col_reg,
-        dst_reg: table_name_reg,
-        extra_amount: 0,
-    });
-
-    program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
-    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
-    program.emit_insn(Insn::AddImm {
-        register: r_seq,
-        value: 0,
-    });
-    program.emit_insn(Insn::RowId {
-        cursor_id: seq_cursor_id,
-        dest: r_seq_rowid,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: loop_end_label,
-    });
-
-    program.preassign_label_to_next_insn(found_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: seq_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(loop_end_label);
+    crate::translate::sequence::emit_sqlite_sequence_row_read(
+        program,
+        seq_cursor_id,
+        table_name_reg,
+        r_seq,
+        r_seq_rowid,
+    );
 }
 
 fn emit_notnulls(
@@ -2612,8 +2562,8 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
-    fn has_virtual_columns(&self) -> bool {
-        self.col_mappings.len() - self.num_non_virtual_cols > 0
+    fn has_generated_columns(&self) -> bool {
+        self.col_mappings.iter().any(|m| m.column.is_generated())
     }
 
     /// Returns the column mapping for a given column name.
@@ -2975,8 +2925,7 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.is_virtual_generated() {
-        // virtual columns are computed in a separate pass in compute_virtual_columns
+    } else if column.is_generated() {
     } else if column.hidden() {
         program.emit_insn(Insn::Null {
             dest: column_register,

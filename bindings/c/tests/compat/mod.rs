@@ -282,12 +282,886 @@ const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
 const SQLITE_UTF8: i32 = 1;
+const SQLITE_OPEN_READONLY: i32 = 0x00000001;
 const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod tests {
     use super::*;
+    #[test]
+    fn uri_malformed_percent_sequences_remain_literal() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            for (index, suffix) in ["%zz.db", "%.db", "%2.db", "%G0.db"].iter().enumerate() {
+                let path = directory.path().join(format!("literal-{index}{suffix}"));
+                let uri =
+                    std::ffi::CString::new(format!("file:{}?%zz=50%&note=%2", path.display()))
+                        .unwrap();
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+                assert!(path.exists());
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn uri_empty_decoded_paths_open_private_temporary_databases() {
+        unsafe {
+            for uri in [
+                c"file:",
+                c"file:?mode=rwc",
+                c"file://",
+                c"file://localhost",
+                c"file:%00ignored?mode=rwc",
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(sqlite3_db_filename(db, c"main".as_ptr())),
+                    c""
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"CREATE TABLE t(x); INSERT INTO t VALUES(7)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                let mut other = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut other, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        other,
+                        c"SELECT * FROM t".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_ERROR
+                );
+                assert_eq!(sqlite3_close(other), SQLITE_OK);
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_empty_paths_open_private_temporary_databases() {
+        unsafe {
+            for (uri, flags) in [
+                (c"", SQLITE_OPEN_READONLY),
+                (c"file:?mode=ro", 6 | SQLITE_OPEN_URI),
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, flags, ptr::null()),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(sqlite3_db_filename(db, c"main".as_ptr())),
+                    c""
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"SELECT 1".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"CREATE TABLE t(x)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    8
+                );
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn uri_readwrite_without_create_preserves_missing_path() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            for (suffix, flags) in [
+                ("?mode=rw", 6 | SQLITE_OPEN_URI),
+                ("", SQLITE_OPEN_READWRITE),
+            ] {
+                let path = dir.path().join(if suffix.is_empty() {
+                    "flags.db"
+                } else {
+                    "uri.db"
+                });
+                let name = std::ffi::CString::new(if suffix.is_empty() {
+                    path.display().to_string()
+                } else {
+                    format!("file:{}{suffix}", path.display())
+                })
+                .unwrap();
+                let mut db = ptr::null_mut();
+                let rc = sqlite3_open_v2(name.as_ptr(), &mut db, flags, ptr::null());
+                if !db.is_null() {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+                assert_eq!(rc, SQLITE_CANTOPEN);
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn uri_memory_flag_preserves_readonly_unless_mode_changes_it() {
+        unsafe {
+            for (uri, expected) in [
+                (c"file::memory:", 8),
+                (c"file::memory:?mode=memory", SQLITE_OK),
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(
+                        uri.as_ptr(),
+                        &mut db,
+                        1 | 0x80 | SQLITE_OPEN_URI,
+                        ptr::null()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        db,
+                        c"CREATE TABLE t(x)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    expected
+                );
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn uri_memory_mode_matches_sqlite_access_transitions() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            for (index, (flags, query, expected)) in [
+                (1 | SQLITE_OPEN_URI, "mode=rw", 3),
+                (1 | SQLITE_OPEN_URI, "mode=memory&mode=rw", SQLITE_OK),
+                (1 | SQLITE_OPEN_URI, "mode=memory&mode=rwc", SQLITE_OK),
+                (1 | 0x80 | SQLITE_OPEN_URI, "mode=rw", SQLITE_OK),
+                (1 | 0x80 | SQLITE_OPEN_URI, "mode=rwc", SQLITE_OK),
+                (1 | 0x80 | SQLITE_OPEN_URI, "mode=ro&mode=rw", 3),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = dir.path().join(format!("transition-{index}.db"));
+                let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(name.as_ptr(), &mut db), SQLITE_OK);
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+                let uri =
+                    std::ffi::CString::new(format!("file:{}?{query}", path.display())).unwrap();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, flags, ptr::null()),
+                    expected
+                );
+                if expected == SQLITE_OK {
+                    assert_eq!(
+                        sqlite3_exec(
+                            db,
+                            c"CREATE TABLE t(x)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                }
+                if !db.is_null() {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uri_access_reports_invalid_flags_and_parameters() {
+        unsafe {
+            for flags in [0, 3, 4, 5, 7] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(c":memory:".as_ptr(), &mut db, flags, ptr::null()),
+                    SQLITE_MISUSE
+                );
+                if !db.is_null() {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+            }
+            for uri in [
+                c"file::memory:?mode=unknown",
+                c"file::memory:?cache=unknown",
+                c"file://remote/path",
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_ERROR
+                );
+                if !db.is_null() {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uri_access_cannot_widen_an_earlier_restriction() {
+        unsafe {
+            for uri in [
+                c"file::memory:?mode=ro&mode=rw",
+                c"file::memory:?mode=ro&mode=rwc",
+            ] {
+                let mut db = ptr::null_mut();
+                let rc = sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null());
+                if !db.is_null() {
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                }
+                assert_eq!(rc, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn readwrite_existing_main_without_wal_can_open_and_insert() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            for use_uri in [false, true] {
+                let path = directory.path().join(format!("existing-{use_uri}.db"));
+                let filename = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                let mut original = ptr::null_mut();
+                assert_eq!(sqlite3_open(filename.as_ptr(), &mut original), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_exec(
+                        original,
+                        c"CREATE TABLE t(x)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_close(original), SQLITE_OK);
+                let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+                if wal.exists() {
+                    std::fs::remove_file(&wal).unwrap();
+                }
+                assert!(path.metadata().unwrap().len() > 0);
+                assert!(!wal.exists());
+
+                let (open_name, flags) = if use_uri {
+                    (
+                        std::ffi::CString::new(format!("file:{}?mode=rw", path.display())).unwrap(),
+                        6 | SQLITE_OPEN_URI,
+                    )
+                } else {
+                    (filename, SQLITE_OPEN_READWRITE)
+                };
+                let mut reopened = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(open_name.as_ptr(), &mut reopened, flags, ptr::null()),
+                    SQLITE_OK,
+                    "URI={use_uri}"
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        reopened,
+                        c"INSERT INTO t VALUES(7)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                scalar_query(reopened, "SELECT count(*) FROM t", 1);
+                assert_eq!(sqlite3_close(reopened), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn uri_authority_is_validated_before_query_and_fragment() {
+        unsafe {
+            for uri in [
+                c"file://localhost?mode=ro",
+                c"file://#x",
+                c"file://?mode=memory",
+                c"file://localhost#fragment",
+            ] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(uri.as_ptr(), &mut db, 6 | SQLITE_OPEN_URI, ptr::null()),
+                    SQLITE_ERROR,
+                    "{uri:?}"
+                );
+                assert!(!db.is_null());
+                assert_eq!(sqlite3_errcode(db), SQLITE_ERROR);
+                let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                    .to_str()
+                    .unwrap();
+                assert!(message.starts_with("invalid uri authority:"), "{message}");
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_connections_can_begin_reserved_transactions_without_writing() {
+        unsafe {
+            for keep_writer_open in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("readonly-transactions.db");
+                let filename = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                let mut writer = ptr::null_mut();
+                assert_eq!(sqlite3_open(filename.as_ptr(), &mut writer), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_exec(
+                        writer,
+                        c"CREATE TABLE t(x); INSERT INTO t VALUES(7)".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                if !keep_writer_open {
+                    assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                }
+                let uri =
+                    std::ffi::CString::new(format!("file:{}?mode=ro", path.display())).unwrap();
+                let mut reader = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open_v2(
+                        uri.as_ptr(),
+                        &mut reader,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+                        ptr::null()
+                    ),
+                    SQLITE_OK
+                );
+                for begin in [c"BEGIN IMMEDIATE", c"BEGIN EXCLUSIVE"] {
+                    assert_eq!(sqlite3_get_autocommit(reader), 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            begin.as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK,
+                        "{begin:?}, cached writer={keep_writer_open}"
+                    );
+                    assert_eq!(sqlite3_get_autocommit(reader), 0);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"INSERT INTO t VALUES(9)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        8
+                    );
+                    assert_eq!(sqlite3_get_autocommit(reader), 0);
+                    scalar_query(reader, "SELECT count(*) FROM t", 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"COMMIT".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        SQLITE_OK
+                    );
+                    assert_eq!(sqlite3_get_autocommit(reader), 1);
+                    assert_eq!(
+                        sqlite3_exec(
+                            reader,
+                            c"INSERT INTO t VALUES(9)".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            ptr::null_mut()
+                        ),
+                        8
+                    );
+                }
+                assert_eq!(sqlite3_close(reader), SQLITE_OK);
+                if keep_writer_open {
+                    scalar_query(writer, "SELECT count(*) FROM t", 1);
+                    assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uri_encoded_readonly_restricts_a_reused_writer() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("shared.db");
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut writer = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"CREATE TABLE t(x)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            let uri = std::ffi::CString::new(format!(
+                "file:{}?m%6fde=r%6f#ignored?mode=rwc",
+                path.display()
+            ))
+            .unwrap();
+            let mut reader = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut reader, 6 | SQLITE_OPEN_URI, ptr::null()),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    reader,
+                    c"INSERT INTO t VALUES(1)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                8
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    writer,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn failed_open_returns_closeable_error_handle() {
+        unsafe {
+            let directory = tempfile::tempdir().unwrap();
+            let path = std::ffi::CString::new(directory.path().join("absent/db").to_str().unwrap())
+                .unwrap();
+            for v2 in [false, true] {
+                for deferred_close in [false, true] {
+                    let mut db = ptr::dangling_mut();
+                    let rc = if v2 {
+                        sqlite3_open_v2(path.as_ptr(), &mut db, 6, ptr::null())
+                    } else {
+                        sqlite3_open(path.as_ptr(), &mut db)
+                    };
+                    assert_eq!(rc, SQLITE_CANTOPEN);
+                    assert!(!db.is_null());
+                    assert_ne!(db, ptr::dangling_mut());
+                    assert_eq!(sqlite3_errcode(db), SQLITE_CANTOPEN);
+                    let message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_owned();
+                    let diagnostic = message.to_string_lossy();
+                    assert!(
+                        diagnostic.contains("unable to open database"),
+                        "{diagnostic}"
+                    );
+                    #[cfg(all(unix, not(feature = "sqlite3")))]
+                    assert!(
+                        diagnostic.contains("No such file")
+                            || diagnostic.contains("os error 2")
+                            || diagnostic.contains("not found"),
+                        "{diagnostic}"
+                    );
+                    assert_ne!(message.as_c_str(), c"out of memory");
+                    let mut statement = ptr::dangling_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT 1".as_ptr(),
+                            -1,
+                            &mut statement,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_MISUSE
+                    );
+                    assert!(statement.is_null());
+                    assert_eq!(
+                        std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                        message.as_c_str()
+                    );
+                    assert_eq!(
+                        if deferred_close {
+                            sqlite3_close_v2(db)
+                        } else {
+                            sqlite3_close(db)
+                        },
+                        SQLITE_OK
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn callback_errors_return_bare_engine_messages() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut error = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"SELECT * FROM callback_missing_table".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut error
+                ),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(error).to_str().unwrap(),
+                "no such table: callback_missing_table"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                    .to_str()
+                    .unwrap(),
+                "no such table: callback_missing_table"
+            );
+            sqlite3_free(error.cast());
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn scalar_destructor_reentry_child() {
+        if std::env::var_os("TURSO_SCALAR_REENTRY_CHILD").is_none() {
+            return;
+        }
+        struct Probe {
+            db: *mut sqlite3,
+            calls: usize,
+            reenter: bool,
+        }
+        unsafe extern "C" fn destroy(data: *mut libc::c_void) {
+            let probe = &mut *data.cast::<Probe>();
+            probe.calls += 1;
+            if probe.reenter {
+                sqlite3_errcode(probe.db);
+            }
+        }
+        unsafe extern "C" fn callback(_: *mut libc::c_void, _: i32, _: *mut *mut libc::c_void) {}
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut probe = Probe {
+                db,
+                calls: 0,
+                reenter: true,
+            };
+            for (arity, func) in [
+                (0, Some(callback as unsafe extern "C" fn(_, _, _))),
+                (0, Some(callback)),
+                (-2, Some(callback)),
+                (0, None),
+            ] {
+                let rc = sqlite3_create_function_v2(
+                    db,
+                    c"reentry".as_ptr(),
+                    arity,
+                    SQLITE_UTF8,
+                    (&mut probe as *mut Probe).cast(),
+                    func,
+                    None,
+                    None,
+                    Some(destroy),
+                );
+                assert_eq!(rc == SQLITE_OK, arity == 0);
+            }
+            assert!((3..=4).contains(&probe.calls));
+            probe.reenter = false;
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert_eq!(probe.calls, 4);
+        }
+    }
+
+    #[test]
+    fn scalar_destructor_reentry_is_bounded() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::scalar_destructor_reentry_child",
+                "--nocapture",
+            ])
+            .env("TURSO_SCALAR_REENTRY_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("scalar destructor deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn aggregate_registration_validation_reports_error_and_cleans_up() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::aggregate_registration_validation_child",
+                "--nocapture",
+            ])
+            .env("TURSO_AGGREGATE_VALIDATION_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("aggregate rejection destructor deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn aggregate_registration_validation_child() {
+        if std::env::var_os("TURSO_AGGREGATE_VALIDATION_CHILD").is_none() {
+            return;
+        }
+        struct Probe {
+            db: *mut sqlite3,
+            steps: usize,
+            finals: usize,
+            destroyed: usize,
+            observed_error: i32,
+        }
+        unsafe extern "C" fn step(ctx: *mut libc::c_void, _: i32, _: *mut *mut libc::c_void) {
+            (*sqlite3_user_data(ctx).cast::<Probe>()).steps += 1;
+        }
+        unsafe extern "C" fn final_(ctx: *mut libc::c_void) {
+            (*sqlite3_user_data(ctx).cast::<Probe>()).finals += 1;
+            sqlite3_result_int(ctx, 1);
+        }
+        unsafe extern "C" fn destroy(data: *mut libc::c_void) {
+            let probe = &mut *data.cast::<Probe>();
+            probe.destroyed += 1;
+            probe.observed_error = sqlite3_errcode(probe.db);
+        }
+        unsafe {
+            let scalar: unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void) = step;
+            let step = std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void, i32, *mut *mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(step);
+            let final_ = std::mem::transmute::<
+                unsafe extern "C" fn(*mut libc::c_void),
+                unsafe extern "C" fn(),
+            >(final_);
+            let directory = tempfile::tempdir().unwrap();
+            let missing =
+                std::ffi::CString::new(directory.path().join("absent/db").to_str().unwrap())
+                    .unwrap();
+            for failed_handle in [true, false] {
+                let mut db = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_open(
+                        if failed_handle {
+                            missing.as_ptr()
+                        } else {
+                            c":memory:".as_ptr()
+                        },
+                        &mut db,
+                    ),
+                    if failed_handle {
+                        SQLITE_CANTOPEN
+                    } else {
+                        SQLITE_OK
+                    }
+                );
+                let original_message = std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_owned();
+                let mut probe = Probe {
+                    db,
+                    steps: 0,
+                    finals: 0,
+                    destroyed: 0,
+                    observed_error: 0,
+                };
+                for (index, n_args) in [-1, 0, 1, 1000].into_iter().enumerate() {
+                    let attempt = index + 1;
+                    assert_eq!(
+                        sqlite3_create_function_v2(
+                            db,
+                            c"aggregate_validated".as_ptr(),
+                            n_args,
+                            SQLITE_UTF8,
+                            (&mut probe as *mut Probe).cast(),
+                            None,
+                            Some(step),
+                            Some(final_),
+                            Some(destroy),
+                        ),
+                        if failed_handle {
+                            SQLITE_MISUSE
+                        } else {
+                            SQLITE_OK
+                        }
+                    );
+                    if !failed_handle {
+                        assert_eq!(probe.destroyed, index);
+                        assert_eq!(
+                            sqlite3_create_function_v2(
+                                db,
+                                c"aggregate_validated".as_ptr(),
+                                n_args,
+                                SQLITE_UTF8,
+                                ptr::null_mut(),
+                                None,
+                                None,
+                                None,
+                                None,
+                            ),
+                            SQLITE_OK
+                        );
+                    }
+                    assert_eq!(probe.destroyed, attempt);
+                    assert_eq!(probe.steps, 0);
+                    assert_eq!(probe.finals, 0);
+                    assert_eq!(
+                        probe.observed_error,
+                        if failed_handle {
+                            SQLITE_CANTOPEN
+                        } else {
+                            SQLITE_OK
+                        }
+                    );
+                    if failed_handle {
+                        assert_eq!(
+                            std::ffi::CStr::from_ptr(sqlite3_errmsg(db)),
+                            original_message.as_c_str()
+                        );
+                    }
+                }
+                if !failed_handle {
+                    let oversized_name = std::ffi::CString::new("a".repeat(256)).unwrap();
+                    for (index, (n_args, func, step, final_)) in [
+                        (1, None, Some(step), None),
+                        (1, None, None, Some(final_)),
+                        (1, Some(scalar), Some(step), Some(final_)),
+                        (-2, None, Some(step), Some(final_)),
+                        (1001, None, Some(step), Some(final_)),
+                        (i32::MAX, None, Some(step), Some(final_)),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        assert_eq!(
+                            sqlite3_create_function_v2(
+                                db,
+                                c"aggregate_invalid".as_ptr(),
+                                n_args,
+                                SQLITE_UTF8,
+                                (&mut probe as *mut Probe).cast(),
+                                func,
+                                step,
+                                final_,
+                                Some(destroy),
+                            ),
+                            SQLITE_MISUSE
+                        );
+                        assert_eq!(probe.destroyed, index + 5);
+                        assert_eq!(probe.steps, 0);
+                        assert_eq!(probe.finals, 0);
+                    }
+                    assert_eq!(
+                        sqlite3_create_function_v2(
+                            db,
+                            oversized_name.as_ptr(),
+                            1,
+                            SQLITE_UTF8,
+                            (&mut probe as *mut Probe).cast(),
+                            None,
+                            Some(step),
+                            Some(final_),
+                            Some(destroy),
+                        ),
+                        SQLITE_MISUSE
+                    );
+                    assert_eq!(probe.destroyed, 11);
+                    let mut statement = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(
+                            db,
+                            c"SELECT aggregate_validated(1)".as_ptr(),
+                            -1,
+                            &mut statement,
+                            ptr::null_mut()
+                        ),
+                        SQLITE_ERROR
+                    );
+                    assert!(statement.is_null());
+                    scalar_query(db, "SELECT 1", 1);
+                }
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+                assert_eq!(probe.destroyed, if failed_handle { 4 } else { 11 });
+            }
+        }
+    }
 
     struct ScalarData {
         db: *mut sqlite3,
@@ -5455,7 +6329,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "sqlite3"))]
-    fn test_uri_legacy_reader_defers_writer_activation_until_first_write() {
+    fn test_uri_legacy_reader_requires_reopen_before_writable_open() {
         unsafe {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("legacy.db");
@@ -5494,52 +6368,31 @@ mod tests {
                 ),
                 SQLITE_OK
             );
+            let before = std::fs::read(&path).unwrap();
             let mut writer = ptr::null_mut();
-            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_CANTOPEN);
             assert!(!writer.is_null());
-            assert_eq!(
-                sqlite3_exec(
-                    writer,
-                    c"INSERT INTO t VALUES(2)".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_BUSY
+            let error = std::ffi::CStr::from_ptr(sqlite3_errmsg(writer)).to_string_lossy();
+            assert!(
+                error.contains("read-only") && error.contains("reopen"),
+                "{error}"
             );
-            assert_eq!(sqlite3_errcode(writer), SQLITE_BUSY);
-            assert_eq!(
-                sqlite3_exec(
-                    reader,
-                    c"COMMIT".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-            assert_eq!(
-                sqlite3_exec(
-                    writer,
-                    c"INSERT INTO t VALUES(2)".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-            assert_eq!(
-                sqlite3_exec(
-                    reader,
-                    c"SELECT * FROM t".as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                SQLITE_OK
-            );
-            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
             assert_eq!(sqlite3_close(writer), SQLITE_OK);
+            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+            let mut reopened = ptr::null_mut();
+            assert_eq!(sqlite3_open(name.as_ptr(), &mut reopened), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    reopened,
+                    c"INSERT INTO t VALUES(2)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(reopened), SQLITE_OK);
         }
     }
 
@@ -5835,7 +6688,24 @@ mod tests {
                     };
                     if readonly_first {
                         assert_eq!(open_reader(&mut reader), SQLITE_OK);
+                        #[cfg(feature = "sqlite3")]
                         assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+                        #[cfg(not(feature = "sqlite3"))]
+                        {
+                            let before = std::fs::read(&path).unwrap();
+                            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_CANTOPEN);
+                            let message =
+                                std::ffi::CStr::from_ptr(sqlite3_errmsg(writer)).to_string_lossy();
+                            assert!(
+                                message.contains("read-only") && message.contains("reopen"),
+                                "{message}"
+                            );
+                            assert_eq!(std::fs::read(&path).unwrap(), before);
+                            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+                            assert_eq!(sqlite3_close(reader), SQLITE_OK);
+                            assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
+                            assert_eq!(open_reader(&mut reader), SQLITE_OK);
+                        }
                     } else {
                         assert_eq!(sqlite3_open(name.as_ptr(), &mut writer), SQLITE_OK);
                         assert_eq!(open_reader(&mut reader), SQLITE_OK);

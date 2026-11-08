@@ -83,6 +83,7 @@ impl StmtClass {
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
             | Stmt::CreateRole { .. }
+            | Stmt::Grant(_)
             | Stmt::CreateSequence { .. }
             | Stmt::CreateSchema { .. }
             | Stmt::DropSchema { .. }
@@ -92,7 +93,8 @@ impl StmtClass {
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::DropSequence { .. } => Some(Self::Schema),
+            | Stmt::DropSequence { .. }
+            | Stmt::AlterSequenceOwnedBy { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }

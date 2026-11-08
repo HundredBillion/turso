@@ -211,6 +211,28 @@ struct sqlite3Inner {
 }
 
 impl sqlite3Inner {
+    fn new(conn: Option<Arc<turso_core::Connection>>, filename: CString) -> Self {
+        let e_open_state = if conn.is_some() {
+            SQLITE_STATE_OPEN
+        } else {
+            SQLITE_STATE_SICK
+        };
+        Self {
+            conn,
+            err_code: SQLITE_OK,
+            // Extended result codes are disabled by default, as in SQLite;
+            // sqlite3_extended_result_codes() widens the mask.
+            err_mask: 0xff,
+            malloc_failed: false,
+            e_open_state,
+            p_err: None,
+            filename,
+            stmt_list: std::ptr::null_mut(),
+            inactive_collations: HashMap::new(),
+            temp_path: None,
+        }
+    }
+
     fn connection(&self) -> Option<&Arc<turso_core::Connection>> {
         if matches!(self.e_open_state, SQLITE_STATE_OPEN | SQLITE_STATE_BUSY) {
             self.conn.as_ref()
@@ -240,20 +262,7 @@ impl sqlite3 {
     pub fn new(conn: Arc<turso_core::Connection>, filename: CString) -> Self {
         #[cfg(feature = "csv")]
         register_csv_module(&conn);
-        let inner = sqlite3Inner {
-            conn: Some(conn),
-            err_code: SQLITE_OK,
-            // Extended result codes are disabled by default, as in SQLite;
-            // sqlite3_extended_result_codes() widens the mask.
-            err_mask: 0xff,
-            malloc_failed: false,
-            e_open_state: SQLITE_STATE_OPEN,
-            p_err: None,
-            filename,
-            stmt_list: std::ptr::null_mut(),
-            inactive_collations: HashMap::new(),
-            temp_path: None,
-        };
+        let inner = sqlite3Inner::new(Some(conn), filename);
         Self {
             inner: Mutex::new(inner),
         }
@@ -448,101 +457,143 @@ pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
 pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
 
 /// Percent-decode a URI component (e.g., `%20` -> ` `, `%2F` -> `/`).
-/// Returns None if a percent sequence is malformed or the result is not valid UTF-8.
+/// Malformed escapes stay literal; invalid UTF-8 returns None.
 fn percent_decode(input: &str) -> Option<String> {
+    let input = input.as_bytes();
     let mut bytes = Vec::with_capacity(input.len());
-    let mut iter = input.as_bytes().iter();
-    while let Some(&b) = iter.next() {
-        if b == b'%' {
-            let hi = *iter.next()?;
-            let lo = *iter.next()?;
-            let hex = [hi, lo];
-            let s = std::str::from_utf8(&hex).ok()?;
-            let decoded = u8::from_str_radix(s, 16).ok()?;
-            if decoded == 0 {
-                break;
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let decoded = input
+                .get(index + 1)
+                .zip(input.get(index + 2))
+                .and_then(|(&hi, &lo)| {
+                    Some(((hi as char).to_digit(16)? << 4 | (lo as char).to_digit(16)?) as u8)
+                });
+            if let Some(decoded) = decoded {
+                if decoded == 0 {
+                    break;
+                }
+                bytes.push(decoded);
+                index += 3;
+                continue;
             }
-            bytes.push(decoded);
-        } else {
-            bytes.push(b);
         }
+        bytes.push(input[index]);
+        index += 1;
     }
     String::from_utf8(bytes).ok()
 }
 
+#[derive(Debug)]
 struct ParsedFilename {
     path: String,
     memory: bool,
     cache_shared: bool,
     access: i32,
+    shared_mvcc: Option<SharedMvccOptions>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SharedMvccOptions {
+    history_limit: std::num::NonZeroU64,
+}
+
+#[derive(Debug)]
 struct OpenError {
     code: i32,
     message: String,
 }
 
-fn parse_uri_filename(uri: &str, mut access: i32) -> Result<ParsedFilename, OpenError> {
+fn parse_uri_filename(uri: &str, access: i32) -> Result<ParsedFilename, OpenError> {
     let invalid = |message: String| OpenError {
         code: SQLITE_ERROR,
         message,
     };
-    let after_file = uri[5..]
-        .split('#')
-        .next()
-        .expect("split always returns a component");
+    let (ordinary, effective_access) = turso_core::UriOpenOptions::parse_with_flags(uri, access)
+        .map_err(|error| OpenError {
+            code: error.code,
+            message: error.message,
+        })?;
+    let after_file = uri[5..].split('#').next().unwrap();
     let (raw_path, query) = after_file.split_once('?').unwrap_or((after_file, ""));
-    let raw_path = if let Some(authority_path) = raw_path.strip_prefix("//") {
-        let (authority, path) = authority_path
-            .split_once('/')
-            .unwrap_or((authority_path, ""));
-        if !authority.is_empty() && authority != "localhost" {
-            return Err(invalid(format!("invalid uri authority: {authority}")));
-        }
-        if authority_path.contains('/') {
-            format!("/{path}")
-        } else {
-            String::new()
-        }
-    } else {
-        raw_path.to_owned()
-    };
-    let path = percent_decode(&raw_path).ok_or_else(|| invalid("invalid URI encoding".into()))?;
-    let mut cache_shared = false;
+    let path = ordinary.path;
+    let cache_shared = ordinary.cache == turso_core::CacheMode::Shared;
+    let mut shared_mvcc = false;
+    let mut history_limit = None;
+    let mut custom_vfs = false;
+    let mut memory_requested = access & SQLITE_OPEN_MEMORY != 0;
     for parameter in query.split('&') {
-        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-        let key = percent_decode(key).ok_or_else(|| invalid("invalid URI encoding".into()))?;
-        let value = percent_decode(value).ok_or_else(|| invalid("invalid URI encoding".into()))?;
+        let (raw_key, raw_value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        let key = percent_decode(raw_key).ok_or_else(|| invalid("invalid URI encoding".into()))?;
+        let value =
+            percent_decode(raw_value).ok_or_else(|| invalid("invalid URI encoding".into()))?;
+        if key.starts_with("turso_mvcc") && (raw_key.contains("%00") || raw_value.contains("%00")) {
+            return Err(invalid("NUL in shared MVCC URI option".into()));
+        }
         match key.as_str() {
-            "mode" => {
-                let mode = match value.as_str() {
-                    "ro" => SQLITE_OPEN_READONLY,
-                    "rw" => SQLITE_OPEN_READWRITE,
-                    "rwc" => SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                    "memory" => SQLITE_OPEN_MEMORY,
-                    _ => return Err(invalid(format!("no such access mode: {value}"))),
-                };
-                if mode != SQLITE_OPEN_MEMORY && mode > access {
-                    return Err(OpenError {
-                        code: SQLITE_PERM,
-                        message: format!("access mode not allowed: {value}"),
-                    });
+            "turso_mvcc" => {
+                if shared_mvcc || value != "shared" {
+                    return Err(invalid(
+                        "turso_mvcc must occur once with value shared".into(),
+                    ));
                 }
-                access = mode;
+                shared_mvcc = true;
             }
-            "cache" => match value.as_str() {
-                "shared" => cache_shared = true,
-                "private" => cache_shared = false,
-                _ => return Err(invalid(format!("no such cache mode: {value}"))),
-            },
+            "turso_mvcc_history_limit" => {
+                if history_limit.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(invalid(
+                        "turso_mvcc_history_limit must occur once with a positive decimal u64"
+                            .into(),
+                    ));
+                }
+                history_limit = Some(value.parse::<std::num::NonZeroU64>().map_err(|_| {
+                    invalid("turso_mvcc_history_limit must be a positive decimal u64".into())
+                })?);
+            }
+            key if key.starts_with("turso_mvcc") => {
+                return Err(invalid(format!("unknown shared MVCC option: {key}")));
+            }
+            "vfs" => custom_vfs |= !raw_value.is_empty(),
+            "mode" => memory_requested |= value == "memory",
             _ => {}
         }
     }
+    let memory = path == ":memory:" || effective_access & SQLITE_OPEN_MEMORY != 0;
+    let shared_mvcc = if shared_mvcc {
+        if memory || path.is_empty() || memory_requested || raw_path.contains("%00") {
+            return Err(invalid(
+                "shared MVCC requires a named persistent database".into(),
+            ));
+        }
+        if custom_vfs {
+            return Err(invalid(
+                "shared MVCC does not support a VFS override".into(),
+            ));
+        }
+        Some(SharedMvccOptions {
+            history_limit: history_limit.unwrap_or(
+                std::num::NonZeroU64::new(64 * 1024 * 1024)
+                    .expect("default history limit is positive"),
+            ),
+        })
+    } else {
+        if history_limit.is_some() {
+            return Err(invalid(
+                "turso_mvcc_history_limit requires turso_mvcc=shared".into(),
+            ));
+        }
+        None
+    };
     Ok(ParsedFilename {
-        memory: path == ":memory:" || path.is_empty() || access & SQLITE_OPEN_MEMORY != 0,
+        memory,
         path,
         cache_shared,
-        access,
+        access: effective_access,
+        shared_mvcc,
     })
 }
 
@@ -551,7 +602,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const ffi::c_char,
     db_out: *mut *mut sqlite3,
     flags: ffi::c_int,
-    _z_vfs: *const ffi::c_char,
+    z_vfs: *const ffi::c_char,
 ) -> ffi::c_int {
     trace!("sqlite3_open_v2");
     if db_out.is_null() {
@@ -586,11 +637,31 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             memory: flags & SQLITE_OPEN_MEMORY != 0 || filename_str == ":memory:",
             cache_shared: false,
             access,
+            shared_mvcc: None,
         }
     };
+    if let Some(options) = parsed.shared_mvcc {
+        if !z_vfs.is_null() && !CStr::from_ptr(z_vfs).to_bytes().is_empty() {
+            return failed_open(
+                db_out,
+                SQLITE_ERROR,
+                "shared MVCC does not support a VFS override",
+            );
+        }
+        trace!(
+            history_limit = options.history_limit.get(),
+            "shared MVCC requested"
+        );
+        return failed_open(
+            db_out,
+            SQLITE_ERROR,
+            "shared MVCC is not available in this build",
+        );
+    }
     let use_memory = parsed.memory;
     let cache_shared = parsed.cache_shared;
-    let temp_path = if filename_str.is_empty() && !use_memory {
+    let access = parsed.access;
+    let temp_path = if parsed.path.is_empty() && !use_memory {
         Some(temp_database_path())
     } else {
         None
@@ -599,15 +670,22 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or(parsed.path);
-    let file_open_flags = if parsed.access == SQLITE_OPEN_READONLY {
+    let file_is_readonly = !use_memory
+        && std::fs::metadata(&effective_filename)
+            .map(|metadata| metadata.permissions().readonly())
+            .unwrap_or(false);
+    let connection_readonly = access & SQLITE_OPEN_READONLY != 0 || file_is_readonly;
+    let file_open_flags = if temp_path.is_some() {
+        turso_core::OpenFlags::Create
+    } else if connection_readonly {
         turso_core::OpenFlags::ReadOnly
-    } else if parsed.access & SQLITE_OPEN_CREATE != 0 || temp_path.is_some() {
+    } else if access & SQLITE_OPEN_CREATE != 0 {
         turso_core::OpenFlags::Create
     } else {
         turso_core::OpenFlags::None
     };
 
-    let mut readonly = parsed.access & SQLITE_OPEN_READONLY != 0;
+    let mut readonly = connection_readonly;
     let use_shared_memory = use_memory && cache_shared && !effective_filename.is_empty();
 
     let db = if use_shared_memory {
@@ -718,18 +796,7 @@ fn open_error_code(error: &LimboError) -> i32 {
 }
 
 unsafe fn failed_open(db_out: *mut *mut sqlite3, code: i32, message: &str) -> i32 {
-    let mut inner = sqlite3Inner {
-        conn: None,
-        err_code: code,
-        err_mask: 0xff,
-        malloc_failed: false,
-        e_open_state: SQLITE_STATE_SICK,
-        p_err: None,
-        filename: CString::default(),
-        stmt_list: std::ptr::null_mut(),
-        inactive_collations: HashMap::new(),
-        temp_path: None,
-    };
+    let mut inner = sqlite3Inner::new(None, CString::default());
     set_db_err_msg(&mut inner, code, message);
     *db_out = sqlite3 {
         inner: Mutex::new(inner),
@@ -3335,16 +3402,21 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     let Ok(name) = CStr::from_ptr(name).to_str() else {
         return SQLITE_MISUSE;
     };
+    if !(-1..=1000).contains(&n_args) || name.len() > 255 {
+        return SQLITE_MISUSE;
+    }
     let name_c = CString::new(name).unwrap();
     let mut registration = match (func, step, final_) {
-        (Some(callback), _, _) => PendingFunction::Scalar(Box::into_raw(Box::new(ScalarBridge {
-            callback: std::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
-            >(callback),
-            user_data,
-            db,
-        }))),
+        (Some(callback), None, None) => {
+            PendingFunction::Scalar(Box::into_raw(Box::new(ScalarBridge {
+                callback: std::mem::transmute::<
+                    unsafe extern "C" fn(),
+                    unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+                >(callback),
+                user_data,
+                db,
+            })))
+        }
         (None, Some(step), Some(final_)) => {
             PendingFunction::Aggregate(Box::into_raw(Box::new(AggBridge {
                 step: std::mem::transmute::<
@@ -3999,6 +4071,132 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structured_error_messages_preserve_payload_without_category() {
+        for error in [
+            LimboError::Corrupt("Internal error: application payload".into()),
+            LimboError::ParseError("Parse error: application payload".into()),
+        ] {
+            let expected = error.bare_message().into_owned();
+            let mut message = ptr::null_mut();
+            handle_limbo_err(error, &mut message);
+            let message = unsafe { CString::from_raw(message) };
+            assert_eq!(message.to_str().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn shared_mvcc_uri_options_preserve_values_and_readonly_access() {
+        use super::*;
+        for (query, expected) in [
+            ("turso_mvcc=shared", 64 * 1024 * 1024),
+            ("turso_mvcc=shared&turso_mvcc_history_limit=1", 1),
+            (
+                "turso_mvcc_history_limit=18446744073709551615&turso_mvcc=shared",
+                u64::MAX,
+            ),
+            ("turso_mvcc=sh%61red&turso_mvcc_history_limi%74=%34%32", 42),
+        ] {
+            let parsed = parse_uri_filename(&format!("file:test.db?mode=ro&{query}"), 6).unwrap();
+            assert_eq!(parsed.access, SQLITE_OPEN_READONLY);
+            assert_eq!(parsed.shared_mvcc.unwrap().history_limit.get(), expected);
+            assert!(!parsed.memory);
+        }
+    }
+
+    #[test]
+    fn shared_mvcc_uri_rejects_ambiguous_or_incompatible_options() {
+        use super::*;
+        for query in [
+            "turso_mvcc",
+            "turso_mvcc=off",
+            "turso_mvcc=SHARED",
+            "turso_mvcc=shared&turso_mvcc=shared",
+            "turso_mvcc=shared&turso_%6dvcc=off",
+            "turso_mvcc=shared&turso_mvcc_history_limit=1&turso_mvcc_history_limit=2",
+            "turso_mvcc_history_limit=1",
+            "turso_mvcc_typo=shared",
+            "turso_mvcc=shared%00off",
+            "turso_mvcc%00ignored=shared",
+            "turso_mvcc=shared&vfs=custom",
+            "turso_mvcc=shared&vfs=%00custom",
+            "turso_mvcc=shared&vfs=custom&vfs=",
+            "turso_mvcc=shared&mode=memory",
+            "mode=memory&mode=rw&turso_mvcc=shared",
+        ] {
+            let error = parse_uri_filename(&format!("file:test.db?{query}"), 6).unwrap_err();
+            assert_eq!(error.code, SQLITE_ERROR, "{query}");
+        }
+        for limit in [
+            "",
+            "0",
+            "18446744073709551616",
+            "-1",
+            "+1",
+            " 1",
+            "1.0",
+            "1%00",
+            "１",
+        ] {
+            assert!(
+                parse_uri_filename(
+                    &format!("file:test.db?turso_mvcc=shared&turso_mvcc_history_limit={limit}"),
+                    6
+                )
+                .is_err(),
+                "{limit}"
+            );
+        }
+        for path in ["", ":memory:", "test%00.db"] {
+            assert!(parse_uri_filename(&format!("file:{path}?turso_mvcc=shared"), 6).is_err());
+        }
+        assert!(parse_uri_filename(
+            "file:test.db?mode=rw&turso_mvcc=shared",
+            6 | SQLITE_OPEN_MEMORY
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shared_mvcc_uri_keeps_ordinary_uri_behavior() {
+        use super::*;
+        let parsed =
+            parse_uri_filename("file:test.db?unknown=value&vfs=ignored&mode=ro", 6).unwrap();
+        assert_eq!(parsed.path, "test.db");
+        assert_eq!(parsed.access, SQLITE_OPEN_READONLY);
+        assert!(parsed.shared_mvcc.is_none());
+        assert!(
+            parse_uri_filename("file:test.db?mode=memory&cache=shared", 6)
+                .unwrap()
+                .memory
+        );
+        assert!(parse_uri_filename("file:test.db#?turso_mvcc=shared", 6)
+            .unwrap()
+            .shared_mvcc
+            .is_none());
+    }
+
+    #[test]
+    fn shared_mvcc_uri_cannot_silently_open_ordinary_database() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.db");
+        let uri = CString::new(format!("file:{}?turso_mvcc=shared", path.display())).unwrap();
+        unsafe {
+            let mut db = std::ptr::null_mut();
+            let result = sqlite3_open_v2(
+                uri.as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                std::ptr::null(),
+            );
+            if !db.is_null() {
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+            assert_eq!(result, SQLITE_ERROR);
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn bare_errors_use_variant_messages() {
@@ -4047,6 +4245,118 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native shared MVCC files"]
+    fn recovered_checkpoint_uses_sqlite_dialect_and_c_connection() {
+        use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
+        #[derive(Debug)]
+        struct Answer;
+        impl ScalarFunction for Answer {
+            type Call = Self;
+            fn create_call(&self) -> turso_core::Result<Self> {
+                Ok(Self)
+            }
+        }
+        impl ScalarCall for Answer {
+            type Output = i64;
+            fn step(
+                &mut self,
+                _: &Arc<turso_core::Connection>,
+                _: &[turso_core::Register],
+            ) -> turso_core::types::IOResultOr<i64> {
+                Ok(turso_core::IOResult::Done(73))
+            }
+        }
+        for readonly in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let dialect: Arc<dyn turso_core::Dialect> = Arc::new(SqliteDialect);
+            let mut options = turso_core::OpenOptions::new(dialect.clone())
+                .db_opts(default_db_opts())
+                .extension_function(
+                    turso_core::ExternalFunc::new_native_scalar(
+                        "recovered_answer".into(),
+                        FunctionArity::Exact(0),
+                        true,
+                        Answer,
+                    )
+                    .unwrap(),
+                );
+            if readonly {
+                options = options.flags(turso_core::OpenFlags::ReadOnly);
+            }
+            let (database, connection) = turso_core::mvcc::database::recovered_checkpoint_for_test(
+                directory.path(),
+                options,
+            )
+            .unwrap();
+            assert!(Arc::ptr_eq(&database.dialect(), &dialect));
+            let mut answers = Vec::new();
+            connection
+                .prepare("SELECT recovered_answer(), sqlite_version() FROM preserved WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    answers.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_owned()));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(answers.len(), 1);
+            assert_eq!(answers[0].0, 73);
+            assert!(!answers[0].1.is_empty());
+            if !readonly {
+                connection
+                    .execute("INSERT INTO recovered_items(value) VALUES('after recovery')")
+                    .unwrap();
+                let mut ids = Vec::new();
+                connection
+                    .prepare("SELECT id FROM recovered_items ORDER BY id")
+                    .unwrap()
+                    .run_with_row_callback(|row| {
+                        ids.push(row.get::<i64>(0)?);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(ids, [1, 10]);
+                let mut sequence = Vec::new();
+                connection
+                    .prepare("SELECT nextval('recovered_sequence')")
+                    .unwrap()
+                    .run_with_row_callback(|row| {
+                        sequence.push(row.get::<i64>(0)?);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(sequence, [42]);
+            }
+            let handle = sqlite3::new(connection, CString::new("recovered.db").unwrap()).into_raw();
+            unsafe {
+                assert_eq!(
+                    sqlite3_db_readonly(handle, c"main".as_ptr()),
+                    i32::from(readonly)
+                );
+                assert_eq!(
+                    sqlite3_exec(
+                        handle,
+                        c"SELECT recovered_answer(), value FROM preserved".as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    SQLITE_OK
+                );
+                let changed = sqlite3_exec(
+                    handle,
+                    c"UPDATE preserved SET value='from recovered C connection' WHERE id=1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                assert_eq!(changed, if readonly { SQLITE_READONLY } else { SQLITE_OK });
+                assert_eq!(sqlite3_close(handle), SQLITE_OK);
+            }
+        }
+    }
 
     #[test]
     fn deferred_close_keeps_handle_alive_during_aggregate_cleanup() {
@@ -4871,7 +5181,10 @@ mod tests {
         let before = std::fs::read(&ro_path).unwrap();
         let wal_path = format!("{}-wal", ro_path.display());
         let wal_before = std::fs::read(&wal_path).ok();
-        conn.execute("PRAGMA ro.wal_checkpoint(TRUNCATE)").unwrap();
+        assert!(matches!(
+            conn.execute("PRAGMA ro.wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::ReadOnly)
+        ));
         assert_eq!(std::fs::read(&ro_path).unwrap(), before);
         assert_eq!(std::fs::read(&wal_path).ok(), wal_before);
 

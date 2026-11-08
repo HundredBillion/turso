@@ -11,6 +11,13 @@
     )
 )]
 #![recursion_limit = "256"]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_frames,
+        reason = "Rust 1.88 generates a libtest descriptor array exceeding the stack lint threshold; non-test library builds retain the strict lint"
+    )
+)]
 
 pub mod alloc;
 pub mod busy;
@@ -37,6 +44,7 @@ pub mod native_ext;
 pub mod numeric;
 pub mod schema;
 pub mod security;
+pub mod shared_mvcc;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
@@ -139,11 +147,12 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::Dialect;
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
+pub use dialect::{Dialect, NewOwner, RelationChange};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
+    SQLITE_CONSTRAINT_UNIQUE,
 };
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
@@ -176,7 +185,9 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
+pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::sequence::{emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
@@ -188,8 +199,10 @@ pub use turso_macros::{
 };
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
-pub use util::IOExt;
-pub use vdbe::array::{array_values_from_any, text_array_literal};
+pub use util::{CacheMode, IOExt, OpenMode, OpenOptions as UriOpenOptions, UriError};
+pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};
+pub use vdbe::builder::{CursorType, ProgramBuilder};
+pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

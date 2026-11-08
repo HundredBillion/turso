@@ -744,13 +744,6 @@ impl<'a> Resolver<'a> {
         self.catalog.resolve_existing_trigger(qualified_name)
     }
 
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.catalog.resolve_existing_sequence(seq_name)
-    }
-
     /// The namespace and bare name of the sequence whose mangled name is
     /// `mangled`.
     pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {
@@ -2242,6 +2235,14 @@ fn emit_index_column_value_new_image(
                     table,
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::Stored { .. } => {
+                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
             }
             GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {

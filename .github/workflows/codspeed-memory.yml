@@ -149,6 +149,8 @@ jobs:
 
       - name: Run memory benchmarks
         uses: CodSpeedHQ/action@v4.17.0
+        env:
+          CODSPEED_SKIP_UPLOAD: ${{ github.repository == 'HundredBillion/turso' && 'true' || 'false' }}
         with:
           mode: memory
           # The CodSpeed runner runs this with `bash -c`; the single quotes
@@ -159,3 +161,12 @@ jobs:
             else
               cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles '${{ matrix.filter }}'
             fi
+
+      - name: Preserve fork memory measurements
+        if: github.repository == 'HundredBillion/turso'
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-measurements-${{ strategy.job-index }}
+          path: /tmp/profile.*.out/
+          if-no-files-found: error
+          retention-days: 7

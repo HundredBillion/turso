@@ -386,31 +386,7 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
-Changing `query_only` does not change the access permission selected when a
-connection opens. In the SQLite C API, a `file:` URI with `mode=ro` keeps the
-main database read-only even after `PRAGMA query_only=0`; private TEMP tables
-remain writable. `mode=rw` requires an existing file, and `mode=rwc` permits
-creating one. URI modes can restrict the caller's open flags but cannot add
-write or creation permission.
-
-For supported builtin, unencrypted filesystem storage, read-only and writable
-connections may share the same database within a process. A writable open does
-not convert storage immediately: the first persistent write or explicit
-checkpoint acquires writer authority. On a legacy rollback-journal file, that
-operation can return busy until existing readers end their transactions. A
-writable connection that already holds its own legacy read transaction must
-end that transaction before retrying the upgrade. Private TEMP operations do
-not activate the main database, and closing an unused writable handle does not
-convert it.
-
-If storage changed outside the process while read-only state was retained, a
-persistent write can require closing all handles and reopening the database.
-A temporary I/O failure while validating unchanged storage can be retried before
-activation changes any files. An I/O failure after activation has changed storage
-requires closing and reopening; the failed operation does not acknowledge a user
-transaction.
-Encrypted, custom, unidentified, multiprocess, and lock-disabled storage do not
-use this activation path.
+Turning `query_only` off does not remove a read-only restriction chosen when opening or connecting to the database.
 
 ### full_column_names / short_column_names
 
@@ -638,6 +614,8 @@ the current setting.
 
 ### wal_checkpoint
 
+A connection cannot explicitly checkpoint a database that it opened or attached read-only, even when another connection has writable access to the same file.
+
 Forces a WAL checkpoint.
 
 ```sql
@@ -646,8 +624,9 @@ PRAGMA wal_checkpoint;
 
 A checkpoint writes pages from the WAL file back to the database file.
 
-On a read-only connection, this pragma leaves the database and WAL unchanged
-and returns `(0, -1, -1)`.
+On a read-only connection, this pragma returns a read-only error and leaves the database and WAL unchanged.
+
+For explicitly enabled shared MVCC databases, every checkpoint mode uses a full, durable checkpoint and truncates the completed logical history. It briefly pauses admission and returns BUSY when a participant still holds a transaction. Existing readers remain valid. A successful checkpoint makes the new physical generation available before admitting further transactions.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 

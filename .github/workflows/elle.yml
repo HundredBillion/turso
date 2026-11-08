@@ -31,7 +31,7 @@ env:
 jobs:
   elle-check:
     name: Elle ${{ matrix.elle_model }} (${{ matrix.mode }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 60
     strategy:
       fail-fast: false

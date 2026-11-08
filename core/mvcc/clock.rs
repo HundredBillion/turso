@@ -16,6 +16,17 @@ pub trait LogicalClock: Send + Sync {
     ///
     /// Pass [`no_op`] when no atomic side-effect is needed (begin timestamps).
     fn get_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64;
+    /// Hold the admission lock while publishing an observed commit. Future local
+    /// timestamps follow it; observing an older timestamp never rewinds the clock.
+    fn publish_observed<F: FnOnce() -> crate::Result<()>>(
+        &self,
+        _timestamp: u64,
+        _publish: F,
+    ) -> crate::Result<()> {
+        Err(crate::LimboError::InvalidArgument(
+            "this clock does not support live peer publication".into(),
+        ))
+    }
     fn reset(&self, ts: u64);
 }
 
@@ -119,6 +130,20 @@ impl LogicalClock for MvccClock {
         *guard += 1;
         f(ts);
         ts
+    }
+
+    fn publish_observed<F: FnOnce() -> crate::Result<()>>(
+        &self,
+        timestamp: u64,
+        publish: F,
+    ) -> crate::Result<()> {
+        let mut guard = self.inner.lock();
+        *guard = (*guard).max(
+            timestamp
+                .checked_add(1)
+                .ok_or_else(|| crate::LimboError::Corrupt("timestamp overflow".into()))?,
+        );
+        publish()
     }
 
     fn reset(&self, ts: u64) {

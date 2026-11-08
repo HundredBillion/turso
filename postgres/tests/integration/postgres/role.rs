@@ -232,6 +232,8 @@ fn role_without_privileges_cannot_call_pragma_functions() {
         .unwrap();
     conn.execute("CREATE VIEW view_of_databases AS SELECT file FROM databases")
         .unwrap();
+    conn.execute("GRANT SELECT ON columns_of_t, databases, view_of_databases TO alice")
+        .unwrap();
 
     conn.execute("SET ROLE alice").unwrap();
 
@@ -254,9 +256,9 @@ fn role_without_privileges_cannot_call_pragma_functions() {
     }
 }
 
-/// Reading a view is allowed until GRANT exists, so the sequences the view
-/// changes are what is denied. PostgreSQL denies reading the view itself
-/// unless SELECT on it was granted.
+/// With SELECT on the views granted, the sequences the views change are
+/// what is denied, as in PostgreSQL, where nextval runs as the reader and
+/// not as the view's owner.
 #[test]
 fn role_without_privileges_cannot_change_a_sequence_through_a_view() {
     let db = TempDatabase::builder().build();
@@ -269,6 +271,8 @@ fn role_without_privileges_cannot_change_a_sequence_through_a_view() {
     conn.execute("CREATE VIEW view_of_set_s AS SELECT n FROM set_s")
         .unwrap();
     conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT SELECT ON next_s, set_s, view_of_set_s TO alice")
+        .unwrap();
     conn.execute("SET ROLE alice").unwrap();
 
     for sql in ["SELECT n FROM next_s", "SELECT n FROM view_of_set_s"] {
@@ -447,4 +451,21 @@ fn role_names(conn: &PgConnection) -> Vec<String> {
         .into_iter()
         .map(|row| row[0].to_string())
         .collect()
+}
+
+/// Without role membership, an owner may give its relation to nobody but
+/// itself; PostgreSQL asks for the ability to SET ROLE to the new owner.
+#[test]
+fn owner_cannot_give_its_table_to_another_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    conn.execute("ALTER TABLE t OWNER TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("ALTER TABLE t OWNER TO bob").unwrap_err();
+    assert_eq!(error.to_string(), "permission denied to set role \"bob\"");
+    conn.execute("ALTER TABLE t OWNER TO CURRENT_USER").unwrap();
 }

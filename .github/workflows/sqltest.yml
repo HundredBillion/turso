@@ -22,7 +22,7 @@ env:
 jobs:
   sqltest-check:
     name: Check .sqltest syntax
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +39,7 @@ jobs:
 
   sqltest-cli:
     name: Run SQL tests (CLI backend)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +59,7 @@ jobs:
 
   sqltest-rust:
     name: Run SQL tests (Rust backend)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +76,7 @@ jobs:
 
   sqltest-js:
     name: Run SQL tests (JS backend, ${{ matrix.mode }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     # The normal and MVCC passes run on separate machines at the same time.
     strategy:
@@ -125,7 +125,7 @@ jobs:
 
   sqltest-tursopg:
     name: Run SQL tests (tursopg backend)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -142,7 +142,7 @@ jobs:
 
   sqltest-postgres:
     name: Run SQL tests (PostgreSQL)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -164,7 +164,7 @@ jobs:
 
   pg-dump-fuzzer:
     name: PostgreSQL dump differential fuzzer
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -177,6 +177,8 @@ jobs:
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 15 --max-time 60 \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
           echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list
@@ -200,7 +202,7 @@ jobs:
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

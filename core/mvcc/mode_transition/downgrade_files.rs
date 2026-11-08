@@ -1,0 +1,430 @@
+use super::ordinary::{lock_exclusive, open_native};
+use super::{fs_error, identity, namespace_for, require_marker, SHARED_MVCC_VERSION};
+use crate::io::{File as IoFile, FileId};
+use crate::mvcc::persistent_storage::logical_log::{LogHeader, LOG_HDR_SIZE};
+use crate::mvcc::shared_files::SharedMvccFiles;
+use crate::sync::Arc;
+use crate::{LimboError, OpenFlags, Result, IO};
+use std::fs::File;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+
+pub(super) struct RetainedFile {
+    pub(super) path: PathBuf,
+    pub(super) file: File,
+    pub(super) id: FileId,
+}
+impl RetainedFile {
+    pub(super) fn open(path: PathBuf) -> Result<Self> {
+        let file = open_native(&path)?;
+        let id = identity(&file)?;
+        let retained = Self { path, file, id };
+        retained.revalidate()?;
+        Ok(retained)
+    }
+    pub(super) fn revalidate(&self) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(&self.path).map_err(fs_error)?;
+        if !metadata.is_file()
+            || identity(&self.file)? != self.id
+            || (FileId {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }) != self.id
+        {
+            return Err(invalid("downgrade file identity changed"));
+        }
+        Ok(())
+    }
+}
+
+/// Native aliases used only while the caller retains completed-checkpoint ownership.
+/// A missing basename WAL is exclusively created and synced before intent publication.
+pub(in crate::mvcc) struct DowngradeFiles {
+    pub(super) main: RetainedFile,
+    wal: RetainedFile,
+    pub(super) files: Vec<RetainedFile>,
+    namespace: PathBuf,
+    namespace_file: File,
+    log_path: PathBuf,
+    log: Option<RetainedFile>,
+    manifest: Arc<dyn IoFile>,
+    main_io: Arc<dyn IoFile>,
+    wal_io: Arc<dyn IoFile>,
+}
+impl DowngradeFiles {
+    pub(in crate::mvcc) fn open(path: &Path, expected: &SharedMvccFiles) -> Result<Self> {
+        Self::open_inner(path, Some(expected))
+    }
+    pub(super) fn open_terminal(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+    fn open_inner(path: &Path, expected: Option<&SharedMvccFiles>) -> Result<Self> {
+        super::require_linux_platform()?;
+        let main = RetainedFile::open(path.to_path_buf())?;
+        lock_exclusive(&main.file)?;
+        let canonical = path.canonicalize().map_err(fs_error)?;
+        let namespace = namespace_for(&canonical, main.id)?;
+        if let Some(expected) = expected {
+            if expected.main.file_id()? != Some(main.id)
+                || namespace != expected.namespace.canonicalize().map_err(fs_error)?
+            {
+                return Err(invalid("downgrade requires the installed native database"));
+            }
+        }
+        let main = RetainedFile {
+            path: canonical,
+            ..main
+        };
+        let marker = super::read_marker(&main.file)?;
+        if marker != SHARED_MVCC_VERSION && (expected.is_some() || marker != 2) {
+            return Err(invalid("downgrade requires shared or terminal WAL mode"));
+        }
+        require_marker(&main.file, marker)?;
+        let namespace_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&namespace)
+            .map_err(fs_error)?;
+        let text = main
+            .path
+            .to_str()
+            .ok_or_else(|| invalid("downgrade path must be UTF-8"))?;
+        require_absent(&PathBuf::from(format!("{text}-tshm")))?;
+        let wal_path = PathBuf::from(format!("{text}-wal"));
+        let wal = match std::fs::symlink_metadata(&wal_path) {
+            Ok(_) => Some(RetainedFile::open(wal_path.clone())?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(fs_error(error)),
+        };
+        let log_path = main.path.with_extension("db-log");
+        let log = match std::fs::symlink_metadata(&log_path) {
+            Ok(_) => Some(RetainedFile::open(log_path.clone())?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(fs_error(error)),
+        };
+        let names = [
+            "manifest",
+            "logical",
+            "physical-wal",
+            "physical-tshm",
+            "authority",
+            "ids-a",
+            "ids-b",
+            "ids-selector",
+        ];
+        let expected_ids = expected
+            .map(|expected| -> Result<_> {
+                Ok([
+                    expected.manifest.file_id()?,
+                    expected.logical.file_id()?,
+                    expected.physical_wal.file_id()?,
+                    expected.physical_coordination.file_id()?,
+                    expected.authority.file_id()?,
+                    expected.id_banks[0].file_id()?,
+                    expected.id_banks[1].file_id()?,
+                    expected.id_selector.file_id()?,
+                ])
+            })
+            .transpose()?;
+        let mut files = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let file = RetainedFile::open(namespace.join(name))?;
+            if expected_ids.is_some_and(|ids| ids[index] != Some(file.id)) {
+                return Err(invalid("downgrade namespace identity changed"));
+            }
+            files.push(file);
+        }
+        let mut ids = vec![main.id];
+        for file in wal.iter().chain(log.iter()).chain(files.iter()) {
+            if file.id.dev != main.id.dev || ids.contains(&file.id) {
+                return Err(invalid(
+                    "downgrade files must have distinct native identities",
+                ));
+            }
+            ids.push(file.id);
+        }
+        // Validate every existing sidecar before creating the only missing file.
+        let wal_length = wal
+            .as_ref()
+            .map(|wal| wal.file.metadata().map(|m| m.len()))
+            .transpose()
+            .map_err(fs_error)?;
+        if (expected.is_some() && wal_length.is_some_and(|length| length != 0))
+            || files[1].file.metadata().map_err(fs_error)?.len() != 0
+            || files[2].file.metadata().map_err(fs_error)?.len() != 0
+        {
+            return Err(invalid("downgrade requires empty ordinary and shared logs"));
+        }
+        if let Some(log) = &log {
+            validate_ordinary_log(log)?;
+        }
+        let wal = match wal {
+            Some(wal) => wal,
+            None => {
+                if expected.is_none() {
+                    return Err(invalid("terminal downgrade WAL is missing"));
+                }
+                let parent = main
+                    .path
+                    .parent()
+                    .ok_or_else(|| invalid("missing database parent"))?;
+                let directory = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                    .open(parent)
+                    .map_err(fs_error)?;
+                let parent_id = identity(&directory)?;
+                main.revalidate()?;
+                let metadata = std::fs::symlink_metadata(parent).map_err(fs_error)?;
+                if parent_id
+                    != (FileId {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    })
+                {
+                    return Err(invalid("downgrade database parent changed"));
+                }
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&wal_path)
+                    .map_err(fs_error)?;
+                let id = identity(&file)?;
+                let wal = RetainedFile {
+                    path: wal_path,
+                    file,
+                    id,
+                };
+                wal.revalidate()?;
+                if id.dev != main.id.dev || ids.contains(&id) {
+                    return Err(invalid("created downgrade WAL identity is invalid"));
+                }
+                wal.file.sync_all().map_err(fs_error)?;
+                directory.sync_all().map_err(fs_error)?;
+                wal
+            }
+        };
+        let io = crate::io::SyscallIO::new()?;
+        let manifest = io.open_file(
+            files[0]
+                .path
+                .to_str()
+                .ok_or_else(|| invalid("manifest path must be UTF-8"))?,
+            OpenFlags::NoLock,
+            false,
+        )?;
+        if manifest.file_id()? != Some(files[0].id) {
+            return Err(invalid("downgrade manifest alias identity changed"));
+        }
+        let main_io = io.open_file(main.path.to_str().unwrap(), OpenFlags::NoLock, false)?;
+        let wal_io = io.open_file(wal.path.to_str().unwrap(), OpenFlags::NoLock, false)?;
+        if main_io.file_id()? != Some(main.id) || wal_io.file_id()? != Some(wal.id) {
+            return Err(invalid("downgrade content alias identity changed"));
+        }
+        let retained = Self {
+            main,
+            wal,
+            files,
+            namespace,
+            namespace_file,
+            log_path,
+            log,
+            manifest,
+            main_io,
+            wal_io,
+        };
+        if expected.is_some() {
+            retained.revalidate()?;
+        } else {
+            retained.revalidate_marker()?;
+        }
+        Ok(retained)
+    }
+    pub(in crate::mvcc) fn revalidate(&self) -> Result<()> {
+        self.revalidate_inner(false)
+    }
+    pub(in crate::mvcc) fn revalidate_marker(&self) -> Result<()> {
+        self.revalidate_inner(true)
+    }
+    fn revalidate_inner(&self, marker_stage: bool) -> Result<()> {
+        self.main.revalidate()?;
+        self.wal.revalidate()?;
+        if marker_stage {
+            let marker = super::read_marker(&self.main.file)?;
+            if !matches!(marker, SHARED_MVCC_VERSION | 2) {
+                return Err(invalid("downgrade marker changed unexpectedly"));
+            }
+            require_marker(&self.main.file, marker)?;
+        } else {
+            require_marker(&self.main.file, SHARED_MVCC_VERSION)?;
+        }
+        let metadata = std::fs::symlink_metadata(&self.namespace).map_err(fs_error)?;
+        if !metadata.is_dir()
+            || identity(&self.namespace_file)?
+                != (FileId {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                })
+        {
+            return Err(invalid("downgrade namespace changed"));
+        }
+        for file in &self.files {
+            file.revalidate()?;
+        }
+        if self.manifest.file_id()? != Some(self.files[0].id)
+            || self.main_io.file_id()? != Some(self.main.id)
+            || self.wal_io.file_id()? != Some(self.wal.id)
+            || (!marker_stage && self.wal.file.metadata().map_err(fs_error)?.len() != 0)
+            || self.files[1].file.metadata().map_err(fs_error)?.len() != 0
+            || self.files[2].file.metadata().map_err(fs_error)?.len() != 0
+        {
+            return Err(invalid("downgrade requires empty ordinary and shared logs"));
+        }
+        require_absent(&PathBuf::from(format!("{}-tshm", self.main.path.display())))?;
+        if let Some(log) = &self.log {
+            log.revalidate()?;
+            validate_ordinary_log(log)?;
+        } else {
+            require_absent(&self.log_path)?;
+        }
+        Ok(())
+    }
+    pub(in crate::mvcc) fn path(&self) -> &Path {
+        &self.main.path
+    }
+    pub(in crate::mvcc) fn main_file(&self) -> Arc<dyn IoFile> {
+        self.main_io.clone()
+    }
+    pub(in crate::mvcc) fn wal_file(&self) -> Arc<dyn IoFile> {
+        self.wal_io.clone()
+    }
+    pub(super) fn selected_manifest(&self) -> Result<crate::mvcc::commit_manifest::ManifestRecord> {
+        Ok(self.selected_manifest_slot()?.1)
+    }
+    pub(super) fn selected_manifest_slot(
+        &self,
+    ) -> Result<(usize, crate::mvcc::commit_manifest::ManifestRecord)> {
+        use crate::mvcc::commit_manifest::{select_latest, ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+        if self.files[0].file.metadata().map_err(fs_error)?.len() != (2 * SLOT_SIZE) as u64 {
+            return Err(invalid("downgrade manifest length changed"));
+        }
+        let mut records = [None; 2];
+        for (index, record) in records.iter_mut().enumerate() {
+            let mut bytes = [0; RECORD_SIZE];
+            self.files[0]
+                .file
+                .read_exact_at(&mut bytes, (index * SLOT_SIZE) as u64)
+                .map_err(fs_error)?;
+            *record = ManifestRecord::decode(&bytes)?;
+        }
+        select_latest(records, self.main.id)
+    }
+    pub(in crate::mvcc) fn require_mirrored(
+        &self,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+    ) -> Result<()> {
+        use crate::mvcc::commit_manifest::{ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+        if self.files[0].file.metadata().map_err(fs_error)?.len() != (2 * SLOT_SIZE) as u64 {
+            return Err(invalid("downgrade manifest length changed"));
+        }
+        for offset in [0, SLOT_SIZE] {
+            let mut bytes = [0; RECORD_SIZE];
+            self.files[0]
+                .file
+                .read_exact_at(&mut bytes, offset as u64)
+                .map_err(fs_error)?;
+            if ManifestRecord::decode(&bytes)? != Some(record) {
+                return Err(invalid("downgrade terminal intent is not mirrored"));
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn cleanup_completed(
+        &self,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+    ) -> Result<()> {
+        self.revalidate_marker()?;
+        require_marker(&self.main.file, 2)?;
+        self.require_mirrored(record)?;
+        if self.wal.file.metadata().map_err(fs_error)?.len() != 0 {
+            return Err(invalid(
+                "downgrade cleanup requires a checkpointed basename WAL",
+            ));
+        }
+        let expected: std::collections::HashSet<_> =
+            self.files.iter().map(|file| file.path.clone()).collect();
+        let actual: std::collections::HashSet<_> = std::fs::read_dir(&self.namespace)
+            .map_err(fs_error)?
+            .map(|entry| entry.map(|entry| entry.path()).map_err(fs_error))
+            .collect::<Result<_>>()?;
+        if expected != actual {
+            return Err(invalid("unexpected downgrade namespace entry"));
+        }
+        let parent = self
+            .main
+            .path
+            .parent()
+            .ok_or_else(|| invalid("missing database parent"))?;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(parent)
+            .map_err(fs_error)?;
+        #[cfg(test)]
+        super::downgrade_marker::crash_barrier("cleanup-start");
+        if let Some(log) = &self.log {
+            log.revalidate()?;
+            std::fs::remove_file(&log.path).map_err(fs_error)?;
+            directory.sync_all().map_err(fs_error)?;
+            #[cfg(test)]
+            super::downgrade_marker::crash_barrier("cleanup-log");
+        }
+        for file in self.files.iter().skip(1) {
+            file.revalidate()?;
+            std::fs::remove_file(&file.path).map_err(fs_error)?;
+            #[cfg(test)]
+            super::downgrade_marker::crash_barrier(&format!(
+                "cleanup-{}",
+                file.path.file_name().unwrap().to_string_lossy()
+            ));
+        }
+        self.namespace_file.sync_all().map_err(fs_error)?;
+        self.files[0].revalidate()?;
+        std::fs::remove_file(&self.files[0].path).map_err(fs_error)?;
+        self.namespace_file.sync_all().map_err(fs_error)?;
+        #[cfg(test)]
+        super::downgrade_marker::crash_barrier("cleanup-manifest");
+        std::fs::remove_dir(&self.namespace).map_err(fs_error)?;
+        directory.sync_all().map_err(fs_error)?;
+        Ok(())
+    }
+    pub(in crate::mvcc) fn manifest(&self) -> Arc<dyn IoFile> {
+        self.manifest.clone()
+    }
+    pub(in crate::mvcc) fn wal_id(&self) -> FileId {
+        self.wal.id
+    }
+}
+fn require_absent(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(invalid("unexpected ordinary sidecar during downgrade")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(fs_error(error)),
+    }
+}
+fn invalid(message: &str) -> LimboError {
+    LimboError::InvalidArgument(message.into())
+}
+
+pub(super) fn validate_ordinary_log(log: &RetainedFile) -> Result<()> {
+    let length = log.file.metadata().map_err(fs_error)?.len();
+    if length > LOG_HDR_SIZE as u64 {
+        return Err(invalid("ordinary logical log contains frames"));
+    }
+    let mut bytes = vec![0; length as usize];
+    log.file.read_exact_at(&mut bytes, 0).map_err(fs_error)?;
+    LogHeader::validate_header_only_file(&bytes)
+}

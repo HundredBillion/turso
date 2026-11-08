@@ -323,7 +323,6 @@ pub fn translate_pragma(
             }
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
             program.begin_write_on_database(database_id, schema_cookie)?;
-            program.begin_write_operation()?;
         }
         TransactionMode::Concurrent => {
             program.begin_concurrent_operation();
@@ -646,6 +645,11 @@ fn update_pragma(
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
+            if !connection.dialect().supports_capture_data_changes() {
+                crate::bail_parse_error!(
+                    "capture_data_changes is not supported with this frontend"
+                );
+            }
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             // InitCdcVersion handles everything at execution time:
@@ -1000,7 +1004,7 @@ fn query_pragma(
             // Allocate two more here as one was allocated at the top.
             let passive_allowed = connection
                 .mv_store_for_db(database_id)
-                .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
+                .is_none_or(|mv_store| mv_store.is_shared() || mv_store.uses_passive_checkpoint());
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
@@ -2005,6 +2009,8 @@ fn emit_columns_for_table_info(
             1
         } else if column.is_virtual_generated() {
             2
+        } else if column.is_stored_generated() {
+            3
         } else {
             // normal column
             0

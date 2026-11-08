@@ -272,6 +272,12 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         rows: Vec<Vec<Value>>,
     },
+    /// Loading the dialect's own schema state, such as the PostgreSQL
+    /// frontend's relation catalog.
+    LoadDialectSchema {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -1049,6 +1055,17 @@ impl Connection {
         input: &str,
         origin: StatementOrigin,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        #[cfg(all(host_shared_wal, unix))]
+        if origin == StatementOrigin::Root
+            && !self.is_mvcc_bootstrap_connection()
+            && !self.schema_reparse_in_progress()
+            && self.has_no_open_transaction_state()
+        {
+            let store = self.db.get_mv_store().as_ref().cloned();
+            if let Some(store) = store {
+                store.refresh_shared_schema_for_prepare(self)?;
+            }
+        }
         self.maybe_update_schema();
 
         let syms = self.syms.read();
@@ -1127,7 +1144,6 @@ impl Connection {
         sql: impl AsRef<str>,
         origin: StatementOrigin,
     ) -> Result<Statement> {
-        self.db.check_storage_health()?;
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1147,7 +1163,13 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                // An engine schema statement is the engine's own SQLite text,
+                // whatever the database's dialect parses.
+                if matches!(origin, StatementOrigin::EngineSchemaWrite) {
+                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                } else {
+                    self.parse_sql(sql)?
+                }
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1730,6 +1752,19 @@ impl Connection {
                         Ok(())
                     }));
                     inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
+                    inner.phase = self.load_dialect_schema_phase(&inner.fresh, true)?;
+                }
+                ReparsePhase::LoadDialectSchema { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "dialect schema state must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.dialect_schema =
+                        Some(self.db.dialect().build_schema_state(&inner.fresh, rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1758,37 +1793,104 @@ impl Connection {
         }
     }
 
-    /// Returns the phase that loads the roles table into `fresh`, or the
-    /// stats refresh phase if the dialect has no roles or the database has no
-    /// roles table. The fresh
+    /// Returns the phase that loads the roles table into `fresh`, moving on
+    /// to the dialect's schema state and then the stats refresh if the
+    /// dialect has no roles or the database has no roles table. The fresh
     /// schema is installed first, because the current schema may not contain
     /// the roles table yet.
     fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !self.db.dialect().supports_roles()
-            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-        {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
+        if !self.db.dialect().supports_roles() {
+            return self.load_dialect_schema_phase(fresh, false);
+        }
+        if !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME) {
+            return self.load_dialect_schema_phase(fresh, false);
         }
         self.with_schema_mut(|schema| {
             *schema = fresh.try_clone()?;
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
-        let stmt = self.prepare_roles_read()?;
+        let stmt = self.prepare_engine_metadata_read(SELECT_ROLES_SQL)?;
         Ok(ReparsePhase::LoadRoles {
             stmt: Box::new(stmt),
             rows: Vec::new(),
         })
     }
 
-    /// Prepares the read of the roles table, for opening the database and
-    /// for reading the schema again. The table belongs to the engine, so its
-    /// name is looked up in every database, whatever the search path says.
-    /// The read is a top-level statement, so it runs in its own read
-    /// transaction when the schema is read outside a transaction.
-    pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
-        self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
+    /// Returns the phase that loads the dialect's own schema state into
+    /// `fresh`, or the stats refresh phase if the dialect keeps none in this
+    /// database. `schema_installed` says whether the roles phase already
+    /// installed the fresh schema on the connection.
+    fn load_dialect_schema_phase(
+        self: &Arc<Connection>,
+        fresh: &Schema,
+        schema_installed: bool,
+    ) -> Result<ReparsePhase> {
+        let Some(sql) = self.db.dialect().schema_state_query(fresh) else {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        };
+        if !schema_installed {
+            self.with_schema_mut(|schema| {
+                *schema = fresh.try_clone()?;
+                Ok::<_, crate::alloc::TryReserveError>(())
+            })??;
+        }
+        let stmt = self.prepare_engine_metadata_read(&sql)?;
+        Ok(ReparsePhase::LoadDialectSchema {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Prepares a read of an engine table that holds state the schema is
+    /// built from: the roles, or the dialect's own schema state. The table
+    /// belongs to the engine, so its name is looked up in every database,
+    /// whatever the search path says. The read is a top-level statement, so
+    /// it runs in its own read transaction when the schema is read outside
+    /// a transaction.
+    pub(crate) fn prepare_engine_metadata_read(
+        self: &Arc<Connection>,
+        sql: &str,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
+    }
+
+    /// Reads the dialect's own schema state into the database's schema and
+    /// this connection's. A frontend that creates its schema table when it
+    /// opens a database calls this after the creation commits, because the
+    /// open itself loaded the schema before the table existed.
+    pub fn reload_dialect_schema(self: &Arc<Connection>) -> Result<()> {
+        let dialect = self.db.dialect();
+        let Some(sql) = dialect.schema_state_query(&self.current_schema()) else {
+            return Ok(());
+        };
+        let rows = self
+            .prepare_engine_metadata_read(&sql)?
+            .run_collect_rows()?;
+        let state = self.with_schema(crate::MAIN_DB_ID, |schema| {
+            dialect.build_schema_state(schema, &rows)
+        })?;
+        self.db.with_schema_mut(|schema| {
+            schema.dialect_schema = Some(state.clone());
+            Ok(())
+        })?;
+        self.with_schema_mut(|schema| {
+            schema.dialect_schema = Some(state);
+        })?;
+        Ok(())
+    }
+
+    /// Prepares a schema statement of the engine's own: SQLite text whatever
+    /// the database's dialect, allowed to name the engine's reserved objects,
+    /// and run as an ordinary top-level statement with its own transaction
+    /// work. Frontends use it to create and fill their internal tables at
+    /// open, like the relation catalog of the PostgreSQL frontend.
+    pub fn prepare_engine_schema_statement(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        self.start_nested();
+        let statement = self.prepare_with_origin(sql, StatementOrigin::EngineSchemaWrite);
+        self.end_nested();
+        statement
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -2005,13 +2107,20 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        // Private memory targets and VFS backends without shared WAL keep their local WAL.
+        db_opts = db_opts.with_multiprocess_wal(
+            db_opts.enable_multiprocess_wal
+                && !is_memory_like(&opts.path)
+                && io.supports_shared_wal_coordination(),
+        );
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts.clone())
+                .skip_db_opts_check_on_registry_hit(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -2488,6 +2597,11 @@ impl Connection {
         let _checkpoint_guard =
             self.begin_explicit_checkpoint(self.pager.load().clone(), false, crate::MAIN_DB_ID)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
+            #[cfg(all(host_shared_wal, unix))]
+            if mv_store.is_shared() {
+                return crate::mvcc::database::checkpoint_shared(self.clone(), mode);
+            }
+
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(
                     matches!(
@@ -2538,8 +2652,16 @@ impl Connection {
         if self.is_closed() {
             return Ok(());
         }
-        self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
+        // Live statements may still own page-1 IO; finish it before rollback releases init_lock.
+        pager.drain_page1_io()?;
+        self.with_all_attached_pagers_with_index(|pagers| {
+            for (_, pager) in pagers {
+                pager.drain_page1_io()?;
+            }
+            Ok::<(), LimboError>(())
+        })?;
+        self.closed.store(true, Ordering::SeqCst);
 
         match self.get_tx_state() {
             TransactionState::None => {
@@ -2568,14 +2690,20 @@ impl Connection {
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
+        // Shared commits durably publish the logical log and manifest. Physical WAL
+        // maintenance requires its checkpoint authority, never an unscoped close.
+        let shared_mvcc = self
+            .mv_store()
+            .as_ref()
+            .is_some_and(|store| store.is_shared());
         let should_checkpoint_on_close = pager
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
-            && self.db.writer_is_active()
             && !self.is_readonly(crate::MAIN_DB_ID)
             && !is_memory_db
+            && !shared_mvcc
             && should_checkpoint_on_close
         {
             self.pager
@@ -2868,30 +2996,11 @@ impl Connection {
         self.db.get_database_canonical_path()
     }
 
-    pub(crate) fn check_database_storage(&self, index: usize) -> Result<()> {
-        if index == crate::TEMP_DB_ID {
-            return Ok(());
-        }
-        if index == crate::MAIN_DB_ID {
-            return self.db.check_storage_health();
-        }
-        let catalog = self.attached_databases.read();
-        catalog
-            .index_to_data
-            .get(&index)
-            .ok_or(LimboError::SchemaUpdated)?
-            .db
-            .check_storage_health()
-    }
-
     pub(crate) fn ensure_database_writable(&self, index: usize) -> Result<()> {
         if self.is_readonly(index) {
             return Err(LimboError::ReadOnly);
         }
-        if index == crate::TEMP_DB_ID {
-            return Ok(());
-        }
-        self.get_source_database(index).ensure_writable_ready()
+        Ok(())
     }
 
     /// Check if a specific attached database is read only or not, by its index
@@ -2932,7 +3041,9 @@ impl Connection {
         };
 
         let pager = self.get_pager_from_database_index(&database_id)?;
-        pager.set_initial_page_size(size)?;
+        if !pager.set_initial_page_size(size)? {
+            return Ok(());
+        }
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
@@ -3540,7 +3651,7 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::CreateSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        self.prepare_namespace_stmt(statement)?.run_ignore_rows()?;
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()?;
         let namespace = self
             .current_qualifiers()
             .get(name)
@@ -3564,13 +3675,14 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::DropSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        self.prepare_namespace_stmt(statement)?.run_ignore_rows()
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()
     }
 
-    /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
+    /// Prepares a statement that a frontend built as an AST, such as CREATE
+    /// SCHEMA, DROP SCHEMA or GRANT. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
-    /// schema, translates the statement itself.
-    pub fn prepare_namespace_stmt(
+    /// schema, translates the AST itself.
+    pub fn prepare_ast_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
