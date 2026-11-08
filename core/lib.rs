@@ -11,6 +11,13 @@
     )
 )]
 #![recursion_limit = "256"]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_frames,
+        reason = "Rust 1.88 generates a libtest descriptor array exceeding the stack lint threshold; non-test library builds retain the strict lint"
+    )
+)]
 
 pub mod alloc;
 pub mod busy;
