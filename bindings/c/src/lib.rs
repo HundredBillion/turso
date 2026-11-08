@@ -4272,15 +4272,17 @@ mod tests {
         for readonly in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let dialect: Arc<dyn turso_core::Dialect> = Arc::new(SqliteDialect);
-            let mut options = turso_core::OpenOptions::new(dialect.clone()).extension_function(
-                turso_core::ExternalFunc::new_native_scalar(
-                    "recovered_answer".into(),
-                    FunctionArity::Exact(0),
-                    true,
-                    Answer,
-                )
-                .unwrap(),
-            );
+            let mut options = turso_core::OpenOptions::new(dialect.clone())
+                .db_opts(default_db_opts())
+                .extension_function(
+                    turso_core::ExternalFunc::new_native_scalar(
+                        "recovered_answer".into(),
+                        FunctionArity::Exact(0),
+                        true,
+                        Answer,
+                    )
+                    .unwrap(),
+                );
             if readonly {
                 options = options.flags(turso_core::OpenFlags::ReadOnly);
             }
