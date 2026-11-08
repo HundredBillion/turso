@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 273a01ba707534870af18d575430e8565c0c7306
+          ref: cd5e4ec61dcede8e7c158d75ef7d373b173980f8
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,19 +28,29 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 273a01ba707534870af18d575430e8565c0c7306
+          test "$(git rev-parse HEAD)" = cd5e4ec61dcede8e7c158d75ef7d373b173980f8
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Actual child lock phase and supervisor control
+      - name: Cleanup, recovery and genuine extent acceptance
         run: |
-          set +e
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_old_handle_close -- --ignored --test-threads=1 --nocapture 2>&1 | tee lock-probe.log
-          echo "${PIPESTATUS[0]}" > lock-status.txt
-          set -e
-          grep '^test result:' lock-probe.log | tail -1 | tee lock-summary.txt
-          grep -Eq '^test result: (ok. 1 passed; 0 failed;|FAILED. 0 passed; 1 failed;)' lock-summary.txt
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_child_failure -- --ignored --test-threads=1 --nocapture 2>&1 | tee child-control.log
-          grep '^test result:' child-control.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_partial_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee partial.log
+          grep '^test result:' partial.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_extent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent.log
+          grep '^test result:' extent.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
+          grep '^test result:' resume.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee cleanup.log
+          grep '^test result:' cleanup.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_creation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee creation.log
+          grep '^test result:' creation.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee preparation.log
+          grep '^test result:' preparation.log | tail -1 | grep -q '^test result: ok. 7 passed; 0 failed;'
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_ -- --ignored --skip old_handle_close --test-threads=1 --nocapture 2>&1 | tee marker.log
+          grep '^test result:' marker.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
+      - name: Strict library lint and formatting
+        run: |
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -53,3 +63,17 @@ jobs:
             *status.txt
             *summary.txt
           retention-days: 14
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cd5e4ec61dcede8e7c158d75ef7d373b173980f8
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-windows
+          cache-on-failure: true
+      - run: cargo check --locked -p turso_core --lib --features conn_raw_api
