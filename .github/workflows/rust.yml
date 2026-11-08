@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4c4cbb97bec4444c00d15c08a41aca42ca823834
+          ref: d82be999aa783d88e6856ed6cb523981d1c3f6b4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,31 +24,23 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 4c4cbb97bec4444c00d15c08a41aca42ca823834
+          test "$(git rev-parse HEAD)" = d82be999aa783d88e6856ed6cb523981d1c3f6b4
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Independent worker conflict and restart audits
+      - name: Genuine installed checkpoint preparation expected RED
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee build.log
-          status=0
-          for selector in shared_worker_native_update_conflicts shared_worker_native_delete_conflicts shared_worker_native_unique_conflicts shared_worker_native_disjoint_updates_delete_and_insert_both_commit shared_worker_native_snapshot_multirow_ack_and_rolling_restart; do
-            set +e
-            timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
-            code=${PIPESTATUS[0]}
-            set -e
-            if test "$code" != 0 || ! grep -q '1 passed; 0 failed' "$selector.log"; then status=1; fi
-          done
-          exit "$status"
-      - name: Library lint and clean source
-        run: |
-          set -o pipefail
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-          git diff --exit-code
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_prepare_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee downgrade-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '0 passed; 1 failed' downgrade-red.log
+          grep -q 'genuine installed checkpoint must prepare downgrade intent' downgrade-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-worker-acceptance-audit
+          name: shared-downgrade-preparation
           path: |
             source.txt
             rustc.txt
