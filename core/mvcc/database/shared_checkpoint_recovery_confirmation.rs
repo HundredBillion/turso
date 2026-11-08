@@ -374,7 +374,7 @@ mod tests {
             )
             .unwrap();
         let mut load = ManifestLoad::new(fake, guard, runtime.database_id).unwrap();
-        let loaded = fake_io.block(|| load.poll()).unwrap();
+        let loaded = fake_io.block(|| Ok(load.poll()?)).unwrap();
         let error = match loaded.mirror_recovered_completion(evidence) {
             Err(error) => error,
             Ok(_) => panic!("substitute manifest file authorized recovered completion"),
