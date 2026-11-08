@@ -310,14 +310,14 @@ fn shared_connection_native_later_commits_keep_the_physical_checkpoint_tag() {
         .unwrap();
 }
 
-struct HeldMainRead {
+pub(super) struct HeldMainRead {
     file: Arc<dyn File>,
     offset: u64,
     completion: Completion,
 }
 
 impl HeldMainRead {
-    fn complete(&self) {
+    pub(super) fn complete(&self) {
         drop(
             self.file
                 .pread(self.offset, self.completion.clone())
@@ -328,7 +328,7 @@ impl HeldMainRead {
 }
 
 #[derive(Default)]
-struct ConnectionIoControl {
+pub(super) struct ConnectionIoControl {
     delay_at_read: crate::sync::atomic::AtomicUsize,
     main_reads: crate::sync::atomic::AtomicUsize,
     main_path: PathBuf,
@@ -458,4 +458,33 @@ impl crate::IO for ConnectionIo {
     fn step(&self) -> Result<()> {
         self.inner.step()
     }
+}
+
+impl ConnectionIoControl {
+    pub(super) fn delay_after_reads(&self, reads: usize) {
+        self.delay_at_read.store(
+            self.main_reads.load(Ordering::Acquire) + reads,
+            Ordering::Release,
+        );
+    }
+    pub(super) fn take_pending(&self) -> HeldMainRead {
+        self.pending_read
+            .lock()
+            .take()
+            .expect("expected delayed native read")
+    }
+}
+
+pub(super) fn delaying_native_read(
+    path: PathBuf,
+) -> (Arc<dyn crate::IO>, Arc<ConnectionIoControl>) {
+    let control = Arc::new(ConnectionIoControl {
+        main_path: path,
+        ..Default::default()
+    });
+    let io: Arc<dyn crate::IO> = Arc::new(ConnectionIo {
+        inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+        control: control.clone(),
+    });
+    (io, control)
 }

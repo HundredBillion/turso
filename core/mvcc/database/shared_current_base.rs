@@ -284,6 +284,13 @@ fn validate_physical_metadata(
             "current physical database is truncated or unaligned".into(),
         ));
     }
+    let physical_pages = i64::try_from(size / page_size)
+        .map_err(|_| LimboError::Corrupt("current physical database has too many pages".into()))?;
+    if ids.logical_floor() > -physical_pages {
+        return Err(LimboError::Corrupt(
+            "current ID floor does not cover the physical file".into(),
+        ));
+    }
     database.validate_shared_base_layout(runtime, header)?;
     if !manifest.guard()?.io_retired() {
         return Err(LimboError::Busy);
@@ -424,6 +431,55 @@ mod tests {
         let mut load = ManifestLoad::new(forged, guard, runtime.database_id).unwrap();
         let manifest = memory.block(|| Ok(load.poll()?)).unwrap();
         assert!(CurrentBaseInspection::new(runtime, database, manifest).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn current_base_native_rejects_physical_extent_without_id_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let database = crate::Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let store = database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap().clone();
+        let mut open = runtime.begin_open().unwrap();
+        io.block(|| open.poll_manifest()).unwrap();
+        let mut inspection = CurrentBaseInspection::new(
+            runtime.clone(),
+            database.clone(),
+            open.loaded.take().unwrap(),
+        )
+        .unwrap();
+        let inspected = io.block(|| inspection.poll()).unwrap();
+        let (evidence, manifest, _) = inspected.into_parts();
+        let pages = evidence
+            .logical_floor()
+            .checked_neg()
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        let size = (pages as u64) * u64::from(evidence.header().page_size.get());
+        manifest.into_guard().unwrap().finish().unwrap();
+        drop(open);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let mut open = runtime.begin_open().unwrap();
+        io.block(|| open.poll_manifest()).unwrap();
+        let mut inspection =
+            CurrentBaseInspection::new(runtime, database, open.loaded.take().unwrap()).unwrap();
+        assert!(
+            matches!(io.block(|| inspection.poll()), Err(LimboError::Corrupt(message)) if message.contains("ID floor does not cover the physical file"))
+        );
     }
 
     #[test]

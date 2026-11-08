@@ -14,6 +14,12 @@ fn shared_idle_generation_native_reloads_after_checkpoint_and_later_commits() {
     }
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_idle_generation_native_cancel_partial_replay_then_retry_latest() {
+    run_idle_generation_case("cancel");
+}
+
 fn run_idle_generation_case(role: &str) {
     let old_process = Mutex::new(None);
     let fixture = shared_completed_checkpoint_fixture(|path| {
@@ -61,10 +67,17 @@ fn run_idle_generation_case(role: &str) {
         reader.receive(),
         format!("READY {} after first commit", target.database.generation)
     );
-    fixture
-        .connection
-        .execute("UPDATE preserved SET value='after second commit' WHERE id=1")
-        .unwrap();
+    if role == "cancel" {
+        fixture
+            .connection
+            .execute("UPDATE preserved SET value=replace(hex(zeroblob(8000)),'0','x') WHERE id=1")
+            .unwrap();
+    } else {
+        fixture
+            .connection
+            .execute("UPDATE preserved SET value='after second commit' WHERE id=1")
+            .unwrap();
+    }
     let image = std::fs::read(fixture.namespace.join("manifest")).unwrap();
     assert!(image.len() >= 2 * SLOT_SIZE);
     for slot in image[..2 * SLOT_SIZE].chunks_exact(SLOT_SIZE) {
@@ -77,6 +90,15 @@ fn run_idle_generation_case(role: &str) {
             record.prefix().end_offset > 0,
             "empty completed record was not overwritten"
         );
+    }
+    if role == "cancel" {
+        old.send("cancel");
+        let cancelled = old.receive();
+        assert!(cancelled.starts_with("CANCELLED "), "{cancelled}");
+        fixture
+            .connection
+            .execute("UPDATE preserved SET value='after second commit' WHERE id=1")
+            .unwrap();
     }
     let guard = runtime.files.authority.try_acquire().unwrap();
     let prefix = guard.published().unwrap();
@@ -130,9 +152,21 @@ fn shared_idle_generation_native_child() {
         .unwrap();
     let role = std::env::var("TURSO_IDLE_GENERATION_ROLE").unwrap();
     let hold = role == "hold";
-    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let (io, delayed) = if role == "cancel" {
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let id = crate::io::get_file_id(canonical.to_str().unwrap()).unwrap();
+        let namespace = crate::mvcc::mode_transition::namespace_for(&canonical, id).unwrap();
+        let (io, control) =
+            super::shared_connection_tests::delaying_native_read(namespace.join("logical"));
+        (io, Some(control))
+    } else {
+        (
+            Arc::new(crate::io::SyscallIO::new().unwrap()) as Arc<dyn crate::IO>,
+            None,
+        )
+    };
     let database = crate::Database::open(
-        io,
+        io.clone(),
         &path,
         crate::OpenOptions::new(Arc::new(crate::EngineDialect))
             .flags(if hold {
@@ -163,8 +197,60 @@ fn shared_idle_generation_native_child() {
         assert!(store.txs.is_empty());
     }
     reply(&format!("READY {generation} {value}"));
+    let mut cancelled = None;
     for line in std::io::stdin().lock().lines() {
         match line.unwrap().as_str() {
+            "cancel" => {
+                let control = delayed.as_ref().unwrap();
+                control.delay_after_reads(3);
+                let mut open = runtime.begin_open().unwrap();
+                io.block(|| open.poll_manifest()).unwrap();
+                let latest = open
+                    .loaded
+                    .as_ref()
+                    .unwrap()
+                    .record()
+                    .prefix()
+                    .committed_timestamp;
+                let waiter = match open
+                    .poll_current_prefix(&store, &connection, crate::MAIN_DB_ID, None)
+                    .unwrap()
+                {
+                    IOResult::IO(waiter) => waiter,
+                    IOResult::Done(()) => panic!("reload bypassed delayed logical read"),
+                };
+                let held = control.take_pending();
+                let partial = store.last_committed_tx_ts.load(Ordering::Acquire);
+                let base = store.durable_txid_max.load(Ordering::Acquire);
+                assert!(
+                    base < partial && partial < latest,
+                    "base={base} partial={partial} latest={latest}"
+                );
+                assert!(runtime.replay.lock().is_none());
+                drop(waiter);
+                drop(open);
+                assert!(matches!(
+                    runtime.files.authority.try_acquire(),
+                    Err(LimboError::Busy)
+                ));
+                held.complete();
+                assert!(matches!(
+                    runtime.files.authority.try_acquire(),
+                    Err(LimboError::Busy)
+                ));
+                drop(held);
+                let guard = runtime.files.authority.try_acquire().unwrap();
+                drop(guard);
+                cancelled = Some((
+                    base,
+                    partial,
+                    latest,
+                    store.clock.get_timestamp(crate::mvcc::clock::no_op),
+                ));
+                reply(&format!(
+                    "CANCELLED base={base} partial={partial} latest={latest}"
+                ));
+            }
             "read" => match if role == "constructor" {
                 database
                     .connect(crate::ConnectOpts::new())
@@ -172,7 +258,20 @@ fn shared_idle_generation_native_child() {
             } else {
                 read_value(&connection)
             } {
-                Ok(value) => reply(&format!("VALUE {value}")),
+                Ok(value) => {
+                    if let Some((base, partial, old_latest, clock)) = cancelled.take() {
+                        let identity = runtime.replay.lock().as_ref().unwrap().identity().unwrap();
+                        assert_eq!(identity.database.checkpoint_timestamp, base);
+                        assert!(identity.prefix.committed_timestamp > old_latest);
+                        assert!(store.clock.get_timestamp(crate::mvcc::clock::no_op) > clock);
+                        assert_eq!(
+                            store.last_committed_tx_ts.load(Ordering::Acquire),
+                            identity.prefix.committed_timestamp
+                        );
+                        eprintln!("retry physical={base} partial={partial} old_latest={old_latest} selected_latest={}", identity.prefix.committed_timestamp);
+                    }
+                    reply(&format!("VALUE {value}"));
+                }
                 Err(error) => reply(&format!("ERROR {error:?}")),
             },
             "exit" => {
