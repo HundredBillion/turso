@@ -66,7 +66,7 @@
 - [x] Run focused portable pager/generation/constructor tests and ordinary connection regressions on pinned Rust1.88.
 - [x] Run genuine native initial-open/constructor/idle-generation tests with exact counts and causal controls.
 - [x] Run shared runtime/admission suites and strict library Clippy with bench,conn_raw_api; format and inspect diff.
-- [ ] Obtain independent whole-component review; integrate only tested source commits. Never merge validation workflows or activate public shared mode.
+- [x] Obtain independent whole-component review; integrate only tested source commits. Never merge validation workflows or activate public shared mode.
 
 
 ## Verified scope and evidence
@@ -78,3 +78,8 @@ Initial-open and cached-constructor physical-header cancellation tests retain ac
 The completed certifier checks incarnation readiness; the checkpoint tail separately supplies finalized ID-selector ownership through FinalizedIds. A cert-only test may retain prepared IDs because it publishes no replay or admission readiness.
 
 This component checks private pager state after a local Store/replay installation. Reloading an idle process whose Store/replay still belongs to an earlier generation remains a separate integration gate, including when later commits have overwritten the empty completed record. Generation mismatch remains closed to admission; this component manufactures no completed proof and rewinds no published prefix. Public shared mode remains disabled.
+
+
+Root independently reviewed the whole production component through ef7a2 with no blocking finding. Subsequent portability review found two Unix cfg boundaries: the new snapshot hook and the existing native completion method referencing MaterializedCheckpointProof. Source 0b37ca84557e4bd2f1b34c67cc50c263e7a47840 adds matching guards; native Windows Rust1.88 run 42435377822 passed the library typecheck, independent removal controls producing E0609 and E0412, restored typecheck, and formatting. The follow-up cfg changes received independent review from the checkpoint-tail owner. Unix behavior remains the same as the native-tested implementation.
+
+The final union must still verify the combined ID, watermark and saved-outer-transaction suites after merging the checkpoint tail. Component validation does not replace that integration gate or enable public shared mode.
