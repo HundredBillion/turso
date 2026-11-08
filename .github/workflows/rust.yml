@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b507c9a0cd60dcfc95f2300b6eb5112ff0fa9350
+          ref: df1f14b1f566f0c189cd18b897588ac3ef68aeec
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,10 +28,31 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b507c9a0cd60dcfc95f2300b6eb5112ff0fa9350
+          test "$(git rev-parse HEAD)" = df1f14b1f566f0c189cd18b897588ac3ef68aeec
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
+      - name: Actual captured configuration and genuine missing-bootstrap RED
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api recovery_open_config_ -- --test-threads=1 2>&1 | tee config.log
+          grep -q '2 passed; 0 failed' config.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_preserves_captured_config -- --ignored --test-threads=1 --nocapture 2>&1 | tee config-native.log
+          grep -q '1 passed; 0 failed' config-native.log
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_missing_ready -- --ignored --test-threads=1 --nocapture 2>&1 | tee bootstrap-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'normal recovered database bootstrap is not implemented' bootstrap-red.log
+          grep -q '0 passed; 1 failed' bootstrap-red.log
+      - name: Existing native recovery selection and IDs
+        run: |
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee entry.log
+          grep -q '3 passed; 0 failed' entry.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical.log
+          grep -q '1 passed; 0 failed' physical.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ids_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-recovery.log
+          grep -q '1 passed; 0 failed' ids-recovery.log
       - name: Existing recovered finalization prerequisites
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalized.log
@@ -46,8 +67,16 @@ jobs:
           grep -q '6 passed; 0 failed' constructor.log
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee pager.log
           grep -q '1 passed; 0 failed' pager.log
-          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle.log
-          grep -q '4 passed; 0 failed' idle.log
+          for test in shared_idle_generation_native_reloads_after_checkpoint_and_later_commits shared_idle_generation_native_cancel_partial_replay_then_retry_latest shared_idle_generation_native_cancel_physical_inspection_before_and_after_callback; do
+            timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api "$test" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$test.log"
+            grep -q '1 passed; 0 failed' "$test.log"
+          done
+      - name: Existing live and interrupted checkpoint cohorts
+        run: |
+          for prefix in shared_checkpoint_install_native_ shared_checkpoint_ready_native_ shared_checkpoint_physical_native_ checkpoint_recovery_intent_native_; do
+            timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api "$prefix" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$prefix.log"
+            grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' "$prefix.log"
+          done
       - name: Completed witness and full core union
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee witness.log
