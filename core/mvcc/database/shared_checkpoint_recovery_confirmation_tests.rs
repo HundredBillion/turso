@@ -407,14 +407,14 @@ pub(super) fn fault_fixture_with_seed_and_io(
             let mut state = crate::mvcc::database::SharedIdState::default();
             for _ in 0..32 {
                 io.block(|| {
-                    Ok(store.shared_id_nonblock(
+                    store.shared_id_nonblock(
                         &connection,
                         connection.get_pager(),
                         tx_id,
                         0,
                         crate::mvcc::database::SharedIdRequest::ReserveLogicalTable,
                         &mut state,
-                    )?)
+                    )
                 })
                 .unwrap();
             }
@@ -443,7 +443,7 @@ pub(super) fn fault_fixture_with_seed_and_io(
     guard.publish_checkpoint(&proof).unwrap();
     let (guard, proof) = if target_only {
         let mut finalizer = ids.finalize(guard, proof).unwrap();
-        let finalized = fixture.io.block(|| finalizer.poll()).unwrap();
+        let finalized = fixture.io.block(|| Ok(finalizer.poll()?)).unwrap();
         let (ids, proof) = finalized.into_parts();
         (ids.into_guard(), proof)
     } else {
