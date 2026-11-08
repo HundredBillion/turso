@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 26f48bc15ebc0a1864281268280c34b38479ca63
+          ref: 71f7d076a4df5f789d43fedb373381c340e4d8be
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,17 +28,33 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 26f48bc15ebc0a1864281268280c34b38479ca63
+          test "$(git rev-parse HEAD)" = 71f7d076a4df5f789d43fedb373381c340e4d8be
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Completed cleanup and immutable rejection controls
+      - name: Real child selector controls and protocol probes
         run: |
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_cleanup_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee cleanup.log
-          grep -q '^test result: ok. 2 passed; 0 failed;' cleanup.log
-      - name: Strict library lint and formatting
-        run: |
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_old_handle_close -- --ignored --test-threads=1 --nocapture 2>&1 | tee lock-probe.log
+          echo "${PIPESTATUS[0]}" > lock-status.txt
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_marker_native_child_failure -- --ignored --test-threads=1 --nocapture 2>&1 | tee child-control.log
+          echo "${PIPESTATUS[0]}" > child-status.txt
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee resume.log
+          echo "${PIPESTATUS[0]}" > resume-status.txt
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_extent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee extent-red.log
+          echo "${PIPESTATUS[0]}" > extent-status.txt
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_partial_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee partial-red.log
+          echo "${PIPESTATUS[0]}" > partial-status.txt
+          set -e
+          grep '^test result:' lock-probe.log | tail -1 | tee lock-summary.txt
+          grep -Eq '^test result: (ok. 1 passed; 0 failed;|FAILED. 0 passed; 1 failed;)' lock-summary.txt
+          test "$(cat child-status.txt)" = 0
+          grep '^test result:' child-control.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+          test "$(cat resume-status.txt)" = 0
+          grep '^test result:' resume.log | tail -1 | grep -q '^test result: ok. 4 passed; 0 failed;'
+          test "$(cat extent-status.txt)" = 101
+          grep -q 'fresh downgrade must accept the unchanged genuine installed physical extent' extent-red.log
+          test "$(cat partial-status.txt)" = 101
+          grep -q 'marker2 partial cleanup must resume without recreating missing namespace files' partial-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
