@@ -695,3 +695,6 @@ mod tests;
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_checkpoint_wal_io_tests.rs"]
 mod io_tests;
+
+#[path = "shared_checkpoint_intent_store.rs"]
+mod shared_checkpoint_intent_store;
