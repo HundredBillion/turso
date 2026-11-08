@@ -960,4 +960,115 @@ mod tests {
         assert_eq!(&std::fs::read(&fixture.path).unwrap()[18..20], &[2, 2]);
         drop(completed);
     }
+    #[test]
+    #[ignore = "native downgrade process-death helper"]
+    fn shared_downgrade_crash_child() {
+        let mut fixture = installed_fixture();
+        let location = std::env::var("TURSO_DOWNGRADE_CRASH_LOCATION").unwrap();
+        std::fs::write(
+            &location,
+            format!("{}\n{}\n", fixture.path.display(), fixture.limit),
+        )
+        .unwrap();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent).unwrap();
+        panic!("requested crash phase was not reached");
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem and subprocess signals"]
+    fn shared_downgrade_resume_native_sigkill_marker_phases_preserve_data() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        struct KillChild(std::process::Child);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for phase in ["intent", "commit", "checkpoint"] {
+            let directory = tempfile::tempdir().unwrap();
+            let ready = directory.path().join("ready");
+            let location = directory.path().join("location");
+            let mut child = KillChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        &format!("{}::shared_downgrade_crash_child", module_path!()),
+                        "--nocapture",
+                    ])
+                    .env("TMPDIR", directory.path())
+                    .env("TURSO_DOWNGRADE_CRASH_PHASE", phase)
+                    .env("TURSO_DOWNGRADE_CRASH_READY", &ready)
+                    .env("TURSO_DOWNGRADE_CRASH_LOCATION", &location)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !ready.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "child exited before {phase}"
+                );
+                assert!(Instant::now() < deadline, "child did not reach {phase}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read_to_string(&ready).unwrap(), phase);
+            child.0.kill().unwrap();
+            assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+            let location = std::fs::read_to_string(location).unwrap();
+            let mut lines = location.lines();
+            let path = PathBuf::from(lines.next().unwrap());
+            let limit = lines.next().unwrap().parse().unwrap();
+            let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
+                &path,
+                limit,
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap_or_else(|error| panic!("resume after {phase}: {error}"));
+            assert_eq!(&std::fs::read(&path).unwrap()[18..20], &[2, 2]);
+            drop(completed);
+            let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+            let db = Database::open(
+                io,
+                path.to_str().unwrap(),
+                OpenOptions::new(Arc::new(EngineDialect)),
+            )
+            .unwrap();
+            let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+            let mut rows = Vec::new();
+            connection
+                .prepare("SELECT value FROM preserved WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    rows.push(row.get::<String>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, ["materialized shared row"]);
+            let mut integrity = Vec::new();
+            connection
+                .prepare("PRAGMA integrity_check")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    integrity.push(row.get::<String>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(integrity, ["ok"]);
+        }
+    }
 }

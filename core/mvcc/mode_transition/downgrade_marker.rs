@@ -153,6 +153,8 @@ fn commit_prepared(proof: Arc<PreparedDowngradeMarker>) -> Result<CompletedDowng
     }
     proof.revalidate()?;
     proof.mirror()?;
+    #[cfg(test)]
+    crash_barrier("intent");
     if read == 254 {
         connection.execute("BEGIN IMMEDIATE")?;
         pager.io.block(|| {
@@ -162,6 +164,8 @@ fn commit_prepared(proof: Arc<PreparedDowngradeMarker>) -> Result<CompletedDowng
             })
         })?;
         connection.execute("COMMIT")?;
+        #[cfg(test)]
+        crash_barrier("commit");
     }
     connection.checkpoint(crate::CheckpointMode::Truncate {
         upper_bound_inclusive: None,
@@ -170,6 +174,8 @@ fn commit_prepared(proof: Arc<PreparedDowngradeMarker>) -> Result<CompletedDowng
         .main_file()
         .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)?;
     pager.io.wait_for_completion(sync)?;
+    #[cfg(test)]
+    crash_barrier("checkpoint");
     connection.close()?;
     drop(pager);
     drop(connection);
@@ -184,4 +190,17 @@ fn commit_prepared(proof: Arc<PreparedDowngradeMarker>) -> Result<CompletedDowng
 }
 fn invalid(message: &str) -> LimboError {
     LimboError::InvalidArgument(message.into())
+}
+
+#[cfg(test)]
+pub(super) fn crash_barrier(phase: &str) {
+    if std::env::var("TURSO_DOWNGRADE_CRASH_PHASE").as_deref() != Ok(phase) {
+        return;
+    }
+    let ready = std::env::var("TURSO_DOWNGRADE_CRASH_READY").unwrap();
+    std::fs::write(&ready, phase).unwrap();
+    std::fs::File::open(&ready).unwrap().sync_all().unwrap();
+    loop {
+        std::thread::park();
+    }
 }
