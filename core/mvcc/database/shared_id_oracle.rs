@@ -109,23 +109,6 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
                 "committed ID oracle authority or prefix changed".into(),
             ));
         }
-        let pager = self.context().pager();
-        if pager.get_reserved_space().is_none() {
-            let (page_size, reserved) = return_if_io!(
-                pager.with_header(|header| (header.page_size, header.reserved_space))
-            );
-            if pager.get_page_size() != Some(page_size)
-                || !page_size.has_valid_reserved_space(reserved)
-                || (reserved == CHECKSUM_REQUIRED_RESERVED_BYTES)
-                    != (pager.io_ctx.read().get_reserved_space_bytes()
-                        == CHECKSUM_REQUIRED_RESERVED_BYTES)
-            {
-                return Err(LimboError::InvalidArgument(
-                    "oracle header layout differs from the initialized database".into(),
-                ));
-            }
-            pager.set_reserved_space_bytes(reserved);
-        }
         if self.request.is_some_and(|current| current != *request) {
             return Err(LimboError::InvalidArgument(
                 "committed ID oracle request changed during I/O".into(),
@@ -181,8 +164,27 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator> SharedIdOracle<C, A> {
             } else {
                 Phase::Rewind
             };
-            self.cursor = Some(self.cursor(schema_table)?);
             self.request = Some(*request);
+        }
+        let pager = self.context().pager();
+        if pager.get_reserved_space().is_none() {
+            let (page_size, reserved) = return_if_io!(
+                pager.with_header(|header| (header.page_size, header.reserved_space))
+            );
+            if pager.get_page_size() != Some(page_size)
+                || !page_size.has_valid_reserved_space(reserved)
+                || (reserved == CHECKSUM_REQUIRED_RESERVED_BYTES)
+                    != (pager.io_ctx.read().get_reserved_space_bytes()
+                        == CHECKSUM_REQUIRED_RESERVED_BYTES)
+            {
+                return Err(LimboError::InvalidArgument(
+                    "oracle header layout differs from the initialized database".into(),
+                ));
+            }
+            pager.set_reserved_space_bytes(reserved);
+        }
+        if self.cursor.is_none() {
+            self.cursor = Some(self.cursor(i64::from(SQLITE_SCHEMA_MVCC_TABLE_ID))?);
         }
         loop {
             let cursor = self.cursor.as_mut().expect("request owns cursor");
