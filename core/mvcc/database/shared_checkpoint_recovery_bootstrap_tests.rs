@@ -488,11 +488,22 @@ fn checkpoint_recovery_bootstrap_native_factory_waits_for_physical_retirement() 
         assert!(matches!(factory.poll(evidence).unwrap(), IOResult::IO(_)));
         let held = observer.read.lock().held.take().unwrap();
         held.complete();
-        let waiter = match factory.poll(evidence).unwrap() {
-            IOResult::IO(waiter) => waiter,
-            IOResult::Done(_) => panic!("factory completed before retained physical read retired"),
-        };
-        drop(waiter);
+        let mut retirement = None;
+        for _ in 0..100 {
+            match factory.poll(evidence).unwrap() {
+                IOResult::IO(waiter) if !waiter.0.finished() => {
+                    retirement = Some(waiter.0);
+                    break;
+                }
+                IOResult::IO(waiter) => io.wait_for_completion(waiter.0).unwrap(),
+                IOResult::Done(_) => {
+                    panic!("factory completed before retained physical read retired")
+                }
+            }
+        }
+        let retirement = retirement.expect("factory must wait for actual backend retirement");
+        assert!(!retirement.finished());
+        drop(retirement);
         assert!(!evidence.guard().io_retired());
         drop(held);
         io.block(|| factory.poll(evidence)).unwrap();
