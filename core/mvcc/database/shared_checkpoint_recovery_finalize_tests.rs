@@ -313,6 +313,11 @@ impl crate::IO for EpochIo {
         self.inner.step()
     }
 }
+type AppendImage = (
+    Option<crate::mvcc::persistent_storage::logical_log::LogHeader>,
+    u64,
+    u32,
+);
 struct Fixture {
     io: Arc<dyn crate::IO>,
     runtime: Arc<SharedMvccRuntime>,
@@ -325,6 +330,7 @@ struct Fixture {
     target: RecoveryIdentity,
     initial_epoch: u64,
     initial_next: u64,
+    old_append: Option<AppendImage>,
     _directory: tempfile::TempDir,
 }
 impl Fixture {
@@ -370,7 +376,13 @@ impl Fixture {
     }
 }
 fn fresh_fixture(target_only: bool) -> Fixture {
-    let (_directory, path, namespace, earlier, old_maximum, target) = {
+    fresh_fixture_with_io(target_only, |io| io)
+}
+fn fresh_fixture_with_io(
+    target_only: bool,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> Fixture {
+    let (_directory, path, namespace, earlier, old_maximum, target, old_append) = {
         let mut old = fault_fixture_with_seed(target_only, true);
         let inspected = old.inspected.take().unwrap();
         let maximum = inspected.ids.max_owner_epoch();
@@ -379,6 +391,11 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         }
         let target = inspected.ids.identity();
         drop(inspected);
+        let old_append = {
+            let log = old.runtime.storage.logical_log.read();
+            (log.header().cloned(), log.offset, log.running_crc)
+        };
+        assert!(old_append.0.is_some() && old_append.1 > 0);
         (
             old._directory,
             old.path,
@@ -386,6 +403,7 @@ fn fresh_fixture(target_only: bool) -> Fixture {
             old.earlier_coordination,
             maximum,
             target,
+            old_append,
         )
     };
     let paths = [
@@ -417,10 +435,10 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         before
     );
     let trace = Arc::new(EpochTrace::default());
-    let io: Arc<dyn crate::IO> = Arc::new(EpochIo {
+    let io: Arc<dyn crate::IO> = decorate(Arc::new(EpochIo {
         inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
         trace: trace.clone(),
-    });
+    }));
     let canonical = std::fs::canonicalize(&path).unwrap();
     let main = io
         .open_file(canonical.to_str().unwrap(), crate::OpenFlags::NoLock, false)
@@ -481,6 +499,7 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         target,
         initial_epoch: epoch,
         initial_next: next_timestamp,
+        old_append: Some(old_append),
         _directory,
     }
 }
@@ -531,6 +550,7 @@ fn ready_fixture(target_only: bool) -> Fixture {
         target,
         initial_epoch,
         initial_next,
+        old_append: None,
         _directory: old._directory,
     }
 }
@@ -1084,3 +1104,6 @@ fn checkpoint_recovery_reclaim_native_rejects_preexisting_store_before_mutation(
     assert!(fixture.runtime.replay.lock().is_none());
     assert!(fixture.runtime.reserve_store().is_err());
 }
+
+#[path = "shared_checkpoint_recovery_reclaim_tests.rs"]
+mod reclaim_tests;

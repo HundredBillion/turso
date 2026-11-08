@@ -67,18 +67,18 @@ The runtime reservation implementation uses a private mutex with states Free, Re
 
 **Interfaces:** Consume FinalizedRecoveredCheckpoint and return the sealed ReclaimedRecoveredCheckpoint with the same proof, lease, finalized IDs, pause and uncommitted Store reservation.
 
-- [ ] Reserve the fresh Runtime before mutation. Require replay None, source_identity None, proof/guard same active lease, owned native authority, exact target map, finalized target IDs with no pending checkpoint, native snapshot quiescence, empty retained physical WAL, unchanged main file ID/extent/header bounds and physical timestamp/floor. Return Busy for unretired I/O; do not weaken ordinary publication checks.
-- [ ] Use the sealed finalized-ID suspension bridge to move the original guard through ManifestLoad of runtime.files.manifest. Wait for backend retirement, then require exact normal/empty/salt-zero target record and original proof lease. Rejoin the finalized IDs through the sealed proof/lease-gated bridge. Retain this selected record; do not mirror, advance sequence or manufacture another completion proof.
-- [ ] Bind the actual retained logical GuardedFile with bind_checkpoint. Drive these phases with one pending Completion and explicit callback-result checking before each transition:
+- [x] Reserve the fresh Runtime before mutation. Require replay None, source_identity None, proof/guard same active lease, owned native authority, exact target map, finalized target IDs with no pending checkpoint, native snapshot quiescence, empty retained physical WAL, unchanged main file ID/extent/header bounds and physical timestamp/floor. Return Busy for unretired I/O; do not weaken ordinary publication checks.
+- [x] Use the sealed finalized-ID suspension bridge to move the original guard through ManifestLoad of runtime.files.manifest. Wait for backend retirement, then require exact normal/empty/salt-zero target record and original proof lease. Rejoin the finalized IDs through the sealed proof/lease-gated bridge. Retain this selected record; do not mirror, advance sequence or manufacture another completion proof.
+- [x] Bind the actual retained logical GuardedFile with bind_checkpoint. Drive these phases with one pending Completion and explicit callback-result checking before each transition:
 
 ```text
 Validate -> FreshManifest -> ValidateAgain -> Truncate(0)
          -> FULLsync -> PhysicalRetirement -> AdoptEmpty -> SealedResult
 ```
 
-- [ ] Immediately before truncate, after final physical retirement, and before output, recheck proof/lease/native ownership/map/IDs/no snapshots/replay None and first-Store reservation ownership. Require actual logical size zero and concrete Storage file identity/no pending write before calling `adopt_shared_prefix(None, 0, 0, target.database.checkpoint_timestamp)`; afterwards verify offset0/CRC0/no header. Do not release authority or pause.
-- [ ] On error/drop, clear callback state/bindings and drop guard-bearing finalized evidence before releasing pause/reservation. Physical operation pins retain authority independently. No previous replay is restored. Retry performs real manifest/physical/ID recovery under a new proof; it never reuses an expired lease.
-- [ ] Run focused positive fresh prepared/target-only and already-attached rejection cases. Assert main/physical-WAL/manifest/IDs bytes are unchanged by reclaim, old logical bytes are removed, runtime replay remains None, admission and competing authority remain Busy, and no Store has been constructed. Commit after independent source review and GREEN.
+- [x] Immediately before truncate, after final physical retirement, and before output, recheck proof/lease/native ownership/map/IDs/no snapshots/replay None and first-Store reservation ownership. Require actual logical size zero and concrete Storage file identity/no pending write before calling `adopt_shared_prefix(None, 0, 0, target.database.checkpoint_timestamp)`; afterwards verify offset0/CRC0/no header. Do not release authority or pause.
+- [x] On error/drop, clear callback state/bindings and drop guard-bearing finalized evidence before releasing pause/reservation. Physical operation pins retain authority independently. No previous replay is restored. Retry performs real manifest/physical/ID recovery under a new proof; it never reuses an expired lease.
+- [x] Run focused positive fresh prepared/target-only and already-attached rejection cases. Assert main/physical-WAL/manifest/IDs bytes are unchanged by reclaim, old logical bytes are removed, runtime replay remains None, admission and competing authority remain Busy, and no Store has been constructed. Commit after independent source review and GREEN.
 
 ## Task 3: Fault, cancellation and stale-evidence controls
 
