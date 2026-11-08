@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 61051c85cb78cc8cacf2f2088f53b15695a9ded2
+          ref: 43e52b88c39d227308a2bb98addff190cf231c85
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,19 +24,53 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 61051c85cb78cc8cacf2f2088f53b15695a9ded2
+          test "$(git rev-parse HEAD)" = 43e52b88c39d227308a2bb98addff190cf231c85
           rustc -Vv | tee rustc.txt
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
       - name: Guarded constructor honors paused admission
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause-red.log
           grep -q '3 passed; 0 failed' pause-red.log
+      - name: Removing physical read ownership must release authority too early
+        run: |
+          trap 'git restore core/mvcc/database/shared_runtime.rs' EXIT
+          python3 -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_runtime.rs"); s=p.read_text(); old="self.begin_open_with_read_policy(true)"; assert s.count(old)==1; p.write_text(s.replace(old,"self.begin_open_with_read_policy(false)"))'
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_cancel_keeps_header_authority_until_backend_release -- --ignored --test-threads=1 --nocapture 2>&1 | tee read-pin-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' read-pin-red.log
+          grep -q 'cancelled header read released authority before backend release' read-pin-red.log
+          git restore core/mvcc/database/shared_runtime.rs
+      - name: Removing cancelled initializer cleanup must leave a physical reader
+        run: |
+          trap 'git restore core/database/shared_connection.rs' EXIT
+          python3 -c 'from pathlib import Path; p=Path("core/database/shared_connection.rs"); s=p.read_text(); old="self.init.cancel();"; assert s.count(old)==1; p.write_text(s.replace(old,""))'
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_cancel_keeps_header_authority_until_backend_release -- --ignored --test-threads=1 --nocapture 2>&1 | tee read-lock-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q '0 passed; 1 failed' read-lock-red.log
+          grep -q 'cancelled page-one initialization retained its physical read lock' read-lock-red.log
+          git restore core/database/shared_connection.rs
+      - name: Restored exact source and strict lint
+        run: |
+          git diff --exit-code
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee restored-green.log
+          grep -q '3 passed; 0 failed' restored-green.log
+          cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
+          cargo fmt --all -- --check
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-constructor-61051-green
+          name: shared-constructor-43e52-controls
           path: |
             source.txt
             rustc.txt
             pause-red.log
+            read-pin-red.log
+            read-lock-red.log
+            restored-green.log
