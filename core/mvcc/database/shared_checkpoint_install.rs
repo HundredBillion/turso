@@ -294,6 +294,10 @@ impl<C: LogicalClock, A: ConcurrentAllocator> Drop for SharedCheckpointLocalInst
 }
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_checkpoint_install_fault_tests.rs"]
+mod fault_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 mod tests {
     use super::*;
 
@@ -374,6 +378,11 @@ mod tests {
         drop(installing);
         drop(installed);
         assert!(runtime.replay.lock().is_none());
+        assert!(fixture
+            .connection
+            .execute("SELECT value FROM preserved")
+            .is_err());
+        assert!(store.txs.is_empty());
         let options = crate::OpenOptions::new(fixture.database.dialect().clone())
             .with_shared_mvcc_for_test(fixture.limit);
         let fresh =
