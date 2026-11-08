@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e7d7b3dc64456d44452053fc8f4218bbac254820
+          ref: 0c6390c7c90dae52292f99580830d7d7516b75c2
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = e7d7b3dc64456d44452053fc8f4218bbac254820
+          test "$(git rev-parse HEAD)" = 0c6390c7c90dae52292f99580830d7d7516b75c2
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -45,6 +45,15 @@ jobs:
           test "$status" -ne 0
           grep -q 'recovered logical reclamation is not implemented' stub-red.log
           grep -q '0 passed; 1 failed' stub-red.log
+      - name: Existing runtime accepts an unsafe second Store RED
+        run: |
+          set +e
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_rejects_second_store -- --ignored --test-threads=1 --nocapture 2>&1 | tee ownership-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'a second Store attached to an already claimed runtime' ownership-red.log
+          grep -q '0 passed; 1 failed' ownership-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
