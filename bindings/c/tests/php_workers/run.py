@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Independent PHP process acceptance; shared mode must attest its capability."""
+
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import select
 import signal
 import subprocess
@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 
 
 class UnsupportedMode(RuntimeError):
@@ -36,14 +37,29 @@ class Worker:
             query |= {"turso_mvcc": "shared", "turso_mvcc_history_limit": "67108864"}
         uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?" + urllib.parse.urlencode(query)
         plain_path = suite.args.api == "sqlite3" and (mode != "shared" or suite.args.shared_open_flag)
-        config = {"uri": str(path) if plain_path else uri, "api": suite.args.api, "engine": suite.args.engine,
-                  "library": suite.args.library, "mode": mode, "readonly": readonly,
-                  "busy_ms": suite.args.busy_ms,
-                  "open_flag": suite.args.shared_open_flag if mode == "shared" else 0}
+        config = {
+            "uri": str(path) if plain_path else uri,
+            "api": suite.args.api,
+            "engine": suite.args.engine,
+            "library": suite.args.library,
+            "mode": mode,
+            "readonly": readonly,
+            "busy_ms": suite.args.busy_ms,
+            "open_flag": suite.args.shared_open_flag if mode == "shared" else 0,
+        }
         self.stderr = (suite.output / f"{name}.stderr.log").open("wb")
-        self.process = subprocess.Popen([suite.args.php, "-d", "display_errors=stderr",
-            str(Path(__file__).with_name("worker.php")), json.dumps(config)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr)
+        self.process = subprocess.Popen(
+            [
+                suite.args.php,
+                "-d",
+                "display_errors=stderr",
+                str(Path(__file__).with_name("worker.php")),
+                json.dumps(config),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr,
+        )
         suite.workers.append(self)
         hello = self.receive()
         suite.record("startup", worker=name, hello=hello)
@@ -134,7 +150,9 @@ class Suite:
         self.events = (self.output / "events.jsonl").open("w")
         self.ledger = (self.output / "acknowledgments.jsonl").open("w")
         self.library_hash = hashlib.sha256(Path(args.library).read_bytes()).hexdigest() if args.library else None
-        self.record("configuration", configuration=vars(args) | {"output": str(self.output)}, library_sha256=self.library_hash)
+        self.record(
+            "configuration", configuration=vars(args) | {"output": str(self.output)}, library_sha256=self.library_hash
+        )
 
     def record(self, event, **values):
         self.events.write(json.dumps({"event": event, "monotonic_ns": time.monotonic_ns(), **values}) + "\n")
@@ -216,8 +234,9 @@ class Suite:
             second.sql("ROLLBACK")
             self.record("wal_control_serialized_second_writer", acceptance=False)
         reader.rows("SELECT sum(value) FROM items", [[60]])
-        self.record("overlap_barrier", active_write_transactions=2 if self.mode == "shared" else 1,
-                    active_reader_pid=reader.pid)
+        self.record(
+            "overlap_barrier", active_write_transactions=2 if self.mode == "shared" else 1, active_reader_pid=reader.pid
+        )
         first.sql("COMMIT")
         if self.mode != "shared":
             second.sql("BEGIN")
@@ -257,8 +276,15 @@ class Suite:
             second.sql("UPDATE items SET value=222 WHERE id=2")
             second.sql("COMMIT")
         second.rows("SELECT id,value FROM items ORDER BY id", [[1, 11], [2, 222], [3, 30]])
-        for sql in ["BEGIN", "UPDATE items SET value=12 WHERE id=1", "SAVEPOINT edit",
-                    "UPDATE items SET value=99 WHERE id=1", "ROLLBACK TO edit", "RELEASE edit", "COMMIT"]:
+        for sql in [
+            "BEGIN",
+            "UPDATE items SET value=12 WHERE id=1",
+            "SAVEPOINT edit",
+            "UPDATE items SET value=99 WHERE id=1",
+            "ROLLBACK TO edit",
+            "RELEASE edit",
+            "COMMIT",
+        ]:
             first.sql(sql)
         second.rows("SELECT id,value FROM items ORDER BY id", [[1, 12], [2, 222], [3, 30]])
         first.close()
@@ -269,8 +295,11 @@ class Suite:
         cases = [
             ("UPDATE items SET value=13 WHERE id=1", "UPDATE items SET value=14 WHERE id=1", (5, 6)),
             ("DELETE FROM items WHERE id=3", "UPDATE items SET value=31 WHERE id=3", (5, 6)),
-            ("INSERT INTO items(id,label,value) VALUES(200,'collision',1)",
-             "INSERT INTO items(id,label,value) VALUES(201,'collision',2)", (5, 6, 19)),
+            (
+                "INSERT INTO items(id,label,value) VALUES(200,'collision',1)",
+                "INSERT INTO items(id,label,value) VALUES(201,'collision',2)",
+                (5, 6, 19),
+            ),
         ]
         for winning, conflicting, allowed in cases:
             for worker in [first, second]:
@@ -283,7 +312,9 @@ class Suite:
                 result = second.sql("COMMIT", ok=False)
             second.bounded_error(result, allowed)
             second.sql("ROLLBACK")
-        first.rows("SELECT id,label,value FROM items ORDER BY id", [[1, "one", 13], [2, "two", 222], [200, "collision", 1]])
+        first.rows(
+            "SELECT id,label,value FROM items ORDER BY id", [[1, "one", 13], [2, "two", 222], [200, "collision", 1]]
+        )
         for worker in [first, second]:
             worker.sql("BEGIN")
         first.sql("INSERT INTO items(label,value) VALUES('auto-a',1)")
@@ -307,7 +338,9 @@ class Suite:
         first.close()
         second.close()
         fresh = Worker(self, "ids-reopened")
-        fresh.rows("SELECT id FROM items WHERE label IN ('auto-a','auto-b') ORDER BY id", [[i] for i in self.expected_ids])
+        fresh.rows(
+            "SELECT id FROM items WHERE label IN ('auto-a','auto-b') ORDER BY id", [[i] for i in self.expected_ids]
+        )
         sequence = fresh.sql("SELECT seq FROM sqlite_sequence WHERE name='items'")["rows"][0][0]
         assert sequence >= max(self.expected_ids)
         fresh.sql("INSERT INTO items(label,value) VALUES('after-reopen',3)")
@@ -339,8 +372,10 @@ class Suite:
         self.record("readonly_bytes", before=before, after=after)
         if self.args.engine == "sqlite":
             assert all(after.get(path) == digest for path, digest in before.items())
-            assert all(Path(path).name.endswith("-wal") and Path(path).stat().st_size == 0
-                       for path in after.keys() - before.keys()), "unexpected SQLite control sidecar write"
+            assert all(
+                Path(path).name.endswith("-wal") and Path(path).stat().st_size == 0
+                for path in after.keys() - before.keys()
+            ), "unexpected SQLite control sidecar write"
         else:
             assert after == before, "read-only operations changed durable files"
 
@@ -355,14 +390,19 @@ class Suite:
                 if self.mode == "shared" and root == self.database:
                     assert all(path.is_file() for path in durable), "shared durable files are missing"
                 paths.extend(durable)
-        return {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in paths if path.exists()}
+        return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.exists()}
 
     def single_worker_control(self):
         worker = Worker(self, "single-worker")
         worker.rows("SELECT count(*) FROM items", [[3]])
-        for sql in ["BEGIN", "UPDATE items SET value=11 WHERE id=1", "SAVEPOINT edit",
-                    "UPDATE items SET value=99 WHERE id=1", "ROLLBACK TO edit", "RELEASE edit"]:
+        for sql in [
+            "BEGIN",
+            "UPDATE items SET value=11 WHERE id=1",
+            "SAVEPOINT edit",
+            "UPDATE items SET value=99 WHERE id=1",
+            "ROLLBACK TO edit",
+            "RELEASE edit",
+        ]:
             worker.sql(sql)
         worker.rows("SELECT value FROM items WHERE id=1", [[11]])
         worker.sql("ROLLBACK")
@@ -422,7 +462,11 @@ class Suite:
                 event = writer.receive()
                 assert event == {"event": "executing", "id": writer.pending}, event
                 writer.kill()
-                self.record("unreported_commit", transaction=transaction, crash_point="command execution announced; IO phase unknown")
+                self.record(
+                    "unreported_commit",
+                    transaction=transaction,
+                    crash_point="command execution announced; IO phase unknown",
+                )
                 outcomes[transaction] = "complete-or-absent"
         if reader:
             reader.rows("SELECT count(*) FROM pairs", [[0]])
@@ -473,14 +517,27 @@ def verify_recovery(ledger, outcomes, actual):
 
 
 def snapshot_tree(directory):
-    return {str(path.relative_to(directory)): "directory" if path.is_dir()
-            else hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted(directory.rglob("*"))}
+    return {
+        str(path.relative_to(directory)): "directory"
+        if path.is_dir()
+        else hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(directory.rglob("*"))
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=["sqlite-wal-control", "sqlite-shared-negative-control", "turso-single-worker-control", "turso-wal-control", "shared-acceptance"], required=True)
+    parser.add_argument(
+        "--profile",
+        choices=[
+            "sqlite-wal-control",
+            "sqlite-shared-negative-control",
+            "turso-single-worker-control",
+            "turso-wal-control",
+            "shared-acceptance",
+        ],
+        required=True,
+    )
     parser.add_argument("--api", choices=["pdo", "sqlite3"], default="pdo")
     parser.add_argument("--php", default="php")
     parser.add_argument("--library", default="")
@@ -488,22 +545,28 @@ def main():
     parser.add_argument("--busy-ms", type=int, default=100)
     parser.add_argument("--deadline", type=float, default=5)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--shared-open-flag", type=lambda value: int(value, 0), default=0,
-                        help="explicit test-only vendor flag; does not implement or imply capability")
+    parser.add_argument(
+        "--shared-open-flag",
+        type=lambda value: int(value, 0),
+        default=0,
+        help="explicit test-only vendor flag; does not implement or imply capability",
+    )
     args = parser.parse_args()
     args.engine = "sqlite" if args.profile.startswith("sqlite-") else "turso"
     if args.engine == "turso" and not args.library:
         parser.error("Turso profiles require --library with exact loaded shared library")
     if not 0 <= args.busy_ms <= 1000 or not 1 <= args.deadline <= 30:
         parser.error("busy timeout/deadline outside bounded test range")
-    if args.shared_open_flag < 0 or args.shared_open_flag > 0x7fffffff or args.shared_open_flag & 0x7:
+    if args.shared_open_flag < 0 or args.shared_open_flag > 0x7FFFFFFF or args.shared_open_flag & 0x7:
         parser.error("vendor flag must fit positive C int and not change access flags")
     if args.profile == "shared-acceptance" and (args.api != "pdo" or args.shared_open_flag):
         parser.error("initial shared-mode acceptance is PDO URI only; SQLite3 flags are diagnostic, unsupported API")
     suite = Suite(args)
     try:
         suite.run()
-        print(json.dumps({"status": "passed", "profile": args.profile, "acceptance": args.profile == "shared-acceptance"}))
+        print(
+            json.dumps({"status": "passed", "profile": args.profile, "acceptance": args.profile == "shared-acceptance"})
+        )
     except UnsupportedMode as error:
         suite.record("unsupported", reason=str(error), acceptance=False)
         print(json.dumps({"status": "unsupported", "acceptance": False, "reason": str(error)}))

@@ -286,12 +286,7 @@ fn shared_generation_reload_native_installs_only_under_completed_checkpoint_auth
     let store = fixture.database.get_mv_store().as_ref().unwrap().clone();
     let header = fixture
         .io
-        .block(|| {
-            Ok(fixture
-                .connection
-                .get_pager()
-                .with_header(|header| *header)?)
-        })
+        .block(|| fixture.connection.get_pager().with_header(|header| *header))
         .unwrap();
     let schema = fixture.connection.schema.read().clone();
     let target = fixture
@@ -347,12 +342,7 @@ fn shared_generation_reload_native_rejects_stale_or_busy_preparation() {
         let store = fixture.database.get_mv_store().as_ref().unwrap().clone();
         let header = fixture
             .io
-            .block(|| {
-                Ok(fixture
-                    .connection
-                    .get_pager()
-                    .with_header(|header| *header)?)
-            })
+            .block(|| fixture.connection.get_pager().with_header(|header| *header))
             .unwrap();
         let schema = fixture.connection.schema.read().clone();
         let target = fixture

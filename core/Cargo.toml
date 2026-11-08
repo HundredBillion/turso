@@ -196,7 +196,3 @@ rand_chacha = { workspace = true }
 env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
-
-[[example]]
-name = "shared_open_probe"
-required-features = ["test_helper"]

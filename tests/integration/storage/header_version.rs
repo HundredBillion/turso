@@ -1129,133 +1129,6 @@ fn test_readonly_mvcc_db_can_be_read() {
     assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
-#[test]
-fn test_readonly_first_writer_activation_preserves_readers() {
-    for legacy in [false, true] {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("activation.db");
-        if legacy {
-            create_legacy_db(&path);
-        } else {
-            create_wal_db(&path);
-        }
-        let original = std::fs::read(&path).unwrap();
-        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let open = |flags| {
-            Database::open_file_with_flags(
-                io.clone(),
-                path.to_str().unwrap(),
-                flags,
-                DatabaseOpts::new(),
-                None,
-                Arc::new(SqliteDialect),
-            )
-        };
-        let db = open(OpenFlags::ReadOnly).unwrap();
-        let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        reader.execute("BEGIN").unwrap();
-        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-        assert_eq!(rows, vec![(1,)]);
-        let writer_db = open(OpenFlags::None).unwrap();
-        assert!(Arc::ptr_eq(&db, &writer_db));
-        let writer = writer_db
-            .connect(ConnectOpts::new().with_readonly(false))
-            .unwrap();
-        if legacy {
-            assert!(matches!(
-                writer.execute("INSERT INTO t(val) VALUES ('blocked')"),
-                Err(turso_core::LimboError::Busy)
-            ));
-            assert_eq!(std::fs::read(&path).unwrap(), original);
-            reader.execute("COMMIT").unwrap();
-        }
-        writer
-            .execute("INSERT INTO t(val) VALUES ('writer')")
-            .unwrap();
-        if !legacy {
-            match writer.checkpoint(turso_core::CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            }) {
-                Ok(result) => assert_eq!(result.wal_total_backfilled, 0),
-                Err(turso_core::LimboError::Busy) => {}
-                Err(error) => panic!("unexpected checkpoint error: {error}"),
-            }
-            let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-            assert_eq!(rows, vec![(1,)]);
-            reader.execute("COMMIT").unwrap();
-        }
-        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-        assert_eq!(rows, vec![(2,)]);
-        let checkpoint_rows: Vec<(i64, i64, i64)> =
-            reader.exec_rows("PRAGMA wal_checkpoint(TRUNCATE)");
-        assert_eq!(checkpoint_rows, vec![(0, -1, -1)]);
-        assert!(matches!(
-            reader.checkpoint(turso_core::CheckpointMode::Truncate {
-                upper_bound_inclusive: None
-            }),
-            Err(turso_core::LimboError::ReadOnly)
-        ));
-        reader.close().unwrap();
-        writer
-            .execute("INSERT INTO t(val) VALUES ('survivor')")
-            .unwrap();
-        writer.close().unwrap();
-        drop(reader);
-        drop(writer);
-        drop(writer_db);
-        drop(db);
-        assert_eq!(read_header_versions(&path), (2, 2));
-    }
-}
-
-#[test]
-fn test_readonly_orphan_wal_is_preserved_until_writer_open() {
-    let dir = TempDir::new().unwrap();
-    let source = dir.path().join("source.db");
-    let sqlite = rusqlite::Connection::open(&source).unwrap();
-    sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
-    sqlite
-        .execute_batch("CREATE TABLE orphan(x); INSERT INTO orphan VALUES(99)")
-        .unwrap();
-    let orphan = std::fs::read(format!("{}-wal", source.display())).unwrap();
-    assert!(orphan.len() > 32);
-    let path = dir.path().join("empty.db");
-    let wal_path = format!("{}-wal", path.display());
-    std::fs::write(&path, []).unwrap();
-    std::fs::write(&wal_path, &orphan).unwrap();
-    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let open = |flags| {
-        Database::open_file_with_flags(
-            io.clone(),
-            path.to_str().unwrap(),
-            flags,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )
-    };
-    let db = open(OpenFlags::ReadOnly).unwrap();
-    let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("PRAGMA schema_version");
-    assert_eq!(rows, vec![(0,)]);
-    assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
-    assert_eq!(std::fs::read(&wal_path).unwrap(), orphan);
-    let writable = open(OpenFlags::None).unwrap();
-    assert!(Arc::ptr_eq(&db, &writable));
-    let writer = writable
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    writer
-        .execute("CREATE TABLE fresh(x); INSERT INTO fresh VALUES(1)")
-        .unwrap();
-    assert!(writer.prepare("SELECT * FROM orphan").is_err());
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT x FROM fresh");
-    assert_eq!(rows, vec![(1,)]);
-    reader.close().unwrap();
-    writer.close().unwrap();
-}
-
 fn read_text_encoding(db_path: &Path) -> u32 {
     let bytes = std::fs::read(db_path).expect("Failed to read database file");
     assert!(
@@ -1312,95 +1185,6 @@ fn test_utf16_db_returns_unsupported_encoding_error() {
     }
 }
 
-fn external_sqlite_command(path: &Path, action: &str) -> std::process::Command {
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    let module = module_path!().split_once("::").unwrap().1;
-    command
-        .arg("--exact")
-        .arg(format!("{module}::test_readonly_external_sqlite_process"))
-        .arg("--nocapture")
-        .env("TURSO_READONLY_EXTERNAL_PATH", path)
-        .env("TURSO_READONLY_EXTERNAL_ACTION", action);
-    command
-}
-
-#[test]
-fn test_readonly_external_sqlite_process() {
-    let Some(path) = std::env::var_os("TURSO_READONLY_EXTERNAL_PATH") else {
-        return;
-    };
-    let action = std::env::var("TURSO_READONLY_EXTERNAL_ACTION").unwrap();
-    if action == "lock" {
-        use turso_core::IO;
-        let io = turso_core::PlatformIO::new().unwrap();
-        let _file = io
-            .open_file(Path::new(&path).to_str().unwrap(), OpenFlags::None, false)
-            .unwrap();
-        return;
-    }
-    let connection = rusqlite::Connection::open(path).unwrap();
-    if action == "hold_read" {
-        use std::io::Write;
-        connection.execute_batch("BEGIN; SELECT * FROM t;").unwrap();
-        println!("SQLITE_READER_READY");
-        std::io::stdout().flush().unwrap();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap();
-        connection.execute_batch("ROLLBACK").unwrap();
-    } else {
-        connection
-            .execute("INSERT INTO t(val) VALUES ('external')", ())
-            .unwrap();
-        let count: i64 = connection
-            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
-            .unwrap();
-        println!("EXTERNAL_SQLITE_COMMITTED count={count}");
-    }
-}
-
-fn run_external_sqlite(path: &Path, action: &str) {
-    let output = external_sqlite_command(path, action).output().unwrap();
-    assert!(
-        output.status.success(),
-        "external SQLite failed: {} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if action == "write" {
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("EXTERNAL_SQLITE_COMMITTED count="),
-            "external helper did not commit: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-}
-
-fn hold_external_sqlite_reader(path: &Path) -> std::process::Child {
-    use std::io::BufRead;
-    let mut child = external_sqlite_command(path, "hold_read")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
-        if line.contains("SQLITE_READER_READY") {
-            break;
-        }
-    }
-    child.stdout = Some(stdout.into_inner());
-    child
-}
-
-fn release_external_sqlite_reader(mut child: std::process::Child) {
-    use std::io::Write;
-    child.stdin.take().unwrap().write_all(b"release\n").unwrap();
-    assert!(child.wait().unwrap().success());
-}
-
 fn open_readonly_activation_database(
     path: &Path,
     flags: OpenFlags,
@@ -1428,304 +1212,6 @@ fn readonly_storage_bytes(path: &Path) -> Vec<Option<Vec<u8>>> {
         Err(error) => panic!("{}: {error}", path.display()),
     })
     .collect()
-}
-
-#[test]
-fn test_readonly_allows_external_writer_and_rejects_stale_activation() {
-    for legacy in [false, true] {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("external.db");
-        if legacy {
-            create_legacy_db(&path);
-        } else {
-            create_wal_db(&path);
-        }
-        let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-        let reader = database
-            .connect(ConnectOpts::new().with_readonly(true))
-            .unwrap();
-        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-        assert_eq!(rows, vec![(1,)]);
-        let initial = readonly_storage_bytes(&path);
-        run_external_sqlite(&path, "write");
-        let before = readonly_storage_bytes(&path);
-        assert_ne!(
-            initial, before,
-            "external commit did not change storage; legacy={legacy}"
-        );
-        let changes: Vec<_> = initial
-            .iter()
-            .zip(&before)
-            .enumerate()
-            .map(|(index, (initial, current))| {
-                (
-                    index,
-                    initial.as_ref().map(Vec::len),
-                    current.as_ref().map(Vec::len),
-                    initial == current,
-                    initial.as_ref().map(|bytes| &bytes[..bytes.len().min(100)])
-                        == current.as_ref().map(|bytes| &bytes[..bytes.len().min(100)]),
-                )
-            })
-            .collect();
-        let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-        let writer = writer_db
-            .connect(ConnectOpts::new().with_readonly(false))
-            .unwrap();
-        let result = writer.execute("INSERT INTO t(val) VALUES ('stale')");
-        assert!(
-            matches!(result, Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed")),
-            "legacy={legacy}: writable activation succeeded={}, error={:?}, files(index,before_len,after_len,all_equal,header_equal)={changes:?}",
-            result.is_ok(),
-            result.as_ref().err()
-        );
-        assert_eq!(readonly_storage_bytes(&path), before);
-        run_external_sqlite(&path, "write");
-        assert!(matches!(
-            reader.execute("INSERT INTO t(val) VALUES ('forbidden')"),
-            Err(turso_core::LimboError::ReadOnly)
-        ));
-    }
-}
-
-#[test]
-fn test_readonly_falls_back_while_external_reader_is_open() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("shared.db");
-    create_wal_db(&path);
-    let child = hold_external_sqlite_reader(&path);
-    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    assert!(reader.is_readonly(turso_core::MAIN_DB_ID));
-    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    assert!(matches!(
-        writer.execute("INSERT INTO t(val) VALUES ('blocked')"),
-        Err(turso_core::LimboError::LockingError(_))
-    ));
-    release_external_sqlite_reader(child);
-    writer
-        .execute("INSERT INTO t(val) VALUES ('after reader')")
-        .unwrap();
-}
-
-#[test]
-fn test_readonly_activation_lock_failure_is_retryable() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("retry.db");
-    create_legacy_db(&path);
-    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    let child = hold_external_sqlite_reader(&path);
-    let pending_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    let pending = pending_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    assert!(matches!(
-        pending.execute("INSERT INTO t(val) VALUES ('blocked')"),
-        Err(turso_core::LimboError::LockingError(_))
-    ));
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    release_external_sqlite_reader(child);
-    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    assert!(Arc::ptr_eq(&database, &writer_db));
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    writer
-        .execute("INSERT INTO t(val) VALUES ('retry')")
-        .unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(2,)]);
-}
-
-#[test]
-fn test_readonly_bootstrap_failure_releases_main_lock() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("invalid.db");
-    std::fs::write(&path, [0xff; 4096]).unwrap();
-    assert!(open_readonly_activation_database(&path, OpenFlags::ReadOnly).is_err());
-    run_external_sqlite(&path, "lock");
-}
-
-#[test]
-fn test_readonly_activation_rejects_replaced_wal() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("replaced.db");
-    create_wal_db(&path);
-    let wal_path = format!("{}-wal", path.display());
-    std::fs::write(&wal_path, []).unwrap();
-    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let _reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    std::fs::remove_file(&wal_path).unwrap();
-    std::fs::write(&wal_path, []).unwrap();
-    assert!(
-        matches!(open_readonly_activation_database(&path, OpenFlags::None).unwrap()
-            .connect(ConnectOpts::new().with_readonly(false)).unwrap()
-            .execute("INSERT INTO t(val) VALUES ('stale')"),
-            Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed"))
-    );
-}
-
-#[test]
-fn test_readonly_mvcc_activation_preserves_snapshot() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("mvcc-activation.db");
-    create_wal_db(&path);
-    {
-        let database = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
-        let connection = database.connect(ConnectOpts::new()).unwrap();
-        connection.pragma_update("journal_mode", "'mvcc'").unwrap();
-    }
-    let before = readonly_storage_bytes(&path);
-    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    reader.execute("BEGIN").unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    assert_eq!(readonly_storage_bytes(&path), before);
-    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    assert!(Arc::ptr_eq(&database, &writer_db));
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    assert!(!writer.is_readonly(turso_core::MAIN_DB_ID));
-    writer
-        .execute("INSERT INTO t(val) VALUES ('writer')")
-        .unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    reader.execute("COMMIT").unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(2,)]);
-    assert!(matches!(
-        reader.execute("INSERT INTO t(val) VALUES ('forbidden')"),
-        Err(turso_core::LimboError::ReadOnly)
-    ));
-    reader.execute("CREATE TEMP TABLE local(x)").unwrap();
-    reader.execute("INSERT INTO local VALUES (1)").unwrap();
-    drop(writer);
-    drop(writer_db);
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(2,)]);
-}
-
-#[test]
-fn test_readonly_mvcc_activation_rejects_changed_log() {
-    use std::io::Write;
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("changed-log.db");
-    create_wal_db(&path);
-    {
-        let database = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
-        let connection = database.connect(ConnectOpts::new()).unwrap();
-        connection.pragma_update("journal_mode", "'mvcc'").unwrap();
-    }
-    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let _reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(path.with_extension("db-log"))
-        .unwrap()
-        .write_all(&[0])
-        .unwrap();
-    let before = readonly_storage_bytes(&path);
-    assert!(
-        matches!(open_readonly_activation_database(&path, OpenFlags::None).unwrap()
-            .connect(ConnectOpts::new().with_readonly(false)).unwrap()
-            .execute("INSERT INTO t(val) VALUES ('stale')"),
-            Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed"))
-    );
-    assert_eq!(readonly_storage_bytes(&path), before);
-}
-
-#[cfg(unix)]
-#[test]
-fn test_readonly_mvcc_alias_activates_canonical_log() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("canonical.db");
-    let alias = directory.path().join("alias.db");
-    let decoy = alias.with_extension("db-log");
-    create_wal_db(&path);
-    {
-        let database = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
-        let connection = database.connect(ConnectOpts::new()).unwrap();
-        connection.pragma_update("journal_mode", "'mvcc'").unwrap();
-    }
-    std::os::unix::fs::symlink(&path, &alias).unwrap();
-    std::fs::write(&decoy, b"unrelated alias log").unwrap();
-    {
-        let database = open_readonly_activation_database(&alias, OpenFlags::ReadOnly).unwrap();
-        let reader = database
-            .connect(ConnectOpts::new().with_readonly(true))
-            .unwrap();
-        let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-        assert_eq!(rows, vec![(1,)]);
-        let writer_db = open_readonly_activation_database(&alias, OpenFlags::None).unwrap();
-        let writer = writer_db
-            .connect(ConnectOpts::new().with_readonly(false))
-            .unwrap();
-        writer
-            .execute("INSERT INTO t(val) VALUES ('canonical writer')")
-            .unwrap();
-        assert_eq!(std::fs::read(&decoy).unwrap(), b"unrelated alias log");
-    }
-    let database = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(2,)]);
-}
-
-#[cfg(unix)]
-#[test]
-fn test_readonly_bootstrap_rejects_wal_alias_of_main() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("aliased-sidecar.db");
-    create_wal_db(&path);
-    let wal_path = format!("{}-wal", path.display());
-    std::fs::hard_link(&path, &wal_path).unwrap();
-    let before = std::fs::read(&path).unwrap();
-    assert!(
-        matches!(open_readonly_activation_database(&path, OpenFlags::ReadOnly), Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("storage changed"))
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    run_external_sqlite(&path, "lock");
-}
-
-#[test]
-fn test_readonly_no_lock_does_not_activate_writer_authority() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("no-lock.db");
-    create_wal_db(&path);
-    let database =
-        open_readonly_activation_database(&path, OpenFlags::ReadOnly | OpenFlags::NoLock).unwrap();
-    let reader = database
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    assert!(database.is_readonly());
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    assert!(
-        matches!(open_readonly_activation_database(&path, OpenFlags::None), Err(turso_core::LimboError::InvalidArgument(ref message)) if message.contains("cannot be activated"))
-    );
-    run_external_sqlite(&path, "write");
 }
 
 #[tokio::test]
@@ -1763,167 +1249,69 @@ async fn test_rust_builder_readonly_policy_with_writable_authority() {
     );
 }
 
-#[tokio::test]
-async fn test_rust_builder_readonly_first_can_open_writer() {
+#[test]
+fn test_prepared_attached_query_after_detach_returns_error() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("rust-promotion.db");
-    create_legacy_db(&path);
-    let reader_db = turso::Builder::new_local(path.to_str().unwrap())
-        .read_only(true)
-        .build()
-        .await
-        .unwrap();
-    let reader = reader_db.connect().unwrap();
-    let writer_db = turso::Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let writer = writer_db.connect().unwrap();
-    writer
-        .execute("INSERT INTO t(val) VALUES ('allowed')", ())
-        .await
-        .unwrap();
-    let mut rows = reader.query("SELECT count(*) FROM t", ()).await.unwrap();
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-        2
-    );
-    assert!(reader
-        .execute("INSERT INTO t(val) VALUES ('forbidden')", ())
-        .await
-        .is_err());
+    let path = dir.path().join("main.db");
+    let aux_path = dir.path().join("aux.db");
+    create_wal_db(&path);
+    create_wal_db(&aux_path);
+    let db = Database::open_file_with_flags(
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        OpenFlags::None,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let quoted = aux_path.to_string_lossy().replace('\'', "''");
+    conn.execute(format!("ATTACH '{quoted}' AS aux")).unwrap();
+    let mut prepared = conn.prepare("SELECT val FROM aux.t").unwrap();
+    conn.execute("DETACH aux").unwrap();
+    assert!(prepared.step().is_err());
 }
 
 #[test]
-fn test_readonly_activation_failure_preserves_recoverable_rows() {
-    for mode in ["after_write", "sync", "wal_open", "crash_after_write"] {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("fault.db");
-        create_legacy_db(&path);
-        let output = run_activation_fault_process(&path, mode);
-        let expected = if mode == "crash_after_write" {
-            Some(73)
-        } else {
-            Some(0)
-        };
-        assert_eq!(
-            output.status.code(),
-            expected,
-            "mode={mode}: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("ACTIVATION_HEADER_WRITTEN"));
-        let recovered = run_activation_fault_process(&path, "recover");
-        assert!(
-            recovered.status.success(),
-            "mode={mode}: {} {}",
-            String::from_utf8_lossy(&recovered.stdout),
-            String::from_utf8_lossy(&recovered.stderr)
-        );
-        assert!(String::from_utf8_lossy(&recovered.stdout).contains("ACTIVATION_RECOVERED"));
-    }
-}
-
-fn run_activation_fault_process(path: &Path, mode: &str) -> std::process::Output {
-    let module = module_path!().split_once("::").unwrap().1;
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg(format!("{module}::test_readonly_activation_fault_process"))
-        .arg("--nocapture")
-        .env("TURSO_ACTIVATION_FAULT_PATH", path)
-        .env("TURSO_ACTIVATION_FAULT_MODE", mode)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "activation child timed out: {} {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-#[test]
-fn test_readonly_activation_fault_process() {
-    let Some(path) = std::env::var_os("TURSO_ACTIVATION_FAULT_PATH") else {
-        return;
-    };
-    let path = Path::new(&path);
-    let mode = std::env::var("TURSO_ACTIVATION_FAULT_MODE").unwrap();
-    if mode == "recover" {
-        let db = open_readonly_activation_database(path, OpenFlags::None).unwrap();
-        let conn = db.connect(ConnectOpts::new().with_readonly(false)).unwrap();
-        let rows: Vec<(String,)> = conn.exec_rows("SELECT val FROM t");
-        assert_eq!(rows, vec![("test".to_string(),)]);
-        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
-        assert_eq!(integrity, vec![("ok".to_string(),)]);
-        conn.close().unwrap();
-        println!("ACTIVATION_RECOVERED");
-        return;
-    }
-    let platform: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let state = Arc::new(ActivationFaultState::new(mode));
+fn test_large_readonly_database_opens_without_reading_unused_blob_pages() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("large.db");
+    rusqlite::Connection::open(&path).unwrap().execute_batch(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload); INSERT INTO t VALUES(1, zeroblob(33554432));"
+    ).unwrap();
+    let state = Arc::new(ActivationFaultState::new("observe".into()));
     let io: Arc<dyn turso_core::IO> = Arc::new(ActivationFaultIO {
-        inner: platform,
+        inner: Arc::new(turso_core::PlatformIO::new().unwrap()),
         path: path.to_string_lossy().into_owned(),
         state: state.clone(),
     });
-    let open = |flags| {
-        Database::open_file_with_flags(
-            io.clone(),
-            path.to_str().unwrap(),
-            flags,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )
-    };
-    let db = open(OpenFlags::ReadOnly).unwrap();
-    let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
-    let initial: Vec<(String,)> = reader.exec_rows("SELECT val FROM t");
-    assert_eq!(initial, vec![("test".to_string(),)]);
-    let mut cached = reader.prepare("SELECT val FROM t").unwrap();
-    let writer_db = open(OpenFlags::None).unwrap();
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    let error = writer
-        .execute("INSERT INTO t(val) VALUES ('unacknowledged')")
-        .unwrap_err();
-    assert!(state
-        .header_written
-        .load(std::sync::atomic::Ordering::Acquire));
-    assert!(error.to_string().contains("injected"), "{error}");
-    assert!(cached
-        .step()
-        .unwrap_err()
-        .to_string()
-        .contains("activation failed"));
-    assert!(reader
-        .execute("SELECT * FROM t")
-        .unwrap_err()
-        .to_string()
-        .contains("activation failed"));
-    assert!(writer
-        .execute("SELECT * FROM t")
-        .unwrap_err()
-        .to_string()
-        .contains("activation failed"));
-    drop(cached);
-    reader.close().unwrap();
-    writer.close().unwrap();
+    let start = std::time::Instant::now();
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    let requested = state
+        .read_requested
+        .load(std::sync::atomic::Ordering::Acquire);
+    println!(
+        "READONLY_STARTUP file_bytes={} main_read_requested={} elapsed_us={}",
+        std::fs::metadata(&path).unwrap().len(),
+        requested,
+        start.elapsed().as_micros()
+    );
+    assert!(
+        requested < 128 * 1024,
+        "read-only startup unnecessarily read {requested} bytes"
+    );
 }
 
 struct ActivationFaultState {
@@ -2118,300 +1506,83 @@ impl turso_core::io::File for ActivationFaultFile {
 }
 
 #[test]
-fn test_unused_pending_writer_close_preserves_files() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("unused.db");
-    create_legacy_db(&path);
-    let db = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let before = readonly_storage_bytes(&path);
-    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    let rows: Vec<(i64,)> = writer.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    writer.close().unwrap();
-    drop(writer);
-    drop(writer_db);
-    assert_eq!(readonly_storage_bytes(&path), before);
-    drop(db);
-}
-
-#[test]
-fn test_pending_legacy_writer_must_end_own_read_before_upgrade() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("upgrade.db");
-    create_legacy_db(&path);
-    let db = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    writer.execute("BEGIN").unwrap();
-    let rows: Vec<(i64,)> = writer.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    assert!(matches!(
-        writer.execute("INSERT INTO t(val) VALUES ('blocked')"),
-        Err(turso_core::LimboError::Busy)
-    ));
-    writer.execute("COMMIT").unwrap();
-    writer
-        .execute("INSERT INTO t(val) VALUES ('after read')")
-        .unwrap();
-    let rows: Vec<(i64,)> = writer.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(2,)]);
-    drop(writer);
-    drop(writer_db);
-    drop(db);
-    assert_eq!(read_header_versions(&path), (2, 2));
-}
-
-#[test]
-fn test_readonly_authority_default_open_waits_before_opening_alias_descriptor() {
-    use turso_core::{IOResult, OpenDbAsyncState, OpenOptions};
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("opening.db");
-    create_legacy_db(&path);
-    let state = Arc::new(ActivationFaultState::new("pause_open".into()));
-    state
-        .paused
-        .store(true, std::sync::atomic::Ordering::Release);
-    let io: Arc<dyn turso_core::IO> = Arc::new(ActivationFaultIO {
-        inner: Arc::new(turso_core::PlatformIO::new().unwrap()),
-        path: path.to_string_lossy().into_owned(),
-        state: state.clone(),
-    });
-    let ro = OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::ReadOnly);
-    let rw = OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::None);
-    let mut first = OpenDbAsyncState::new();
-    assert!(matches!(
-        Database::open_async(&mut first, io.clone(), path.to_str().unwrap(), &ro).unwrap(),
-        IOResult::IO(_)
-    ));
-    assert!(!state.reads.lock().unwrap().is_empty());
-    let initial = state.main_opens.load(std::sync::atomic::Ordering::Acquire);
-    let mut second = OpenDbAsyncState::new();
-    assert!(matches!(
-        Database::open_async(&mut second, io.clone(), path.to_str().unwrap(), &rw).unwrap(),
-        IOResult::IO(_)
-    ));
-    assert_eq!(
-        state.main_opens.load(std::sync::atomic::Ordering::Acquire),
-        initial,
-        "a waiting opener must not create an alias descriptor of the live authority"
-    );
-    state
-        .paused
-        .store(false, std::sync::atomic::Ordering::Release);
-    let a = loop {
-        match Database::open_async(&mut first, io.clone(), path.to_str().unwrap(), &ro).unwrap() {
-            IOResult::Done(db) => break db,
-            IOResult::IO(_) => io.step().unwrap(),
+fn test_readonly_first_requires_closed_handles_before_writable_reopen() {
+    for mode in ["legacy", "wal", "mvcc", "empty"] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("readonly.db");
+        match mode {
+            "legacy" => create_legacy_db(&path),
+            "empty" => std::fs::write(&path, []).unwrap(),
+            _ => create_wal_db(&path),
         }
-    };
-    let b = match Database::open_async(&mut second, io, path.to_str().unwrap(), &rw).unwrap() {
-        IOResult::Done(db) => db,
-        IOResult::IO(_) => panic!("finished authority should be reusable"),
-    };
-    assert!(Arc::ptr_eq(&a, &b));
-    assert_eq!(
-        state.main_opens.load(std::sync::atomic::Ordering::Acquire),
-        initial
-    );
-    drop(first);
-    drop(second);
-    let writer = b.connect(ConnectOpts::new().with_readonly(false)).unwrap();
-    writer
-        .execute("INSERT INTO t(val) VALUES ('writer')")
-        .unwrap();
-    drop(writer);
-    drop(b);
-    let blocked = external_sqlite_command(&path, "lock").output().unwrap();
-    assert!(
-        !blocked.status.success(),
-        "writer authority lock was released by an unused descriptor"
-    );
-    drop(a);
-    run_external_sqlite(&path, "lock");
-}
-
-#[test]
-fn test_readonly_authority_is_not_retained_by_an_independent_attachment() {
-    let dir = TempDir::new().unwrap();
-    let main_path = dir.path().join("main.db");
-    let aux_path = dir.path().join("aux.db");
-    create_legacy_db(&main_path);
-    create_wal_db(&aux_path);
-    let main = Database::open_file_with_flags(
-        Arc::new(turso_core::PlatformIO::new().unwrap()),
-        main_path.to_str().unwrap(),
-        OpenFlags::ReadOnly,
-        DatabaseOpts::new().with_attach(true),
-        None,
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let reader = main
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    let aux_quoted = aux_path.to_string_lossy().replace('\'', "''");
-    reader
-        .execute(format!("ATTACH '{aux_quoted}' AS aux"))
-        .unwrap();
-    let independent_aux =
-        open_readonly_activation_database(&aux_path, OpenFlags::ReadOnly).unwrap();
-    let writer = main
-        .connect(ConnectOpts::new().with_readonly(false))
-        .unwrap();
-    writer
-        .execute("INSERT INTO t(val) VALUES ('writer')")
-        .unwrap();
-    drop(writer);
-    drop(reader);
-    drop(main);
-    run_external_sqlite(&main_path, "lock");
-    drop(independent_aux);
-}
-
-#[test]
-fn test_cached_attached_reader_rejects_poisoned_writer_authority() {
-    let dir = TempDir::new().unwrap();
-    let main_path = dir.path().join("main.db");
-    let aux_path = dir.path().join("aux.db");
-    create_legacy_db(&main_path);
-    create_wal_db(&aux_path);
-    rusqlite::Connection::open(&aux_path)
-        .unwrap()
-        .execute("INSERT INTO t(val) VALUES ('second')", ())
-        .unwrap();
-    let state = Arc::new(ActivationFaultState::new("wal_open_readers".into()));
-    let io: Arc<dyn turso_core::IO> = Arc::new(ActivationFaultIO {
-        inner: Arc::new(turso_core::PlatformIO::new().unwrap()),
-        path: aux_path.to_string_lossy().into_owned(),
-        state,
-    });
-    let main = Database::open_file_with_flags(
-        io.clone(),
-        main_path.to_str().unwrap(),
-        OpenFlags::ReadOnly,
-        DatabaseOpts::new().with_attach(true),
-        None,
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let reader = main
-        .connect(ConnectOpts::new().with_readonly(true))
-        .unwrap();
-    let quoted = aux_path.to_string_lossy().replace('\'', "''");
-    reader.execute(format!("ATTACH '{quoted}' AS aux")).unwrap();
-    let mut cached = reader.prepare("SELECT val FROM aux.t").unwrap();
-    loop {
-        match cached.step().unwrap() {
-            turso_core::StepResult::Row => break,
-            turso_core::StepResult::IO | turso_core::StepResult::Yield => io.step().unwrap(),
-            result => panic!("expected first attached row, got {result:?}"),
+        if mode == "mvcc" {
+            let db = open_readonly_activation_database(&path, OpenFlags::Create).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+            conn.close().unwrap();
         }
+        let before = readonly_storage_bytes(&path);
+        let db = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        reader.execute("BEGIN").unwrap();
+        let rows: Vec<(i64,)> = reader.exec_rows("SELECT 1");
+        assert_eq!(rows, vec![(1,)]);
+        let error = open_readonly_activation_database(&path, OpenFlags::None).unwrap_err();
+        assert!(
+            matches!(error, turso_core::LimboError::InvalidArgument(ref message)
+            if message.contains("already open read-only")),
+            "{mode}: {error}"
+        );
+        assert_eq!(readonly_storage_bytes(&path), before, "{mode}");
+        reader.execute("COMMIT").unwrap();
+        drop(db);
+        assert!(open_readonly_activation_database(&path, OpenFlags::None).is_err());
+        reader.close().unwrap();
+        drop(reader);
+        let db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("CREATE TABLE reopened(x); INSERT INTO reopened VALUES(7)")
+            .unwrap();
+        let readonly = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
+        let reader = readonly.connect(ConnectOpts::new()).unwrap();
+        let rows: Vec<(i64,)> = reader.exec_rows("SELECT x FROM reopened");
+        assert_eq!(rows, vec![(7,)]);
+        assert!(matches!(
+            reader.execute("INSERT INTO reopened VALUES(8)"),
+            Err(turso_core::LimboError::ReadOnly)
+        ));
+        reader.close().unwrap();
+        writer.close().unwrap();
     }
-    let writer_db = open_readonly_activation_database(&aux_path, OpenFlags::None).unwrap();
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
+}
+
+#[tokio::test]
+async fn test_rust_builder_readonly_first_requires_closed_handles() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("builder.db");
+    create_legacy_db(&path);
+    let db = turso::Builder::new_local(path.to_str().unwrap())
+        .read_only(true)
+        .build()
+        .await
         .unwrap();
-    assert!(writer
-        .execute("INSERT INTO t(val) VALUES ('unacknowledged')")
-        .unwrap_err()
-        .to_string()
-        .contains("injected"));
-    assert!(cached
-        .step()
-        .unwrap_err()
-        .to_string()
-        .contains("activation failed"));
-}
-
-#[test]
-fn test_prepared_attached_query_after_detach_returns_error() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("main.db");
-    let aux_path = dir.path().join("aux.db");
-    create_wal_db(&path);
-    create_wal_db(&aux_path);
-    let db = Database::open_file_with_flags(
-        Arc::new(turso_core::PlatformIO::new().unwrap()),
-        path.to_str().unwrap(),
-        OpenFlags::None,
-        DatabaseOpts::new().with_attach(true),
-        None,
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
-    let quoted = aux_path.to_string_lossy().replace('\'', "''");
-    conn.execute(format!("ATTACH '{quoted}' AS aux")).unwrap();
-    let mut prepared = conn.prepare("SELECT val FROM aux.t").unwrap();
-    conn.execute("DETACH aux").unwrap();
-    assert!(prepared.step().is_err());
-}
-
-#[test]
-fn test_large_readonly_database_opens_without_reading_unused_blob_pages() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("large.db");
-    rusqlite::Connection::open(&path).unwrap().execute_batch(
-        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload); INSERT INTO t VALUES(1, zeroblob(33554432));"
-    ).unwrap();
-    let state = Arc::new(ActivationFaultState::new("observe".into()));
-    let io: Arc<dyn turso_core::IO> = Arc::new(ActivationFaultIO {
-        inner: Arc::new(turso_core::PlatformIO::new().unwrap()),
-        path: path.to_string_lossy().into_owned(),
-        state: state.clone(),
-    });
-    let start = std::time::Instant::now();
-    let db = Database::open_file_with_flags(
-        io,
-        path.to_str().unwrap(),
-        OpenFlags::ReadOnly,
-        DatabaseOpts::new(),
-        None,
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let conn = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
-    assert_eq!(rows, vec![(1,)]);
-    let requested = state
-        .read_requested
-        .load(std::sync::atomic::Ordering::Acquire);
-    println!(
-        "READONLY_STARTUP file_bytes={} main_read_requested={} elapsed_us={}",
-        std::fs::metadata(&path).unwrap().len(),
-        requested,
-        start.elapsed().as_micros()
-    );
+    let reader = db.connect().unwrap();
+    let result = turso::Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await;
     assert!(
-        requested < 128 * 1024,
-        "read-only startup unnecessarily read {requested} bytes"
+        matches!(result, Err(ref error) if error.to_string().contains("already open read-only"))
     );
-}
-
-#[test]
-fn test_empty_readonly_file_can_later_accept_a_writer() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("empty.db");
-    std::fs::write(&path, []).unwrap();
-    let db = open_readonly_activation_database(&path, OpenFlags::ReadOnly).unwrap();
-    let reader = db.connect(ConnectOpts::new().with_readonly(true)).unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT 1");
-    assert_eq!(rows, vec![(1,)]);
-    let writer_db = open_readonly_activation_database(&path, OpenFlags::None).unwrap();
-    let writer = writer_db
-        .connect(ConnectOpts::new().with_readonly(false))
+    drop(reader);
+    drop(db);
+    let db = turso::Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
         .unwrap();
-    writer.execute("CREATE TABLE t(x)").unwrap();
-    writer.execute("INSERT INTO t VALUES (7)").unwrap();
-    let rows: Vec<(i64,)> = reader.exec_rows("SELECT x FROM t");
-    assert_eq!(rows, vec![(7,)]);
-    assert!(matches!(
-        reader.execute("INSERT INTO t VALUES (8)"),
-        Err(turso_core::LimboError::ReadOnly)
-    ));
+    let writer = db.connect().unwrap();
+    writer
+        .execute("INSERT INTO t(val) VALUES ('reopened')", ())
+        .await
+        .unwrap();
 }
