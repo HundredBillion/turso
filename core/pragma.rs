@@ -538,6 +538,30 @@ mod tests {
     use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
 
     #[test]
+    fn turso_mvcc_mode_reports_actual_private_mode() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let database =
+            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
+        let connection = database.connect(ConnectOpts::new()).unwrap();
+        for (setup, expected) in [(None, "off"), (Some("PRAGMA journal_mode=mvcc"), "private")] {
+            if let Some(sql) = setup {
+                connection.execute(sql).unwrap();
+            }
+            let mut modes = Vec::new();
+            connection
+                .prepare("PRAGMA turso_mvcc_mode")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    modes.push(row.get::<&str>(0)?.to_owned());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(modes, [expected]);
+        }
+        assert!(connection.prepare("PRAGMA turso_mvcc_mode=shared").is_err());
+    }
+
+    #[test]
     fn filter_starts_each_pragma_scan_at_rowid_one() {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =

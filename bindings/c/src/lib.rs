@@ -4280,6 +4280,7 @@ mod tests {
                         },
                     ptr::null(),
                 );
+                assert!(!handle.is_null());
                 assert_eq!(
                     rc,
                     SQLITE_OK,
@@ -4302,10 +4303,9 @@ mod tests {
                     SQLITE_OK
                 );
                 assert_eq!(sqlite3_step(statement), SQLITE_ROW);
-                assert_eq!(
-                    CStr::from_ptr(sqlite3_column_text(statement, 0).cast()).to_bytes(),
-                    b"shared"
-                );
+                let mode = sqlite3_column_text(statement, 0);
+                assert!(!mode.is_null());
+                assert_eq!(CStr::from_ptr(mode.cast()).to_bytes(), b"shared");
                 assert_eq!(sqlite3_step(statement), SQLITE_DONE);
                 assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
                 assert_eq!(
