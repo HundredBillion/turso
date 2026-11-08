@@ -1,4 +1,4 @@
-name: Fresh recovery selection sealed endpoint
+name: Recovery Store continuation native integration
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4532b92040e8a5c7565d718d26da93e12e32f79d
+          ref: 198914e3ef213ea03805dca8d6e82550ef705732
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,34 +27,22 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 4532b92040e8a5c7565d718d26da93e12e32f79d
+          test "$(git rev-parse HEAD)" = 198914e3ef213ea03805dca8d6e82550ef705732
           uname -a | tee environment.txt
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fresh-selection-green.log
-          grep -q '5 passed; 0 failed' fresh-selection-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee selection-retirement-green.log
-          grep -q '2 passed; 0 failed' selection-retirement-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee normal-bootstrap-green.log
-          grep -q '14 passed; 0 failed' normal-bootstrap-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee source-store-green.log
-          grep -q '6 passed; 0 failed' source-store-green.log
-          python3 - <<'PATCH'
-          p='core/mvcc/database/shared_checkpoint_recovery.rs'
-          s=open(p).read(); old='            || !pause.belongs_to(&runtime.gate)\n'; assert s.count(old)==1
-          open(p,'w').write(s.replace(old,''))
-          PATCH
-          set +e
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_fresh_selection_rejects_foreign_pause -- --ignored --test-threads=1 --nocapture > foreign-pause-red.log 2>&1
-          code=$?
-          set -e
-          git restore core/mvcc/database/shared_checkpoint_recovery.rs
-          cat foreign-pause-red.log
-          test "$code" -ne 0
-          grep -q '0 passed; 1 failed' foreign-pause-red.log
-          grep -q 'foreign pause authorized fresh recovery' foreign-pause-red.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee fresh-selection-restored-green.log
-          grep -q '5 passed; 0 failed' fresh-selection-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api intent_source_store_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee owned-carrier-green.log
+          grep -q '8 passed; 0 failed' owned-carrier-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --skip physical_wal_peer_child --list 2>&1 | tee recovery-test-list.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --skip physical_wal_peer_child --test-threads=1 --nocapture 2>&1 | tee recovery-continuation-green.log
+          python3 - <<'CHECK'
+          import re
+          names=[x for x in open('recovery-test-list.log') if x.rstrip().endswith(': test')]
+          assert len(names)>50,len(names)
+          rows=re.findall(r'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored',open('recovery-continuation-green.log').read())
+          assert rows and rows[-1]==(str(len(names)),'0','0'),(len(names),rows[-3:])
+          print('FINAL_RECOVERY_PARENT',rows[-1])
+          CHECK
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
