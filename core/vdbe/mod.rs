@@ -3687,6 +3687,14 @@ impl Program {
             }
         }
         #[cfg(all(host_shared_wal, unix))]
+        if let Err(error) = self.finish_shared_sequence_inner_before_rollback(state, pager) {
+            capture_abort_error(
+                &mut abort_error,
+                error,
+                "Failed to retire autonomous shared commit before outer rollback",
+            );
+        }
+        #[cfg(all(host_shared_wal, unix))]
         if let Err(error) =
             execute::finish_abandoned_shared_named_rollback(state, &self.connection, pager)
         {
@@ -4213,6 +4221,47 @@ impl Program {
             return Err(err);
         }
         Ok(())
+    }
+
+    #[cfg(all(host_shared_wal, unix))]
+    fn finish_shared_sequence_inner_before_rollback(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<()> {
+        use crate::IOExt;
+        let Some(pending) = state.sequence_inner_tx_pending.as_ref() else {
+            return Ok(());
+        };
+        let Some(store) = self
+            .connection
+            .mv_store_for_db(pending.db)
+            .filter(|store| store.is_shared())
+        else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let inner = pending.inner_tx_id;
+        let saved_outer = pending.saved_outer;
+        // Complete an already-started autonomous commit, not the nextval SQL.
+        // Its publication lease and durable outcome must retire before the outer
+        // savepoint can release claims under that same authority.
+        let result = match state.sequence_inner_commit.as_mut() {
+            Some(commit) => pager.io.block(|| commit.step(&store)),
+            None => Ok(()),
+        };
+        // Drop observes sticky durability even after a failed poll. It must run
+        // before any decision to roll back the inner transaction.
+        state.sequence_inner_commit = None;
+        if store.is_tx_rollbackable(inner) {
+            store.rollback_tx(inner, pager.clone(), &self.connection, db);
+        }
+        self.connection.set_mv_tx_for_db(db, saved_outer);
+        if saved_outer.is_some() {
+            self.connection.auto_commit.store(false, Ordering::SeqCst);
+        }
+        state.sequence_inner_tx_pending = None;
+        result
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {

@@ -139,13 +139,13 @@ fn check_retirement(
         matches!(peer.execute(peer_insert), Err(crate::LimboError::Busy)),
         "callback completion released physical ownership"
     );
-    assert!(
-        matches!(
-            receive.recv_timeout(Duration::from_millis(20)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "reset/drop acknowledged before backend completion retirement"
-    );
+    match receive.recv_timeout(Duration::from_millis(20)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => (),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("worker failed before physical retirement")
+        }
+        Ok(event) => panic!("reset/drop acknowledged {event} before backend completion retirement"),
+    }
     drop(held);
     assert_eq!(
         receive.recv_timeout(Duration::from_secs(20)).unwrap(),
