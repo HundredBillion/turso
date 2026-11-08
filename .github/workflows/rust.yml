@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: da79546aa2b0f429b52c39fa64221ac8b3ea501b
+          ref: c9630d203fa4575afc800c252499aa52b30ee3db
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,7 +23,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = da79546aa2b0f429b52c39fa64221ac8b3ea501b
+          test "$(git rev-parse HEAD)" = c9630d203fa4575afc800c252499aa52b30ee3db
           rustc -Vv | tee rustc.txt
       - name: Current base evidence and existing ID protocol
         run: |
@@ -31,6 +31,9 @@ jobs:
           grep -q '4 passed; 0 failed' current-base-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-base-green.log
           grep -q '2 passed; 0 failed' physical-base-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api current_local_install_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee local-install-green.log
+          grep -q '2 passed; 0 failed' local-install-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_generation_ -- --include-ignored --test-threads=1 2>&1 | tee generation-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee id-protocol-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
@@ -39,7 +42,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: selected-current-physical-base-da79
+          name: selected-current-local-install-c963
           path: |
             source.txt
             rustc.txt
