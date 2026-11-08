@@ -257,14 +257,9 @@ impl LoadedIds {
             })
     }
 
-    /// Includes room for a floor-only replacement bank before the selected bank can be reclaimed.
+    /// Reserves a replacement bank and durable release records for retained claims/owners.
     pub(in crate::mvcc) fn required_budget_bytes(&self) -> Result<u64> {
-        use crate::io::File;
-        let inactive = 1 - usize::from(self.selection.selected.bank);
-        let headroom = ((2 * PAGE_SIZE) as u64).saturating_sub(self.files.banks[inactive].size()?);
-        self.retained_bytes()?
-            .checked_add(headroom)
-            .ok_or(LimboError::TooBig)
+        self.required_budget_for(&self.state, self.selection.selector.sequence)
     }
 
     pub(in crate::mvcc) fn into_guard(self) -> AuthorityGuard {
@@ -282,6 +277,9 @@ impl LoadedIds {
             return Err(invalid(
                 "ID append requires the current finalized generation",
             ));
+        }
+        if let journal::Change::Claim { ordinal, .. } = change {
+            ordinal.checked_add(1).ok_or(LimboError::DatabaseFull)?;
         }
         let record = journal::Record {
             sequence: self
@@ -303,16 +301,6 @@ impl LoadedIds {
             .ok_or(LimboError::TooBig)?;
         let bank = usize::from(selector.active.bank);
         let physical_active = self.files.banks[bank].size()?;
-        let required = self
-            .required_budget_bytes()?
-            .checked_add(self.identity.prefix.end_offset)
-            .and_then(|bytes| {
-                bytes.checked_add(selector.active.end.saturating_sub(physical_active))
-            })
-            .ok_or(LimboError::TooBig)?;
-        if required > self.files.history_budget {
-            return Err(LimboError::Busy);
-        }
         let bytes = &mut self.banks[bank];
         bytes.try_reserve_exact(PAGE_SIZE)?;
         bytes.extend_from_slice(&record);
@@ -323,6 +311,16 @@ impl LoadedIds {
             self.identity.database.generation,
             (selector.active.snapshot_end as usize) - PAGE_SIZE,
         )?;
+        let required = self
+            .required_budget_for(&self.state, selector.sequence)?
+            .checked_add(self.identity.prefix.end_offset)
+            .and_then(|bytes| {
+                bytes.checked_add(selector.active.end.saturating_sub(physical_active))
+            })
+            .ok_or(LimboError::TooBig)?;
+        if required > self.files.history_budget {
+            return Err(LimboError::Busy);
+        }
         let selector_bytes = selector.encode()?;
         let record_buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
         record_buffer.as_mut_slice().copy_from_slice(&record);
@@ -344,6 +342,27 @@ impl LoadedIds {
             pending: None,
             finished: false,
         })
+    }
+
+    fn required_budget_for(&self, state: &journal::State, selector_sequence: u64) -> Result<u64> {
+        use crate::io::File;
+        let credits = state.release_record_credits()?;
+        state
+            .last_record
+            .checked_add(credits)
+            .ok_or(LimboError::DatabaseFull)?;
+        selector_sequence
+            .checked_add(credits)
+            .ok_or(LimboError::DatabaseFull)?;
+        let cleanup = credits
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(LimboError::TooBig)?;
+        let inactive = 1 - usize::from(self.selection.selected.bank);
+        let headroom = ((2 * PAGE_SIZE) as u64).saturating_sub(self.files.banks[inactive].size()?);
+        self.retained_bytes()?
+            .checked_add(headroom)
+            .and_then(|bytes| bytes.checked_add(cleanup))
+            .ok_or(LimboError::TooBig)
     }
 }
 
@@ -1201,10 +1220,16 @@ mod tests {
         let IOResult::Done(outcome) = operation.poll().unwrap() else {
             panic!("synchronous oracle");
         };
+        let state = journal::State::replay(&f.bank.bytes.lock()[PAGE_SIZE..], 1).unwrap();
+        let release_records: usize = state
+            .active_owners()
+            .map(|owner| state.claims(owner).count() + 1)
+            .sum();
         assert_eq!(
             outcome.required_budget_bytes,
             outcome.retained_bytes
                 + ((2 * PAGE_SIZE) as u64).saturating_sub(f.unused.size().unwrap())
+                + (release_records * PAGE_SIZE) as u64
         );
         assert_eq!(
             outcome.retained_bytes,
@@ -1994,6 +2019,113 @@ mod tests {
         let physical =
             f.bank.size().unwrap() + f.unused.size().unwrap() + f.selector.size().unwrap();
         assert_eq!(f.files.history_budget - physical, (2 * PAGE_SIZE) as u64);
+    }
+
+    #[test]
+    fn id_claim_reserves_selector_sequences_for_release_and_retirement() {
+        for sequence in [u64::MAX - 3, u64::MAX - 2] {
+            let f = writable_fixture();
+            let registration = registration(&f);
+            let mut current = loaded(&f);
+            current.selection.selector.sequence = sequence;
+            let before = [&f.bank, &f.unused, &f.selector]
+                .map(|file| file.mutations.load(Ordering::Acquire));
+            let result = current.append(journal::Change::Claim {
+                owner: owner(&registration),
+                ordinal: 1,
+                claim: journal::Claim {
+                    key: journal::ClaimKey::LogicalTable,
+                    value: -200,
+                },
+            });
+            if sequence == u64::MAX - 3 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(LimboError::DatabaseFull)));
+            }
+            assert_eq!(
+                before,
+                [&f.bank, &f.unused, &f.selector]
+                    .map(|file| file.mutations.load(Ordering::Acquire))
+            );
+        }
+    }
+
+    #[test]
+    fn id_append_reserves_release_capacity_at_a_fixed_budget() {
+        let mut f = writable_fixture();
+        Arc::get_mut(&mut f.files).unwrap().history_budget = (9 * PAGE_SIZE) as u64;
+        let registration = registration(&f);
+        let owner = owner(&registration);
+        let mut append = loaded(&f)
+            .append(journal::Change::Claim {
+                owner,
+                ordinal: 1,
+                claim: journal::Claim {
+                    key: journal::ClaimKey::LogicalTable,
+                    value: -200,
+                },
+            })
+            .unwrap();
+        let IOResult::Done(current) = append.poll().unwrap() else {
+            panic!("synchronous claim fixture");
+        };
+        drop(append);
+        assert_eq!(
+            current.required_budget_bytes().unwrap(),
+            f.files.history_budget,
+            "acknowledged claim must reserve its release record as well as checkpoint headroom"
+        );
+        let before = f.bank.bytes.lock().clone();
+        assert!(
+            matches!(
+                current.append(journal::Change::LogicalFloor(-300)),
+                Err(LimboError::Busy)
+            ),
+            "unrelated append spent mandatory release capacity"
+        );
+        assert_eq!(*f.bank.bytes.lock(), before);
+        let mut guard = f.authority.try_acquire().unwrap();
+        guard.recover(f.identity.prefix).unwrap();
+        let mut loading = f.files.load(guard, f.identity).unwrap();
+        let IOResult::Done(current) = loading.poll().unwrap() else {
+            panic!("synchronous load fixture");
+        };
+        let mut release = current
+            .append(journal::Change::ReleaseAfter {
+                owner,
+                next_ordinal: 1,
+            })
+            .unwrap();
+        let IOResult::Done(released) = release.poll().unwrap() else {
+            panic!("synchronous release fixture");
+        };
+        assert_eq!(released.state.claims(owner).count(), 0);
+        assert_eq!(released.state.logical_floor, -200);
+        assert!(released.required_budget_bytes().unwrap() <= f.files.history_budget);
+        let mut retirement = released
+            .append(journal::Change::ReleaseOwner { owner })
+            .unwrap();
+        let IOResult::Done(retired) = retirement.poll().unwrap() else {
+            panic!("synchronous owner retirement fixture");
+        };
+        assert!(retired.state.owner_retired(owner));
+        assert!(retired.required_budget_bytes().unwrap() <= f.files.history_budget);
+        retired.guard.finish().unwrap();
+        let before =
+            [&f.bank, &f.unused, &f.selector].map(|file| file.mutations.load(Ordering::Acquire));
+        assert_eq!(
+            policy(
+                &f,
+                super::super::policy::IdAction::ReleaseOwner { owner },
+                None
+            ),
+            super::super::policy::IdResult::Released
+        );
+        assert_eq!(
+            [&f.bank, &f.unused, &f.selector].map(|file| file.mutations.load(Ordering::Acquire)),
+            before
+        );
     }
 
     #[test]

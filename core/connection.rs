@@ -1049,6 +1049,17 @@ impl Connection {
         input: &str,
         origin: StatementOrigin,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        #[cfg(all(host_shared_wal, unix))]
+        if origin == StatementOrigin::Root
+            && !self.is_mvcc_bootstrap_connection()
+            && !self.schema_reparse_in_progress()
+            && self.has_no_open_transaction_state()
+        {
+            let store = self.db.get_mv_store().as_ref().cloned();
+            if let Some(store) = store {
+                store.refresh_shared_schema_for_prepare(self)?;
+            }
+        }
         self.maybe_update_schema();
 
         let syms = self.syms.read();

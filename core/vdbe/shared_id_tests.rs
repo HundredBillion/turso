@@ -271,6 +271,36 @@ fn shared_id_opcode_native_claim_yield_resume_reset_drop() {
 
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
+fn shared_prepare_native_imports_peer_sequence_before_any_statement() {
+    let (_directory, first, second) = pair();
+    first
+        .execute("CREATE SEQUENCE newly_committed_sequence")
+        .unwrap();
+    let prepared = second.prepare("SELECT nextval('newly_committed_sequence')");
+    assert!(
+        prepared.is_ok(),
+        "prepare used the schema from before the peer committed: {:?}",
+        prepared.err()
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_prepare_native_imports_peer_table_before_any_statement() {
+    let (_directory, first, second) = pair();
+    first
+        .execute("CREATE TABLE newly_committed_table(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let prepared = second.prepare("SELECT id FROM newly_committed_table");
+    assert!(
+        prepared.is_ok(),
+        "prepare used the schema from before the peer committed: {:?}",
+        prepared.err()
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
 fn shared_id_stale_prepare_native_peer_sequence_ddl() {
     let (_directory, first, second) = pair();
     first.execute("CREATE SEQUENCE peer_sequence").unwrap();
