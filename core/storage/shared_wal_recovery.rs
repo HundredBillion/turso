@@ -86,6 +86,83 @@ impl SharedWalRecoveryLocks {
     }
 }
 
+#[cfg(unix)]
+impl SharedWalRecoveryLocks {
+    pub(crate) fn install_empty(
+        self: &Arc<Self>,
+        evidence: &crate::mvcc::database::RecoveredPhysicalWalEvidence,
+    ) -> Result<()> {
+        let (wal, checksum, transactions) = evidence.empty_wal_state(self)?;
+        self.validate_mapping(&self.mapping)?;
+        let local = self.mapping.local_lock_state.lock();
+        if !local.recovery_held || local.recovery_poisoned {
+            return Err(LimboError::InvalidArgument(
+                "physical recovery lost exclusion before repair".into(),
+            ));
+        }
+        let header = self.mapping.header();
+        let visibility = header
+            .visibility_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        let epoch = header
+            .checkpoint_epoch
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(LimboError::DatabaseFull)?;
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: transactions.max(header.transaction_count.load(Ordering::Acquire)),
+            visibility_generation: visibility,
+            checkpoint_seq: wal.checkpoint_seq,
+            checkpoint_epoch: epoch,
+            page_size: wal.page_size,
+            salt_1: wal.salt_1,
+            salt_2: wal.salt_2,
+            checksum_1: checksum.0,
+            checksum_2: checksum.1,
+            reader_slot_count: header.reader_slot_count,
+        };
+        let sequence = header.snapshot_seq.load(Ordering::Acquire) | 1;
+        header.snapshot_seq.store(sequence, Ordering::Release);
+        self.mapping.clear_backfill_proof();
+        self.mapping
+            .discard_durable_frame_index_for_exclusive_rebuild();
+        header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
+        header
+            .checkpoint_owner
+            .store(UNOWNED_LOCK, Ordering::Release);
+        for index in 0..header.reader_slot_count as usize {
+            self.mapping.reader_frames()[index].store(UNUSED_READER_FRAME, Ordering::Release);
+            self.mapping.reader_owners()[index].store(UNOWNED_LOCK, Ordering::Release);
+        }
+        for bitmap in self.mapping.reader_bitmap_words() {
+            bitmap.store(u64::MAX, Ordering::Release);
+        }
+        MappedSharedWalCoordination::store_snapshot_fields(header, snapshot);
+        header
+            .snapshot_seq
+            .store(sequence.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn begin_sync(
+        self: &Arc<Self>,
+        evidence: crate::mvcc::database::RecoveryWalSyncEvidence,
+    ) -> Result<Completion> {
+        evidence.validate(self)?;
+        let completion = Completion::new_sync(move |result| {
+            let _owner = &evidence;
+            if let Err(error) = result {
+                tracing::debug!(%error, "physical recovery coordination sync failed");
+            }
+        });
+        self.mapping.file.sync(completion, FileSyncType::FullFsync)
+    }
+}
+
 impl Drop for SharedWalRecoveryLocks {
     fn drop(&mut self) {
         let mut local = self.mapping.local_lock_state.lock();

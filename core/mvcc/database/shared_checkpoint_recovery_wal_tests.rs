@@ -37,6 +37,11 @@ fn committed_image(fixture: &IntentCrashFixture, guard: &AuthorityGuard) -> Vec<
         }
         let source = 32 + (frame as usize - 1) * frame_size + 24;
         let target = (page as usize - 1) * page_size;
+        let payload = &bytes[source..source + page_size];
+        let marker = b"acknowledged before checkpoint ";
+        if payload.windows(marker.len()).any(|bytes| bytes == marker) {
+            eprintln!("ACK_DATA_ROOT={page}");
+        }
         expected[target..target + page_size].copy_from_slice(&bytes[source..source + page_size]);
     }
     drop(wal);
@@ -124,6 +129,36 @@ fn checkpoint_recovery_wal_native_restores_committed_image_without_completion_or
                 recovered.parts.persistent_timestamp,
                 record.prefix().committed_timestamp
             );
+            eprintln!("PHYSICAL_RECOVERY_UNADMITTED_OUTPUT");
+            let file: Arc<dyn File> = ReadPinnedFile::new_for_checkpoint_recovery(
+                fixture.runtime.files.main.clone(),
+                recovered.guard(),
+            )
+            .unwrap();
+            let mut opening = SharedPhysicalConnection::new_with_retained_file(
+                fixture.io.clone(),
+                fixture.path.to_str().unwrap().to_owned(),
+                crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+                file,
+            )
+            .unwrap();
+            let reader = fixture.io.block(|| opening.poll()).unwrap();
+            let mut rows = Vec::new();
+            reader
+                .prepare("SELECT value FROM preserved WHERE id=1")
+                .unwrap()
+                .run_with_row_callback(|row| {
+                    rows.push(row.get::<&str>(0)?.to_owned());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                rows,
+                [format!("acknowledged before checkpoint {commits}")],
+                "recovered data row differs from acknowledged value"
+            );
+            drop(reader);
+            drop(opening);
             assert_eq!(std::fs::read(&fixture.path).unwrap(), expected);
             assert_eq!(fixture.runtime.files.physical_wal.size().unwrap(), 0);
             assert!(fixture.runtime.replay.lock().is_none());
@@ -140,4 +175,75 @@ fn checkpoint_recovery_wal_native_restores_committed_image_without_completion_or
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_wal_native_preserves_matching_original_options_and_rejects_conflicts() {
+    for case in 0..5 {
+        let fixture = IntentCrashFixture::new(CrashPoint::FirstMainBackfillWrite, 1);
+        let limit = fixture.runtime.files.authority.configured_history_limit();
+        let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+        let selected = fixture.io.block(|| opening.poll()).unwrap();
+        let mut mirror = selected.begin_intent_mirror().unwrap();
+        let intent = fixture.io.block(|| mirror.poll()).unwrap();
+        let mut options = crate::OpenOptions::new(Arc::new(crate::EngineDialect));
+        options = match case {
+            0 => options.with_shared_mvcc_for_test(limit),
+            1 => options.with_shared_mvcc_for_test(limit + 4096),
+            2 => options.wal_path("must-not-open-this-override"),
+            3 => options.db_opts(crate::DatabaseOpts::new().with_multiprocess_wal(true)),
+            _ => options.db_opts(
+                crate::DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+            ),
+        };
+        let result = intent.begin_physical_wal_recovery(options);
+        if case == 0 {
+            let mut recovery = result.unwrap();
+            let recovered = fixture.io.block(|| recovery.poll()).unwrap();
+            assert_eq!(
+                recovered.parts.persistent_timestamp,
+                recovered.record().prefix().committed_timestamp
+            );
+            assert!(recovered.guard().requires_recovery());
+        } else {
+            assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+            fixture.assert_durable_unchanged();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_wal_native_original_readonly_participant_cannot_copy() {
+    let fixture = IntentCrashFixture::new(CrashPoint::FirstMainBackfillWrite, 1);
+    let path = fixture.path.canonicalize().unwrap();
+    let limit = fixture.runtime.files.authority.configured_history_limit();
+    let main = fixture
+        .io
+        .open_file(
+            path.to_str().unwrap(),
+            crate::OpenFlags::ReadOnly | crate::OpenFlags::NoLock,
+            false,
+        )
+        .unwrap();
+    let runtime = SharedMvccRuntime::open_existing(
+        fixture.io.clone(),
+        main.clone(),
+        main.file_id().unwrap().unwrap(),
+        &path,
+        limit,
+        true,
+    )
+    .unwrap();
+    let mut opening = runtime.begin_checkpoint_recovery().unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
+    let mut mirror = selected.begin_intent_mirror().unwrap();
+    let intent = fixture.io.block(|| mirror.poll()).unwrap();
+    let options =
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit);
+    assert!(
+        matches!(intent.begin_physical_wal_recovery(options), Err(LimboError::InvalidArgument(message)) if message == "shared checkpoint recovery requires a writable participant")
+    );
+    fixture.assert_durable_unchanged();
 }

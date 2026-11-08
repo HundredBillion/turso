@@ -11,6 +11,7 @@ pub(crate) struct SharedPhysicalConnection {
     connection: Option<Arc<Connection>>,
     reparse: crate::connection::ReparseSchemaState,
     terminal: bool,
+    scanned_wal: Option<Arc<RwLock<WalFileShared>>>,
 }
 
 #[allow(dead_code)]
@@ -32,7 +33,61 @@ impl SharedPhysicalConnection {
         Self::new(io, path, options.storage(Arc::new(DatabaseFile::new(file))))
     }
 
+    pub(crate) fn validate_recovery_options(
+        options: &OpenOptions,
+        history_limit: u64,
+    ) -> Result<()> {
+        if history_limit == 0 {
+            return Err(LimboError::Corrupt(
+                "shared recovery history limit is zero".into(),
+            ));
+        }
+        if options
+            .shared_mvcc_history_limit
+            .is_some_and(|requested| requested != history_limit)
+        {
+            return Err(LimboError::InvalidArgument(
+                "physical recovery history limit differs from runtime".into(),
+            ));
+        }
+        if options.storage.is_some()
+            || options.readonly_storage.is_some()
+            || options.durable_storage.is_some()
+            || options.wal_path.is_some()
+            || options.encryption.is_some()
+            || options.page_codec.is_some()
+            || options.db_opts.enable_encryption
+            || options.db_opts.enable_multiprocess_wal
+            || options.db_opts.enable_experimental_mvcc_passive_checkpoint
+        {
+            return Err(LimboError::InvalidArgument(
+                "physical WAL recovery requires private unencoded retained storage".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn new_with_retained_wal(
+        io: Arc<dyn IO>,
+        path: String,
+        options: OpenOptions,
+        file: Arc<dyn crate::File>,
+        scanned_wal: Arc<RwLock<WalFileShared>>,
+    ) -> Result<Self> {
+        let mut opening = Self::new_with_retained_file(io, path, options, file)?;
+        opening.scanned_wal = Some(scanned_wal);
+        Ok(opening)
+    }
+
     pub(crate) fn new(io: Arc<dyn IO>, path: String, options: OpenOptions) -> Result<Self> {
+        if options.db_opts.enable_multiprocess_wal
+            || options.db_opts.enable_experimental_mvcc_passive_checkpoint
+            || options.wal_path.is_some()
+        {
+            return Err(LimboError::InvalidArgument(
+                "physical reader excludes shared coordination options".into(),
+            ));
+        }
         if path.is_empty() || is_memory_like(&path) {
             return Err(LimboError::InvalidArgument(
                 "physical reader requires a persistent diagnostic path".into(),
@@ -78,6 +133,7 @@ impl SharedPhysicalConnection {
             connection: None,
             reparse: Default::default(),
             terminal: false,
+            scanned_wal: None,
         })
     }
 
@@ -101,11 +157,32 @@ impl SharedPhysicalConnection {
 
     fn poll_inner(&mut self) -> IOResultOr<Arc<Connection>> {
         if self.pager.is_none() {
-            self.pager = Some(Arc::new(return_if_io!(self.database._init_nonblock(
-                &mut self.init,
-                None,
-                None
-            ))));
+            let mut pager = return_if_io!(self.database._init_nonblock(&mut self.init, None, None));
+            if let Some(scanned) = self.scanned_wal.take() {
+                let shared = scanned.read();
+                let header_size = shared.metadata.wal_header.lock().page_size;
+                if shared.metadata.max_frame.load(Ordering::Acquire) > 0
+                    && pager.get_page_size().map(|size| size.get()) != Some(header_size)
+                {
+                    return Err(LimboError::Corrupt(
+                        "physical WAL page size differs from main".into(),
+                    )
+                    .into());
+                }
+                let snapshot = shared.last_checksum_and_max_frame();
+                drop(shared);
+                let wal = WalFile::new(
+                    self.database.io.clone(),
+                    scanned,
+                    snapshot,
+                    self.database.buffer_pool.clone(),
+                );
+                wal.set_io_context(pager.io_ctx.read().clone());
+                pager.set_wal(Arc::new(wal));
+                pager.clear_page_cache(true);
+                pager.set_schema_cookie(None);
+            }
+            self.pager = Some(Arc::new(pager));
         }
         if self.connection.is_none() {
             let pager = self.pager.as_ref().unwrap();

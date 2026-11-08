@@ -1,4 +1,10 @@
 #[cfg(all(host_shared_wal, unix))]
+#[path = "checkpoint_intent_inspection.rs"]
+mod checkpoint_intent_inspection;
+#[cfg(all(host_shared_wal, unix))]
+pub(in crate::mvcc) use checkpoint_intent_inspection::CheckpointIntentInspection;
+
+#[cfg(all(host_shared_wal, unix))]
 #[path = "checkpoint_recovery_confirmation.rs"]
 pub(in crate::mvcc) mod checkpoint_recovery_confirmation;
 

@@ -94,7 +94,11 @@ mod shared_runtime;
 #[allow(unused_imports)]
 pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[cfg(all(host_shared_wal, unix))]
-pub(in crate::mvcc) use shared_runtime::{RecoveryCompletionEvidence, RecoveryIntentEvidence};
+pub(crate) use shared_runtime::{RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence};
+#[cfg(all(host_shared_wal, unix))]
+pub(in crate::mvcc) use shared_runtime::{
+    RecoveryCompletionEvidence, RecoveryIntentEvidence, RecoveryWalEvidence,
+};
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
 pub(crate) use shared_runtime::{
