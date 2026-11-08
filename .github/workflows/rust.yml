@@ -1,75 +1,49 @@
-name: Shared pager Windows compilation
+name: Idle shared Store generation baseline
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  windows-pager-check:
-    runs-on: windows-latest
+  idle-generation-red:
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
-    defaults:
-      run:
-        shell: bash
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 0b37ca84557e4bd2f1b34c67cc50c263e7a47840
+          ref: 8d5a193dba976c7aa9ffd261330666c63f00fe26
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: pager-generation-windows-188
-      - name: Record exact source and platform
+          shared-key: recovery-native-143ccda
+      - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 0b37ca84557e4bd2f1b34c67cc50c263e7a47840
+          test "$(git rev-parse HEAD)" = 8d5a193dba976c7aa9ffd261330666c63f00fe26
           rustc -Vv | tee rustc.txt
-      - name: Windows shared-refresh typecheck
+          stat -f -c 'temporary filesystem: %T (%t)' /tmp
+      - name: Actual checkpoint and later commits must expose stale idle Store
         run: |
-          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-check.log
-          cargo fmt --all -- --check
-          git diff --exit-code
-      - name: Removing the Unix guard must reproduce the Windows field error
-        run: |
-          trap 'git restore core/mvcc/database/shared_refresh.rs' EXIT
-          python -c 'from pathlib import Path; p=Path("core/mvcc/database/shared_refresh.rs"); s=p.read_text(); old="        #[cfg(all(host_shared_wal, unix))]\n"; assert s.count(old)==1; p.write_text(s.replace(old,""))'
           set +e
-          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-cfg-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-generation-red.log
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -ne 0
-          grep -q 'E0609' windows-cfg-red.log
-          grep -q 'shared_runtime' windows-cfg-red.log
-          git restore core/mvcc/database/shared_refresh.rs
-      - name: Removing the native checkpoint guard must reproduce its missing proof type
-        run: |
-          trap 'git restore core/mvcc/commit_manifest/checkpoint_publication.rs' EXIT
-          python -c 'from pathlib import Path; p=Path("core/mvcc/commit_manifest/checkpoint_publication.rs"); s=p.read_text(); old="    #[cfg(all(host_shared_wal, unix))]\n    pub(in crate::mvcc) fn begin_completion("; assert s.count(old)==1; p.write_text(s.replace(old,"    pub(in crate::mvcc) fn begin_completion("))'
-          set +e
-          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-proof-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'E0412' windows-proof-red.log
-          grep -q 'MaterializedCheckpointProof' windows-proof-red.log
-          git restore core/mvcc/commit_manifest/checkpoint_publication.rs
-      - name: Restored Windows source must typecheck
-        run: |
+          grep -q '0 passed; 1 failed' idle-generation-red.log
+          grep -q 'idle old-generation process failed to refresh a nonempty newer generation' idle-generation-red.log
+          grep -q 'shared replay boundary changed incompatibly' idle-generation-red.log
           git diff --exit-code
-          cargo check --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee windows-restored.log
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pager-generation-0b37-windows
+          name: idle-generation-8d5a-red
           path: |
             source.txt
             rustc.txt
-            windows-check.log
-            windows-cfg-red.log
-            windows-proof-red.log
-            windows-restored.log
+            idle-generation-red.log
