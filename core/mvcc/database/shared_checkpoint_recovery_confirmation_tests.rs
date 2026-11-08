@@ -361,12 +361,47 @@ fn inspect(fixture: &FaultFixture) -> InspectedRecoveryIds {
     fixture.io.block(|| Ok(loading.poll()?)).unwrap()
 }
 fn fault_fixture(target_only: bool) -> FaultFixture {
+    fault_fixture_with_seed(target_only, false)
+}
+fn fault_fixture_with_seed(target_only: bool, seed_owner: bool) -> FaultFixture {
     let control = Arc::new(Control::default());
-    let fixture = shared_prepared_checkpoint_fixture(|_| {
-        Arc::new(ControlledIo {
+    let fixture = shared_prepared_checkpoint_fixture(|path| {
+        let io: Arc<dyn crate::IO> = Arc::new(ControlledIo {
             inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
             control: control.clone(),
-        })
+        });
+        if seed_owner {
+            let database = crate::Database::open(
+                io.clone(),
+                path.to_str().unwrap(),
+                crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                    .with_shared_mvcc_for_test(64 * 1024 * 1024),
+            )
+            .unwrap();
+            let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+            connection
+                .execute("BEGIN; SELECT value FROM preserved")
+                .unwrap();
+            let tx_id = connection.get_mv_tx_id_for_db(0).unwrap();
+            let store = database.get_mv_store().as_ref().unwrap().clone();
+            let mut state = crate::mvcc::database::SharedIdState::default();
+            for _ in 0..32 {
+                io.block(|| {
+                    Ok(store.shared_id_nonblock(
+                        &connection,
+                        connection.get_pager(),
+                        tx_id,
+                        0,
+                        crate::mvcc::database::SharedIdRequest::ReserveLogicalTable,
+                        &mut state,
+                    )?)
+                })
+                .unwrap();
+            }
+            state.reset();
+            connection.execute("ROLLBACK").unwrap();
+        }
+        io
     });
     let runtime = fixture
         .database
@@ -682,4 +717,33 @@ fn checkpoint_recovery_confirmation_native_finalized_selector_does_not_infer_sou
     assert_eq!(*fixture.control.offsets.lock(), [0, SLOT_SIZE as u64]);
     assert_eq!(unchanged_files(&fixture), before);
     assert!(confirmed.guard().requires_recovery());
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_physical_floor() {
+    let mut fixture = fault_fixture_with_seed(false, true);
+    let before = unchanged_files(&fixture);
+    let inspected = fixture.inspected.take().unwrap();
+    let maximum = inspected.ids.max_owner_epoch();
+    assert!(
+        maximum.is_some(),
+        "fixture did not retain a genuine journal owner epoch"
+    );
+    let physical = -(i64::try_from(
+        fixture.runtime.files.main.size().unwrap()
+            / u64::from(inspected.parts.header.page_size.get()),
+    )
+    .unwrap());
+    assert!(
+        inspected.ids.logical_floor() < physical,
+        "fixture did not distinguish permanent ID floor from physical extent"
+    );
+    let mut state = inspected.begin_confirmation().unwrap();
+    let confirmed = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+    assert_eq!(confirmed.max_owner_epoch(), maximum);
+    assert_eq!(confirmed.proof().materialized_floor(), physical);
+    assert_eq!(confirmed.proof().source_identity(), None);
+    assert!(confirmed.guard().requires_recovery());
+    assert_eq!(unchanged_files(&fixture), before);
 }
