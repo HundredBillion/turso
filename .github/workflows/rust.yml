@@ -1,4 +1,4 @@
-name: Explicit offline operator
+name: SDK inherited OFD control
 on:
   workflow_dispatch:
 permissions:
@@ -12,93 +12,35 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
 jobs:
-  cli:
+  sdk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1433499fa7537979376334ce1136fce60fb130c3
+          ref: 94a20d73f13dd76e8ac33ad674b5efc27a04a2f6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Exact non-test executable
-        id: build
+      - name: Focused ownership
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 1433499fa7537979376334ce1136fce60fb130c3
           rustc -Vv | tee rustc.txt
-          stat -f -c '%T %t' . /tmp
-          cargo build --locked -p turso_cli --bin tursodb 2>&1 | tee build.log
-          sha256sum target/debug/tursodb | tee binary-sha256.txt
-          target/debug/tursodb --version | tee version.txt
-          ldd target/debug/tursodb | tee libraries.txt
-      - name: Actual CLI no-write and closed-worker operators
+          cargo test --locked -p turso_sdk_kit --lib codec_reopen_observes_inherited_ofd_until_child_exec -- --nocapture 2>&1 | tee focused.log
+      - name: Full SDK ownership
+        if: always()
         run: |
-          failed=0
-          for case in no-write close roundtrip new stock stock-delete stock-wal stock-wal-crash stock-refusals busy; do
-            set +e
-            python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case "$case" > "$case.log" 2>&1
-            status=$?
-            set -e
-            echo "$status" > "$case-status.txt"
-            if test "$status" -ne 0; then failed=1; else grep -q '"result": "passed"' "$case.log"; fi
+          cargo test --locked -p turso_sdk_kit --lib -- --nocapture 2>&1 | tee sdk.log
+          for repeat in $(seq 1 20); do
+            cargo test --locked -p turso_sdk_kit --lib page_codec_is_applied_to_sdk_connections -- --nocapture 2>&1 | tee "codec-repeat-$repeat.log"
           done
-          test "$failed" -eq 0
-      - name: Ordinary core SDK and native close contracts
-        if: always() && steps.build.outcome == 'success'
-        run: |
-          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api,bench,fts -- --test-threads=2 2>&1 | tee core.log
-          grep '^test result:' core.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
-          cargo test --locked -p turso_core --lib --features conn_raw_api,bench,fts shared_offline_operator_native_close_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee native-close.log
-          grep '^test result:' native-close.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
-          cargo tree --locked -p turso_sdk_kit -e features > sdk-features.txt
-          cargo test --locked -p turso_sdk_kit --lib 2>&1 | tee sdk.log
-          for repeat in 1 2 3; do
-            cargo test --locked -p turso_sdk_kit --lib -- --nocapture 2>&1 | tee "sdk-repeat-$repeat.log"
-          done
-          grep '^test result:' sdk.log | tail -1 | grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;'
-      - name: Actual CLI resume after genuine native crash fixtures
-        if: always() && steps.build.outcome == 'success'
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api,bench,fts --no-run --message-format=json > test-build.json 2> test-build.log
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          rows=[json.loads(line) for line in Path('test-build.json').read_text().splitlines()]
-          matches=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r.get('target',{}).get('name')=='turso_core' and r.get('profile',{}).get('test') and r.get('executable')]
-          assert len(matches)==1,matches
-          Path('test-binary.txt').write_text(matches[0])
-          PY
-          python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --test-binary "$(cat test-binary.txt)" --case crash 2>&1 | tee crash.log
-          grep -q '"case": "crash", "result": "passed"' crash.log
-      - name: Strict source lint and formatting
-        if: always() && steps.build.outcome == 'success'
-        run: |
-          cargo clippy --locked -p turso_core -p turso_cli --all-targets --features turso_core/bench -- -D warnings 2>&1 | tee clippy.log
-          cargo fmt --all --check
-          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-offline-operator
+          name: sdk-inherited-ofd-control
           path: |
             *.log
-            *.txt
-            *.diff
-          retention-days: 14
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 1433499fa7537979376334ce1136fce60fb130c3
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fork-mvcc-windows
-          cache-on-failure: true
-      - run: cargo check --locked -p turso_core -p turso_cli --lib --bins
+            source.txt
+            rustc.txt
