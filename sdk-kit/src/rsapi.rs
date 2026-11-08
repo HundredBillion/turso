@@ -1870,6 +1870,10 @@ mod tests {
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
 
+    // A forked child temporarily inherits OFD ownership until exec closes its
+    // descriptors. Keep immediate same-file reopen checks outside that window.
+    static NATIVE_REOPEN_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn structured_constraint_errors_keep_sqlite_codes() {
         for kind in [
@@ -2103,6 +2107,7 @@ mod tests {
     #[test]
     fn cached_sdk_join_preserves_existing_process_file_lock() {
         use turso_core::IO;
+        let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
 
         const CHILD_PATH: &str = "TURSO_SDK_LOCK_PROBE_PATH";
         const CHILD_BLOCKED: &str = "TURSO_SDK_LOCK_PROBE_BLOCKED";
@@ -2246,6 +2251,7 @@ mod tests {
 
     #[test]
     pub fn page_codec_is_applied_to_sdk_connections() {
+        let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
         let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
@@ -2253,9 +2259,15 @@ mod tests {
             reserved_bytes: 1,
         });
 
-        {
+        let owners = {
             let db = open_database_with_page_codec(db_path, codec.clone());
             let conn = db.connect().unwrap();
+            let owners = (
+                Arc::downgrade(db.db.lock().unwrap().as_ref().unwrap()),
+                Arc::downgrade(&conn.connection),
+                Arc::downgrade(&conn.connection.get_pager()),
+                Arc::downgrade(&conn.connection.get_pager().db_file),
+            );
 
             let mut stmt = conn
                 .prepare_single("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
@@ -2271,7 +2283,18 @@ mod tests {
                 .prepare_single("PRAGMA wal_checkpoint(TRUNCATE)")
                 .unwrap();
             assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
-        }
+            owners
+        };
+        assert_eq!(
+            (
+                owners.0.strong_count(),
+                owners.1.strong_count(),
+                owners.2.strong_count(),
+                owners.3.strong_count()
+            ),
+            (0, 0, 0, 0),
+            "codec scope retained Database/Connection/Pager/Storage owners"
+        );
 
         let raw_database = std::fs::read(db_path).unwrap();
         assert_ne!(&raw_database[..16], b"SQLite format 3\0");
@@ -2833,6 +2856,7 @@ mod tests {
 
         #[test]
         fn test_encryption() {
+            let _native_lifetime = NATIVE_REOPEN_AND_SPAWN.lock().unwrap();
             let temp_file = NamedTempFile::new().unwrap();
             let db_path = temp_file.path().to_str().unwrap();
 

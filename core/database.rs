@@ -277,10 +277,19 @@ impl OpenOptions {
         dialect.register_native_extensions(options)
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_shared_mvcc_for_test(mut self, history_limit: u64) -> Self {
+    /// Intentionally open an existing native shared-MVCC database.
+    ///
+    /// This never upgrades an ordinary database or creates the shared namespace.
+    /// The stored history limit must match; unsupported platforms and storage
+    /// options are rejected by the open operation.
+    pub fn with_shared_mvcc(mut self, history_limit: u64) -> Self {
         self.shared_mvcc_history_limit = Some(history_limit);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_shared_mvcc_for_test(self, history_limit: u64) -> Self {
+        self.with_shared_mvcc(history_limit)
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {

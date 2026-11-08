@@ -2685,6 +2685,12 @@ impl Connection {
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
+        // Shared commits durably publish the logical log and manifest. Physical WAL
+        // maintenance requires its checkpoint authority, never an unscoped close.
+        let shared_mvcc = self
+            .mv_store()
+            .as_ref()
+            .is_some_and(|store| store.is_shared());
         let should_checkpoint_on_close = pager
             .wal
             .as_ref()
@@ -2692,6 +2698,7 @@ impl Connection {
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.is_readonly(crate::MAIN_DB_ID)
             && !is_memory_db
+            && !shared_mvcc
             && should_checkpoint_on_close
         {
             self.pager

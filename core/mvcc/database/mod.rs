@@ -95,7 +95,7 @@ mod shared_runtime;
 pub(in crate::mvcc) use shared_oracle::SharedOracleTransaction;
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]
-pub(in crate::mvcc) use shared_runtime::InstalledDowngradeSource;
+pub(in crate::mvcc) use shared_runtime::{downgrade_existing, InstalledDowngradeSource};
 #[cfg(all(host_shared_wal, unix))]
 pub(in crate::mvcc) use shared_runtime::RecoveryWalEvidence;
 #[cfg(all(host_shared_wal, unix))]

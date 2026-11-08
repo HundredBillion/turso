@@ -9,6 +9,7 @@ mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
 mod read_state_machine;
+mod shared_mvcc;
 mod sync_server;
 
 #[cfg(feature = "mvcc_repl")]
@@ -76,10 +77,14 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    use clap::Parser as _;
+    let opts = app::Opts::parse();
+    shared_mvcc::validate(&opts)?;
+    if shared_mvcc::run_offline(&opts)? {
+        return Ok(());
+    }
     #[cfg(feature = "mvcc_repl")]
     {
-        use clap::Parser as _;
-        let opts = app::Opts::parse();
         if opts.mvcc {
             let path = opts
                 .database
@@ -91,7 +96,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (mut app, _guard) = app::Limbo::new()?;
+    let (mut app, _guard) = app::Limbo::from_opts(opts)?;
 
     if app.is_mcp_mode() {
         return run_mcp_server(app);

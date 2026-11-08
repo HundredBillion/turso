@@ -2,11 +2,14 @@ use super::ordinary::{resume_prepared_marker, OrdinaryOfflineBackend};
 use super::{OfflineModeChange, OfflinePrerequisite, Result, MIN_HISTORY_LIMIT};
 use std::path::Path;
 
-pub(in crate::mvcc) enum OfflineOperation<'a> {
+pub(crate) enum OfflineOperation<'a> {
     UpgradeExisting {
         path: &'a Path,
     },
     ResumePreparedMarker {
+        path: &'a Path,
+    },
+    DowngradeExisting {
         path: &'a Path,
     },
     ResumeDowngradeMarker {
@@ -21,7 +24,7 @@ pub(in crate::mvcc) enum OfflineOperation<'a> {
     },
 }
 
-pub(in crate::mvcc) fn execute_offline(
+pub(crate) fn execute_offline(
     operation: OfflineOperation<'_>,
     prerequisite: OfflinePrerequisite,
     history_limit: u64,
@@ -43,6 +46,9 @@ pub(in crate::mvcc) fn execute_offline(
         }
         OfflineOperation::ResumePreparedMarker { path } => {
             resume_prepared_marker(path, history_limit, prerequisite)
+        }
+        OfflineOperation::DowngradeExisting { path } => {
+            crate::mvcc::database::downgrade_existing(path, history_limit, prerequisite)
         }
         OfflineOperation::ResumeDowngradeMarker { path } => {
             super::downgrade_resume::resume_marker(path, history_limit, prerequisite)?.cleanup()
