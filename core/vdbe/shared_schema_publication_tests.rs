@@ -7,19 +7,26 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_schema_publication_native_independent_stores() {
-    publication_orders(false);
+    publication_orders(false, false);
 }
 
 #[test]
 #[ignore = "requires native Linux ext-family filesystem"]
 fn shared_schema_publication_native_independent_processes() {
-    publication_orders(true);
+    publication_orders(true, false);
 }
 
-fn publication_orders(processes: bool) {
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_schema_publication_native_sequence_domains() {
+    publication_orders(false, true);
+    publication_orders(true, true);
+}
+
+fn publication_orders(processes: bool, sequence: bool) {
     for same_name in [false, true] {
         for first_commit in [0, 1] {
-            eprintln!("schema publication processes={processes}, same_name={same_name}, first_commit={first_commit}");
+            eprintln!("schema publication processes={processes}, same_name={same_name}, first_commit={first_commit}, sequence={sequence}");
             let directory = tempfile::tempdir().unwrap();
             let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
             let mut workers = [
@@ -35,21 +42,32 @@ fn publication_orders(processes: bool) {
                 assert_eq!(worker.query("SELECT count(*) FROM preserved"), "[1]");
             }
             for (index, worker) in workers.iter_mut().enumerate() {
-                assert_eq!(
-                    worker.execute(&format!(
-                        "CREATE TABLE {}(id INTEGER PRIMARY KEY, value INTEGER)",
-                        names[index]
-                    )),
-                    "OK"
-                );
-                assert_eq!(
-                    worker.execute(&format!(
-                        "INSERT INTO {} VALUES(1,{})",
-                        names[index],
-                        index + 10
-                    )),
-                    "OK"
-                );
+                if sequence {
+                    assert_eq!(
+                        worker.execute(&format!(
+                            "CREATE SEQUENCE {} START {}",
+                            names[index],
+                            index + 10
+                        )),
+                        "OK"
+                    );
+                } else {
+                    assert_eq!(
+                        worker.execute(&format!(
+                            "CREATE TABLE {}(id INTEGER PRIMARY KEY, value INTEGER)",
+                            names[index]
+                        )),
+                        "OK"
+                    );
+                    assert_eq!(
+                        worker.execute(&format!(
+                            "INSERT INTO {} VALUES(1,{})",
+                            names[index],
+                            index + 10
+                        )),
+                        "OK"
+                    );
+                }
             }
             // Both workers acknowledge staged DDL before either is permitted to commit.
             let mut acknowledged = [false; 2];
@@ -78,38 +96,40 @@ fn publication_orders(processes: bool) {
                 "two same-name schema commits acknowledged"
             );
             let mut observer = Worker::open(&path, limit, processes);
-            verify_catalog(&mut observer, names, acknowledged);
+            verify_catalog(&mut observer, names, acknowledged, sequence);
             drop(observer);
             for worker in &mut workers {
-                verify_catalog(worker, names, acknowledged);
+                verify_catalog(worker, names, acknowledged, sequence);
             }
             drop(workers);
             // A new process/store must reconstruct exactly the acknowledged catalog and data.
             let mut reopened = Worker::open(&path, limit, processes);
-            verify_catalog(&mut reopened, names, acknowledged);
+            verify_catalog(&mut reopened, names, acknowledged, sequence);
         }
     }
 }
 
-fn verify_catalog(worker: &mut Worker, names: [&str; 2], acknowledged: [bool; 2]) {
+fn verify_catalog(worker: &mut Worker, names: [&str; 2], acknowledged: [bool; 2], sequence: bool) {
     let count = acknowledged.iter().filter(|ack| **ack).count();
     assert_eq!(
         worker.query(
-            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name LIKE 'created_%'"
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name LIKE '%created_%'"
         ),
         format!("[{count}]")
     );
     assert_eq!(worker.query("SELECT count(*) FROM (SELECT name FROM sqlite_schema WHERE type='table' GROUP BY name HAVING count(*)>1)"), "[0]");
     for (index, accepted) in acknowledged.into_iter().enumerate() {
         if accepted {
-            assert_eq!(
-                worker.query(&format!("SELECT value FROM {} WHERE id=1", names[index])),
-                format!("[{}]", index + 10)
-            );
+            let query = if sequence {
+                format!("SELECT sequence_watermark_experimental('{}')", names[index])
+            } else {
+                format!("SELECT value FROM {} WHERE id=1", names[index])
+            };
+            assert_eq!(worker.query(&query), format!("[{}]", index + 10));
         } else if names[0] != names[1] {
             assert_eq!(
                 worker.query(&format!(
-                    "SELECT count(*) FROM sqlite_schema WHERE name='{}'",
+                    "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%{}'",
                     names[index]
                 )),
                 "[0]"
