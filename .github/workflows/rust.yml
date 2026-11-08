@@ -1,4 +1,4 @@
-name: Prepare peer schema refresh validation
+name: Verified checkpoint and claim lifecycle integration
 on:
   workflow_dispatch:
 permissions:
@@ -11,44 +11,62 @@ env:
 jobs:
   coordinator:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 061450b7883de0e9b686e6aab0d3993f671a6d3a
+          ref: db117f2695226c7dc4fca1bc89de2f8be5363eee
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Exact source and native filesystem
+      - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "061450b7883de0e9b686e6aab0d3993f671a6d3a"
+          test "$(git rev-parse HEAD)" = "db117f2695226c7dc4fca1bc89de2f8be5363eee"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
-      - name: Verified existing peer preparation prerequisite
+      - name: Final checkpoint readiness
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_stale_prepare_native_peer_sequence_ddl -- --ignored --test-threads=1 2>&1 | tee prerequisite.log
-          grep -q '1 passed; 0 failed' prerequisite.log
-      - name: Prepare directly after peer DDL
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee group-0.log
+          grep -q '4 passed; 0 failed' group-0.log
+      - name: Checkpoint installation and retirement
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_prepare_native_ -- --ignored --test-threads=1 2>&1 | tee prepare-green.log
-          grep -q '2 passed; 0 failed' prepare-green.log
-      - name: Native ID and watermark regression coverage
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_install_native_ -- --ignored --test-threads=1 2>&1 | tee group-1.log
+          grep -q '6 passed; 0 failed' group-1.log
+      - name: Connection construction and pager ownership
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 2>&1 | tee ids.log
-          grep -q '13 passed; 0 failed' ids.log
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 2>&1 | tee group-2.log
+          grep -q '6 passed; 0 failed' group-2.log
+      - name: Completed pager certification
+        run: |
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 2>&1 | tee group-3.log
+          grep -q '1 passed; 0 failed' group-3.log
+      - name: Scoped claim lifecycle
+        run: |
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_native_ -- --ignored --test-threads=1 2>&1 | tee group-4.log
+          grep -q '8 passed; 0 failed' group-4.log
+      - name: Actual mutation completion retirement
+        run: |
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_lifecycle_io_native_ -- --ignored --test-threads=1 2>&1 | tee group-5.log
+          grep -q '2 passed; 0 failed' group-5.log
+      - name: Global row and sequence allocation
+        run: |
+          timeout 300s cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 2>&1 | tee group-6.log
+          grep -q '13 passed; 0 failed' group-6.log
+      - name: Watermark readers and durable peer state
+        run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --skip shared_watermark_process_child --test-threads=1 2>&1 | tee watermark.log
           grep -q '3 passed; 0 failed' watermark.log
-      - name: MVCC regression suite and strict lint
+      - name: Full ordinary core and strict lint
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=2 2>&1 | tee mvcc.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' mvcc.log
+          timeout 600s cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=2 2>&1 | tee core.log
+          grep -Eq '[1-9][0-9]* passed; 0 failed' core.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: id-cleanup-capacity
+          name: checkpoint-lifecycle-integration
           path: '*.log'
