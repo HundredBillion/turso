@@ -1,6 +1,11 @@
 name: Verified checkpoint and claim lifecycle integration
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        type: choice
+        default: all
+        options: [all, linux, windows, pdo]
 permissions:
   contents: read
 env:
@@ -11,6 +16,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
   coordinator:
+    if: ${{ inputs.platform != 'windows' && inputs.platform != 'pdo' }}
     defaults:
       run:
         shell: bash
@@ -130,6 +136,7 @@ jobs:
           name: checkpoint-lifecycle-integration
           path: '*.log'
   windows:
+    if: ${{ inputs.platform != 'linux' && inputs.platform != 'pdo' }}
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
@@ -140,6 +147,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
+      - name: Setup MSVC
+        uses: ./.github/shared/setup-msvc
       - name: Check ordinary Windows compatibility
         run: cargo check --locked -p turso_core --lib --features conn_raw_api,bench
       - name: Windows C binding compatibility
@@ -150,3 +159,67 @@ jobs:
           $env:PATH = "$pwd\target\debug;$env:PATH"
           cargo test --locked -p turso_sqlite3 --lib --test compat -- --test-threads=2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  pdo:
+    if: ${{ inputs.platform == 'pdo' || inputs.platform == 'all' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 8f71b5525766e4a070f6397a09d24946794f8cd9
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-mvcc-authority
+          cache-on-failure: true
+      - name: Install actual PHP PDO
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y php-cli php-sqlite3
+          php --version
+          php -l bindings/c/tests/php_workers/worker.php
+      - name: Exact source and supervisor controls
+        run: |
+          test "$(git rev-parse HEAD)" = "8f71b5525766e4a070f6397a09d24946794f8cd9"
+          python3 -m unittest discover -s bindings/c/tests/php_workers -p 'test_*.py' 2>&1 | tee supervisor.log
+          python3 bindings/c/tests/php_workers/run.py --profile sqlite-wal-control --api pdo --output pdo-results/sqlite-control 2>&1 | tee sqlite-pdo.log
+      - name: Build and attest actual Turso PDO library
+        run: |
+          cargo build --locked -p turso_sqlite3
+          mkdir "$RUNNER_TEMP/turso-pdo-loader"
+          ln -s "$PWD/target/debug/libturso_sqlite3.so" "$RUNNER_TEMP/turso-pdo-loader/libsqlite3.so.0"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/turso-pdo-loader:$PWD/target/debug" python3 bindings/c/tests/php_workers/run.py --profile turso-single-worker-control --api pdo --library "$PWD/target/debug/libturso_sqlite3.so" --output pdo-results/turso-control 2>&1 | tee turso-pdo.log
+      - name: Explicit unsupported opt-in never creates files
+        run: |
+          mkdir "$RUNNER_TEMP/shared-refusal"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/turso-pdo-loader:$PWD/target/debug" TURSO_VALIDATION_LIBRARY="$PWD/target/debug/libturso_sqlite3.so" TURSO_VALIDATION_DIR="$RUNNER_TEMP/shared-refusal" php <<'PHP'
+          <?php
+          $expected = realpath(getenv('TURSO_VALIDATION_LIBRARY'));
+          $maps = file_get_contents('/proc/self/maps');
+          if (!$expected || !str_contains($maps, $expected)) {
+              throw new RuntimeException('expected Turso library is not mapped');
+          }
+          $directory = getenv('TURSO_VALIDATION_DIR');
+          $rejected = false;
+          try {
+              new PDO('sqlite:file:'.$directory.'/unavailable.db?turso_mvcc=shared', null, null,
+                  [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::SQLITE_ATTR_OPEN_FLAGS => 0x46]);
+          } catch (PDOException $error) {
+              if (!str_contains($error->getMessage(), 'shared MVCC is not available')) { throw $error; }
+              $rejected = true;
+          }
+          if (!$rejected || array_diff(scandir($directory), ['.', '..']) !== []) {
+              throw new RuntimeException('unsupported shared mode opened or created storage');
+          }
+          echo "Explicit PDO opt-in refused before creating files\n";
+          PHP
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: combined-php-pdo-controls
+          path: |
+            *.log
+            pdo-results
