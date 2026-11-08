@@ -350,6 +350,10 @@ mod tests {
         assert_eq!(confirmed.proof().target_identity(), target);
         assert_eq!(confirmed.max_owner_epoch(), Some(old_maximum));
         assert!(confirmed.guard().requires_recovery());
+        let before_finalizing = paths.each_ref().map(|path| std::fs::read(path).unwrap());
+        for index in [0, 2, 3, 4, 5, 6] {
+            assert_eq!(before_finalizing[index], before[index]);
+        }
         let mut finalizing = confirmed.begin_id_finalization().unwrap();
         let finalized = io.block(|| Ok(finalizing.poll()?)).unwrap();
         let (epoch, ready, after_timestamp) =
@@ -371,7 +375,10 @@ mod tests {
             Err(LimboError::Busy)
         ));
         for index in [0, 1, 2, 3] {
-            assert_eq!(std::fs::read(&paths[index]).unwrap(), before[index]);
+            assert_eq!(
+                std::fs::read(&paths[index]).unwrap(),
+                before_finalizing[index]
+            );
         }
     }
 }
