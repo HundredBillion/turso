@@ -7,6 +7,7 @@ defaults:
   run:
     shell: bash
 env:
+  CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: '1'
@@ -47,8 +48,13 @@ jobs:
           set -e
           echo "$status" > status.txt
           test "$status" -eq 100
-          grep -q 'has overflowed its stack' baseline.log
-          grep -q '1 test run:.*0 passed.*1 failed' baseline.log
+          python3 - <<'PYCODE'
+          import re
+          from pathlib import Path
+          Path('baseline-plain.log').write_text(re.sub(r'\x1b\[[0-9;]*m', '', Path('baseline.log').read_text()))
+          PYCODE
+          grep -q 'has overflowed its stack' baseline-plain.log
+          grep -Eq '1 tests? run:.*0 passed.*1 failed' baseline-plain.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
