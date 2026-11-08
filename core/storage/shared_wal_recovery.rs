@@ -141,4 +141,153 @@ mod tests {
         mapping.release_checkpoint(owner);
         drop(SharedWalRecoveryLocks::acquire(mapping).unwrap());
     }
+
+    enum Participant {
+        Writer,
+        Checkpoint,
+        Reader(SharedReaderSlot),
+    }
+    impl Participant {
+        fn acquire(mapping: &MappedSharedWalCoordination, role: &str) -> Self {
+            let owner = mapping.owner_record();
+            match role {
+                "writer" => {
+                    assert!(mapping.try_acquire_writer(owner));
+                    Self::Writer
+                }
+                "checkpoint" => {
+                    assert!(mapping.try_acquire_checkpoint(owner));
+                    Self::Checkpoint
+                }
+                "wal-reader" => Self::Reader(mapping.register_reader(owner, 7).unwrap()),
+                "main-reader" => Self::Reader(mapping.register_db_file_reader(owner).unwrap()),
+                _ => panic!("unknown physical participant"),
+            }
+        }
+        fn release(self, mapping: &MappedSharedWalCoordination) {
+            match self {
+                Self::Writer => mapping.release_writer(mapping.owner_record()),
+                Self::Checkpoint => mapping.release_checkpoint(mapping.owner_record()),
+                Self::Reader(slot) => mapping.unregister_reader(slot),
+            }
+        }
+        fn assert_unchanged(&self, mapping: &MappedSharedWalCoordination) {
+            match self {
+                Self::Writer => assert_eq!(mapping.writer_owner(), Some(mapping.owner_record())),
+                Self::Checkpoint => {
+                    assert_eq!(mapping.checkpoint_owner(), Some(mapping.owner_record()))
+                }
+                Self::Reader(slot) => {
+                    assert_eq!(mapping.reader_owner(slot.slot_index), Some(slot.owner))
+                }
+            }
+        }
+    }
+
+    fn native_mapping(path: &Path) -> Arc<MappedSharedWalCoordination> {
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        Arc::new(MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap())
+    }
+
+    #[test]
+    #[ignore = "requires native Linux OFD locks"]
+    fn physical_wal_recovery_native_local_owners_remain_valid_until_release() {
+        for role in ["writer", "checkpoint", "wal-reader", "main-reader"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mapping = native_mapping(&directory.path().join("tshm"));
+            let participant = Participant::acquire(&mapping, role);
+            assert!(matches!(
+                SharedWalRecoveryLocks::acquire(mapping.clone()),
+                Err(LimboError::Busy)
+            ));
+            participant.assert_unchanged(&mapping);
+            participant.release(&mapping);
+            drop(SharedWalRecoveryLocks::acquire(mapping.clone()).unwrap());
+            Participant::acquire(&mapping, role).release(&mapping);
+        }
+    }
+
+    struct NativeChild(std::process::Child);
+    impl NativeChild {
+        fn spawn(path: &Path, role: &str) -> Self {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "storage::shared_wal_coordination::recovery::tests::physical_wal_recovery_child", "--ignored", "--nocapture", "--test-threads=1"])
+                .env("TURSO_PHYSICAL_RECOVERY_PATH", path)
+                .env("TURSO_PHYSICAL_RECOVERY_ROLE", role)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if send.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let child = Self(child);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let line = receive
+                    .recv_timeout(deadline.checked_duration_since(Instant::now()).unwrap())
+                    .unwrap()
+                    .unwrap();
+                if line.contains("PHYSICAL_PARTICIPANT_READY") {
+                    return child;
+                }
+            }
+        }
+        fn kill(&mut self) {
+            use std::os::unix::process::ExitStatusExt;
+            self.0.kill().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    assert_eq!(status.signal(), Some(9));
+                    return;
+                }
+                assert!(Instant::now() < deadline, "physical owner failed to exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    impl Drop for NativeChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native Linux OFD locks"]
+    fn physical_wal_recovery_native_foreign_owners_block_until_sigkill() {
+        for role in ["writer", "checkpoint", "wal-reader", "main-reader"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("tshm");
+            let mapping = native_mapping(&path);
+            let mut child = NativeChild::spawn(&path, role);
+            assert!(matches!(
+                SharedWalRecoveryLocks::acquire(mapping.clone()),
+                Err(LimboError::Busy)
+            ));
+            child.kill();
+            drop(SharedWalRecoveryLocks::acquire(mapping.clone()).unwrap());
+            Participant::acquire(&mapping, role).release(&mapping);
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper; requires parent physical participant parameters"]
+    fn physical_wal_recovery_child() {
+        use std::io::Write;
+        let path = std::env::var("TURSO_PHYSICAL_RECOVERY_PATH").unwrap();
+        let role = std::env::var("TURSO_PHYSICAL_RECOVERY_ROLE").unwrap();
+        let mapping = native_mapping(Path::new(&path));
+        let _participant = Participant::acquire(&mapping, &role);
+        println!("PHYSICAL_PARTICIPANT_READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
 }

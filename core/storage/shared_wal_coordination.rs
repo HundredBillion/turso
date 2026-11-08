@@ -26,8 +26,6 @@
 #[cfg(unix)]
 #[path = "shared_wal_recovery.rs"]
 mod recovery;
-#[cfg(unix)]
-pub(crate) use recovery::SharedWalRecoveryLocks;
 
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
