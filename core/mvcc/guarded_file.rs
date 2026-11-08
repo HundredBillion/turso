@@ -417,7 +417,7 @@ mod tests {
         drop(binding);
         let io = RetirementIo {
             inner: crate::io::MemoryIO::new(),
-            backend: backend.clone(),
+            backend,
             steps: Default::default(),
         };
         io.wait_for_completion(waiter.clone()).unwrap();

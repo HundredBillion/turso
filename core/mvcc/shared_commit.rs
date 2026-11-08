@@ -649,8 +649,7 @@ mod tests {
         f.manifest.retire();
         let guard = f.authority.try_acquire().unwrap();
         assert!(guard.requires_recovery());
-        let mut load =
-            ManifestLoad::new(f.manifest.clone(), guard, FileId { dev: 1, ino: 2 }).unwrap();
+        let mut load = ManifestLoad::new(f.manifest, guard, FileId { dev: 1, ino: 2 }).unwrap();
         let IOResult::Done(loaded) = load.poll().unwrap() else {
             panic!("immediate reads")
         };

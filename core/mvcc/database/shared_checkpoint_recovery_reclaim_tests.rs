@@ -203,7 +203,7 @@ fn log_fixture_with_io(
         })
     });
     let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
-    let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+    let finalized = fixture.io.block(|| finalizing.poll()).unwrap();
     assert_finalized(&fixture, &finalized);
     let (header, offset, crc) = fixture.old_append.take().unwrap();
     assert!(header.is_some() && offset > 0);
@@ -255,10 +255,10 @@ fn retry(fixture: &mut Fixture, trace: &LogTrace) -> ReclaimedRecoveredCheckpoin
     trace.enabled.store(false, Ordering::Release);
     fixture.confirmed = Some(fixture.reconfirm());
     let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
-    let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+    let finalized = fixture.io.block(|| finalizing.poll()).unwrap();
     trace.arm(&fixture.runtime, usize::MAX, false, usize::MAX);
     let mut reclaiming = finalized.begin_log_reclamation().unwrap();
-    fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap()
+    fixture.io.block(|| reclaiming.poll()).unwrap()
 }
 fn to_log_delay(
     fixture: &Fixture,
@@ -291,7 +291,7 @@ fn checkpoint_recovery_reclaim_native_log_failures_retry() {
             let (mut fixture, trace, finalized) = log_fixture(boundary, callback_error, usize::MAX);
             let before = preserved(&fixture);
             let mut reclaiming = finalized.begin_log_reclamation().unwrap();
-            let error = match fixture.io.block(|| Ok(reclaiming.poll()?)) {
+            let error = match fixture.io.block(|| reclaiming.poll()) {
                 Ok(_) => panic!("logical reclamation ignored injected failure {boundary}"),
                 Err(error) => error,
             };
@@ -362,7 +362,7 @@ fn checkpoint_recovery_reclaim_native_log_waits_for_physical_retirement() {
         assert!(fixture.runtime.replay.lock().is_none());
         assert!(fixture.runtime.reserve_store().is_err());
         trace.transport.retire();
-        let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+        let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
         assert_reclaimed(&fixture, &trace, &reclaimed);
         assert_eq!(preserved(&fixture), before);
     }
@@ -409,7 +409,7 @@ fn checkpoint_recovery_reclaim_native_log_rejects_changed_evidence() {
             5 => {
                 let mut other = other;
                 let mut finalizing = other.start(usize::MAX, false, usize::MAX);
-                let foreign = other.io.block(|| Ok(finalizing.poll()?)).unwrap();
+                let foreign = other.io.block(|| finalizing.poll()).unwrap();
                 finalized.finalized = foreign.finalized;
             }
             _ => unreachable!(),
@@ -437,7 +437,7 @@ fn checkpoint_recovery_bootstrap_native_preserves_captured_config() {
     let (fixture, trace, finalized) = log_fixture(usize::MAX, false, usize::MAX);
     let config = finalized.config.clone();
     let mut reclaiming = finalized.begin_log_reclamation().unwrap();
-    let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
     assert_reclaimed(&fixture, &trace, &reclaimed);
     assert!(Arc::ptr_eq(&config, reclaimed.config_for_test()));
 }
@@ -447,10 +447,10 @@ fn checkpoint_recovery_bootstrap_native_preserves_captured_config() {
 fn checkpoint_recovery_bootstrap_native_missing_ready() {
     let (fixture, trace, finalized) = log_fixture(usize::MAX, false, usize::MAX);
     let mut reclaiming = finalized.begin_log_reclamation().unwrap();
-    let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
     assert_reclaimed(&fixture, &trace, &reclaimed);
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
-    let _ready = fixture.io.block(|| Ok(bootstrap.poll()?)).unwrap();
+    let _ready = fixture.io.block(|| bootstrap.poll()).unwrap();
     panic!("stub returned recovery readiness without a Database");
 }
 

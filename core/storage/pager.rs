@@ -7949,7 +7949,7 @@ mod allocate_page1_tests {
             }
             let pending = self.pending.lock().take();
             if let Some((file, pos, buffer, completion)) = pending {
-                let _ = file.pwrite(pos, buffer, completion)?;
+                drop(file.pwrite(pos, buffer, completion)?);
             }
             Ok(())
         }
