@@ -1,4 +1,4 @@
-name: Recovered checkpoint logical reclamation validation
+name: Normal recovery bootstrap validation
 on:
   workflow_dispatch:
 permissions:
@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d05a253dcf898ebf5017c25943db7816bef2f16c
+          ref: b507c9a0cd60dcfc95f2300b6eb5112ff0fa9350
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,7 +28,7 @@ jobs:
       - name: Exact native source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = d05a253dcf898ebf5017c25943db7816bef2f16c
+          test "$(git rev-parse HEAD)" = b507c9a0cd60dcfc95f2300b6eb5112ff0fa9350
           test "$(id -u)" -ne 0
           stat -f -c 'filesystem: %T (%t)' /tmp
           rustc -Vv
@@ -40,75 +40,20 @@ jobs:
         run: |
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee reclaim.log
           grep -q '9 passed; 0 failed' reclaim.log
-      - name: Existing Store reservation bypass must fail
+      - name: Existing constructor pager and remote generation cohorts
         run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_store_claim.rs'
-          s=open(p).read()
-          old='        if !matches!(*claim, StoreClaimState::Free) {\n            return Err(LimboError::Busy);\n        }\n'
-          assert s.count(old)==2
-          head,tail=s.rsplit(old,1)
-          open(p,'w').write(head+tail)
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_rejects_preexisting_store_before_mutation -- --ignored --test-threads=1 --nocapture 2>&1 | tee claim-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'reclamation accepted a runtime with a preexisting Store' claim-red.log
-          grep -q '0 passed; 1 failed' claim-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_reclaim.rs core/mvcc/database/shared_store_claim.rs
-      - name: Final logical retirement bypass must fail
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee constructor.log
+          grep -q '6 passed; 0 failed' constructor.log
+          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api shared_pager_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee pager.log
+          grep -q '1 passed; 0 failed' pager.log
+          timeout 300 cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle.log
+          grep -q '4 passed; 0 failed' idle.log
+      - name: Completed witness and full core union
         run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_recovery_reclaim.rs'
-          s=open(p).read()
-          old='                    if !guard.io_retired() {\n                        return Ok(IOResult::IO(IOCompletions(guard.retirement_completion())));\n                    }\n'
-          assert s.count(old)==2
-          head,tail=s.rsplit(old,1)
-          open(p,'w').write(head+tail)
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_log_waits_for_physical_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee retirement-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'logical reclamation escaped before physical retirement' retirement-red.log
-          grep -q '0 passed; 1 failed' retirement-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_reclaim.rs core/mvcc/database/shared_store_claim.rs
-      - name: Actual append cache adoption bypass must fail
-        run: |
-          python3 - <<'PYCONTROL'
-          p='core/mvcc/database/shared_checkpoint_recovery_reclaim.rs'
-          s=open(p).read()
-          a=s.index('                    self.runtime.storage.adopt_shared_prefix(')
-          b=s.index('                    let logical:',a)
-          open(p,'w').write(s[:a]+s[b:])
-          PYCONTROL
-          set +e
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_log_waits_for_physical_retirement -- --ignored --test-threads=1 --nocapture 2>&1 | tee append-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'recovered logical append state is not empty' append-red.log
-          grep -q '0 passed; 1 failed' append-red.log
-          git checkout -- core/mvcc/database/shared_checkpoint_recovery_reclaim.rs core/mvcc/database/shared_store_claim.rs
-      - name: Restored reclaim and witness finalization
-        run: |
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_reclaim_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee reclaim-restored.log
-          grep -q '9 passed; 0 failed' reclaim-restored.log
-          timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_finalize_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee finalization-restored.log
-          grep -q '7 passed; 0 failed' finalization-restored.log
           timeout 180 cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_confirmation_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee witness.log
           grep -q '8 passed; 0 failed' witness.log
-      - name: ID authority and full MVCC coverage
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_ids:: -- --test-threads=1 2>&1 | tee ids.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' ids.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::shared_authority::tests:: -- --test-threads=1 2>&1 | tee authority.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' authority.log
-          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api mvcc:: -- --test-threads=1 2>&1 | tee mvcc.log
-          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' mvcc.log
+          timeout 900 cargo test --locked -p turso_core --lib --features conn_raw_api -- --test-threads=1 2>&1 | tee core.log
+          grep -Eq 'test result: ok. [1-9][0-9]* passed; 0 failed' core.log
       - name: Strict library lint and source integrity
         run: |
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- --deny=warnings 2>&1 | tee clippy.log
