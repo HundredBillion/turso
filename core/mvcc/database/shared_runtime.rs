@@ -1,3 +1,6 @@
+#[path = "shared_store_claim.rs"]
+mod shared_store_claim;
+
 #[path = "shared_current_prefix.rs"]
 mod shared_current_prefix;
 
@@ -65,6 +68,7 @@ pub(crate) struct SharedMvccRuntime {
     storage: Arc<Storage>,
     ids: Arc<SharedIds>,
     replay: Mutex<Option<Arc<SharedReplayContext>>>,
+    store_claim: Mutex<shared_store_claim::StoreClaimState>,
     database_id: FileId,
     wal_path: PathBuf,
 }
@@ -179,6 +183,7 @@ impl SharedMvccRuntime {
             storage,
             ids,
             replay: Mutex::new(None),
+            store_claim: Mutex::new(Default::default()),
             database_id,
             wal_path,
         }))
@@ -418,9 +423,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
         if !self.txs.is_empty() {
             return Err(LimboError::Busy);
         }
-        self.shared_runtime
-            .set(runtime)
-            .map_err(|_| LimboError::Busy)
+        runtime.attach_store(self)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -313,6 +313,11 @@ impl crate::IO for EpochIo {
         self.inner.step()
     }
 }
+type AppendImage = (
+    Option<crate::mvcc::persistent_storage::logical_log::LogHeader>,
+    u64,
+    u32,
+);
 struct Fixture {
     io: Arc<dyn crate::IO>,
     runtime: Arc<SharedMvccRuntime>,
@@ -325,6 +330,7 @@ struct Fixture {
     target: RecoveryIdentity,
     initial_epoch: u64,
     initial_next: u64,
+    old_append: Option<AppendImage>,
     _directory: tempfile::TempDir,
 }
 impl Fixture {
@@ -370,7 +376,13 @@ impl Fixture {
     }
 }
 fn fresh_fixture(target_only: bool) -> Fixture {
-    let (_directory, path, namespace, earlier, old_maximum, target) = {
+    fresh_fixture_with_io(target_only, |io| io)
+}
+fn fresh_fixture_with_io(
+    target_only: bool,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> Fixture {
+    let (_directory, path, namespace, earlier, old_maximum, target, old_append) = {
         let mut old = fault_fixture_with_seed(target_only, true);
         let inspected = old.inspected.take().unwrap();
         let maximum = inspected.ids.max_owner_epoch();
@@ -379,6 +391,11 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         }
         let target = inspected.ids.identity();
         drop(inspected);
+        let old_append = {
+            let log = old.runtime.storage.logical_log.read();
+            (log.header().cloned(), log.offset, log.running_crc)
+        };
+        assert!(old_append.0.is_some() && old_append.1 > 0);
         (
             old._directory,
             old.path,
@@ -386,6 +403,7 @@ fn fresh_fixture(target_only: bool) -> Fixture {
             old.earlier_coordination,
             maximum,
             target,
+            old_append,
         )
     };
     let paths = [
@@ -417,10 +435,10 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         before
     );
     let trace = Arc::new(EpochTrace::default());
-    let io: Arc<dyn crate::IO> = Arc::new(EpochIo {
+    let io: Arc<dyn crate::IO> = decorate(Arc::new(EpochIo {
         inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
         trace: trace.clone(),
-    });
+    }));
     let canonical = std::fs::canonicalize(&path).unwrap();
     let main = io
         .open_file(canonical.to_str().unwrap(), crate::OpenFlags::NoLock, false)
@@ -481,6 +499,7 @@ fn fresh_fixture(target_only: bool) -> Fixture {
         target,
         initial_epoch: epoch,
         initial_next: next_timestamp,
+        old_append: Some(old_append),
         _directory,
     }
 }
@@ -531,6 +550,7 @@ fn ready_fixture(target_only: bool) -> Fixture {
         target,
         initial_epoch,
         initial_next,
+        old_append: None,
         _directory: old._directory,
     }
 }
@@ -914,3 +934,176 @@ fn checkpoint_recovery_finalize_native_witness_and_final_bank_wait_for_physical_
         assert_finalized(&fixture, &finalized);
     }
 }
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_fresh_log_without_admission() {
+    for target_only in [false, true] {
+        let mut fixture = fresh_fixture(target_only);
+        let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+        let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+        assert_finalized(&fixture, &finalized);
+        assert!(
+            !std::fs::read(fixture.namespace.join("logical"))
+                .unwrap()
+                .is_empty(),
+            "fixture must retain real obsolete logical records"
+        );
+        let preserved =
+            [0, 1, 3, 4, 5, 6].map(|index| std::fs::read(&fixture.paths[index]).unwrap());
+        let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+        let reclaimed = fixture.io.block(|| Ok(reclaiming.poll()?)).unwrap();
+        assert_eq!(reclaimed.proof().source_identity(), None);
+        assert_eq!(reclaimed.proof().target_identity(), fixture.target);
+        assert_eq!(
+            reclaimed.guard().published().unwrap(),
+            fixture.target.prefix
+        );
+        assert!(fixture.runtime.reserve_store().is_err());
+        assert!(std::fs::read(fixture.namespace.join("logical"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            [0, 1, 3, 4, 5, 6].map(|index| std::fs::read(&fixture.paths[index]).unwrap()),
+            preserved
+        );
+        assert!(fixture.runtime.replay.lock().is_none());
+        assert!(matches!(
+            fixture.runtime.gate.try_enter_admission(),
+            Err(LimboError::Busy)
+        ));
+        assert!(matches!(
+            fixture.runtime.files.authority.try_acquire(),
+            Err(LimboError::Busy)
+        ));
+    }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_rejects_second_store() {
+    let fixture = fresh_fixture(false);
+    let first = Arc::new(
+        MvStore::new(
+            crate::mvcc::clock::MvccClock::new(),
+            fixture.runtime.storage(),
+            false,
+        )
+        .unwrap(),
+    );
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let first = first.clone();
+            let runtime = fixture.runtime.clone();
+            let barrier = barrier.clone();
+            joins.push(scope.spawn(move || {
+                barrier.wait();
+                first.attach_shared_runtime(runtime)
+            }));
+        }
+        for join in joins {
+            join.join().unwrap().unwrap();
+        }
+    });
+    let second = MvStore::new(
+        crate::mvcc::clock::MvccClock::new(),
+        fixture.runtime.storage(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        second
+            .attach_shared_runtime(fixture.runtime.clone())
+            .is_err(),
+        "a second Store attached to an already claimed runtime"
+    );
+    drop(first);
+    assert!(
+        second
+            .attach_shared_runtime(fixture.runtime.clone())
+            .is_err(),
+        "dropping the first Store reopened its runtime claim"
+    );
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_finalized_suspension() {
+    let mut fixture = fresh_fixture(false);
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+    let (ids, guard) = finalized.finalized.suspend();
+    assert_eq!(ids.proof().target_identity(), fixture.target);
+    let ids = ids.rejoin(guard).unwrap();
+    assert_eq!(ids.guard().published().unwrap(), fixture.target.prefix);
+    assert!(matches!(
+        fixture.runtime.files.authority.try_acquire(),
+        Err(LimboError::Busy)
+    ));
+    let (ids, original_guard) = ids.suspend();
+    let foreign = fresh_fixture(false);
+    let guard = foreign.confirmed.unwrap().guard;
+    assert!(ids.rejoin(guard).is_err());
+    assert_eq!(original_guard.published().unwrap(), fixture.target.prefix);
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_reservation_is_linear() {
+    let fixture = fresh_fixture(false);
+    let store = MvStore::new(
+        crate::mvcc::clock::MvccClock::new(),
+        fixture.runtime.storage(),
+        false,
+    )
+    .unwrap();
+    let reservation = fixture.runtime.reserve_store().unwrap();
+    reservation.validate(&fixture.runtime).unwrap();
+    assert!(fixture.runtime.reserve_store().is_err());
+    assert!(matches!(
+        store.attach_shared_runtime(fixture.runtime.clone()),
+        Err(LimboError::Busy)
+    ));
+    drop(reservation);
+    let mismatch: Arc<dyn crate::mvcc::persistent_storage::DurableStorage> = Arc::new(
+        Storage::new(fixture.runtime.logical.clone(), fixture.io.clone(), None),
+    );
+    let wrong = MvStore::new(crate::mvcc::clock::MvccClock::new(), mismatch, false).unwrap();
+    assert!(wrong
+        .attach_shared_runtime(fixture.runtime.clone())
+        .is_err());
+    let reservation = fixture.runtime.reserve_store().unwrap();
+    let other = fresh_fixture(false);
+    assert!(reservation.validate(&other.runtime).is_err());
+    drop(reservation);
+    store
+        .attach_shared_runtime(fixture.runtime.clone())
+        .unwrap();
+    assert!(fixture.runtime.reserve_store().is_err());
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_reclaim_native_rejects_preexisting_store_before_mutation() {
+    let mut fixture = ready_fixture(false);
+    let mut finalizing = fixture.start(usize::MAX, false, usize::MAX);
+    let finalized = fixture.io.block(|| Ok(finalizing.poll()?)).unwrap();
+    assert!(fixture.runtime.replay.lock().is_none());
+    let before = std::fs::read(fixture.namespace.join("logical")).unwrap();
+    assert!(!before.is_empty());
+    assert!(
+        matches!(finalized.begin_log_reclamation(), Err(LimboError::Busy)),
+        "reclamation accepted a runtime with a preexisting Store"
+    );
+    assert_eq!(
+        std::fs::read(fixture.namespace.join("logical")).unwrap(),
+        before
+    );
+    assert!(fixture.runtime.replay.lock().is_none());
+    assert!(fixture.runtime.reserve_store().is_err());
+}
+
+#[path = "shared_checkpoint_recovery_reclaim_tests.rs"]
+mod reclaim_tests;
