@@ -280,3 +280,16 @@ actual view before unlinking; FULL-sync main first because observed marker bytes
 after process death alone do not establish durable completion. If terminal
 manifest is already gone, only an empty expected namespace and absent ordinary
 log qualify for idempotent directory removal. Unknown entries fail before unlink.
+
+The recovered mirror must refresh durability even when both slot bytes already
+match. Root review identified that observed matching bytes may still belong to an
+interrupted writer. Genuine recovery with matching slots first failed the added
+barrier assertion (0 versus2) in run42504814020. Source49f1 records the actual
+selected slot under continuous ownership and writes/FULL-syncs the opposite copy
+before writing/FULL-syncing the selected copy, without advancing record/sequence.
+This preserves the selected valid record if the first operation fails.
+
+Completed-token cleanup source26f48 passed native2/2 plus strict library lint and
+formatting in run42505270402: actual ordinary-MVCC-generated header-only log is
+removed before ordinary reopen, and unknown/replaced namespace files reject
+before any unlink. This is not partial-cleanup or process-death acceptance.
