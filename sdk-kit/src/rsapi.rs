@@ -2250,8 +2250,8 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn codec_reopen_observes_inherited_ofd_until_child_exec() {
+    fn inherited_codec_probe(guarded: bool) {
+        let mut scope = Some(NATIVE_REOPEN_AND_SPAWN.lock().unwrap());
         use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -2287,7 +2287,10 @@ mod tests {
             .unwrap();
         let parent_release = release.as_raw_fd();
         let parent_ready = ready.as_raw_fd();
+        let (pending, starting) = std::sync::mpsc::channel();
         let spawning = std::thread::spawn(move || {
+            pending.send(()).unwrap();
+            let _scope = guarded.then(|| NATIVE_REOPEN_AND_SPAWN.lock().unwrap());
             let mut command = std::process::Command::new("/bin/true");
             // Only async-signal-safe system calls run between fork and exec.
             unsafe {
@@ -2306,7 +2309,12 @@ mod tests {
             command.spawn()
         });
         let mut byte = [0];
-        ready.read_exact(&mut byte).unwrap();
+        starting
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        if !guarded {
+            ready.read_exact(&mut byte).unwrap();
+        }
         drop(conn);
         drop(db);
         assert_eq!(
@@ -2318,9 +2326,19 @@ mod tests {
             ),
             (0, 0, 0, 0),
         );
+        if guarded {
+            let reopened = open_database_with_page_codec(path, codec.clone());
+            drop(reopened);
+            drop(scope.take());
+            ready.read_exact(&mut byte).unwrap();
+        }
         let attempt = TursoDatabase::new(config);
-        let error = attempt.open().unwrap_err();
-        assert!(error.to_string().contains("Locking error"), "{error}");
+        if guarded {
+            assert!(!attempt.open().unwrap().is_io());
+        } else {
+            let error = attempt.open().unwrap_err();
+            assert!(error.to_string().contains("Locking error"), "{error}");
+        }
         drop(attempt);
         release.write_all(&[1]).unwrap();
         let mut child = spawning.join().unwrap().unwrap();
@@ -2337,11 +2355,24 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let _ending_scope = guarded.then(|| NATIVE_REOPEN_AND_SPAWN.lock().unwrap());
         let reopened = open_database_with_page_codec(path, codec);
         let conn = reopened.connect().unwrap();
         let mut query = conn.prepare_single("SELECT value FROM inherited").unwrap();
         assert_eq!(query.step(None).unwrap(), TursoStatusCode::Row);
         assert_eq!(query.row_value(0).unwrap().as_int(), Some(42));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codec_reopen_observes_inherited_ofd_until_child_exec() {
+        inherited_codec_probe(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codec_reopen_barrier_prevents_child_descriptor_inheritance() {
+        inherited_codec_probe(true);
     }
 
     #[test]
