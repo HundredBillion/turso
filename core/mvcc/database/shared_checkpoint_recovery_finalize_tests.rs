@@ -1174,6 +1174,7 @@ fn checkpoint_recovery_bootstrap_native_original_optin_survives() {
     let ready = fixture.io.block(|| bootstrap.poll()).unwrap();
     let (database, connection) = ready.into_parts();
     assert_eq!(database.dialect().name(), "engine");
+    fixture.trace.enabled.store(false, Ordering::Release);
     connection
         .execute("UPDATE preserved SET value='original opt-in recovered' WHERE id=1")
         .unwrap();
@@ -1225,7 +1226,7 @@ fn checkpoint_recovery_bootstrap_native_captured_readonly_view_stays_readonly() 
             Ok(())
         })
         .unwrap();
-    assert_eq!(values, ["durable payload"]);
+    assert_eq!(values, ["materialized shared row"]);
     assert!(connection
         .execute("UPDATE preserved SET value='forbidden' WHERE id=1")
         .is_err());

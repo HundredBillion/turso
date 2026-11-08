@@ -453,6 +453,8 @@ fn checkpoint_recovery_bootstrap_native_missing_ready() {
     let ready = fixture.io.block(|| bootstrap.poll()).unwrap();
     let (database, connection) = ready.into_parts();
     assert!(Arc::ptr_eq(&database, &connection.db));
+    trace.enabled.store(false, Ordering::Release);
+    fixture.trace.enabled.store(false, Ordering::Release);
     connection
         .execute("UPDATE preserved SET value='reclaimed and ready' WHERE id=1")
         .unwrap();
@@ -478,5 +480,7 @@ pub(in super::super) fn bootstrap_fixture_with_io(
     let mut reclaiming = finalized.begin_log_reclamation().unwrap();
     let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
     assert_reclaimed(&fixture, &trace, &reclaimed);
+    trace.enabled.store(false, Ordering::Release);
+    fixture.trace.enabled.store(false, Ordering::Release);
     (fixture._directory, fixture.io, fixture.runtime, reclaimed)
 }

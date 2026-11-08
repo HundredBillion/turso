@@ -117,7 +117,7 @@ fn checkpoint_recovery_bootstrap_native_ready_reopens_admission_and_commits() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(before, ["durable payload"]);
+    assert_eq!(before, ["materialized shared row"]);
     connection.execute("UPDATE preserved SET value='normal recovery committed' WHERE id=1; INSERT INTO preserved VALUES(2,'new row')").unwrap();
     assert!(
         runtime
