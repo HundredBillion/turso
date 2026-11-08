@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b25efbacffb3ff8dd568651fdc64314b2f180d53
+          ref: 61051c85cb78cc8cacf2f2088f53b15695a9ded2
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,18 +24,18 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = b25efbacffb3ff8dd568651fdc64314b2f180d53
+          test "$(git rev-parse HEAD)" = 61051c85cb78cc8cacf2f2088f53b15695a9ded2
           rustc -Vv | tee rustc.txt
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
       - name: Guarded constructor honors paused admission
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_pause_rejects_connection_before_header_io -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause-red.log
-          grep -q '1 passed; 0 failed' pause-red.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee pause-red.log
+          grep -q '3 passed; 0 failed' pause-red.log
       - name: Preserve exact evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shared-constructor-b25-green
+          name: shared-constructor-61051-green
           path: |
             source.txt
             rustc.txt
