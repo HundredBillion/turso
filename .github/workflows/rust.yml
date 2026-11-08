@@ -3,6 +3,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+defaults:
+  run:
+    shell: bash
 jobs:
   current-id-base:
     runs-on: ubuntu-24.04
@@ -15,26 +18,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 8f7349eb66fcbc15edf8cd2e45e616f69f15ad04
+          ref: 3942c92fc97654b389541f49821cb7623fcf4a27
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
       - name: Record exact source
         run: |
+          set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 8f7349eb66fcbc15edf8cd2e45e616f69f15ad04
+          test "$(git rev-parse HEAD)" = 3942c92fc97654b389541f49821cb7623fcf4a27
           rustc -Vv | tee rustc.txt
       - name: Idle old process and new constructor reload current generation
         run: |
+          set -euo pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-process-green.log
           grep -q '1 passed; 0 failed' idle-process-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_partial_replay_then_retry_latest -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-cancel-green.log
           grep -q '1 passed; 0 failed' idle-cancel-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_cancel_physical_inspection_before_and_after_callback -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-cancel-green.log
+          grep -q '1 passed; 0 failed' physical-cancel-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-error-green.log
           grep -q '1 passed; 0 failed' finish-error-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume -- --ignored --test-threads=1 --nocapture 2>&1 | tee owner-green.log
+          grep -q '1 passed; 0 failed' owner-green.log
       - name: Current base evidence and existing ID protocol
         run: |
+          set -euo pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api id_current_base_ -- --test-threads=1 --nocapture 2>&1 | tee current-base-green.log
           grep -q '4 passed; 0 failed' current-base-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api current_base_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-base-green.log
@@ -49,7 +59,20 @@ jobs:
           git diff --exit-code
       - name: Causal boundary controls and restored complete source
         run: |
+          set -euo pipefail
           set -e
+          python3 - <<'PATCH'
+          p='core/mvcc/database/shared_current_prefix.rs'
+          s=open(p).read(); start=s.index('        database.validate_shared_runtime(&self.runtime)?;'); end=s.index('        if let Some(saved)',start)
+          open(p,'w').write(s[:start]+s[end:])
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume -- --ignored --test-threads=1 --nocapture > owner-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/database/shared_current_prefix.rs
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' owner-control-red.log
           python3 - <<'PATCH'
           p='core/mvcc/database/shared_current_prefix.rs'
           s=open(p).read(); old='MvStore::<C, A>::capture_table_valued_functions(&connection.schema.read())'
@@ -111,11 +134,14 @@ jobs:
           grep -q '1 passed; 0 failed' extent-restored-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_finish_failure_withdraws_local_readiness -- --ignored --test-threads=1 --nocapture 2>&1 | tee finish-restored-green.log
           grep -q '1 passed; 0 failed' finish-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_current_prefix_native_owner_rejection_precedes_stable_replay_and_resume -- --ignored --test-threads=1 --nocapture 2>&1 | tee owner-restored-green.log
+          grep -q '1 passed; 0 failed' owner-restored-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_connection_native_ -- --ignored --test-threads=1 2>&1 | tee constructor-green.log
           grep -q '6 passed; 0 failed' constructor-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_checkpoint_ready_native_ -- --ignored --test-threads=1 2>&1 | tee ready-green.log
           grep -q '4 passed; 0 failed' ready-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee full-core-green.log
+          grep -Eq 'test result: ok. [1-9][0-9]+ passed; 0 failed;' full-core-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
@@ -129,3 +155,31 @@ jobs:
             rustc.txt
             '*green.log'
             '*red.log'
+
+  windows-current-prefix:
+    needs: current-id-base
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 3942c92fc97654b389541f49821cb7623fcf4a27
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pager-generation-windows-0b37
+      - name: Check exact Windows source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 3942c92fc97654b389541f49821cb7623fcf4a27
+          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-check-green.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: idle-current-prefix-windows
+          path: windows-check-green.log
