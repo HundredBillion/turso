@@ -461,9 +461,8 @@ mod tests {
         preparing.load = None;
         let bytes = std::fs::read(fixture.namespace.join("manifest")).unwrap();
         let memory = crate::io::MemoryIO::new();
-        let file = memory
-            .open_file("substitute", crate::OpenFlags::Create, false)
-            .unwrap();
+        let file =
+            crate::IO::open_file(&memory, "substitute", crate::OpenFlags::Create, false).unwrap();
         let buffer = Arc::new(crate::Buffer::new_temporary(bytes.len()));
         buffer.as_mut_slice().copy_from_slice(&bytes);
         drop(
