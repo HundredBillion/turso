@@ -32,7 +32,7 @@ jobs:
           rustc --version | tee -a environment.txt
           stat -f -c '%T %t' . | tee -a environment.txt
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_bootstrap_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-bootstrap-green.log
-          grep -q '8 passed; 0 failed' merged-bootstrap-green.log
+          grep -q '14 passed; 0 failed' merged-bootstrap-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-committed-green.log
           grep -q '5 passed; 0 failed' merged-committed-green.log
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_wal_precommit_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee merged-precommit-green.log
