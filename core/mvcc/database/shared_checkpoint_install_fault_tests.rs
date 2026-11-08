@@ -386,7 +386,9 @@ fn shared_checkpoint_install_native_reselect_rejects_a_new_intent_under_old_proo
     let mut fixture = fixture();
     let path = fixture.namespace.join("manifest");
     let original = std::fs::read(&path).unwrap();
-    let record = ManifestRecord::decode(&original[..RECORD_SIZE]).unwrap();
+    let record = ManifestRecord::decode(&original[..RECORD_SIZE])
+        .unwrap()
+        .expect("fixture has a completed manifest record");
     let intent = record
         .begin_checkpoint(record.prefix().committed_timestamp)
         .unwrap();
