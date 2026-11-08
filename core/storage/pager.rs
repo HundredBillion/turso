@@ -1589,6 +1589,10 @@ pub struct SharedPagerState {
 }
 
 impl SharedPagerState {
+    pub(crate) fn page_size(&self) -> Option<PageSize> {
+        PageSize::new(self.page_size.load(Ordering::SeqCst))
+    }
+
     pub fn new(init_page_1: Option<PageRef>) -> Self {
         let page_size = init_page_1.as_ref().map_or(0, |page| {
             let contents = page.get_contents();
@@ -3242,12 +3246,7 @@ impl Pager {
 
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
-        let value = self.shared.page_size.load(Ordering::SeqCst);
-        if value == 0 {
-            None
-        } else {
-            PageSize::new(value)
-        }
+        self.shared.page_size()
     }
 
     /// Get the current page size, panicking if not set.

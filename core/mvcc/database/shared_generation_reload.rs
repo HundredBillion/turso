@@ -1,4 +1,13 @@
+use super::shared_runtime::CurrentBaseEvidence;
 use super::*;
+use crate::mvcc::commit_manifest::LoadedManifest;
+use crate::mvcc::shared_authority::PublishedPrefix;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReloadOrigin {
+    CompletedCheckpoint,
+    Current(PublishedPrefix),
+}
 
 pub(in crate::mvcc) struct PreparedGenerationReload<A: ConcurrentAllocator> {
     roots: Arc<SkipMap<MVTableId, RootEntry, BasicComparator, A>>,
@@ -8,6 +17,7 @@ pub(in crate::mvcc) struct PreparedGenerationReload<A: ConcurrentAllocator> {
     logical_floor: i64,
     source_frontier: u64,
     source_schema_generation: u64,
+    origin: ReloadOrigin,
 }
 
 impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
@@ -17,6 +27,35 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
         schema: &Schema,
         checkpoint_timestamp: u64,
     ) -> Result<PreparedGenerationReload<A>> {
+        self.prepare_generation_map(
+            header,
+            schema,
+            checkpoint_timestamp,
+            ReloadOrigin::CompletedCheckpoint,
+        )
+    }
+
+    pub(in crate::mvcc) fn prepare_current_generation_reload(
+        &self,
+        evidence: &CurrentBaseEvidence,
+        manifest: &LoadedManifest,
+    ) -> Result<PreparedGenerationReload<A>> {
+        evidence.validate_closed_store(self, manifest)?;
+        self.prepare_generation_map(
+            evidence.header(),
+            evidence.schema(),
+            evidence.identity().database.checkpoint_timestamp,
+            ReloadOrigin::Current(evidence.identity().prefix),
+        )
+    }
+
+    fn prepare_generation_map(
+        &self,
+        header: DatabaseHeader,
+        schema: &Schema,
+        checkpoint_timestamp: u64,
+        origin: ReloadOrigin,
+    ) -> Result<PreparedGenerationReload<A>> {
         let source_roots = self.table_id_to_rootpage.load_full();
         let pages = i64::from(header.database_size.get());
         let source_frontier = self.last_committed_tx_ts.load(Ordering::Acquire);
@@ -24,7 +63,13 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
         if pages == 0
             || header.read_version.0 != SHARED_MVCC_VERSION
             || header.write_version.0 != SHARED_MVCC_VERSION
-            || checkpoint_timestamp < source_frontier
+            || match origin {
+                ReloadOrigin::CompletedCheckpoint => checkpoint_timestamp < source_frontier,
+                ReloadOrigin::Current(prefix) => {
+                    checkpoint_timestamp > prefix.committed_timestamp
+                        || source_frontier > prefix.committed_timestamp
+                }
+            }
             || checkpoint_timestamp >= crate::mvcc::shared_authority::MAX_TIMESTAMP
             || source_schema_generation == u64::MAX
         {
@@ -71,6 +116,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> MvStore<C, A> {
             logical_floor,
             source_frontier,
             source_schema_generation,
+            origin,
         })
     }
 }
@@ -161,7 +207,8 @@ impl<A: ConcurrentAllocator> PreparedGenerationReload<A> {
             LimboError::InvalidArgument("generation reload requires shared runtime".into())
         })?;
         let target = proof.target_identity();
-        if !runtime.owns_authority(guard)
+        if self.origin != ReloadOrigin::CompletedCheckpoint
+            || !runtime.owns_authority(guard)
             || !proof.matches_lease(guard)
             || guard.published()? != target.prefix
             || target.database.checkpoint_timestamp != self.checkpoint_timestamp
@@ -177,6 +224,32 @@ impl<A: ConcurrentAllocator> PreparedGenerationReload<A> {
         if !guard.io_retired() || !guard.live_registrations()?.is_empty() {
             return Err(LimboError::Busy);
         }
+        self.publish_local_map(store, proof.materialized_floor())
+    }
+
+    pub(in crate::mvcc) fn install_current<C: LogicalClock>(
+        self,
+        store: &MvStore<C, A>,
+        evidence: &CurrentBaseEvidence,
+        manifest: &LoadedManifest,
+    ) -> Result<()> {
+        evidence.validate_closed_store(store, manifest)?;
+        if self.origin != ReloadOrigin::Current(evidence.identity().prefix)
+            || self.checkpoint_timestamp != evidence.identity().database.checkpoint_timestamp
+            || self.source_frontier > evidence.identity().prefix.committed_timestamp
+        {
+            return Err(LimboError::InvalidArgument(
+                "local reload preparation differs from its selected physical base".into(),
+            ));
+        }
+        self.publish_local_map(store, evidence.logical_floor())
+    }
+
+    fn publish_local_map<C: LogicalClock>(
+        self,
+        store: &MvStore<C, A>,
+        physical_floor: i64,
+    ) -> Result<()> {
         if store.experimental_mvcc_passive_checkpoint
             || store
                 .checkpoint_in_progress
@@ -228,7 +301,7 @@ impl<A: ConcurrentAllocator> PreparedGenerationReload<A> {
         let index_epoch = increment(store.index_rows_epoch.load(Ordering::Acquire))?;
         let next_table = self
             .logical_floor
-            .min(proof.materialized_floor())
+            .min(physical_floor)
             .checked_sub(1)
             .ok_or_else(|| LimboError::Corrupt("generation reload logical IDs exhausted".into()))?;
         store.clock.publish_observed(self.checkpoint_timestamp, || {

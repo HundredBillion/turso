@@ -108,7 +108,16 @@ impl SharedRefresh {
         connection: &Arc<Connection>,
         options: SharedBeginOptions,
     ) -> IOResultOr<TxID> {
-        let mut loaded = return_if_io!(self.poll(store, connection));
+        let loaded = return_if_io!(self.poll(store, connection));
+        Self::begin_loaded(loaded, store, connection, options)
+    }
+
+    pub(super) fn begin_loaded<C: LogicalClock, A: ConcurrentAllocator>(
+        mut loaded: LoadedManifest,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+        options: SharedBeginOptions,
+    ) -> IOResultOr<TxID> {
         #[cfg(all(host_shared_wal, unix))]
         if let Some(runtime) = store.shared_runtime.get() {
             runtime.certify_database_pager(
