@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6a602a807
+          ref: 6a602a8075da5b53171450b00e7e05a80da84a7a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: taiki-e/install-action@v2
         with:
@@ -27,7 +27,7 @@ jobs:
           github-token: ${{ github.token }}
       - name: Verify benchmark provenance and unpack
         run: |
-          test "$(git rev-parse HEAD)" = "$(git rev-parse 6a602a807)"
+          test "$(git rev-parse HEAD)" = "6a602a8075da5b53171450b00e7e05a80da84a7a"
           echo 'Benchmark binaries: public PR head 57e1589300ee76f4e9b5b550d8729e40d5c91dfe, build run42512954346.'
           echo 'This run validates workflow measurement and artifact handling, not newer engine performance.'
           mkdir -p target
