@@ -851,6 +851,11 @@ mod tests {
             OfflinePrerequisite::AllOlderWorkersStopped,
         )
         .expect("fresh terminal downgrade must resume without a live installed source");
+        assert_eq!(
+            completed.recovered_mirror_syncs(),
+            2,
+            "fresh recovery must establish both terminal durability barriers"
+        );
         assert_eq!(&std::fs::read(&fixture.path).unwrap()[18..20], &[2, 2]);
         assert_unchanged(&namespace_bytes);
         drop(completed);
@@ -1041,7 +1046,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("resume after {phase}: {error}"));
             assert_eq!(&std::fs::read(&path).unwrap()[18..20], &[2, 2]);
             drop(completed);
-            let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+            let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
             let db = Database::open(
                 io,
                 path.to_str().unwrap(),

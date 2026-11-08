@@ -22,6 +22,8 @@ pub(super) struct RecoveredDowngradeSource {
     pub(super) logical_floor: i64,
     _ids: SuspendedRecoveryIds,
     _pause: CheckpointPause,
+    #[cfg(test)]
+    mirror_syncs: std::sync::atomic::AtomicUsize,
 }
 impl RecoveredDowngradeSource {
     fn open(path: &Path, history_limit: u64) -> Result<Self> {
@@ -144,6 +146,8 @@ impl RecoveredDowngradeSource {
             logical_floor,
             _ids: ids,
             _pause: pause,
+            #[cfg(test)]
+            mirror_syncs: std::sync::atomic::AtomicUsize::new(0),
         };
         result.revalidate()?;
         Ok(result)
@@ -169,6 +173,10 @@ impl RecoveredDowngradeSource {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn mirror_syncs(&self) -> usize {
+        self.mirror_syncs.load(std::sync::atomic::Ordering::SeqCst)
+    }
     pub(super) fn mirror(&self) -> Result<()> {
         self.revalidate()?;
         let bytes = self.record.encode();
@@ -182,6 +190,9 @@ impl RecoveredDowngradeSource {
                 file.write_all_at(&bytes, offset as u64)
                     .map_err(super::fs_error)?;
                 file.sync_all().map_err(super::fs_error)?;
+                #[cfg(test)]
+                self.mirror_syncs
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
         self.files.require_mirrored(self.record)

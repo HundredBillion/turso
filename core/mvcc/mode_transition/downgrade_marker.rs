@@ -92,6 +92,13 @@ pub(in crate::mvcc) struct CompletedDowngradeMarker {
 }
 
 impl CompletedDowngradeMarker {
+    #[cfg(test)]
+    pub(in crate::mvcc) fn recovered_mirror_syncs(&self) -> usize {
+        match &self._proof.origin {
+            MarkerOrigin::Recovered(source) => source.mirror_syncs(),
+            MarkerOrigin::Installed(_) => 0,
+        }
+    }
     pub(in crate::mvcc) fn cleanup(self) -> Result<()> {
         Err(invalid(
             "completed downgrade namespace cleanup is not implemented",
