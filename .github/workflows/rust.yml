@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fe4fd771d04609ab4fb1229394f272d63f7f3f42
+          ref: ba3c6d0bf659497f2c4625c8c967ea9638c09506
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = fe4fd771d04609ab4fb1229394f272d63f7f3f42
+          test "$(git rev-parse HEAD)" = ba3c6d0bf659497f2c4625c8c967ea9638c09506
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
@@ -36,10 +36,30 @@ jobs:
           set -o pipefail
           timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee ids-native.log
           grep -q '13 passed; 0 failed' ids-native.log
-          for selector in shared_watermark_identity_native_ shared_watermark_io_native_; do
+          for selector in shared_watermark_identity_native_ shared_watermark_io_native_ shared_watermark_process_native_; do
             timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
             grep -q '1 passed; 0 failed' "$selector.log"
           done
+      - name: Reset hook causal control and restored acceptance
+        run: |
+          set -o pipefail
+          python3 -c 'from pathlib import Path; p=Path("core/vdbe/mod.rs"); s=p.read_text(); old="self.shared_watermark.reset();"; assert s.count(old)==1; p.write_text(s.replace(old,"/* validation-only omitted watermark reset */"))'
+          trap 'git restore -- core/vdbe/mod.rs' EXIT
+          git diff -- core/vdbe/mod.rs > reset-negative.diff
+          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee reset-negative-build.log
+          set +e
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee reset-negative.log
+          negative_status=${PIPESTATUS[0]}
+          set -e
+          git restore -- core/vdbe/mod.rs
+          trap - EXIT
+          test "$negative_status" -eq 101
+          grep -q '0 passed; 1 failed' reset-negative.log
+          grep -q 'retired read retained ownership' reset-negative.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run 2>&1 | tee reset-restored-build.log
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee reset-restored.log
+          grep -q '1 passed; 0 failed' reset-restored.log
+          git diff --exit-code
       - name: Policy ordinary sequences and lint
         run: |
           set -o pipefail
@@ -56,4 +76,5 @@ jobs:
             source.txt
             rustc.txt
             *.log
+            *.diff
           retention-days: 14
