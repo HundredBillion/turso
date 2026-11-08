@@ -1,3 +1,9 @@
+#[path = "shared_checkpoint_recovery_bootstrap.rs"]
+mod shared_checkpoint_recovery_bootstrap;
+pub(crate) use shared_checkpoint_recovery_bootstrap::{
+    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
+
 use super::*;
 use crate::io::FileSyncType;
 use crate::mvcc::database::shared_runtime::shared_store_claim::SharedStoreReservation;
@@ -17,6 +23,10 @@ impl ReclaimedRecoveredCheckpoint {
     pub(in crate::mvcc) fn proof(&self) -> &CompletedCheckpointProof {
         self.recovered.proof()
     }
+    #[cfg(test)]
+    pub(in crate::mvcc) fn config_for_test(&self) -> &Arc<RecoveryOpenConfig> {
+        &self.recovered.config
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -30,6 +40,7 @@ enum Phase {
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryLogReclamation {
     runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
     parts: Option<PhysicalBaseParts>,
     finalized: Option<FinalizedIds>,
     suspended: Option<SuspendedFinalizedIds>,
@@ -46,6 +57,11 @@ pub(in crate::mvcc) struct RecoveryLogReclamation {
 #[allow(dead_code)]
 impl FinalizedRecoveredCheckpoint {
     pub(in crate::mvcc) fn begin_log_reclamation(self) -> Result<RecoveryLogReclamation> {
+        if self.runtime.original_readonly {
+            return Err(LimboError::InvalidArgument(
+                "shared checkpoint recovery requires a writable participant".into(),
+            ));
+        }
         validate_target(&self.runtime, &self.parts, self.proof(), self.guard())?;
         if !self.guard().io_retired() {
             return Err(LimboError::Busy);
@@ -59,6 +75,7 @@ impl FinalizedRecoveredCheckpoint {
         )?;
         Ok(RecoveryLogReclamation {
             runtime: self.runtime,
+            config: self.config,
             parts: Some(self.parts),
             finalized: None,
             suspended: Some(suspended),
@@ -188,6 +205,7 @@ impl RecoveryLogReclamation {
                     return Ok(IOResult::Done(ReclaimedRecoveredCheckpoint {
                         recovered: FinalizedRecoveredCheckpoint {
                             runtime: self.runtime.clone(),
+                            config: self.config.clone(),
                             parts: self.parts.take().unwrap(),
                             finalized: self.finalized.take().unwrap(),
                             pause: self.pause.take().unwrap(),
@@ -243,9 +261,25 @@ fn validate_target(
     proof: &CompletedCheckpointProof,
     guard: &AuthorityGuard,
 ) -> Result<()> {
+    validate_geometry(
+        runtime,
+        &parts.header,
+        parts.persistent_timestamp,
+        proof,
+        guard,
+    )
+}
+
+fn validate_geometry(
+    runtime: &Arc<SharedMvccRuntime>,
+    header: &DatabaseHeader,
+    persistent_timestamp: u64,
+    proof: &CompletedCheckpointProof,
+    guard: &AuthorityGuard,
+) -> Result<()> {
     let target = proof.target_identity();
     let bytes = runtime.files.main.size()?;
-    let page_size = u64::from(parts.header.page_size.get());
+    let page_size = u64::from(header.page_size.get());
     let floor = i64::try_from(bytes / page_size)
         .ok()
         .and_then(i64::checked_neg)
@@ -258,8 +292,8 @@ fn validate_target(
         || runtime.files.main.file_id()? != Some(runtime.database_id)
         || runtime.files.physical_wal.size()? != 0
         || bytes % page_size != 0
-        || bytes / page_size < u64::from(parts.header.database_size.get())
-        || parts.persistent_timestamp != target.database.checkpoint_timestamp
+        || bytes / page_size < u64::from(header.database_size.get())
+        || persistent_timestamp != target.database.checkpoint_timestamp
         || proof.materialized_floor() != floor
         || target.database.generation == 0
         || target.prefix.end_offset != 0

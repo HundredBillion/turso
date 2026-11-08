@@ -1299,37 +1299,42 @@ impl MappedSharedWalCoordination {
         // range, trim them before publishing the new header so later frame
         // appends cannot observe a stale tail.
         self.rollback_frames(snapshot.max_frame);
-        self.with_snapshot_write(|header| {
-            header
-                .max_frame
-                .store(snapshot.max_frame, Ordering::Release);
-            header
-                .nbackfills
-                .store(snapshot.nbackfills, Ordering::Release);
-            header
-                .transaction_count
-                .store(snapshot.transaction_count, Ordering::Release);
-            header
-                .visibility_generation
-                .store(snapshot.visibility_generation, Ordering::Release);
-            header
-                .checkpoint_seq
-                .store(snapshot.checkpoint_seq, Ordering::Release);
-            header
-                .checkpoint_epoch
-                .store(snapshot.checkpoint_epoch, Ordering::Release);
-            header
-                .page_size
-                .store(snapshot.page_size, Ordering::Release);
-            header.salt_1.store(snapshot.salt_1, Ordering::Release);
-            header.salt_2.store(snapshot.salt_2, Ordering::Release);
-            header
-                .checksum_1
-                .store(snapshot.checksum_1, Ordering::Release);
-            header
-                .checksum_2
-                .store(snapshot.checksum_2, Ordering::Release);
-        });
+        self.with_snapshot_write(|header| Self::store_snapshot_fields(header, snapshot));
+    }
+
+    fn store_snapshot_fields(
+        header: &SharedWalCoordinationMapHeader,
+        snapshot: SharedWalCoordinationHeader,
+    ) {
+        header
+            .max_frame
+            .store(snapshot.max_frame, Ordering::Release);
+        header
+            .nbackfills
+            .store(snapshot.nbackfills, Ordering::Release);
+        header
+            .transaction_count
+            .store(snapshot.transaction_count, Ordering::Release);
+        header
+            .visibility_generation
+            .store(snapshot.visibility_generation, Ordering::Release);
+        header
+            .checkpoint_seq
+            .store(snapshot.checkpoint_seq, Ordering::Release);
+        header
+            .checkpoint_epoch
+            .store(snapshot.checkpoint_epoch, Ordering::Release);
+        header
+            .page_size
+            .store(snapshot.page_size, Ordering::Release);
+        header.salt_1.store(snapshot.salt_1, Ordering::Release);
+        header.salt_2.store(snapshot.salt_2, Ordering::Release);
+        header
+            .checksum_1
+            .store(snapshot.checksum_1, Ordering::Release);
+        header
+            .checksum_2
+            .store(snapshot.checksum_2, Ordering::Release);
     }
 
     /// Repair transient runtime state when a process determines that it can

@@ -204,6 +204,13 @@ impl SharedBaseContextState {
 }
 
 impl PhysicalBaseParts {
+    pub(in crate::mvcc) fn matches_base_metadata(&self, other: &Self) -> bool {
+        bytemuck::bytes_of(&self.header) == bytemuck::bytes_of(&other.header)
+            && self.persistent_timestamp == other.persistent_timestamp
+            && self.schema_rows == other.schema_rows
+            && self.type_sqls == other.type_sqls
+    }
+
     pub(in crate::mvcc) fn into_context<C: LogicalClock, A: ConcurrentAllocator>(
         self,
         store: &MvStore<C, A>,

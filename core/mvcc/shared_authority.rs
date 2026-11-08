@@ -151,6 +151,10 @@ impl std::fmt::Debug for SnapshotRegistration {
 }
 
 impl SharedMvccAuthority {
+    pub(super) fn configured_history_limit(&self) -> u64 {
+        self.load(HISTORY_LIMIT_OFFSET)
+    }
+
     pub(super) fn file_id(&self) -> Result<Option<FileId>> {
         self.file.file_id()
     }

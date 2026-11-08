@@ -1,6 +1,7 @@
 use super::shared_checkpoint_recovery::CheckpointRecoverySelection;
 use super::*;
 use crate::database::shared_physical::SharedPhysicalConnection;
+use crate::database::shared_recovered::RecoveryOpenConfig;
 use crate::mvcc::database::shared_bootstrap::{PhysicalBaseParts, PhysicalBaseReadState};
 use crate::mvcc::read_pinned_file::ReadPinnedFile;
 
@@ -8,17 +9,25 @@ use crate::mvcc::read_pinned_file::ReadPinnedFile;
 pub(in crate::mvcc) struct InspectedRecoveryBase {
     parts: PhysicalBaseParts,
     selection: CheckpointRecoverySelection,
+    config: Arc<RecoveryOpenConfig>,
 }
 
 impl InspectedRecoveryBase {
-    pub(in crate::mvcc) fn into_parts(self) -> (PhysicalBaseParts, CheckpointRecoverySelection) {
-        (self.parts, self.selection)
+    pub(in crate::mvcc) fn into_parts(
+        self,
+    ) -> (
+        PhysicalBaseParts,
+        CheckpointRecoverySelection,
+        Arc<RecoveryOpenConfig>,
+    ) {
+        (self.parts, self.selection, self.config)
     }
 }
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryPhysicalRead {
     selection: Option<CheckpointRecoverySelection>,
+    config: Arc<RecoveryOpenConfig>,
     opening: Option<SharedPhysicalConnection>,
     reader: Option<Arc<Connection>>,
     state: PhysicalBaseReadState,
@@ -51,14 +60,12 @@ impl CheckpointRecoverySelection {
         let path = runtime.path.to_str().ok_or_else(|| {
             LimboError::InvalidArgument("shared database path must be UTF-8".into())
         })?;
-        let opening = SharedPhysicalConnection::new_with_retained_file(
-            runtime.io.clone(),
-            path.to_owned(),
-            options,
-            file,
-        )?;
+        let config = RecoveryOpenConfig::capture(options)?;
+        config.validate_history(runtime.files.authority.configured_history_limit())?;
+        let opening = config.open_physical(runtime.io.clone(), path.to_owned(), file)?;
         Ok(RecoveryPhysicalRead {
             selection: Some(self),
+            config,
             opening: Some(opening),
             reader: None,
             state: Default::default(),
@@ -103,6 +110,7 @@ impl RecoveryPhysicalRead {
         Ok(IOResult::Done(InspectedRecoveryBase {
             parts: self.parts.take().unwrap(),
             selection: self.selection.take().unwrap(),
+            config: self.config.clone(),
         }))
     }
 

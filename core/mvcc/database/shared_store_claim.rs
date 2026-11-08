@@ -10,7 +10,7 @@ pub(super) enum StoreClaimState {
 
 #[allow(dead_code)]
 pub(super) struct SharedStoreReservation {
-    runtime: Arc<SharedMvccRuntime>,
+    runtime: Option<Arc<SharedMvccRuntime>>,
 }
 
 impl SharedMvccRuntime {
@@ -48,16 +48,37 @@ impl SharedMvccRuntime {
         }
         *claim = StoreClaimState::Reserved;
         Ok(SharedStoreReservation {
-            runtime: self.clone(),
+            runtime: Some(self.clone()),
         })
     }
 }
 
 #[allow(dead_code)]
 impl SharedStoreReservation {
+    pub(super) fn construct_store(
+        mut self,
+        allocator: crate::alloc::DynAllocator,
+    ) -> Result<Arc<crate::MvStore>> {
+        let runtime = self.runtime.as_ref().unwrap().clone();
+        self.validate(&runtime)?;
+        let store = Arc::new(MvStore::new_in(
+            crate::mvcc::MvccClock::new(),
+            runtime.storage(),
+            allocator,
+            false,
+        )?);
+        let mut claim = runtime.store_claim.lock();
+        assert!(matches!(*claim, StoreClaimState::Reserved));
+        assert!(store.shared_runtime.set(runtime.clone()).is_ok());
+        *claim = StoreClaimState::Attached;
+        self.runtime = None;
+        Ok(store)
+    }
+
     pub(super) fn validate(&self, runtime: &Arc<SharedMvccRuntime>) -> Result<()> {
-        if !Arc::ptr_eq(runtime, &self.runtime)
-            || !matches!(*self.runtime.store_claim.lock(), StoreClaimState::Reserved)
+        let owner = self.runtime.as_ref().unwrap();
+        if !Arc::ptr_eq(runtime, owner)
+            || !matches!(*owner.store_claim.lock(), StoreClaimState::Reserved)
         {
             return Err(LimboError::InvalidArgument(
                 "fresh Store reservation changed owner".into(),
@@ -68,8 +89,10 @@ impl SharedStoreReservation {
 }
 impl Drop for SharedStoreReservation {
     fn drop(&mut self) {
-        let mut claim = self.runtime.store_claim.lock();
-        assert!(matches!(*claim, StoreClaimState::Reserved));
-        *claim = StoreClaimState::Free;
+        if let Some(runtime) = self.runtime.take() {
+            let mut claim = runtime.store_claim.lock();
+            assert!(matches!(*claim, StoreClaimState::Reserved));
+            *claim = StoreClaimState::Free;
+        }
     }
 }

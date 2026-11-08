@@ -186,11 +186,19 @@ fn log_fixture(
     callback_error: bool,
     delay: usize,
 ) -> (Fixture, Arc<LogTrace>, FinalizedRecoveredCheckpoint) {
+    log_fixture_with_io(fail, callback_error, delay, |io| io)
+}
+fn log_fixture_with_io(
+    fail: usize,
+    callback_error: bool,
+    delay: usize,
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> (Fixture, Arc<LogTrace>, FinalizedRecoveredCheckpoint) {
     let trace = Arc::new(LogTrace::default());
     let wrapping = trace.clone();
     let mut fixture = fresh_fixture_with_io(false, move |inner| {
         Arc::new(LogIo {
-            inner,
+            inner: decorate(inner),
             trace: wrapping,
         })
     });
@@ -421,4 +429,58 @@ fn checkpoint_recovery_reclaim_native_log_rejects_changed_evidence() {
         );
         assert!(fixture.runtime.replay.lock().is_none());
     }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_preserves_captured_config() {
+    let (fixture, trace, finalized) = log_fixture(usize::MAX, false, usize::MAX);
+    let config = finalized.config.clone();
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
+    assert_reclaimed(&fixture, &trace, &reclaimed);
+    assert!(Arc::ptr_eq(&config, reclaimed.config_for_test()));
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_missing_ready() {
+    let (fixture, trace, finalized) = log_fixture(usize::MAX, false, usize::MAX);
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
+    assert_reclaimed(&fixture, &trace, &reclaimed);
+    let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+    let ready = fixture.io.block(|| bootstrap.poll()).unwrap();
+    let (database, connection) = ready.into_parts();
+    assert!(Arc::ptr_eq(&database, &connection.db));
+    trace.enabled.store(false, Ordering::Release);
+    fixture.trace.enabled.store(false, Ordering::Release);
+    connection
+        .execute("UPDATE preserved SET value='reclaimed and ready' WHERE id=1")
+        .unwrap();
+}
+
+pub(in super::super) fn bootstrap_fixture() -> (
+    tempfile::TempDir,
+    Arc<dyn crate::IO>,
+    Arc<SharedMvccRuntime>,
+    ReclaimedRecoveredCheckpoint,
+) {
+    bootstrap_fixture_with_io(|io| io)
+}
+pub(in super::super) fn bootstrap_fixture_with_io(
+    decorate: impl FnOnce(Arc<dyn crate::IO>) -> Arc<dyn crate::IO>,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn crate::IO>,
+    Arc<SharedMvccRuntime>,
+    ReclaimedRecoveredCheckpoint,
+) {
+    let (fixture, trace, finalized) = log_fixture_with_io(usize::MAX, false, usize::MAX, decorate);
+    let mut reclaiming = finalized.begin_log_reclamation().unwrap();
+    let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
+    assert_reclaimed(&fixture, &trace, &reclaimed);
+    trace.enabled.store(false, Ordering::Release);
+    fixture.trace.enabled.store(false, Ordering::Release);
+    (fixture._directory, fixture.io, fixture.runtime, reclaimed)
 }

@@ -1,7 +1,11 @@
 #[path = "shared_checkpoint_recovery_finalize.rs"]
 mod shared_checkpoint_recovery_finalize;
+pub(crate) use shared_checkpoint_recovery_finalize::{
+    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
 
 use super::*;
+use crate::database::shared_recovered::RecoveryOpenConfig;
 use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
 use crate::mvcc::shared_authority::AuthorityGuard;
 use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::SuspendedRecoveryIds;
@@ -9,6 +13,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::SuspendedRecovery
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveredCheckpointConfirmation {
     runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
     ids: SuspendedRecoveryIds,
     max_owner_epoch: Option<u64>,
@@ -80,6 +85,7 @@ impl RecoveryCompletionEvidence {
 
 struct RetainedConfirmation {
     runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
     ids: SuspendedRecoveryIds,
     max_owner_epoch: Option<u64>,
@@ -105,6 +111,7 @@ fn suspend_inspected(
 )> {
     let InspectedRecoveryIds {
         runtime,
+        config,
         parts,
         record,
         pause,
@@ -156,6 +163,7 @@ fn suspend_inspected(
     Ok((
         RetainedConfirmation {
             runtime,
+            config,
             parts,
             ids,
             max_owner_epoch,
@@ -225,6 +233,7 @@ impl RecoveryCheckpointConfirmationState {
         self.finished = true;
         Ok(IOResult::Done(RecoveredCheckpointConfirmation {
             runtime: retained.runtime,
+            config: retained.config,
             parts: retained.parts,
             ids: retained.ids,
             max_owner_epoch: retained.max_owner_epoch,

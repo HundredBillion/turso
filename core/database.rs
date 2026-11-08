@@ -9,6 +9,8 @@ mod shared_connection;
 mod shared_oracle;
 #[cfg(all(host_shared_wal, unix))]
 pub(crate) mod shared_physical;
+#[cfg(all(host_shared_wal, unix))]
+pub(crate) mod shared_recovered;
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
@@ -808,6 +810,8 @@ pub struct DatabaseSharedState<
     #[cfg(all(host_shared_wal, unix))]
     shared_mvcc_runtime: Option<Arc<mvcc::database::SharedMvccRuntime>>,
     #[cfg(all(host_shared_wal, unix))]
+    recovery_construction: Option<Arc<mvcc::database::RecoveryConstructionPermit>>,
+    #[cfg(all(host_shared_wal, unix))]
     offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
     #[cfg(all(host_shared_wal, unix))]
     offline_downgrade: Option<Arc<mvcc::PreparedDowngradeMarker>>,
@@ -1021,6 +1025,8 @@ impl Database {
                 durable_storage: None,
                 #[cfg(all(host_shared_wal, unix))]
                 shared_mvcc_runtime: None,
+                #[cfg(all(host_shared_wal, unix))]
+                recovery_construction: None,
                 #[cfg(all(host_shared_wal, unix))]
                 offline_marker_recovery: None,
                 #[cfg(all(host_shared_wal, unix))]
@@ -3045,7 +3051,22 @@ impl Database {
                     pager.clear_page_cache(true);
                     pager.set_schema_cookie(None);
 
-                    if open_mv_store {
+                    #[cfg(all(host_shared_wal, unix))]
+                    let reuse_recovered_store = if let Some(permit) = &self.recovery_construction {
+                        if !open_mv_store {
+                            return Err(LimboError::InvalidArgument(
+                                "recovery construction requires the existing MVCC marker".into(),
+                            )
+                            .into());
+                        }
+                        permit.validate_database(self)?;
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(all(host_shared_wal, unix)))]
+                    let reuse_recovered_store = false;
+                    if open_mv_store && !reuse_recovered_store {
                         let canonical_path = self.get_database_canonical_path();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(

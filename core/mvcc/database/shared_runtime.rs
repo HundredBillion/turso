@@ -28,6 +28,10 @@ mod shared_checkpoint_intent_fixture;
 
 #[path = "shared_checkpoint_recovery_wal.rs"]
 mod shared_checkpoint_recovery_wal;
+pub(in crate::mvcc) use shared_checkpoint_recovery_wal::RecoveryWalEvidence;
+pub(crate) use shared_checkpoint_recovery_wal::{
+    RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence,
+};
 
 #[path = "shared_checkpoint_recovery_physical.rs"]
 mod shared_checkpoint_recovery_physical;
@@ -35,6 +39,9 @@ mod shared_checkpoint_recovery_physical;
 #[path = "shared_checkpoint_recovery_ids.rs"]
 mod shared_checkpoint_recovery_ids;
 pub(in crate::mvcc) use shared_checkpoint_recovery_ids::RecoveryCompletionEvidence;
+pub(crate) use shared_checkpoint_recovery_ids::{
+    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
 
 #[path = "shared_id_runtime.rs"]
 mod shared_id_runtime;
@@ -73,6 +80,7 @@ pub(crate) struct SharedMvccRuntime {
     replay: Mutex<Option<Arc<SharedReplayContext>>>,
     store_claim: Mutex<shared_store_claim::StoreClaimState>,
     database_id: FileId,
+    original_readonly: bool,
     wal_path: PathBuf,
 }
 
@@ -188,6 +196,7 @@ impl SharedMvccRuntime {
             replay: Mutex::new(None),
             store_claim: Mutex::new(Default::default()),
             database_id,
+            original_readonly: readonly,
             wal_path,
         }))
     }

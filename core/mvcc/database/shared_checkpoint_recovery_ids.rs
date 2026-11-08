@@ -1,9 +1,13 @@
 #[path = "shared_checkpoint_recovery_confirmation.rs"]
 mod shared_checkpoint_recovery_confirmation;
 pub(in crate::mvcc) use shared_checkpoint_recovery_confirmation::RecoveryCompletionEvidence;
+pub(crate) use shared_checkpoint_recovery_confirmation::{
+    RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
 
 use super::shared_checkpoint_recovery_physical::InspectedRecoveryBase;
 use super::*;
+use crate::database::shared_recovered::RecoveryOpenConfig;
 use crate::mvcc::checkpoint_gate::CheckpointPause;
 use crate::mvcc::commit_manifest::ManifestRecord;
 use crate::mvcc::database::shared_bootstrap::PhysicalBaseParts;
@@ -14,6 +18,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::{
 #[allow(dead_code)]
 pub(in crate::mvcc) struct InspectedRecoveryIds {
     runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
     record: ManifestRecord,
     pause: CheckpointPause,
@@ -23,6 +28,7 @@ pub(in crate::mvcc) struct InspectedRecoveryIds {
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryIdInspection {
     runtime: Arc<SharedMvccRuntime>,
+    config: Arc<RecoveryOpenConfig>,
     parts: Option<PhysicalBaseParts>,
     record: ManifestRecord,
     pause: Option<CheckpointPause>,
@@ -32,7 +38,7 @@ pub(in crate::mvcc) struct RecoveryIdInspection {
 impl InspectedRecoveryBase {
     #[allow(dead_code)]
     pub(in crate::mvcc) fn begin_id_inspection(self) -> Result<RecoveryIdInspection> {
-        let (parts, selection) = self.into_parts();
+        let (parts, selection, config) = self.into_parts();
         let record = selection.manifest.record();
         let prefix = record.prefix();
         if record.requires_recovery()
@@ -65,6 +71,7 @@ impl InspectedRecoveryBase {
         )?;
         Ok(RecoveryIdInspection {
             runtime: selection.runtime,
+            config,
             parts: Some(parts),
             record,
             pause: Some(selection.pause),
@@ -93,6 +100,7 @@ impl RecoveryIdInspection {
         self.load = None;
         Ok(IOResult::Done(InspectedRecoveryIds {
             runtime: self.runtime.clone(),
+            config: self.config.clone(),
             parts: self.parts.take().unwrap(),
             record: self.record,
             pause: self.pause.take().unwrap(),
