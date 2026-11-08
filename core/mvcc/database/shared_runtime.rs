@@ -831,6 +831,88 @@ mod tests {
         assert!(connection.prepare("SELECT * FROM preserved").is_ok());
     }
 
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_prepare_busy_native_handler_releases_contended_authority() {
+        let (_directory, database, connection) = prepare_busy_fixture();
+        let runtime = database
+            .get_mv_store()
+            .as_ref()
+            .unwrap()
+            .shared_runtime
+            .get()
+            .unwrap()
+            .clone();
+        let held = Arc::new(crate::sync::Mutex::new(Some(
+            runtime.files.authority.try_acquire().unwrap(),
+        )));
+        let calls = Arc::new(crate::sync::atomic::AtomicUsize::new(0));
+        let release = held.clone();
+        let observed = calls.clone();
+        connection.set_busy_handler(Some(Box::new(move |count| {
+            assert_eq!(count, 0);
+            observed.fetch_add(1, Ordering::SeqCst);
+            release.lock().take().unwrap().finish().unwrap();
+            1
+        })));
+        let statement = connection.prepare("BEGIN").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(held.lock().is_none());
+        assert!(connection.auto_commit.load(Ordering::SeqCst));
+        assert_eq!(connection.get_mv_tx_id_for_db(0), None);
+        drop(statement);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_prepare_busy_native_timeout_is_bounded_without_admission() {
+        let (_directory, database, connection) = prepare_busy_fixture();
+        let runtime = database
+            .get_mv_store()
+            .as_ref()
+            .unwrap()
+            .shared_runtime
+            .get()
+            .unwrap()
+            .clone();
+        let held = runtime.files.authority.try_acquire().unwrap();
+        assert!(matches!(connection.prepare("BEGIN"), Err(LimboError::Busy)));
+        connection.set_busy_timeout(std::time::Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        assert!(matches!(connection.prepare("BEGIN"), Err(LimboError::Busy)));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(10),
+            "timeout ignored: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "timeout unbounded: {elapsed:?}"
+        );
+        assert!(connection.auto_commit.load(Ordering::SeqCst));
+        assert_eq!(connection.get_mv_tx_id_for_db(0), None);
+        held.finish().unwrap();
+        assert!(connection.prepare("BEGIN").is_ok());
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn prepare_busy_fixture() -> (tempfile::TempDir, Arc<crate::Database>, Arc<Connection>) {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let database = crate::Database::open(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        (directory, database, connection)
+    }
+
     #[test]
     fn shared_fixture_materializes_metadata_and_marker_through_pager() {
         let dir = tempfile::tempdir().unwrap();

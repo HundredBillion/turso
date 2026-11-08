@@ -49,3 +49,16 @@
 ## Provisional preflight
 
 Focused C URI and capability tests may run before the recovery integrations are complete to expose ABI and worker-harness defects early. Such runs do not satisfy the release gate. The complete shared profile and combined recovery checks must pass together before public activation is integrated or the PR is marked ready.
+
+### Task 3: Honor busy handling during shared prepare admission
+
+**Blocked by:** The actual PDO overlap counterexample.
+
+**Files:** `core/mvcc/database/shared_runtime.rs` and native validation workflow.
+
+**Interfaces:** Consume existing `BusyHandlerState` and `Connection::get_busy_handler`. Retry only `runtime.begin_open()` lock acquisition before schema compilation; never retry SQL, a partially run statement, or a failed replay.
+
+- [ ] Reproduce ignored busy handling with a native held-authority test whose custom handler releases the genuine guard; verify the callback is invoked once and BEGIN remains unexecuted.
+- [ ] Verify default immediate BUSY and a configured bounded timeout with no transaction admission, followed by a successful prepare after guard release.
+- [ ] Use the existing handler/backoff only for initial lock acquisition; preserve all later errors and lifetime cleanup.
+- [ ] Run the native counterexamples, existing prepare/cancellation tests, strict lint, and unchanged simultaneous-BEGIN PHP overlap barrier.
