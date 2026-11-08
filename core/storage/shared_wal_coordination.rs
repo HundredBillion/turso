@@ -122,6 +122,8 @@ struct ProcessLocalCoordinationEntry {
 /// recognize "our own slot" without probing the cross-process lock.
 #[derive(Debug)]
 struct LocalLockState {
+    recovery_held: bool,
+    recovery_poisoned: bool,
     writer_lock_held: bool,
     checkpoint_lock_held: bool,
     reader_locks: Vec<usize>,
@@ -809,6 +811,8 @@ impl MappedSharedWalCoordination {
                 reader_slot_count,
             ))),
             local_lock_state: Mutex::new(LocalLockState {
+                recovery_held: false,
+                recovery_poisoned: false,
                 writer_lock_held: false,
                 checkpoint_lock_held: false,
                 reader_locks: vec![0; reader_slot_count as usize],
@@ -1350,6 +1354,10 @@ impl MappedSharedWalCoordination {
     /// authoritative liveness signal for this database file; relying on PID
     /// probes here is weaker and can misclassify recycled PIDs as live.
     pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
+        let local = self.local_lock_state.lock();
+        if local.recovery_held || local.recovery_poisoned {
+            return;
+        }
         let header = self.header();
         header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
         header
@@ -1360,7 +1368,6 @@ impl MappedSharedWalCoordination {
         // clearing: another live process may hold a slot. Blindly clearing
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
-        let local = self.local_lock_state.lock();
         let process_local = self.process_local_ownership.lock();
         for slot_index in 0..header.reader_slot_count {
             if local.reader_locks[slot_index as usize] > 0 {
@@ -1771,7 +1778,7 @@ impl MappedSharedWalCoordination {
     /// Attempt to acquire the writer lock for this mapping.
     pub(crate) fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
         let mut local = self.local_lock_state.lock();
-        if local.writer_lock_held {
+        if local.recovery_held || local.recovery_poisoned || local.writer_lock_held {
             return false;
         }
         if self.uses_linux_ofd_locking() {
@@ -1862,8 +1869,12 @@ impl MappedSharedWalCoordination {
 
     /// Determine whether the writer or checkpoint lock is currently held by any process.
     pub(crate) fn writer_or_checkpoint_lock_active(&self) -> bool {
-        let (writer_held, checkpoint_held) = self
-            .with_local_lock_state(|entry| (entry.writer_lock_held, entry.checkpoint_lock_held));
+        let (writer_held, checkpoint_held) = self.with_local_lock_state(|entry| {
+            (
+                entry.writer_lock_held || entry.recovery_held || entry.recovery_poisoned,
+                entry.checkpoint_lock_held || entry.recovery_held || entry.recovery_poisoned,
+            )
+        });
         if self.uses_linux_ofd_locking() {
             return self.byte_lock_is_held(WRITER_LOCK_OFFSET, writer_held)
                 || self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, checkpoint_held);
@@ -1879,7 +1890,9 @@ impl MappedSharedWalCoordination {
 
     /// Determine whether the checkpoint lock is currently held by any process.
     pub(crate) fn checkpoint_lock_active(&self) -> bool {
-        let checkpoint_held = self.with_local_lock_state(|entry| entry.checkpoint_lock_held);
+        let checkpoint_held = self.with_local_lock_state(|entry| {
+            entry.checkpoint_lock_held || entry.recovery_held || entry.recovery_poisoned
+        });
         if self.uses_linux_ofd_locking() {
             return self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, checkpoint_held);
         }
@@ -1898,7 +1911,7 @@ impl MappedSharedWalCoordination {
     /// Attempt to acquire the checkpoint lock for this mapping.
     pub(crate) fn try_acquire_checkpoint(&self, owner: SharedOwnerRecord) -> bool {
         let mut local = self.local_lock_state.lock();
-        if local.checkpoint_lock_held {
+        if local.recovery_held || local.recovery_poisoned || local.checkpoint_lock_held {
             return false;
         }
         if self.uses_linux_ofd_locking() {
@@ -1979,7 +1992,10 @@ impl MappedSharedWalCoordination {
                 (slot_index as usize) < local.reader_locks.len(),
                 "reader slot registry index out of range"
             );
-            if local.reader_locks[slot_index as usize] > 0 {
+            if local.recovery_held
+                || local.recovery_poisoned
+                || local.reader_locks[slot_index as usize] > 0
+            {
                 return false;
             }
             let offset = Self::process_lock_offset_for_reader(slot_index);
@@ -2038,6 +2054,9 @@ impl MappedSharedWalCoordination {
         for attempt in 0..2 {
             let bitmap = self.reader_bitmap_words();
             let mut local = self.local_lock_state.lock();
+            if local.recovery_held || local.recovery_poisoned {
+                return None;
+            }
             let mut process_local = self.process_local_ownership.lock();
             for slot_index in 0..self.header().reader_slot_count {
                 if local.reader_locks[slot_index as usize] > 0 {
@@ -2151,6 +2170,10 @@ impl MappedSharedWalCoordination {
         max_frame: u64,
     ) -> Option<SharedReaderSlot> {
         {
+            let local = self.local_lock_state.lock();
+            if local.recovery_held || local.recovery_poisoned {
+                return None;
+            }
             let mut process_local = self.process_local_ownership.lock();
             if let Some(slot) = process_local.retain_shared_snapshot_reader(max_frame) {
                 return Some(slot);
@@ -2269,6 +2292,9 @@ impl MappedSharedWalCoordination {
         id = "reader_slot_frame_zero_means_db_file_reader"
     )]
     pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
+        if self.with_local_lock_state(|local| local.recovery_held || local.recovery_poisoned) {
+            return Some(0);
+        }
         self.live_reader_frames()
             .filter(|frame| *frame != DB_FILE_READER_FRAME)
             .min()
@@ -2277,6 +2303,9 @@ impl MappedSharedWalCoordination {
     /// Whether a reader in any process reads only the database file.
     /// Checkpoints must not backfill any new frame while one is active.
     pub(crate) fn has_active_db_file_reader(&self) -> bool {
+        if self.with_local_lock_state(|local| local.recovery_held || local.recovery_poisoned) {
+            return true;
+        }
         self.live_reader_frames()
             .any(|frame| frame == DB_FILE_READER_FRAME)
     }

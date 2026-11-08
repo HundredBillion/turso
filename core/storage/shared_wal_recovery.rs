@@ -1,16 +1,111 @@
 use super::*;
+use crate::io::FileId;
 
 pub(crate) struct SharedWalRecoveryLocks {
     mapping: Arc<MappedSharedWalCoordination>,
+    file_id: FileId,
+    offsets: Vec<u64>,
 }
 
 impl SharedWalRecoveryLocks {
     pub(crate) fn acquire(mapping: Arc<MappedSharedWalCoordination>) -> Result<Arc<Self>> {
-        let _ = mapping;
-        Err(LimboError::InvalidArgument(
-            "physical WAL recovery exclusion is not implemented".into(),
-        ))
+        if !mapping.uses_linux_ofd_locking() {
+            return Err(LimboError::InvalidArgument(
+                "physical WAL recovery requires native Linux OFD locks".into(),
+            ));
+        }
+        let file_id = mapping.file.file_id()?.ok_or_else(|| {
+            LimboError::InvalidArgument("physical WAL recovery requires native storage".into())
+        })?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(mapping.header().reader_slot_count as usize + 2)?;
+        let mut local = mapping.local_lock_state.lock();
+        if local.recovery_poisoned {
+            return Err(LimboError::InvalidArgument(
+                "physical WAL recovery lost native lock ownership".into(),
+            ));
+        }
+        if local.recovery_held
+            || local.writer_lock_held
+            || local.checkpoint_lock_held
+            || local.reader_locks.iter().any(|count| *count != 0)
+        {
+            return Err(LimboError::Busy);
+        }
+        let wanted = [CHECKPOINT_LOCK_OFFSET, WRITER_LOCK_OFFSET]
+            .into_iter()
+            .chain(
+                (0..mapping.header().reader_slot_count)
+                    .map(MappedSharedWalCoordination::process_lock_offset_for_reader),
+            );
+        for offset in wanted {
+            let result = mapping
+                .file
+                .shared_wal_try_lock_byte(offset, true, mapping.lock_kind());
+            let error = match result {
+                Ok(true) => {
+                    offsets.push(offset);
+                    continue;
+                }
+                Ok(false) => LimboError::Busy,
+                Err(error) => error,
+            };
+            let cleanup = release_offsets(&mapping, &offsets);
+            if let Err(cleanup) = cleanup {
+                local.recovery_poisoned = true;
+                return Err(cleanup);
+            }
+            return Err(error);
+        }
+        local.recovery_held = true;
+        drop(local);
+        Ok(Arc::new(Self {
+            mapping,
+            file_id,
+            offsets,
+        }))
     }
+
+    pub(crate) fn validate_mapping(
+        &self,
+        mapping: &Arc<MappedSharedWalCoordination>,
+    ) -> Result<()> {
+        let local = self.mapping.local_lock_state.lock();
+        if !Arc::ptr_eq(&self.mapping, mapping)
+            || self.mapping.file.file_id()? != Some(self.file_id)
+            || !local.recovery_held
+            || local.recovery_poisoned
+        {
+            return Err(LimboError::InvalidArgument(
+                "physical WAL recovery exclusion changed owner or native file".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SharedWalRecoveryLocks {
+    fn drop(&mut self) {
+        let mut local = self.mapping.local_lock_state.lock();
+        if let Err(error) = release_offsets(&self.mapping, &self.offsets) {
+            local.recovery_poisoned = true;
+            tracing::error!(%error, "failed releasing physical WAL recovery locks");
+        }
+        local.recovery_held = false;
+    }
+}
+
+fn release_offsets(mapping: &MappedSharedWalCoordination, offsets: &[u64]) -> Result<()> {
+    let mut first_error = None;
+    for offset in offsets.iter().rev() {
+        if let Err(error) = mapping
+            .file
+            .shared_wal_unlock_byte(*offset, mapping.lock_kind())
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
