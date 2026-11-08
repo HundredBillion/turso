@@ -103,4 +103,16 @@ Evidence:
 - Native run [42318232064](https://github.com/HundredBillion/turso/actions/runs/42318232064) checked exact source `784b38afc2ddfae50bd25e7f9f9a6ee98490a37d`. The real completed marker254 fixture passed using retained runtime main wrapped in ReadPinnedFile and DatabaseFile. It read the materialized payload and exact persisted checkpoint timestamp, preserved source state/main bytes, and verified read pins retired before returning control to the caller.
 - The same run passed coordinator3, completion3, ID-finalization3, guarded15, shared221 (20 explicitly ignored), native materialization/open/commit two each, and strict library Clippy. Local format/diff checks and strict library Clippy also passed.
 
-Task 1 fact collection/validation, Task 2 delayed factory cancellation tests, and Task 3 evidence/recovery integration remain unfinished. The factory's native success is not end-to-end recovery or public-mode acceptance.
+The factory evidence above covers the independent staging connection. Subsequent physical facts and retirement checks are recorded below; neither milestone is end-to-end recovery or public-mode acceptance.
+
+## Verified live physical staging milestone (2026-11-07)
+
+`d4013baff` extracts store-independent `PhysicalBaseReadState` and `PhysicalBaseParts` while preserving the existing bootstrap-to-RecoverCtx wrapper. The timestamp reader/validator is shared through an unconditional module, so ordinary metadata reads do not depend on Unix/shared-WAL support. Raw parts contain actual header, schema/type rows and persistent timestamp; they do not authorize recovery or generation publication.
+
+`b5205e5f4` consumes the coordinator's original PublishedSharedCheckpoint and returns verified physical staging with the same FinalizedIds, completion proof, authority and admission pause. It checks exact store/runtime/lease/native main identity, quiescence, empty WAL, marker/header extent, physical schema roots, persistent target timestamp and ID floor. All main reads use the read-pinned retained file and an isolated bootstrap connection. Evidence does not escape before backend completion retirement.
+
+Native [run 42430397394](https://github.com/HundredBillion/turso/actions/runs/42430397394) verified exact source `7df8f89ec43d405fe89d78b5939f1dd6e0b75157`: three live staging cases, four fact/bootstrap cases, three publication-coordinator cases, two read-pin tests, 558 MVCC database tests (22 ignored), strict library lint, formatting and source integrity passed. Cancellation coverage delays both the 512-byte header read and a schema-page read, before and after callback readiness, while checking authority exclusion and unchanged live schema/cache/main bytes. Successful fact collection also waits while the backend retains the completed physical Completion.
+
+Two deliberate controls failed at their intended assertions, then the restored implementation passed: bypassing read pins released authority before backend retirement; bypassing the retirement wait returned physical evidence too early. The original staging stub also failed at its explicit missing implementation in [run 42429344746](https://github.com/HundredBillion/turso/actions/runs/42429344746).
+
+This milestone does not install store metadata or pager generations, replace local replay/schema state, reclaim the logical log, finish authority, release admission, or enable public mode. Fresh interrupted-checkpoint acquisition, physical reconciliation and recovered-proof construction remain separately owned recovery work.
