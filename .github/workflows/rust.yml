@@ -1,4 +1,4 @@
-name: Recovery physical inspection native validation
+name: Completed target ID inspection expected RED
 on:
   workflow_dispatch:
 permissions:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c98f47d3b4c66565c089f98ff4e6bc4c2a3804fe
+          ref: 9bdcfc5062410054dbc47540cc81df8ae59a066f
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,7 +25,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = "$(git rev-parse c98f47d3b4c66565c089f98ff4e6bc4c2a3804fe)"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse 9bdcfc5062410054dbc47540cc81df8ae59a066f)"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Verified recovery and physical-collector prerequisites
@@ -38,19 +38,16 @@ jobs:
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_physical_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-green.log
           grep -q '1 passed; 0 failed' physical-green.log
-      - name: Recovery cancellation and existing physical reader/pins
+      - name: Exact missing unrecovered ID inspection
         run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_io_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee recovery-io.log
-          grep -q '2 passed; 0 failed' recovery-io.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_physical_connection_ -- --test-threads=1 --nocapture 2>&1 | tee factory.log
-          grep -q '3 passed; 0 failed' factory.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api read_pinned_file::tests:: -- --test-threads=1 --nocapture 2>&1 | tee pin.log
-          grep -q '2 passed; 0 failed' pin.log
-      - name: Full MVCC and strict library lint
-        run: |
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::database:: -- --test-threads=2 2>&1 | tee mvcc.log
-          grep -Eq '[1-9][0-9]* passed; 0 failed' mvcc.log
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee lint.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ids_native_ -- --ignored --test-threads=1 --nocapture > ids-red.log 2>&1
+          result=$?
+          set -e
+          cat ids-red.log
+          test "$result" -ne 0
+          grep -q 'completed checkpoint ID inspection is not implemented' ids-red.log
+          grep -q '0 passed; 1 failed' ids-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
