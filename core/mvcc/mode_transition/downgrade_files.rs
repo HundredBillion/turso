@@ -38,7 +38,7 @@ impl RetainedFile {
 }
 
 /// Native aliases used only while the caller retains completed-checkpoint ownership.
-/// No path is created, truncated, or removed by this preparation slice.
+/// A missing basename WAL is exclusively created and synced before intent publication.
 pub(in crate::mvcc) struct DowngradeFiles {
     main: RetainedFile,
     wal: RetainedFile,
@@ -79,12 +79,11 @@ impl DowngradeFiles {
             .ok_or_else(|| invalid("downgrade path must be UTF-8"))?;
         require_absent(&PathBuf::from(format!("{text}-tshm")))?;
         let wal_path = PathBuf::from(format!("{text}-wal"));
-        if !wal_path.try_exists().map_err(fs_error)? {
-            return Err(invalid(
-                "downgrade preparation requires an existing empty basename WAL",
-            ));
-        }
-        let wal = RetainedFile::open(wal_path)?;
+        let wal = match std::fs::symlink_metadata(&wal_path) {
+            Ok(_) => Some(RetainedFile::open(wal_path.clone())?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(fs_error(error)),
+        };
         let log_path = main.path.with_extension("db-log");
         let log = match std::fs::symlink_metadata(&log_path) {
             Ok(_) => Some(RetainedFile::open(log_path.clone())?),
@@ -110,7 +109,7 @@ impl DowngradeFiles {
             files.push(file);
         }
         let mut ids = vec![main.id];
-        for file in std::iter::once(&wal).chain(log.iter()).chain(files.iter()) {
+        for file in wal.iter().chain(log.iter()).chain(files.iter()) {
             if file.id.dev != main.id.dev || ids.contains(&file.id) {
                 return Err(invalid(
                     "downgrade files must have distinct native identities",
@@ -118,6 +117,67 @@ impl DowngradeFiles {
             }
             ids.push(file.id);
         }
+        // Validate every existing sidecar before creating the only missing file.
+        let wal_length = wal
+            .as_ref()
+            .map(|wal| wal.file.metadata().map(|m| m.len()))
+            .transpose()
+            .map_err(fs_error)?;
+        if wal_length.is_some_and(|length| length != 0)
+            || files[1].file.metadata().map_err(fs_error)?.len() != 0
+            || files[2].file.metadata().map_err(fs_error)?.len() != 0
+        {
+            return Err(invalid("downgrade requires empty ordinary and shared logs"));
+        }
+        if let Some(log) = &log {
+            validate_ordinary_log(log)?;
+        }
+        let wal = match wal {
+            Some(wal) => wal,
+            None => {
+                let parent = main
+                    .path
+                    .parent()
+                    .ok_or_else(|| invalid("missing database parent"))?;
+                let directory = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                    .open(parent)
+                    .map_err(fs_error)?;
+                let parent_id = identity(&directory)?;
+                main.revalidate()?;
+                let metadata = std::fs::symlink_metadata(parent).map_err(fs_error)?;
+                if parent_id
+                    != (FileId {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    })
+                {
+                    return Err(invalid("downgrade database parent changed"));
+                }
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&wal_path)
+                    .map_err(fs_error)?;
+                let id = identity(&file)?;
+                let wal = RetainedFile {
+                    path: wal_path,
+                    file,
+                    id,
+                };
+                wal.revalidate()?;
+                if id.dev != main.id.dev || ids.contains(&id) {
+                    return Err(invalid("created downgrade WAL identity is invalid"));
+                }
+                wal.file.sync_all().map_err(fs_error)?;
+                directory.sync_all().map_err(fs_error)?;
+                wal
+            }
+        };
         let io = crate::io::SyscallIO::new()?;
         let manifest = io.open_file(
             files[0]
@@ -193,13 +253,7 @@ impl DowngradeFiles {
         require_absent(&PathBuf::from(format!("{}-tshm", self.main.path.display())))?;
         if let Some(log) = &self.log {
             log.revalidate()?;
-            let length = log.file.metadata().map_err(fs_error)?.len();
-            if length > LOG_HDR_SIZE as u64 {
-                return Err(invalid("ordinary logical log contains frames"));
-            }
-            let mut bytes = vec![0; length as usize];
-            log.file.read_exact_at(&mut bytes, 0).map_err(fs_error)?;
-            LogHeader::validate_header_only_file(&bytes)?;
+            validate_ordinary_log(log)?;
         } else {
             require_absent(&self.log_path)?;
         }
@@ -250,4 +304,14 @@ fn require_absent(path: &Path) -> Result<()> {
 }
 fn invalid(message: &str) -> LimboError {
     LimboError::InvalidArgument(message.into())
+}
+
+fn validate_ordinary_log(log: &RetainedFile) -> Result<()> {
+    let length = log.file.metadata().map_err(fs_error)?.len();
+    if length > LOG_HDR_SIZE as u64 {
+        return Err(invalid("ordinary logical log contains frames"));
+    }
+    let mut bytes = vec![0; length as usize];
+    log.file.read_exact_at(&mut bytes, 0).map_err(fs_error)?;
+    LogHeader::validate_header_only_file(&bytes)
 }

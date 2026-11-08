@@ -343,17 +343,10 @@ mod tests {
     #[test]
     #[ignore = "requires native Linux ext-family filesystem"]
     fn shared_downgrade_prepare_native_rejects_sidecars_without_writes() {
-        for case in [
-            "missing",
-            "nonempty",
-            "alias",
-            "ordinary-log",
-            "ordinary-coordination",
-        ] {
+        for case in ["nonempty", "alias", "ordinary-log", "ordinary-coordination"] {
             let mut fixture = installed_fixture();
             let wal = PathBuf::from(format!("{}-wal", fixture.path.display()));
             match case {
-                "missing" => std::fs::remove_file(&wal).unwrap(),
                 "nonempty" => std::fs::write(&wal, b"not empty").unwrap(),
                 "alias" => {
                     std::fs::remove_file(&wal).unwrap();
@@ -377,13 +370,6 @@ mod tests {
                 OfflinePrerequisite::AllOlderWorkersStopped,
             );
             assert!(result.is_err(), "accepted {case}");
-            if case == "missing" {
-                assert!(result
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("existing empty basename WAL"));
-            }
             assert_unchanged(&before);
             assert_eq!(std::fs::read(&wal).ok(), wal_before);
             assert!(fixture.runtime.replay.lock().is_none());
@@ -796,5 +782,33 @@ mod tests {
             expected
         );
         assert_eq!(std::fs::metadata(&wal).unwrap().ino(), expected.ino);
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_creation_native_invalid_sidecars_do_not_create_wal() {
+        for coordination in [false, true] {
+            let mut fixture = installed_fixture();
+            let wal = PathBuf::from(format!("{}-wal", fixture.path.display()));
+            std::fs::remove_file(&wal).unwrap();
+            let invalid = if coordination {
+                PathBuf::from(format!("{}-tshm", fixture.path.display()))
+            } else {
+                fixture.path.with_extension("db-log")
+            };
+            std::fs::write(&invalid, b"unrelated content").unwrap();
+            let before = unchanged_files(&fixture);
+            assert!(fixture
+                .installed
+                .take()
+                .unwrap()
+                .begin_downgrade(
+                    fixture.connection.clone(),
+                    OfflinePrerequisite::AllOlderWorkersStopped,
+                )
+                .is_err());
+            assert!(!wal.exists());
+            assert_eq!(std::fs::read(&invalid).unwrap(), b"unrelated content");
+            assert_unchanged(&before);
+        }
     }
 }
