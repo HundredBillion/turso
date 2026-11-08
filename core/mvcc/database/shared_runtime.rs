@@ -52,6 +52,7 @@ pub(crate) struct SharedOpenState {
     manifest_ready: bool,
     bindings: Vec<FileBinding>,
     pin_physical_reads: bool,
+    connection_refreshed: bool,
 }
 
 #[derive(Default)]
@@ -213,6 +214,7 @@ impl SharedMvccRuntime {
             manifest_ready: false,
             bindings: Vec::new(),
             pin_physical_reads,
+            connection_refreshed: false,
         })
     }
 }
@@ -286,7 +288,25 @@ impl SharedOpenState {
         Ok(())
     }
 
-    pub(crate) fn finish_connection(&mut self) -> IOResultOr<()> {
+    pub(crate) fn finish_connection<C: LogicalClock, A: ConcurrentAllocator>(
+        &mut self,
+        store: &MvStore<C, A>,
+        connection: &Arc<Connection>,
+    ) -> IOResultOr<()> {
+        if !self.connection_refreshed {
+            if self.refresh.is_none() {
+                let replay = self.runtime.replay.lock().clone().ok_or(LimboError::Busy)?;
+                self.refresh = Some(
+                    replay.refresh(self.loaded.take().unwrap(), self.runtime.logical.clone())?,
+                );
+            }
+            self.loaded = Some(return_if_io!(self
+                .refresh
+                .as_mut()
+                .unwrap()
+                .poll(store, connection)));
+            self.connection_refreshed = true;
+        }
         let guard = self.loaded.as_ref().ok_or(LimboError::Busy)?.guard()?;
         if !guard.io_retired() {
             return Ok(IOResult::IO(crate::types::IOCompletions(

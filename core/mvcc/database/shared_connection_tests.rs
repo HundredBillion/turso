@@ -107,6 +107,82 @@ fn shared_connection_native_cancel_keeps_header_authority_until_backend_release(
     }
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_connection_native_initial_open_cancel_keeps_header_authority_until_backend_release() {
+    for read_offset in 1..=2 {
+        for complete_before_drop in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, limit) = shared_runtime_fixture(directory.path());
+            let control = Arc::new(ConnectionIoControl {
+                main_path: path.clone(),
+                ..Default::default()
+            });
+            let io: Arc<dyn crate::IO> = Arc::new(ConnectionIo {
+                inner: Arc::new(crate::io::SyscallIO::new().unwrap()),
+                control: control.clone(),
+            });
+            let main = io
+                .open_file(path.to_str().unwrap(), crate::OpenFlags::None, false)
+                .unwrap();
+            let probe = SharedMvccRuntime::open_existing(
+                io.clone(),
+                main.clone(),
+                main.file_id().unwrap().unwrap(),
+                &path,
+                limit,
+                false,
+            )
+            .unwrap();
+            control.delay_at_read.store(
+                control.main_reads.load(Ordering::Acquire) + read_offset,
+                Ordering::Release,
+            );
+            let options = crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit);
+            let mut state = crate::OpenDbAsyncState::new();
+            let waiter = match crate::Database::open_async(
+                &mut state,
+                io.clone(),
+                path.to_str().unwrap(),
+                &options,
+            )
+            .unwrap()
+            {
+                IOResult::IO(waiter) => waiter,
+                IOResult::Done(_) => {
+                    panic!("initial open bypassed delayed physical read {read_offset}")
+                }
+            };
+            let held = control
+                .pending_read
+                .lock()
+                .take()
+                .expect("initial open did not submit expected header read");
+            if complete_before_drop {
+                held.complete();
+            }
+            drop(waiter);
+            drop(state);
+            assert!(
+                matches!(probe.files.authority.try_acquire(), Err(LimboError::Busy)),
+                "cancelled initial header read released authority before backend release"
+            );
+            if !complete_before_drop {
+                held.complete();
+            }
+            assert!(matches!(probe.begin_open(), Err(LimboError::Busy)));
+            drop(held);
+            let guard = probe.files.authority.try_acquire().unwrap();
+            drop(guard);
+            drop(probe);
+            let database = crate::Database::open(io, path.to_str().unwrap(), options).unwrap();
+            let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+            connection.execute("SELECT value FROM preserved").unwrap();
+        }
+    }
+}
+
 struct HeldMainRead {
     file: Arc<dyn File>,
     offset: u64,

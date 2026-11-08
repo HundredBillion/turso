@@ -9,6 +9,7 @@ pub(super) struct SharedConnectState {
     context: Option<ConnectionContext>,
     pager: Option<Arc<Pager>>,
     connection: Option<Arc<Connection>>,
+    generation_validated: bool,
 }
 
 impl SharedConnectState {
@@ -37,6 +38,7 @@ impl SharedConnectState {
             context: Some(context),
             pager: None,
             connection: None,
+            generation_validated: false,
         })
     }
 
@@ -48,7 +50,10 @@ impl SharedConnectState {
             .into());
         }
         return_if_io!(self.open.poll_manifest());
-        self.open.validate_connection_generation()?;
+        if !self.generation_validated {
+            self.open.validate_connection_generation()?;
+            self.generation_validated = true;
+        }
         if self.pager.is_none() {
             self.pager = Some(Arc::new(return_if_io!(database._init_nonblock(
                 &mut self.init,
@@ -69,7 +74,10 @@ impl SharedConnectState {
                 self.opts.readonly.unwrap_or(database.readonly_bootstrap),
             )?);
         }
-        return_if_io!(self.open.finish_connection());
+        return_if_io!(self.open.finish_connection(
+            database.get_mv_store().as_ref().ok_or(LimboError::Busy)?,
+            self.connection.as_ref().unwrap(),
+        ));
         Ok(IOResult::Done(self.connection.take().unwrap()))
     }
 }
