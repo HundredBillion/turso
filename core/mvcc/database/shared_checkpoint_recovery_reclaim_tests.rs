@@ -416,7 +416,7 @@ fn checkpoint_recovery_reclaim_native_log_rejects_changed_evidence() {
         }
         let rejected = match finalized.begin_log_reclamation() {
             Err(_) => true,
-            Ok(mut state) => fixture.io.block(|| Ok(state.poll()?)).is_err(),
+            Ok(mut state) => fixture.io.block(|| state.poll()).is_err(),
         };
         assert!(
             rejected,
