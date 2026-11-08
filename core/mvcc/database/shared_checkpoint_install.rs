@@ -512,15 +512,73 @@ mod tests {
             runtime.gate.try_enter_admission(),
             Err(LimboError::Busy)
         ));
+        let durable_paths = [
+            fixture.path.clone(),
+            fixture.namespace.join("manifest"),
+            fixture.namespace.join("logical"),
+            fixture.namespace.join("physical-wal"),
+            fixture.namespace.join("ids-a"),
+            fixture.namespace.join("ids-b"),
+            fixture.namespace.join("ids-selector"),
+        ];
+        let durable_before: Vec<_> = durable_paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert!(matches!(
+            fixture.connection.execute("SELECT value FROM preserved"),
+            Err(LimboError::Busy)
+        ));
+        assert!(matches!(
+            fixture.database.connect(crate::ConnectOpts::new()),
+            Err(LimboError::Busy)
+        ));
+        assert!(runtime.replay.lock().is_none());
+        assert!(store.txs.is_empty());
         assert!(installing.poll().is_err());
         drop(installing);
         drop(installed);
         assert!(runtime.replay.lock().is_none());
-        assert!(fixture
+        let mut resumed_values = Vec::new();
+        fixture
             .connection
-            .execute("SELECT value FROM preserved")
-            .is_err());
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                resumed_values.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(resumed_values, ["materialized shared row"]);
+        assert_eq!(
+            runtime.replay.lock().as_ref().unwrap().identity().unwrap(),
+            target
+        );
+        assert_eq!(
+            store.last_committed_tx_ts.load(Ordering::Acquire),
+            target.prefix.committed_timestamp
+        );
+        assert_eq!(
+            store.durable_txid_max.load(Ordering::Acquire),
+            target.database.checkpoint_timestamp
+        );
+        assert!(Arc::ptr_eq(
+            &fixture.database.schema.lock(),
+            &fixture.connection.schema.read()
+        ));
         assert!(store.txs.is_empty());
+        let guard = runtime.files.authority.try_acquire().unwrap();
+        assert_eq!(guard.published().unwrap(), target.prefix);
+        assert!(guard.live_registrations().unwrap().is_empty());
+        guard.finish().unwrap();
+        let durable_after: Vec<_> = durable_paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert_eq!(
+            durable_after, durable_before,
+            "local readiness reconstruction changed durable files"
+        );
         let options = crate::OpenOptions::new(fixture.database.dialect().clone())
             .with_shared_mvcc_for_test(fixture.limit);
         let fresh =
