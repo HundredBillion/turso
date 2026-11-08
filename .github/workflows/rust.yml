@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: c9630d203fa4575afc800c252499aa52b30ee3db
+          ref: df80b69b9822d9c1ac3b377296c9c6982ea09373
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -23,8 +23,12 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = c9630d203fa4575afc800c252499aa52b30ee3db
+          test "$(git rev-parse HEAD)" = df80b69b9822d9c1ac3b377296c9c6982ea09373
           rustc -Vv | tee rustc.txt
+      - name: Idle old process and new constructor reload current generation
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_idle_generation_native_reloads_after_checkpoint_and_later_commits -- --ignored --test-threads=1 --nocapture 2>&1 | tee idle-process-green.log
+          grep -q '1 passed; 0 failed' idle-process-green.log
       - name: Current base evidence and existing ID protocol
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api id_current_base_ -- --test-threads=1 --nocapture 2>&1 | tee current-base-green.log
