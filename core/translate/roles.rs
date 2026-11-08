@@ -6,11 +6,14 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
-//! may not write to any table, use a sequence or change the schema. It may
-//! read tables, which row-level security limits, and switch roles.
+//! Privileges other than ownership are not checked yet, so a role that is
+//! not a superuser may not write to any table, use a sequence or change the
+//! schema it does not own. It may read tables, which row-level security
+//! limits, and switch roles.
 
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::sync::Arc;
+use crate::Connection;
 use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
@@ -25,11 +28,17 @@ use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
-/// Fails if a role that is not a superuser may not run `stmt` at all. Uses of
+/// Fails if a role that is not a superuser may not run `stmt` at all. The
+/// owner of a relation may drop and alter it; everything else needs a
+/// superuser. Uses of
 /// sequences and PRAGMAs inside the statement are checked when they are
 /// compiled, by [check_sequence_change] and [check_pragma_function], so that
 /// the views a query reads are checked too.
-pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
+pub fn check_statement_privileges(
+    stmt: &ast::Stmt,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     let denial = match stmt {
         ast::Stmt::Select(_) => return Ok(()),
         ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
@@ -58,35 +67,103 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
         | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
         ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
         ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
+        ast::Stmt::AlterSequenceOwnedBy { seq_name, .. } => {
+            let namespace = crate::translate::sequence::sequence_namespace(seq_name, resolver)
+                .ok()
+                .flatten();
+            if may_act_as_owner(resolver, connection, namespace, seq_name.name.as_str()) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Alter,
+                Object::Sequence(seq_name.name.as_str().to_string()),
+            )
+        }
         ast::Stmt::CreateType { .. } | ast::Stmt::CreateDomain { .. } => {
             PermissionDenied::privilege(
                 Action::Create,
                 Object::Schema(MAIN_SCHEMA_NAME.to_string()),
             )
         }
-        ast::Stmt::CreateIndex { tbl_name, .. } => {
-            PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
+        // The dialect decides who may grant on each relation, from the
+        // privileges it stores.
+        ast::Stmt::Grant(_) => return Ok(()),
+        // PostgreSQL lets the table's owner index it when it also has CREATE
+        // on the index's schema, which only a superuser has until GRANT
+        // exists, as for CREATE TABLE.
+        ast::Stmt::CreateIndex {
+            idx_name, tbl_name, ..
+        } => {
+            // The table is the one of the index's schema, which is how
+            // translate_create_index resolves it.
+            let mut qualified = ast::QualifiedName::single(tbl_name.clone());
+            qualified.namespace.clone_from(&idx_name.namespace);
+            if may_act_as_owner_of_table(resolver, connection, &qualified) {
+                create_in_schema_denial(idx_name)
+            } else {
+                PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
+            }
         }
         ast::Stmt::CreateTrigger { tbl_name, .. } => PermissionDenied::privilege(
             Action::CreateTrigger,
             Object::Table(tbl_name.name.as_str().to_string()),
         ),
-        ast::Stmt::AlterTable(alter) => PermissionDenied::owner(
-            Action::Alter,
-            Object::Table(alter.name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropTable { tbl_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Table(tbl_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropIndex { idx_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Index(idx_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropView { view_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::View(view_name.name.as_str().to_string()),
-        ),
+        ast::Stmt::AlterTable(alter) => {
+            let owner = may_act_as_owner_of_table(resolver, connection, &alter.name);
+            let owner_denial = || {
+                PermissionDenied::owner(
+                    Action::Alter,
+                    Object::Table(alter.name.name.as_str().to_string()),
+                )
+            };
+            match &alter.body {
+                // The owner may give its relation to a role it may set
+                // itself, as in PostgreSQL; without role membership that is
+                // itself, which changes nothing. Anyone else must be the
+                // owner.
+                ast::AlterTableBody::OwnerTo { role, .. } if owner => {
+                    if may_set_role(resolver, connection, role) {
+                        return Ok(());
+                    }
+                    PermissionDenied::privilege(Action::SetRole, Object::Role(role_spec_name(role)))
+                }
+                ast::AlterTableBody::OwnerTo { .. } => owner_denial(),
+                // Renaming also needs CREATE on the schema, as in
+                // PostgreSQL, which only a superuser has until GRANT exists.
+                ast::AlterTableBody::RenameTo(_) if owner => create_in_schema_denial(&alter.name),
+                // The owner may run every other ALTER on its relation.
+                _ if owner => return Ok(()),
+                _ => owner_denial(),
+            }
+        }
+        ast::Stmt::DropTable { tbl_name, .. } => {
+            if may_act_as_owner_of_table(resolver, connection, tbl_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::Table(tbl_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::DropIndex { idx_name, .. } => {
+            let namespace = resolver.find_existing_index(idx_name).ok().flatten();
+            if may_act_as_owner(resolver, connection, namespace, idx_name.name.as_str()) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::Index(idx_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::DropView { view_name, .. } => {
+            if may_act_as_owner_of_table(resolver, connection, view_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::View(view_name.name.as_str().to_string()),
+            )
+        }
         ast::Stmt::DropTrigger { trigger_name, .. } => PermissionDenied::owner(
             Action::Drop,
             Object::Trigger(trigger_name.name.as_str().to_string()),
@@ -97,10 +174,18 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
         ast::Stmt::DropDomain { domain_name, .. } => {
             PermissionDenied::owner(Action::Drop, Object::Type(domain_name.to_string()))
         }
-        ast::Stmt::DropSequence { seq_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Sequence(seq_name.name.as_str().to_string()),
-        ),
+        ast::Stmt::DropSequence { seq_name, .. } => {
+            let namespace = crate::translate::sequence::sequence_namespace(seq_name, resolver)
+                .ok()
+                .flatten();
+            if may_act_as_owner(resolver, connection, namespace, seq_name.name.as_str()) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::Sequence(seq_name.name.as_str().to_string()),
+            )
+        }
         ast::Stmt::CreateSchema { .. } => database_denial(Action::Create),
         ast::Stmt::DropSchema { name } => {
             PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string()))
@@ -129,6 +214,64 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
     Err(permission_denied(denial))
 }
 
+/// Whether the current role may run an owner-gated statement on the table or
+/// view `name` names: the dialect says the role owns it. A relation that does not
+/// resolve is let through, so the statement fails in translation with its
+/// usual missing-relation error, as PostgreSQL orders the checks.
+fn may_act_as_owner_of_table(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    name: &ast::QualifiedName,
+) -> bool {
+    let namespace = resolver.find_existing_table(name).ok().flatten();
+    may_act_as_owner(resolver, connection, namespace, name.name.as_str())
+}
+
+/// [`may_act_as_owner_of_table`] with the relation already resolved: None
+/// means it does not exist, and translation reports that.
+fn may_act_as_owner(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: Option<NamespaceRef>,
+    name: &str,
+) -> bool {
+    let Some(namespace) = namespace else {
+        return true;
+    };
+    if namespace.database_id != MAIN_DB_ID {
+        return false;
+    }
+    let normalized = crate::util::normalize_ident(name);
+    resolver.with_schema(MAIN_DB_ID, |schema| {
+        resolver
+            .catalog
+            .dialect
+            .relation_owner(schema, namespace.id, &normalized)
+            == Some(connection.current_role())
+    })
+}
+
+/// Whether the session may `SET ROLE` to `role`, which is what giving a
+/// relation to `role` takes.
+fn may_set_role(resolver: &Resolver, connection: &Arc<Connection>, role: &ast::RoleSpec) -> bool {
+    let roles = &resolver.schema().roles;
+    let target = match role {
+        ast::RoleSpec::CurrentRole => Some(connection.current_role()),
+        ast::RoleSpec::SessionUser => Some(connection.session_role()),
+        ast::RoleSpec::Name(name) => roles.get_by_name(name).map(|role| role.id),
+    };
+    target.is_some_and(|target| roles.can_set_role(connection.current_role(), target))
+}
+
+/// The name a denial calls `role` by.
+fn role_spec_name(role: &ast::RoleSpec) -> String {
+    match role {
+        ast::RoleSpec::Name(name) => name.clone(),
+        ast::RoleSpec::CurrentRole => "current_user".to_string(),
+        ast::RoleSpec::SessionUser => "session_user".to_string(),
+    }
+}
+
 fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
     PermissionDenied::privilege(
         Action::Write,
@@ -145,6 +288,41 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     Err(permission_denied(PermissionDenied::privilege(
         Action::Write,
         Object::Sequence(sequence.to_string()),
+    )))
+}
+
+/// Fails if the statement is compiled for a role that may not read relation
+/// `name` of `namespace`, a table, view or materialized view, which `object`
+/// names in the error. Inside a view, the view's owner is the reader, as in
+/// PostgreSQL, so a view shows its readers the tables its owner may read.
+/// Relations outside the main database, temp among them, have no
+/// privileges, and everyone reads them.
+pub(crate) fn check_read_privilege(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    object: Object,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let dialect = &resolver.catalog.dialect;
+    let schema = resolver.schema();
+    let reader = match resolver.catalog.enclosing_view() {
+        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => dialect
+            .relation_owner(schema, view_namespace.id, &view_name)
+            .unwrap_or_else(|| connection.current_role()),
+        _ => connection.current_role(),
+    };
+    if schema.roles.is_superuser(reader)
+        || dialect.role_may_read(schema, namespace.id, name, reader)
+    {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        object,
     )))
 }
 
@@ -176,6 +354,57 @@ fn database_denial(action: Action) -> PermissionDenied {
 
 fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
+}
+
+/// `GRANT`: the dialect stores the privileges with each relation, through
+/// its relation hooks, as it stores ownership.
+pub fn translate_grant(
+    grant: &ast::Grant,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let mut changes = Vec::with_capacity(grant.relations.len());
+    for qualified_name in &grant.relations {
+        let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
+        // A schema that does not exist is reported as such, not as a
+        // missing relation.
+        if qualified_name.namespace.is_some() {
+            resolver.resolve_namespace(qualified_name)?;
+        }
+        let Some((namespace, kind)) =
+            crate::translate::alter::owned_relation(resolver, qualified_name, &normalized_name)
+        else {
+            bail_parse_error!(
+                "relation \"{}\" does not exist",
+                crate::util::table_name_for_error(qualified_name)
+            );
+        };
+        if kind == ast::RelationKind::Index {
+            bail_parse_error!("\"{normalized_name}\" is an index");
+        }
+        // Only the main database has dialect schema state to store the
+        // privileges in; a temp table has none, and nothing to store.
+        if namespace.database_id != MAIN_DB_ID {
+            continue;
+        }
+        changes.push(crate::RelationChange::Grant {
+            namespace: namespace.id,
+            name: normalized_name,
+            privileges: grant.privileges.clone(),
+            grantees: grant.grantees.clone(),
+        });
+    }
+    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_relation_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    emit_schema_cookie(resolver, program);
+    Ok(())
 }
 
 /// Creates a role that is not a superuser and cannot log in.

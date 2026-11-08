@@ -118,6 +118,15 @@ impl DowngradeIntentPublication {
 }
 
 impl MirroredDowngradeIntent {
+    #[cfg(all(host_shared_wal, unix))]
+    pub(in crate::mvcc) fn installed_source(&self) -> Result<&InstalledDowngradeSource> {
+        self._source.as_ref().ok_or_else(|| {
+            LimboError::InvalidArgument(
+                "marker transition requires a genuine installed checkpoint".into(),
+            )
+        })
+    }
+
     pub(in crate::mvcc) fn record(&self) -> ManifestRecord {
         self.record
     }

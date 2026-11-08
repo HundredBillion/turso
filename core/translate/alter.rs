@@ -1,8 +1,11 @@
 use crate::alloc::TursoIteratorExt;
+use crate::dialect::{NewOwner, RelationChange};
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::RelationKind;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::types::StrictType;
+use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -13,7 +16,7 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        check_column_type, validate_check_expr, validate_default_expr,
+        self, check_column_type, validate_check_expr, validate_default_expr,
         validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
@@ -58,9 +61,14 @@ fn validate(
     alter_table: &ast::AlterTableBody,
     table_name: &str,
     supports_namespaces: bool,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    // Check if someone is trying to ALTER a system table
-    if crate::schema::is_system_table(table_name) {
+    // Only the engine's own statements, which run nested, may alter a system
+    // table, as a frontend does to add a column to its catalog table.
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && crate::schema::is_system_table(table_name)
+    {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
@@ -823,11 +831,26 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
+    if let ast::AlterTableBody::OwnerTo {
+        kind,
+        role,
+        if_exists,
+    } = &alter_table
+    {
+        return translate_alter_owner(
+            &qualified_name,
+            *kind,
+            role,
+            *if_exists,
+            resolver,
+            program,
+            connection,
+        );
+    }
     let namespace = resolver.resolve_existing_table(&qualified_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     let mangled_table_name = resolver.mangle_name(namespace, &normalize_ident(table_name));
     // For attached databases, qualify sqlite_schema with the database name
@@ -838,6 +861,7 @@ pub fn translate_alter_table(
         &alter_table,
         table_name,
         resolver.catalog.dialect.supports_namespaces(),
+        connection,
     )?;
     reject_alter_of_view(&alter_table, table_name, resolver, namespace)?;
 
@@ -886,6 +910,9 @@ pub fn translate_alter_table(
     let mut btree = (*original_btree).clone();
 
     match alter_table {
+        ast::AlterTableBody::OwnerTo { .. } => {
+            unreachable!("OWNER TO is translated before the table is resolved")
+        }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
@@ -1060,11 +1087,11 @@ pub fn translate_alter_table(
                 }
             }
 
-            // Check if any virtual column depends on the dropped column
+            // Check if any generated column depends on the dropped column
             {
                 let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));
@@ -1224,16 +1251,20 @@ pub fn translate_alter_table(
                     }
                 )
             });
-            if is_stored {
-                return Err(LimboError::ParseError(
-                    "cannot add a STORED column".to_string(),
-                ));
-            }
             if is_generated {
                 for c in &col_def.constraints {
-                    if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
-                        validate_generated_function_calls(expr, &resolver.catalog)?;
+                    match &c.constraint {
+                        ast::ColumnConstraint::Generated { expr, .. } => {
+                            crate::schema::validate_generated_expr(expr)?;
+                            validate_generated_function_calls(expr, &resolver.catalog)?;
+                        }
+                        ast::ColumnConstraint::Default(_) => {
+                            return Err(LimboError::ParseError(format!(
+                                "generated column \"{}\" cannot have a DEFAULT value",
+                                col_def.col_name
+                            )));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1363,6 +1394,16 @@ pub fn translate_alter_table(
                     "generated UPDATE statement did not parse as expected".to_string(),
                 ));
             };
+
+            if is_stored {
+                btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
+                emit_halt_if_table_has_rows(
+                    program,
+                    &original_btree,
+                    database_id,
+                    "cannot add a STORED column",
+                )?;
+            }
 
             let mut computes_default_for_existing_rows = false;
             if !is_generated {
@@ -1495,6 +1536,9 @@ pub fn translate_alter_table(
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
 
+            // Under a dialect whose relation names are unique across kinds,
+            // a name any relation has is taken, as for CREATE.
+            schema::relation_name_is_taken(resolver, namespace, &normalized_new_name, false)?;
             // Views whose SQL failed to load are absent from the schema maps
             // but their rows are still in sqlite_schema, so the name is taken.
             let new_name_taken = resolver.with_schema(database_id, |s| {
@@ -1677,6 +1721,36 @@ pub fn translate_alter_table(
                 );
             }
 
+            if schema::dialect_relation_hooks_apply(connection, database_id)? {
+                // Automatic indexes are renamed with the table, because
+                // their names embed it.
+                let mut changes = vec![RelationChange::Rename {
+                    namespace: namespace.id,
+                    old_name: normalized_old_name,
+                    new_name: normalized_new_name,
+                }];
+                for index in &table_indexes {
+                    let Some(new_name) = renamed_automatic_index_name(
+                        &index.name,
+                        &mangled_table_name,
+                        &mangled_new_name,
+                    ) else {
+                        continue;
+                    };
+                    changes.push(RelationChange::Rename {
+                        namespace: namespace.id,
+                        old_name: index.name.clone(),
+                        new_name,
+                    });
+                }
+                resolver.catalog.dialect.translate_relation_changes(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    &changes,
+                )?;
+            }
+
             for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
@@ -1776,7 +1850,7 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            if !col_name.eq_ignore_ascii_case(from) && btree.get_column(col_name).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -1830,6 +1904,19 @@ pub fn translate_alter_table(
                 if old_column.unique() {
                     return Err(LimboError::ParseError(
                         "UNIQUE constraint cannot be altered".to_string(),
+                    ));
+                }
+            }
+
+            if !rename {
+                let affected = btree.columns_affected_by_update([column_index])?;
+                if (&affected)
+                    .into_iter()
+                    .any(|idx| btree.columns()[idx].is_stored_generated())
+                {
+                    return Err(LimboError::ParseError(
+                        "cannot alter a STORED column or a column that a STORED column uses"
+                            .to_string(),
                     ));
                 }
             }
@@ -2414,6 +2501,103 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+/// Translates `ALTER TABLE name OWNER TO role`, and the same for the other
+/// relation kinds: the dialect records the new owner in its own schema
+/// state, and moves what the relation owns with it, such as the sequences
+/// of a table's serial columns. As in PostgreSQL, a table's indexes change
+/// owner with the table, because they belong to it, and `ALTER INDEX ...
+/// OWNER TO` changes nothing, because an index is owned by its table.
+/// `ALTER TABLE` accepts every relation kind; the other forms refuse a
+/// relation of another kind.
+///
+/// [`crate::translate::roles::check_statement_privileges`] lets a superuser
+/// run it, and the owner when it names a role it may set, which without
+/// role membership is itself.
+fn translate_alter_owner(
+    qualified_name: &ast::QualifiedName,
+    kind: RelationKind,
+    role: &ast::RoleSpec,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let normalized_name = normalize_ident(qualified_name.name.as_str());
+    let Some((namespace, existing_kind)) =
+        owned_relation(resolver, qualified_name, &normalized_name)
+    else {
+        if if_exists {
+            return Ok(());
+        }
+        crate::bail_parse_error!("relation \"{normalized_name}\" does not exist");
+    };
+    if namespace.database_id != crate::MAIN_DB_ID {
+        crate::bail_parse_error!("permission denied: \"{normalized_name}\" is a system catalog");
+    }
+    // ALTER TABLE accepts every relation kind, as in PostgreSQL; the other
+    // forms want their own.
+    if kind != RelationKind::Table && existing_kind != kind {
+        crate::bail_parse_error!(
+            "\"{normalized_name}\" is not {}",
+            relation_kind_phrase(kind)
+        );
+    }
+    // The dialect decides what goes with the relation, such as a table's
+    // indexes, and whose an index's owner is.
+    let changes = [RelationChange::ChangeOwner {
+        namespace: namespace.id,
+        name: normalized_name,
+        owner: NewOwner::Role(role.clone()),
+    }];
+
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_relation_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    schema::emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// `kind` as an `ALTER ... OWNER TO` error names it.
+fn relation_kind_phrase(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Table => "a table",
+        RelationKind::View => "a view",
+        RelationKind::MaterializedView => "a materialized view",
+        RelationKind::Sequence => "a sequence",
+        RelationKind::Index => "an index",
+    }
+}
+
+/// The namespace and kind of the relation `qualified_name` names: a table,
+/// view, materialized view, sequence or index, whichever exists. None when
+/// none does.
+pub(crate) fn owned_relation(
+    resolver: &Resolver,
+    qualified_name: &ast::QualifiedName,
+    normalized_name: &str,
+) -> Option<(NamespaceRef, RelationKind)> {
+    let namespace = if qualified_name.namespace.is_some() {
+        resolver.resolve_namespace(qualified_name).ok()?
+    } else {
+        resolver
+            .find_existing_table(qualified_name)
+            .ok()
+            .flatten()
+            .or_else(|| resolver.find_existing_index(qualified_name).ok().flatten())
+            .or_else(|| resolver.find_existing_sequence(normalized_name))?
+    };
+    resolver
+        .with_schema(namespace.database_id, |schema| {
+            schema.relation_kind(namespace.id, normalized_name)
+        })
+        .map(|kind| (namespace, kind))
+}
+
 /// Adds the FOREIGN KEY of an inline `REFERENCES` clause on column
 /// `column_name` to `table`. `constraint` must be a
 /// [ast::ColumnConstraint::ForeignKey].
@@ -2470,6 +2654,8 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
+        // OWNER TO works on views; it is translated before this check runs.
+        ast::AlterTableBody::OwnerTo { .. } => Ok(()),
     }
 }
 

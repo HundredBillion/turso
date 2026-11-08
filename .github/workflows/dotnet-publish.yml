@@ -105,7 +105,7 @@ jobs:
           artifact-name: native-iossimulator-arm64
           ios-deployment-target: "12.2"
 
-        - os: blacksmith-4vcpu-windows-2025
+        - os: "${{ github.repository == 'HundredBillion/turso' && 'windows-2025' || 'blacksmith-4vcpu-windows-2025' }}"
           make-target: build-rust-windows64
           target: x86_64-pc-windows-msvc
           artifact-name: native-win-x64
@@ -544,7 +544,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - os: blacksmith-4vcpu-windows-2025
+        - os: "${{ github.repository == 'HundredBillion/turso' && 'windows-2025' || 'blacksmith-4vcpu-windows-2025' }}"
           rid: win-x64
           executable: NativeAotSample.exe
 

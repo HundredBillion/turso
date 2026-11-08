@@ -24,17 +24,52 @@ pub struct TranslateResult {
     pub prereqs: Vec<ast::Stmt>,
     /// The main translated command.
     pub cmd: ast::Cmd,
+    /// Statements that run after the main command, as `ALTER SEQUENCE ...
+    /// OWNED BY` does for a serial column's sequence, which belongs to the
+    /// table once the table exists.
+    pub postreqs: Vec<ast::Stmt>,
+    /// The sequences of the serial columns of a CREATE TABLE statement.
+    pub serial_sequences: Vec<SerialSequence>,
 }
+
+/// The sequence of a serial column of a CREATE TABLE statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialSequence {
+    pub column: String,
+    /// The schema the sequence is in: the table's.
+    pub schema: String,
+    /// The sequence's bare name.
+    pub name: String,
+    /// Whether the name is `<table>_<column>_seq`, the one the statement's
+    /// text implies. A table whose sequence is named otherwise has to be
+    /// stored as text that names the sequence.
+    pub has_default_name: bool,
+}
+
+/// Whether a schema, by name, has a relation of a name.
+type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
+    /// None when nothing is known about the schema, as in tests.
+    relation_name_is_taken: Option<RelationNameCheck>,
 }
 
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A translator that names a serial column's sequence around the
+    /// relations its schema has, asking `is_taken(schema, name)`.
+    pub fn with_relation_name_check(
+        mut self,
+        is_taken: impl Fn(&str, &str) -> bool + 'static,
+    ) -> Self {
+        self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
@@ -147,6 +182,8 @@ impl PostgreSQLTranslator {
             return Ok(TranslateResult {
                 prereqs: translated.prereqs,
                 cmd: translated.cmd,
+                postreqs: translated.postreqs,
+                serial_sequences: translated.serial_sequences,
             });
         }
 
@@ -158,6 +195,8 @@ impl PostgreSQLTranslator {
         Ok(TranslateResult {
             prereqs: vec![],
             cmd,
+            postreqs: vec![],
+            serial_sequences: vec![],
         })
     }
 
@@ -194,6 +233,7 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::AlterSeqStmt(alter) => self.translate_alter_sequence(alter)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -271,7 +311,7 @@ impl PostgreSQLTranslator {
     fn translate_create_table(
         &self,
         create: &pg_query::protobuf::CreateStmt,
-    ) -> Result<(ast::Stmt, Vec<String>), ParseError> {
+    ) -> Result<(ast::Stmt, Vec<SerialSequence>), ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -314,7 +354,7 @@ impl PostgreSQLTranslator {
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
         // Collect implicit sequence names for serial columns
-        let mut serial_sequences: Vec<String> = Vec::new();
+        let mut serial_sequences: Vec<SerialSequence> = Vec::new();
 
         // Extract table name for serial sequence naming
         let tbl_name_str = tbl_name.name.as_str().to_string();
@@ -489,12 +529,12 @@ impl PostgreSQLTranslator {
         let namespace = serial_sequence_namespace(tbl_name);
 
         let prereqs = serial_sequences
-            .into_iter()
-            .map(|seq_name| ast::Stmt::CreateSequence {
-                if_not_exists: true,
+            .iter()
+            .map(|sequence| ast::Stmt::CreateSequence {
+                if_not_exists: false,
                 seq_name: ast::QualifiedName::fullname(
                     exact_name(&namespace),
-                    exact_name(seq_name),
+                    exact_name(&sequence.name),
                 ),
                 start: None,
                 increment: None,
@@ -503,11 +543,82 @@ impl PostgreSQLTranslator {
                 cycle: false,
             })
             .collect();
+        // PostgreSQL links a serial column's sequence to the column once the
+        // table exists, so the sequence belongs to the table.
+        let postreqs = serial_sequences
+            .iter()
+            .map(|sequence| ast::Stmt::AlterSequenceOwnedBy {
+                seq_name: ast::QualifiedName::fullname(
+                    exact_name(&namespace),
+                    exact_name(&sequence.name),
+                ),
+                owner: Some((tbl_name.clone(), exact_name(&sequence.column))),
+            })
+            .collect();
 
         Ok(TranslateResult {
             prereqs,
             cmd: ast::Cmd::Stmt(stmt),
+            postreqs,
+            serial_sequences,
         })
+    }
+
+    /// Translates `ALTER SEQUENCE name OWNED BY { table.column | NONE }`, the
+    /// one ALTER SEQUENCE form supported.
+    fn translate_alter_sequence(
+        &self,
+        alter: &pg_query::protobuf::AlterSeqStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(sequence) = &alter.sequence else {
+            return Err(ParseError::ParseError(
+                "ALTER SEQUENCE: missing name".to_string(),
+            ));
+        };
+        if alter.missing_ok {
+            return Err(not_supported("ALTER SEQUENCE IF EXISTS"));
+        }
+        let seq_name = self.qualified_name_from_range_var(sequence)?;
+        let mut owner = None;
+        for option in &alter.options {
+            let Some(Node::DefElem(elem)) = option.node.as_ref() else {
+                continue;
+            };
+            if elem.defname != "owned_by" {
+                return Err(not_supported(format!(
+                    "ALTER SEQUENCE {}",
+                    elem.defname.to_uppercase().replace('_', " ")
+                )));
+            }
+            let Some(Node::List(list)) = elem.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
+                return Err(ParseError::ParseError(
+                    "ALTER SEQUENCE OWNED BY: invalid owner".to_string(),
+                ));
+            };
+            let names = extract_key_columns(&list.items)?;
+            owner = Some(match names.as_slice() {
+                [none] if none.eq_ignore_ascii_case("none") => None,
+                [table, column] => Some((
+                    ast::QualifiedName::single(exact_name(table)),
+                    exact_name(column),
+                )),
+                [schema, table, column] => Some((
+                    ast::QualifiedName::fullname(exact_name(schema), exact_name(table)),
+                    exact_name(column),
+                )),
+                _ => {
+                    return Err(ParseError::ParseError(
+                        "invalid OWNED BY option".to_string(),
+                    ))
+                }
+            });
+        }
+        let Some(owner) = owner else {
+            return Err(not_supported("ALTER SEQUENCE without OWNED BY"));
+        };
+        Ok(ast::Stmt::AlterSequenceOwnedBy { seq_name, owner })
     }
 
     /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
@@ -517,7 +628,7 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
-        serial_sequences: &mut Vec<String>,
+        serial_sequences: &mut Vec<SerialSequence>,
         check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
@@ -629,11 +740,7 @@ impl PostgreSQLTranslator {
 
         // For serial columns, add DEFAULT nextval('namespace.tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let seq_name = format!(
-                "{}_{}_seq",
-                tbl_name.name.as_str().to_lowercase(),
-                name.to_lowercase()
-            );
+            let (seq_name, has_default_name) = self.serial_sequence_name(tbl_name, &name);
             // The stored text of a table of a schema names the table by its
             // mangled name, and the sequence's mangled name is that name with
             // the same suffix, so the default names the sequence that way.
@@ -642,12 +749,18 @@ impl PostgreSQLTranslator {
             } else {
                 format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
             };
-            serial_sequences.push(seq_name);
+            serial_sequences.push(SerialSequence {
+                column: name.clone(),
+                schema: serial_sequence_namespace(tbl_name),
+                name: seq_name,
+                has_default_name,
+            });
             default_expr = Some(ast::Expr::FunctionCall {
                 name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{sequence}'"
+                    "'{}'",
+                    sequence.replace('\'', "''")
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -718,6 +831,31 @@ impl PostgreSQLTranslator {
             col_type,
             constraints,
         })
+    }
+
+    /// The name of the sequence of serial column `column` of table
+    /// `tbl_name`, and whether it is `<table>_<column>_seq`. It is, unless a
+    /// relation of the table's schema has that name; then it is the first
+    /// of `<table>_<column>_seq1`, `<table>_<column>_seq2`, ... that none
+    /// has, as PostgreSQL names it.
+    fn serial_sequence_name(&self, tbl_name: &ast::QualifiedName, column: &str) -> (String, bool) {
+        let name = format!(
+            "{}_{}_seq",
+            tbl_name.name.as_str().to_lowercase(),
+            column.to_lowercase()
+        );
+        let Some(is_taken) = &self.relation_name_is_taken else {
+            return (name, true);
+        };
+        let schema = serial_sequence_namespace(tbl_name);
+        if !is_taken(&schema, &name) {
+            return (name, true);
+        }
+        let free_name = (1..)
+            .map(|n| format!("{name}{n}"))
+            .find(|name| !is_taken(&schema, name))
+            .expect("the numbers never run out");
+        (free_name, false)
     }
 
     /// Convert a PgForeignKey to an AST ForeignKeyClause.
@@ -840,18 +978,6 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation)?;
 
-        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
-            return Err(not_supported(format!(
-                "ALTER {}",
-                drop_object_type_name(
-                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
-                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
-                )
-            )));
-        }
-        if alter.missing_ok {
-            return Err(not_supported("ALTER TABLE IF EXISTS"));
-        }
         if alter.cmds.len() > 1 {
             return Err(not_supported("ALTER TABLE with multiple subcommands"));
         }
@@ -870,6 +996,43 @@ impl PostgreSQLTranslator {
 
         let subtype = AlterTableType::try_from(cmd.subtype)
             .map_err(|_| ParseError::ParseError("ALTER TABLE: invalid subtype".into()))?;
+        // OWNER TO works on every relation kind, so ALTER VIEW, ALTER
+        // MATERIALIZED VIEW, ALTER SEQUENCE and ALTER INDEX reach it too.
+        if subtype == AlterTableType::AtChangeOwner {
+            let kind = match pg_query::protobuf::ObjectType::try_from(alter.objtype) {
+                Ok(pg_query::protobuf::ObjectType::ObjectTable) => ast::RelationKind::Table,
+                Ok(pg_query::protobuf::ObjectType::ObjectView) => ast::RelationKind::View,
+                Ok(pg_query::protobuf::ObjectType::ObjectMatview) => {
+                    ast::RelationKind::MaterializedView
+                }
+                Ok(pg_query::protobuf::ObjectType::ObjectSequence) => ast::RelationKind::Sequence,
+                Ok(pg_query::protobuf::ObjectType::ObjectIndex) => ast::RelationKind::Index,
+                other => {
+                    return Err(not_supported(format!(
+                        "ALTER {} OWNER TO",
+                        drop_object_type_name(
+                            other.unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                        )
+                    )))
+                }
+            };
+            return Ok(ast::Stmt::AlterTable(ast::AlterTable {
+                name,
+                body: Self::translate_change_owner(cmd, kind, alter.missing_ok)?,
+            }));
+        }
+        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
+            return Err(not_supported(format!(
+                "ALTER {}",
+                drop_object_type_name(
+                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
+                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                )
+            )));
+        }
+        if alter.missing_ok {
+            return Err(not_supported("ALTER TABLE IF EXISTS"));
+        }
         if cmd.missing_ok {
             return Err(not_supported(format!(
                 "ALTER TABLE {} IF [NOT] EXISTS",
@@ -957,6 +1120,37 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Stmt::AlterTable(ast::AlterTable { name, body }))
+    }
+
+    /// Translates the `OWNER TO` subcommand of `ALTER TABLE`, `ALTER VIEW`,
+    /// `ALTER MATERIALIZED VIEW`, `ALTER SEQUENCE` and `ALTER INDEX`.
+    fn translate_change_owner(
+        cmd: &pg_query::protobuf::AlterTableCmd,
+        kind: ast::RelationKind,
+        if_exists: bool,
+    ) -> Result<ast::AlterTableBody, ParseError> {
+        use pg_query::protobuf::RoleSpecType;
+
+        let Some(new_owner) = &cmd.newowner else {
+            return Err(ParseError::ParseError("OWNER TO: missing role".into()));
+        };
+        let role = match RoleSpecType::try_from(new_owner.roletype) {
+            Ok(RoleSpecType::RolespecCstring) => ast::RoleSpec::Name(new_owner.rolename.clone()),
+            Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                ast::RoleSpec::CurrentRole
+            }
+            Ok(RoleSpecType::RolespecSessionUser) => ast::RoleSpec::SessionUser,
+            _ => {
+                return Err(ParseError::ParseError(
+                    "role \"public\" does not exist".into(),
+                ))
+            }
+        };
+        Ok(ast::AlterTableBody::OwnerTo {
+            kind,
+            role,
+            if_exists,
+        })
     }
 
     fn translate_rename_stmt(
@@ -3327,7 +3521,9 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
+                    let text =
+                        non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -6268,6 +6464,45 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     magnitude > limit
 }
 
+/// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
+/// decimal digits. Turso's numeric literal parser reads only decimal and hex
+/// text, and reads hex the SQLite way, so a value above i64 wraps around.
+/// Returns `None` for a decimal literal.
+fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
+    let literal = literal.replace('_', "");
+    let (sign, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", literal.as_str()),
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => return None,
+    };
+    // Decimal digits, least significant first. A literal can be longer than
+    // any integer type, so the digits are converted one at a time.
+    let mut decimal = vec![0u32];
+    for c in unsigned[2..].chars() {
+        let mut carry = c.to_digit(radix)?;
+        for digit in decimal.iter_mut() {
+            let value = *digit * radix + carry;
+            *digit = value % 10;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal.push(carry % 10);
+            carry /= 10;
+        }
+    }
+    let digits: String = decimal
+        .iter()
+        .rev()
+        .map(|d| char::from_digit(*d, 10).unwrap())
+        .collect();
+    Some(format!("{sign}{digits}"))
+}
+
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -6323,7 +6558,10 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
     use pg_query::protobuf::node::Node;
     match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
         Some(Node::Integer(i)) => Some(i.ival as i64),
-        Some(Node::Float(f)) => f.fval.parse::<i64>().ok(),
+        Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
+            .unwrap_or_else(|| f.fval.clone())
+            .parse::<i64>()
+            .ok(),
         _ => None,
     }
 }
@@ -7060,6 +7298,136 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// A GRANT SELECT statement on tables. The frontend checks that its tables
+/// and roles exist, expands `ALL TABLES IN SCHEMA`, and hands the engine a
+/// GRANT statement that stores the privilege with each table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgGrantSelectStmt {
+    pub tables: PgGrantTables,
+    pub roles: Vec<PgGrantee>,
+}
+
+/// The tables of a GRANT SELECT statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgGrantTables {
+    /// `ON [TABLE] t, s.u`: the names the tables have in the engine, as for
+    /// any other statement, so that `pg_catalog.pg_class` names the catalog
+    /// table.
+    Named(Vec<ast::QualifiedName>),
+    /// `ON ALL TABLES IN SCHEMA s, ...`: the schemas.
+    AllInSchemas(Vec<String>),
+}
+
+/// A role that a GRANT gives a privilege to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgGrantee {
+    /// `PUBLIC`, every role.
+    Public,
+    /// `CURRENT_ROLE` or `CURRENT_USER`: the role the session runs as now.
+    CurrentRole,
+    /// `SESSION_USER`: the role the session logged in as.
+    SessionUser,
+    /// A role by name.
+    Role(String),
+}
+
+impl PgGrantee {
+    /// The grantee as the engine's GRANT names it.
+    pub fn to_ast(&self) -> ast::Grantee {
+        match self {
+            PgGrantee::Public => ast::Grantee::Public,
+            PgGrantee::CurrentRole => ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+            PgGrantee::SessionUser => ast::Grantee::Role(ast::RoleSpec::SessionUser),
+            PgGrantee::Role(name) => ast::Grantee::Role(ast::RoleSpec::Name(name.clone())),
+        }
+    }
+}
+
+/// Extracts a GRANT SELECT statement on tables. Only SELECT on tables is
+/// stored, so any other GRANT, and REVOKE, are rejected rather than reported
+/// as done.
+pub fn try_extract_grant_select(
+    parse_result: &ParseResult,
+) -> Result<Option<PgGrantSelectStmt>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::GrantStmt(grant), ..)) = nodes.first() else {
+        return Ok(None);
+    };
+    if !grant.is_grant {
+        return Err(not_supported("REVOKE"));
+    }
+    let only_select = !grant.privileges.is_empty()
+        && grant.privileges.iter().all(|privilege| {
+            matches!(
+                &privilege.node,
+                Some(Node::AccessPriv(privilege))
+                    if privilege.priv_name.eq_ignore_ascii_case("select")
+                        && privilege.cols.is_empty()
+            )
+        });
+    if grant.objtype != ObjectType::ObjectTable as i32 || !only_select {
+        return Err(not_supported("GRANT other than GRANT SELECT on tables"));
+    }
+    if grant.grant_option {
+        return Err(not_supported("GRANT ... WITH GRANT OPTION"));
+    }
+    if grant.grantor.is_some() {
+        return Err(not_supported("GRANT ... GRANTED BY"));
+    }
+    let tables = match GrantTargetType::try_from(grant.targtype) {
+        Ok(GrantTargetType::AclTargetObject) => PgGrantTables::Named(
+            grant
+                .objects
+                .iter()
+                .map(|object| match &object.node {
+                    Some(Node::RangeVar(table)) => {
+                        PostgreSQLTranslator::new().qualified_name_from_range_var(table)
+                    }
+                    _ => Err(ParseError::ParseError(
+                        "GRANT: unexpected table node".into(),
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        Ok(GrantTargetType::AclTargetAllInSchema) => PgGrantTables::AllInSchemas(
+            grant
+                .objects
+                .iter()
+                .map(|object| match &object.node {
+                    Some(Node::String(schema)) => Ok(schema.sval.clone()),
+                    _ => Err(ParseError::ParseError(
+                        "GRANT: unexpected schema node".into(),
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        _ => return Err(not_supported("GRANT other than GRANT SELECT on tables")),
+    };
+    let roles = grant
+        .grantees
+        .iter()
+        .map(|grantee| {
+            let Some(Node::RoleSpec(role)) = &grantee.node else {
+                return Err(ParseError::ParseError("GRANT: unexpected role node".into()));
+            };
+            match RoleSpecType::try_from(role.roletype) {
+                Ok(RoleSpecType::RolespecPublic) => Ok(PgGrantee::Public),
+                Ok(RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser) => {
+                    Ok(PgGrantee::CurrentRole)
+                }
+                Ok(RoleSpecType::RolespecSessionUser) => Ok(PgGrantee::SessionUser),
+                Ok(RoleSpecType::RolespecCstring) => Ok(PgGrantee::Role(role.rolename.clone())),
+                _ => Err(ParseError::ParseError("GRANT: unknown role kind".into())),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some(PgGrantSelectStmt { tables, roles }))
+}
+
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
 /// compatibility but are not stored.
 #[derive(Debug, Clone)]
@@ -7299,6 +7667,7 @@ pub enum FrontendStmt {
     DropSchema(PgDropSchemaStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
+    GrantSelect(PgGrantSelectStmt),
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -7335,6 +7704,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_comment_on(parse_result) {
         return Ok(Some(FrontendStmt::CommentOn(stmt)));
+    }
+    if let Some(stmt) = try_extract_grant_select(parse_result)? {
+        return Ok(Some(FrontendStmt::GrantSelect(stmt)));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -8072,6 +8444,7 @@ mod tests {
                 FrontendStmt::DropSchema(_) => "drop schema",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
+                FrontendStmt::GrantSelect(_) => "grant select",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -8090,6 +8463,7 @@ mod tests {
             ("DROP SCHEMA app CASCADE", "drop schema"),
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
+            ("GRANT SELECT ON t TO alice", "grant select"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
             ("COPY t TO STDOUT", "copy to"),
         ] {
@@ -12030,5 +12404,107 @@ mod tests {
         assert!(
             !check_set_transaction(&crate::parse("SET search_path TO public").unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn grant_select_names_its_tables_and_roles() {
+        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap());
+
+        assert_eq!(
+            grant(
+                "GRANT SELECT ON t, app.\"Docs\" TO alice, \"Bob\", PUBLIC, CURRENT_USER, SESSION_USER"
+            )
+            .unwrap(),
+            Some(PgGrantSelectStmt {
+                tables: PgGrantTables::Named(vec![
+                    ast::QualifiedName::single(exact_name("t")),
+                    ast::QualifiedName::fullname(exact_name("app"), exact_name("Docs")),
+                ]),
+                roles: vec![
+                    PgGrantee::Role("alice".to_string()),
+                    PgGrantee::Role("Bob".to_string()),
+                    PgGrantee::Public,
+                    PgGrantee::CurrentRole,
+                    PgGrantee::SessionUser,
+                ],
+            })
+        );
+        assert_eq!(
+            grant("GRANT SELECT ON ALL TABLES IN SCHEMA public, app TO anon").unwrap(),
+            Some(PgGrantSelectStmt {
+                tables: PgGrantTables::AllInSchemas(vec!["public".to_string(), "app".to_string()]),
+                roles: vec![PgGrantee::Role("anon".to_string())],
+            })
+        );
+        assert_eq!(grant("SELECT 1").unwrap(), None);
+    }
+
+    #[test]
+    fn grant_select_names_catalog_tables_as_other_statements_do() {
+        let grant = |sql: &str| try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap();
+        let names = |sql: &str| match grant(sql).unwrap().tables {
+            PgGrantTables::Named(tables) => tables
+                .into_iter()
+                .map(|table| table.to_string())
+                .collect::<Vec<_>>(),
+            PgGrantTables::AllInSchemas(_) => unreachable!("tables are named"),
+        };
+
+        assert_eq!(
+            names(
+                "GRANT SELECT ON pg_class, pg_catalog.pg_roles, information_schema.schemata TO r"
+            ),
+            vec![
+                "main.pg_class",
+                "main.pg_roles",
+                "main.pg_information_schema_schemata"
+            ]
+        );
+    }
+
+    #[test]
+    fn grant_other_than_select_on_tables_is_not_supported() {
+        for (sql, message) in [
+            ("REVOKE SELECT ON t FROM alice", "REVOKE is not supported"),
+            (
+                "GRANT INSERT ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT, UPDATE ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT ALL ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT (a) ON t TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT ON SEQUENCE s TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT USAGE ON SCHEMA public TO alice",
+                "GRANT other than GRANT SELECT on tables is not supported",
+            ),
+            (
+                "GRANT SELECT ON t TO alice WITH GRANT OPTION",
+                "GRANT ... WITH GRANT OPTION is not supported",
+            ),
+            (
+                "GRANT SELECT ON t TO alice GRANTED BY postgres",
+                "GRANT ... GRANTED BY is not supported",
+            ),
+            (
+                "GRANT SELECT ON otherdb.public.t TO alice",
+                "a cross-database reference is not supported",
+            ),
+        ] {
+            let error = try_extract_grant_select(&crate::parse(sql).unwrap()).unwrap_err();
+            assert_eq!(error.to_string(), message, "{sql}");
+        }
     }
 }

@@ -51,6 +51,9 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+#[cfg(all(test, feature = "fs"))]
+mod temp_schema_write_tests;
+
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -128,6 +131,7 @@ pub fn translate(
         origin,
         crate::statement::StatementOrigin::InternalHelper
             | crate::statement::StatementOrigin::EngineMetadataRead
+            | crate::statement::StatementOrigin::EngineSchemaWrite
     );
     let search_path = if is_engine_statement {
         None
@@ -169,7 +173,7 @@ pub fn translate(
             .is_superuser(connection.current_role())
     {
         resolver.role_is_not_superuser = true;
-        roles::check_statement_privileges(&stmt)?;
+        roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
 
     match stmt {
@@ -234,6 +238,7 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::Grant(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -246,6 +251,7 @@ fn translate_statement(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::AlterSequenceOwnedBy { .. }
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
     );
@@ -409,7 +415,7 @@ fn translate_statement(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, connection, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -421,10 +427,11 @@ fn translate_statement(
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
         ast::Stmt::CreateRole { role_name } => {
             roles::translate_create_role(&role_name, resolver, program)?
         }
+        ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -556,7 +563,16 @@ fn translate_statement(
             if_exists,
             seq_name,
         } => {
-            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, connection, program)?;
+        }
+        ast::Stmt::AlterSequenceOwnedBy { seq_name, owner } => {
+            sequence::translate_alter_sequence_owned_by(
+                &seq_name,
+                owner.as_ref(),
+                resolver,
+                connection,
+                program,
+            )?;
         }
         ast::Stmt::CreateSchema { name } => {
             schema::translate_create_schema(&name, resolver, program)?;
@@ -631,6 +647,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::Grant(_) => "grant",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",
@@ -651,6 +668,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::AlterSequenceOwnedBy { .. } => "alter_sequence_owned_by",
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
     }

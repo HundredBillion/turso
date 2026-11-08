@@ -1117,6 +1117,23 @@ pub fn is_system_table(table_name: &str) -> bool {
         .any(|prefix| table_name.to_lowercase().starts_with(prefix))
 }
 
+/// Whether a relation of kind `kind` named `name` is the user's, as against
+/// the engine's. Tables and views named `sqlite_*` or `__turso_internal_*`
+/// are the engine's. A sequence may be named `sqlite_*`, since only its
+/// backing table could collide with the engine's tables and that has a
+/// prefix of its own. The `sqlite_autoindex_*` indexes of a user's table
+/// are the user's, as PostgreSQL gives constraint indexes `pg_class` rows.
+pub fn is_user_relation_name(kind: RelationKind, name: &str) -> bool {
+    match kind {
+        RelationKind::Table | RelationKind::View | RelationKind::MaterializedView => {
+            !is_system_table(name)
+        }
+        RelationKind::Sequence | RelationKind::Index => name
+            .get(..TURSO_INTERNAL_PREFIX.len())
+            .is_none_or(|prefix| !prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX)),
+    }
+}
+
 /// Check if a table is one of the internal tables that store a materialized
 /// view's state, of any storage version.
 pub fn is_materialized_view_state_table(table_name: &str) -> bool {
@@ -1282,7 +1299,18 @@ pub struct Schema {
 
     /// The roles of the database. Copies of the schema share them.
     pub roles: Arc<RoleCatalog>,
+
+    /// Schema state of the database's dialect, opaque to core: what the
+    /// dialect's [`crate::Dialect::build_schema_state`] built from its own
+    /// schema table, such as the PostgreSQL frontend's relation catalog.
+    /// None when the dialect keeps none. Copies of the schema share it.
+    pub dialect_schema: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
+
+/// What kind of relation a schema object is, for the relations that
+/// [`Schema::user_relations`] lists. The parser defines it, because
+/// `ALTER ... OWNER TO` names a kind.
+pub use turso_parser::ast::RelationKind;
 
 /// Materialized views the loader read before the names of the namespaces,
 /// with the roots of their state tables. A view body names tables by their
@@ -1534,6 +1562,7 @@ impl Schema {
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
             roles: Arc::default(),
+            dialect_schema: None,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1675,6 +1704,76 @@ impl Schema {
     pub(crate) fn unname_namespace(&mut self, id: NamespaceId) {
         if let Some(objects) = self.namespaces.get_mut(&id) {
             objects.name = None;
+        }
+    }
+
+    /// The relations a user made: every user table, view, materialized
+    /// view, sequence and index, in every namespace. Engine tables
+    /// (`sqlite_*`, `__turso_internal_*`), virtual tables and their indexes
+    /// are not among them; the automatic `sqlite_autoindex_*` indexes of
+    /// user tables are.
+    pub fn user_relations(&self) -> Vec<(NamespaceId, String, RelationKind)> {
+        let mut relations = vec![];
+        for (namespace, objects) in &self.namespaces {
+            for (name, table) in &objects.tables {
+                let kind = if objects.materialized_view_names.contains(name) {
+                    RelationKind::MaterializedView
+                } else {
+                    RelationKind::Table
+                };
+                if !is_user_relation_name(kind, name) || table.btree().is_none() {
+                    continue;
+                }
+                relations.push((*namespace, name.clone(), kind));
+            }
+            for name in objects.views.keys() {
+                if !is_user_relation_name(RelationKind::View, name) {
+                    continue;
+                }
+                relations.push((*namespace, name.clone(), RelationKind::View));
+            }
+            for name in objects.sequences.keys() {
+                if !is_user_relation_name(RelationKind::Sequence, name) {
+                    continue;
+                }
+                relations.push((*namespace, name.clone(), RelationKind::Sequence));
+            }
+            for (table_name, indexes) in &objects.indexes {
+                if !is_user_relation_name(RelationKind::Table, table_name) {
+                    continue;
+                }
+                for index in indexes {
+                    if !is_user_relation_name(RelationKind::Index, &index.name)
+                        || index.is_backing_btree_index()
+                    {
+                        continue;
+                    }
+                    relations.push((*namespace, index.name.clone(), RelationKind::Index));
+                }
+            }
+        }
+        relations
+    }
+
+    /// What kind of relation `name` of `namespace` is, whichever kind has
+    /// the name: a materialized view before its backing table, then a
+    /// table, view, sequence or index. None when no relation has it.
+    pub fn relation_kind(&self, namespace: NamespaceId, name: &str) -> Option<RelationKind> {
+        if self.is_materialized_view(namespace, name) {
+            Some(RelationKind::MaterializedView)
+        } else if self.get_table(namespace, name).is_some() {
+            Some(RelationKind::Table)
+        } else if self.get_view(namespace, name).is_some() {
+            Some(RelationKind::View)
+        } else if self.get_sequence(namespace, name).is_some() {
+            Some(RelationKind::Sequence)
+        } else if self
+            .indexes(namespace)
+            .any(|index| index.name.eq_ignore_ascii_case(name))
+        {
+            Some(RelationKind::Index)
+        } else {
+            None
         }
     }
 
@@ -5021,6 +5120,7 @@ impl TryClone for Schema {
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             roles: self.roles.clone(),
+            dialect_schema: self.dialect_schema.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
@@ -5462,7 +5562,8 @@ pub(crate) struct GeneratedColGraph {
     dependencies: Vec<ColumnMask>,
     /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
     dependents: Vec<ColumnMask>,
-    /// Column indices in topological (dependency) order. Contains all columns.
+    /// All column indices, built by passes over the table in column order, each
+    /// pass taking every column whose inputs are already taken.
     topological_sort: Vec<usize>,
 }
 
@@ -5474,9 +5575,11 @@ impl GeneratedColGraph {
         let mut direct_dependents = try_vec![ColumnMask::default(); n]?;
         let mut in_degree: Vec<u32> = try_vec![0; n]?;
 
-        // walk each virtual column's expression once to extract edges
+        // walk each generated column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+            let (GeneratedType::Virtual { ref expr, .. } | GeneratedType::Stored { ref expr, .. }) =
+                col.generated_type()
+            else {
                 continue;
             };
             let mut direct = BitSet::default();
@@ -5495,16 +5598,22 @@ impl GeneratedColGraph {
             }
         }
 
-        // Kahn's algorithm (topological sort) over direct_deps.
         let mut topological_sort: Vec<usize> = Vec::try_with_capacity_ext(n)?;
-        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
-        while let Some(i) = ready.pop() {
-            topological_sort.try_push(i)?;
-            for j in direct_dependents[i].iter() {
-                in_degree[j] -= 1;
-                if in_degree[j] == 0 {
-                    ready.try_push(j)?;
+        let mut sorted = try_vec![false; n]?;
+        loop {
+            let sorted_before_pass = topological_sort.len();
+            for i in 0..n {
+                if sorted[i] || in_degree[i] > 0 {
+                    continue;
                 }
+                sorted[i] = true;
+                topological_sort.try_push(i)?;
+                for j in direct_dependents[i].iter() {
+                    in_degree[j] -= 1;
+                }
+            }
+            if topological_sort.len() == sorted_before_pass {
+                break;
             }
         }
 
@@ -5748,6 +5857,24 @@ impl BTreeTable {
         Ok(())
     }
 
+    /// Fails when a STORED generated column has a custom type or reads a column that has one.
+    // FIXME: allow custom types in STORED generated columns once custom types stabilize.
+    pub(crate) fn check_stored_columns_have_no_custom_types(&self, schema: &Schema) -> Result<()> {
+        let graph = self.column_graph()?;
+        for (idx, column) in self.columns.iter().enumerate() {
+            if !column.is_stored_generated() {
+                continue;
+            }
+            let uses_custom_type = std::iter::once(idx)
+                .chain(graph.dependencies[idx].iter())
+                .any(|i| schema.column_has_custom_type(&self.columns[i], self.is_strict));
+            if uses_custom_type {
+                bail_parse_error!("stored generated columns cannot use custom types");
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `column` is part of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
     /// table.
     pub(crate) fn is_key_column(&self, column: &Column) -> bool {
@@ -5881,6 +6008,10 @@ impl BTreeTable {
 
     pub fn has_virtual_columns(&self) -> bool {
         self.has_virtual_columns
+    }
+
+    pub fn has_generated_columns(&self) -> bool {
+        self.columns.iter().any(|c| c.is_generated())
     }
 
     /// Build a `ColumnLayout` for this table's register mapping.
@@ -6025,14 +6156,7 @@ impl BTreeTable {
 
             push_collation(&mut sql, column.text_collation());
 
-            if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
-                if column.generated_always {
-                    sql.push_str(" GENERATED ALWAYS");
-                }
-                sql.push_str(" AS (");
-                sql.push_str(original_sql);
-                sql.push(')');
-            }
+            push_generated_clause(&mut sql, column);
 
             // Add column-level CHECK constraints inline
             for check_constraint in &self.check_constraints {
@@ -6317,7 +6441,7 @@ impl BTreeTable {
         {
             let mut guard = self.columns_mut();
             for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
+                if guard[i].is_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
@@ -6332,7 +6456,7 @@ impl BTreeTable {
         &mut self,
         dropped_index: usize,
     ) -> Result<()> {
-        if !self.has_virtual_columns {
+        if !self.has_generated_columns() {
             return Ok(());
         }
 
@@ -6461,6 +6585,23 @@ fn push_collation(sql: &mut String, collation: Option<TextCollation>) {
             // Custom collation is not allowed in schema definitions
         }
     };
+}
+
+fn push_generated_clause(sql: &mut String, column: &Column) {
+    let (original_sql, stored) = match column.generated_type() {
+        GeneratedType::Virtual { original_sql, .. } => (original_sql, false),
+        GeneratedType::Stored { original_sql, .. } => (original_sql, true),
+        GeneratedType::NotGenerated => return,
+    };
+    if column.generated_always {
+        sql.push_str(" GENERATED ALWAYS");
+    }
+    sql.push_str(" AS (");
+    sql.push_str(original_sql);
+    sql.push(')');
+    if stored {
+        sql.push_str(" STORED");
+    }
 }
 
 /// Topologically sorted generated columns, yielding `(column_index, &Column)`.
@@ -7264,6 +7405,7 @@ pub fn create_table(
 
                 let mut default = None;
                 let mut generated: Option<Box<Expr>> = None;
+                let mut generated_stored = false;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut explicit_notnull = false;
@@ -7282,14 +7424,11 @@ pub fn create_table(
                             ))?;
                         }
                         ast::ColumnConstraint::Generated { expr, typ, .. } => {
-                            if typ
-                                .as_ref()
-                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
-                            {
-                                bail_parse_error!("Stored generated columns are not supported");
-                            }
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
+                            generated_stored = typ
+                                .as_ref()
+                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -7429,11 +7568,12 @@ pub fn create_table(
                     .with(ColDefFlags::ExplicitNotNull, explicit_notnull)
                     .with(ColDefFlags::Unique, unique);
 
+                let gen_type = generated.map(|expr| GeneratedType::new(expr, generated_stored));
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
                     default,
-                    generated,
+                    gen_type,
                     ty,
                     collation,
                     ColDef {
@@ -7952,8 +8092,23 @@ pub enum GeneratedType {
         expr: Box<Expr>,
         original_sql: String,
     },
-    // Stored { resolved: Box<Expr>, original_sql: String },
+    /// Stored generated column: computed at write time and persisted on disk.
+    Stored {
+        expr: Box<Expr>,
+        original_sql: String,
+    },
     NotGenerated,
+}
+
+impl GeneratedType {
+    fn new(expr: Box<Expr>, stored: bool) -> Self {
+        let original_sql = expr.to_string();
+        if stored {
+            GeneratedType::Stored { expr, original_sql }
+        } else {
+            GeneratedType::Virtual { expr, original_sql }
+        }
+    }
 }
 
 impl Column {
@@ -7997,18 +8152,12 @@ impl Column {
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
-        generated: Option<Box<Expr>>,
+        generated: Option<GeneratedType>,
         ty: Type,
         col: Option<TextCollation>,
         coldef: ColDef,
     ) -> Self {
-        let generated_type = match generated {
-            Some(expr) => {
-                let original_sql = expr.to_string();
-                GeneratedType::Virtual { expr, original_sql }
-            }
-            None => GeneratedType::NotGenerated,
-        };
+        let generated_type = generated.unwrap_or(GeneratedType::NotGenerated);
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
             coldef: &coldef,
@@ -8040,7 +8189,8 @@ impl Column {
         let name = value.col_name.as_str();
 
         let mut default = None;
-        let mut generated = None;
+        let mut generated: Option<Box<Expr>> = None;
+        let mut generated_stored = false;
         let mut coldef = ColDef {
             flags: ColDefFlags::from_def_flags(&flags),
             ..Default::default()
@@ -8080,8 +8230,11 @@ impl Column {
                     }
                     collation.replace(collation_seq);
                 }
-                ast::ColumnConstraint::Generated { expr, .. } => {
+                ast::ColumnConstraint::Generated { expr, typ, .. } => {
                     generated = Some(expr.clone());
+                    generated_stored = typ
+                        .as_ref()
+                        .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
                 }
                 _ => {}
             };
@@ -8122,11 +8275,12 @@ impl Column {
                 && primary_key_order != SortOrder::Desc,
         );
 
+        let gen_type = generated.map(|expr| GeneratedType::new(expr, generated_stored));
         let mut col = Column::new(
             Some(name.to_string()),
             ty_str,
             default,
-            generated,
+            gen_type,
             ty,
             collation,
             coldef,
@@ -8199,9 +8353,16 @@ impl Column {
     }
 
     #[inline]
+    pub fn is_stored_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Stored { .. })
+    }
+
+    #[inline]
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_ref())
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -8209,7 +8370,9 @@ impl Column {
     #[inline]
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_mut())
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -8217,6 +8380,10 @@ impl Column {
     #[inline]
     pub fn set_generated_original_sql(&mut self, new_sql: String) {
         if let GeneratedType::Virtual {
+            ref mut original_sql,
+            ..
+        }
+        | GeneratedType::Stored {
             ref mut original_sql,
             ..
         } = self.generated_type

@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build-ios:
     name: Build iOS libraries
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'macos-latest' || 'blacksmith-6vcpu-macos-latest' }}"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +64,7 @@ jobs:
   # merges their outputs into libs/android.
   build-android:
     name: Build Android libraries (${{ matrix.abi }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -154,7 +154,7 @@ jobs:
 
   build-example-ios:
     name: Build example app (iOS)
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'macos-latest' || 'blacksmith-6vcpu-macos-latest' }}"
     timeout-minutes: 45
     needs:
       - build-ios

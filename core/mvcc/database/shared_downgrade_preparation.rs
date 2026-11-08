@@ -13,6 +13,7 @@ pub(in crate::mvcc) struct InstalledDowngradeSource {
     schema: Arc<Schema>,
     replay: Arc<SharedReplayContext>,
     files: DowngradeFiles,
+    physical_layout: InstalledPhysicalLayout,
     _pause: CheckpointPause,
 }
 impl InstalledDowngradeSource {
@@ -22,9 +23,20 @@ impl InstalledDowngradeSource {
                 "downgrade manifest is not the retained synchronous alias".into(),
             ));
         }
-        let guard = loaded.guard()?;
+        if loaded.record().requires_recovery() {
+            return Err(LimboError::InvalidArgument(
+                "downgrade source is not a normal checkpoint".into(),
+            ));
+        }
+        self.validate_metadata(loaded.guard()?, loaded.record())?;
+        self.files.revalidate()
+    }
+    fn validate_metadata(
+        &self,
+        guard: &AuthorityGuard,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+    ) -> Result<()> {
         let target = self.proof.target_identity();
-        let record = loaded.record();
         let store = self
             .connection
             .db
@@ -36,7 +48,6 @@ impl InstalledDowngradeSource {
             || !self.proof.matches_lease(guard)
             || guard.published()? != target.prefix
             || !guard.incarnation_ready()?
-            || record.requires_recovery()
             || record.database_id() != self.runtime.database_id
             || record.prefix() != target.prefix
             || record.log_generation() != target.database.generation
@@ -68,7 +79,37 @@ impl InstalledDowngradeSource {
                 "downgrade append state changed".into(),
             ));
         }
-        self.files.revalidate()
+        Ok(())
+    }
+    pub(in crate::mvcc) fn validate_marker(
+        &self,
+        guard: &AuthorityGuard,
+        record: crate::mvcc::commit_manifest::ManifestRecord,
+    ) -> Result<()> {
+        self.validate_metadata(guard, record)?;
+        if record
+            .downgrade_intent()
+            .is_none_or(|intent| intent.basename_wal_id != self.files.wal_id())
+        {
+            return Err(LimboError::InvalidArgument(
+                "downgrade lost its terminal WAL identity".into(),
+            ));
+        }
+        self.files.revalidate_marker()?;
+        self.files.require_mirrored(record)
+    }
+    pub(in crate::mvcc) fn files(&self) -> &DowngradeFiles {
+        &self.files
+    }
+    pub(in crate::mvcc) fn validate_physical_layout(
+        &self,
+        header: &DatabaseHeader,
+        bytes: u64,
+    ) -> Result<()> {
+        self.physical_layout.validate(header, bytes)
+    }
+    pub(in crate::mvcc) fn physical_floor(&self) -> i64 {
+        self.proof.materialized_floor()
     }
     pub(in crate::mvcc) fn wal_id(&self) -> crate::io::FileId {
         self.files.wal_id()
@@ -101,6 +142,7 @@ impl InstalledLocalCheckpoint {
                 schema: self.schema,
                 replay: self.replay,
                 files,
+                physical_layout: self.physical_layout,
                 _pause: self.pause,
             }),
             publication: None,
@@ -490,5 +532,144 @@ mod tests {
             "same bytes from another manifest backend must not certify offline publication"
         );
         assert_unchanged(&before);
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_marker_native_uses_real_wal_transaction_on_same_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture = installed_fixture();
+        let original_inode = std::fs::metadata(&fixture.path).unwrap().ino();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        let manifest = std::fs::read(fixture.namespace.join("manifest")).unwrap();
+        let marker = crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent)
+            .expect("genuine terminal intent must commit the ordinary WAL marker");
+        let main = std::fs::read(&fixture.path).unwrap();
+        assert_eq!(&main[18..20], &[2, 2]);
+        assert_eq!(
+            std::fs::metadata(&fixture.path).unwrap().ino(),
+            original_inode
+        );
+        assert_eq!(
+            std::fs::read(fixture.namespace.join("manifest")).unwrap(),
+            manifest
+        );
+        assert!(fixture.namespace.join("ids-selector").exists());
+        assert!(std::fs::read(format!("{}-wal", fixture.path.display()))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            fixture.io.open_file(
+                fixture.path.to_str().unwrap(),
+                crate::OpenFlags::None,
+                false
+            ),
+            Err(LimboError::LockingError(_))
+        ));
+        assert!(fixture.runtime.replay.lock().is_none());
+        drop(marker);
+        let db = Database::open(
+            fixture.io.clone(),
+            fixture.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        let mut rows = Vec::new();
+        connection
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, ["materialized shared row"]);
+        let mut integrity = Vec::new();
+        connection
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                integrity.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(integrity, ["ok"]);
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_marker_native_rejects_changed_wal_without_recreation() {
+        for missing in [true, false] {
+            let mut fixture = installed_fixture();
+            let mut preparing = fixture
+                .installed
+                .take()
+                .unwrap()
+                .begin_downgrade(
+                    fixture.connection.clone(),
+                    OfflinePrerequisite::AllOlderWorkersStopped,
+                )
+                .unwrap();
+            let intent = fixture.io.block(|| preparing.poll()).unwrap();
+            let wal = PathBuf::from(format!("{}-wal", fixture.path.display()));
+            std::fs::rename(&wal, fixture.path.with_extension("retained-wal")).unwrap();
+            if !missing {
+                std::fs::write(&wal, b"replacement must survive").unwrap();
+            }
+            let before = unchanged_files(&fixture);
+            let wal_before = std::fs::read(&wal).ok();
+            assert!(crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent).is_err());
+            assert_unchanged(&before);
+            assert_eq!(std::fs::read(&wal).ok(), wal_before);
+        }
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_marker_native_rejects_changed_installed_extent() {
+        use std::os::unix::fs::FileExt;
+        for append in [true, false] {
+            let mut fixture = installed_fixture();
+            let layout = fixture.installed.as_ref().unwrap().physical_layout;
+            assert!(layout.pages > 1);
+            let mut preparing = fixture
+                .installed
+                .take()
+                .unwrap()
+                .begin_downgrade(
+                    fixture.connection.clone(),
+                    OfflinePrerequisite::AllOlderWorkersStopped,
+                )
+                .unwrap();
+            let intent = fixture.io.block(|| preparing.poll()).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fixture.path)
+                .unwrap();
+            if append {
+                file.set_len(layout.bytes + u64::from(layout.page_size))
+                    .unwrap();
+            } else {
+                file.write_all_at(&(layout.pages - 1).to_be_bytes(), 28)
+                    .unwrap();
+            }
+            let before = unchanged_files(&fixture);
+            let wal = PathBuf::from(format!("{}-wal", fixture.path.display()));
+            let wal_before = std::fs::read(&wal).unwrap();
+            let result = crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent);
+            assert!(
+                result.is_err(),
+                "changed installed extent must reject before marker publication"
+            );
+            assert_unchanged(&before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        }
     }
 }

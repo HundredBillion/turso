@@ -2099,6 +2099,119 @@ mod tests {
         db
     }
 
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn cached_sdk_join_preserves_existing_process_file_lock() {
+        use turso_core::IO;
+
+        const CHILD_PATH: &str = "TURSO_SDK_LOCK_PROBE_PATH";
+        const CHILD_BLOCKED: &str = "TURSO_SDK_LOCK_PROBE_BLOCKED";
+        if let Ok(path) = std::env::var(CHILD_PATH) {
+            let io = turso_core::PlatformIO::new().unwrap();
+            let result = io.open_file(&path, OpenFlags::None, true);
+            if std::env::var(CHILD_BLOCKED).unwrap() == "1" {
+                assert!(
+                    matches!(result, Err(LimboError::LockingError(_))),
+                    "another process must not open the SDK owner's locked file"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "lock must be released after all owners close"
+                );
+            }
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config_with_features(None);
+        config.path = directory
+            .path()
+            .join("locked.db")
+            .to_string_lossy()
+            .into_owned();
+        let probe = |blocked: bool, phase: &str| {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rsapi::tests::cached_sdk_join_preserves_existing_process_file_lock",
+                    "--nocapture",
+                ])
+                .env(CHILD_PATH, &config.path)
+                .env(CHILD_BLOCKED, if blocked { "1" } else { "0" })
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("nonblocking file-lock probe exceeded its deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "lock probe failed ({phase}):\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let owner = TursoDatabase::new(config.clone());
+        assert!(!owner.open().unwrap().is_io());
+        let writer = owner.connect().unwrap();
+        execute_sql(&writer, "CREATE TABLE t(x)");
+        probe(true, "before join");
+        let mut readonly_config = config.clone();
+        readonly_config.open_flags = OpenFlags::ReadOnly;
+        let joined = TursoDatabase::new(readonly_config);
+        assert!(!joined.open().unwrap().is_io());
+        probe(true, "joined holder alive");
+        drop(joined);
+        probe(true, "joined holder dropped");
+        let mut readonly_config = config.clone();
+        readonly_config.open_flags = OpenFlags::ReadOnly;
+        let surviving_reader = TursoDatabase::new(readonly_config);
+        assert!(!surviving_reader.open().unwrap().is_io());
+        drop(writer);
+        drop(owner);
+        probe(true, "readonly holder outlives original owner");
+        drop(surviving_reader);
+        probe(false, "all owners dropped");
+    }
+
+    #[test]
+    fn readonly_connection_cannot_write_through_cached_writable_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("mixed.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut config = config_with_features(None);
+        config.path = path;
+        let writer_db = TursoDatabase::new(config.clone());
+        assert!(!writer_db.open().unwrap().is_io());
+        let writer = writer_db.connect().unwrap();
+        execute_sql(&writer, "CREATE TABLE t(x)");
+        execute_sql(&writer, "INSERT INTO t VALUES(1)");
+        config.open_flags = OpenFlags::ReadOnly;
+        let reader_db = TursoDatabase::new(config);
+        assert!(!reader_db.open().unwrap().is_io());
+        let reader = reader_db.connect().unwrap();
+        execute_sql(&reader, "PRAGMA query_only=OFF");
+        let mut statement = reader.prepare_single("INSERT INTO t VALUES(2)").unwrap();
+        assert!(matches!(
+            statement.execute(None),
+            Err(TursoError::Readonly(_))
+        ));
+        execute_sql(&writer, "INSERT INTO t VALUES(3)");
+        assert_eq!(count_rows(&reader), Value::from_i64(2));
+    }
+
     #[test]
     pub fn database_opts_maps_experimental_features() {
         // No features -> all defaults.

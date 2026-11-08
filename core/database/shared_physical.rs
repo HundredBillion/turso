@@ -21,10 +21,7 @@ impl SharedPhysicalConnection {
         options: OpenOptions,
         file: Arc<dyn crate::File>,
     ) -> Result<Self> {
-        if options.storage.is_some()
-            || options.readonly_storage.is_some()
-            || options.durable_storage.is_some()
-        {
+        if options.storage.is_some() || options.durable_storage.is_some() {
             return Err(LimboError::InvalidArgument(
                 "physical reader requires retained runtime storage".into(),
             ));
@@ -42,7 +39,6 @@ impl SharedPhysicalConnection {
             || options.page_codec.is_some()
             || options.db_opts.enable_encryption
             || options.durable_storage.is_some()
-            || options.readonly_storage.is_some()
         {
             return Err(LimboError::InvalidArgument(
                 "physical reader requires unencrypted retained read-only storage".into(),

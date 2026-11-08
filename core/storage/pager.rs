@@ -76,10 +76,6 @@ use ptrmap::*;
 pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
-    pub(crate) fn page(&self) -> &PageRef {
-        &self.0
-    }
-
     pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
         Ok(IOResult::Done(Self(page)))
@@ -4617,6 +4613,12 @@ impl Pager {
 
             match state {
                 CommitState::PrepareWal => {
+                    if self.dirty_pages.read().is_empty() {
+                        // Lock-only transactions must not initialize a WAL that may be read-only.
+                        // WaitSync still syncs frames written through write_frame_raw.
+                        self.commit_info.write().state = CommitState::WaitSync;
+                        continue;
+                    }
                     let page_sz = self.get_page_size_unchecked();
                     let c = wal.prepare_wal_start(page_sz)?;
                     let Some(c) = c else {

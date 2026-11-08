@@ -1,6 +1,7 @@
 use super::shared_checkpoint::PublishedSharedCheckpoint;
 use super::*;
 use crate::mvcc::commit_manifest::{ManifestRecord, RECORD_SIZE, SLOT_SIZE};
+use crate::Value;
 use std::io::{BufRead, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};

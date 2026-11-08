@@ -7,6 +7,28 @@ use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointPro
 use crate::mvcc::database::shared_generation_reload::PreparedGenerationReload;
 use crate::mvcc::shared_authority::AuthorityGuard;
 
+#[derive(Clone, Copy)]
+struct InstalledPhysicalLayout {
+    page_size: u32,
+    reserved: u8,
+    pages: u32,
+    bytes: u64,
+}
+impl InstalledPhysicalLayout {
+    fn validate(&self, header: &DatabaseHeader, bytes: u64) -> Result<()> {
+        if header.page_size.get() != self.page_size
+            || header.reserved_space != self.reserved
+            || header.database_size.get() != self.pages
+            || bytes != self.bytes
+        {
+            return Err(LimboError::Corrupt(
+                "installed physical layout changed before downgrade".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(in crate::mvcc) struct InstalledLocalCheckpoint {
     guard: AuthorityGuard,
     proof: CompletedCheckpointProof,
@@ -14,6 +36,7 @@ pub(in crate::mvcc) struct InstalledLocalCheckpoint {
     replay: Arc<SharedReplayContext>,
     schema: Arc<Schema>,
     original_connection: crate::sync::Weak<Connection>,
+    physical_layout: InstalledPhysicalLayout,
 }
 
 impl InstalledLocalCheckpoint {
@@ -104,6 +127,7 @@ pub(in crate::mvcc) struct SharedCheckpointLocalInstall<C: LogicalClock, A: Conc
     proof: Option<CompletedCheckpointProof>,
     pause: Option<CheckpointPause>,
     prepare_generation: u64,
+    physical_layout: Option<InstalledPhysicalLayout>,
 }
 
 impl VerifiedPhysicalBase {
@@ -146,6 +170,7 @@ impl VerifiedPhysicalBase {
             proof: Some(proof),
             pause: Some(pause),
             prepare_generation: 0,
+            physical_layout: None,
         })
     }
 }
@@ -226,6 +251,12 @@ impl<C: LogicalClock, A: ConcurrentAllocator> SharedCheckpointLocalInstall<C, A>
                         &parts.schema,
                         parts.persistent_timestamp,
                     )?;
+                    self.physical_layout = Some(InstalledPhysicalLayout {
+                        page_size: parts.header.page_size.get(),
+                        reserved: parts.header.reserved_space,
+                        pages: parts.header.database_size.get(),
+                        bytes: self.runtime.files.main.size()?,
+                    });
                     let schema = parts.schema.clone();
                     let context = parts.into_context(&self.store);
                     let replay = SharedReplayContext::new(
@@ -300,6 +331,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> SharedCheckpointLocalInstall<C, A>
                         replay: self.replay.take().unwrap(),
                         schema,
                         original_connection: Arc::downgrade(&self.connection),
+                        physical_layout: self.physical_layout.take().unwrap(),
                     }));
                 }
                 Phase::Finished => {

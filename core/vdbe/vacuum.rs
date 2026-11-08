@@ -322,7 +322,7 @@ pub(crate) fn open_vacuum_temp_db(
     let page_codec = source_conn.pager.load().page_codec_external();
     let db = match &page_codec {
         Some(codec) => Database::open(
-            source_db.storage_io(),
+            source_db.io.clone(),
             &path,
             crate::OpenOptions::new(source_db.dialect())
                 .flags(OpenFlags::Create)
@@ -331,7 +331,7 @@ pub(crate) fn open_vacuum_temp_db(
                 .page_codec(codec.clone()),
         )?,
         None => Database::open_file_with_flags(
-            source_db.storage_io(),
+            source_db.io.clone(),
             &path,
             OpenFlags::Create,
             vacuum_target_opts_from_source(source_db),
@@ -1198,9 +1198,8 @@ fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Resu
 // Build the SELECT and INSERT SQL strings for copying a table's data.
 //
 // Uses the in-memory `BTreeTable` column metadata from the schema to derive
-// the copy-column list. Virtual generated columns are excluded from both
-// SELECT and INSERT since they are computed, not stored. This keeps both
-// lists tied to the same stored-column model.
+// the copy-column list. Generated columns are excluded from both SELECT and
+// INSERT since they are computed, not copied.
 //
 // For e.g. given a schema:
 // CREATE TABLE employees (
@@ -1230,11 +1229,11 @@ pub(crate) fn build_copy_sql(
         )));
     };
 
-    // Collect non-virtual-generated columns with their quoted names.
+    // Collect non-generated columns with their quoted names.
     let mut data_columns: Vec<String> = Vec::new();
     let mut rowid_alias_col_idx: Option<usize> = None;
     for (i, col) in btree.columns().iter().enumerate() {
-        if col.is_virtual_generated() {
+        if col.is_generated() {
             continue;
         }
         if col.is_rowid_alias() {
@@ -1279,7 +1278,7 @@ pub(crate) fn build_copy_sql(
             let mut filtered: Vec<&str> = Vec::new();
             let mut col_physical_idx = 0;
             for (i, col) in btree.columns().iter().enumerate() {
-                if col.is_virtual_generated() {
+                if col.is_generated() {
                     continue;
                 }
                 if i != alias_idx {

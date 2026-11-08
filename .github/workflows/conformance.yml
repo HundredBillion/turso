@@ -19,7 +19,7 @@ jobs:
   javascript:
     name: JavaScript conformance tests
     timeout-minutes: 30
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
@@ -58,7 +58,7 @@ jobs:
   sqlite-tcl:
     name: SQLite TCL conformance tests (part ${{ matrix.part }}/3)
     timeout-minutes: 60
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository == 'HundredBillion/turso' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}"
     # The suite runs its test files one at a time (they share files in the
     # test directory), so it is spread over several machines instead.
     # all.test picks this part's files; every file runs in exactly one part.
