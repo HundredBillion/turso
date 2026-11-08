@@ -47,7 +47,8 @@ jobs:
         run: |
           cargo test --locked -p turso_sqlite3 --lib -- --test-threads=2 2>&1 | tee c-units.log
           grep -Eq '[1-9][0-9]* passed; 0 failed' c-units.log
-          cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=2 2>&1 | tee c-compat.log
+          cargo build --locked -p turso_sqlite3
+          LD_LIBRARY_PATH="$PWD/target/debug" cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=2 2>&1 | tee c-compat.log
           grep -Eq '[1-9][0-9]* passed; 0 failed' c-compat.log
       - name: Core and C lint
         run: |
