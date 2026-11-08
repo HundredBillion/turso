@@ -673,3 +673,7 @@ fn validate_image(
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_checkpoint_recovery_wal_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_checkpoint_wal_io_tests.rs"]
+mod io_tests;
