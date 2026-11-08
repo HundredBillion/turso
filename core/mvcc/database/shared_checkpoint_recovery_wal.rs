@@ -26,3 +26,50 @@ impl SharedMvccRuntime {
         Ok(bindings)
     }
 }
+
+pub(in crate::mvcc) struct RecoveredIntentPhysicalBase {
+    intent: super::shared_checkpoint_recovery_intent::RecoveredCheckpointIntent,
+    parts: crate::mvcc::database::shared_bootstrap::PhysicalBaseParts,
+}
+impl RecoveredIntentPhysicalBase {
+    pub(in crate::mvcc) fn record(&self) -> crate::mvcc::commit_manifest::ManifestRecord {
+        self.intent.record()
+    }
+    pub(in crate::mvcc) fn guard(&self) -> &AuthorityGuard {
+        self.intent.guard()
+    }
+}
+
+pub(in crate::mvcc) struct CheckpointPhysicalWalRecovery {
+    _intent: super::shared_checkpoint_recovery_intent::RecoveredCheckpointIntent,
+    _options: crate::OpenOptions,
+    finished: bool,
+}
+impl CheckpointPhysicalWalRecovery {
+    pub(super) fn new(
+        intent: super::shared_checkpoint_recovery_intent::RecoveredCheckpointIntent,
+        options: crate::OpenOptions,
+    ) -> Result<Self> {
+        Ok(Self {
+            _intent: intent,
+            _options: options,
+            finished: false,
+        })
+    }
+    pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<RecoveredIntentPhysicalBase> {
+        if self.finished {
+            return Err(
+                LimboError::InvalidArgument("physical WAL recovery has ended".into()).into(),
+            );
+        }
+        self.finished = true;
+        Err(LimboError::InvalidArgument(
+            "committed physical WAL recovery is not implemented".into(),
+        )
+        .into())
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_checkpoint_recovery_wal_tests.rs"]
+mod tests;

@@ -36,7 +36,9 @@ fn inspect_crash(fixture: &IntentCrashFixture, point: CrashPoint) -> CheckpointR
             assert_eq!(intents, 1);
             assert_eq!(fixture.runtime.files.physical_wal.size().unwrap(), 0);
         }
-        CrashPoint::FirstMainBackfillWrite => {
+        CrashPoint::FirstMainBackfillWrite
+        | CrashPoint::PartialMainBackfill
+        | CrashPoint::MainSyncedBeforeWalTruncate => {
             assert_eq!(intents, 2);
             let file: Arc<dyn File> =
                 crate::mvcc::read_pinned_file::ReadPinnedFile::new_for_checkpoint_recovery(
@@ -52,7 +54,14 @@ fn inspect_crash(fixture: &IntentCrashFixture, point: CrashPoint) -> CheckpointR
             drop(wal);
         }
     }
-    assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+    match point {
+        CrashPoint::SecondIntentWrite | CrashPoint::FirstMainBackfillWrite => {
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+        }
+        CrashPoint::PartialMainBackfill | CrashPoint::MainSyncedBeforeWalTruncate => {
+            assert_ne!(std::fs::read(&fixture.path).unwrap(), fixture.main_before);
+        }
+    }
     fixture.assert_durable_unchanged();
     selection
 }

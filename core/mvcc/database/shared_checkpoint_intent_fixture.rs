@@ -12,12 +12,16 @@ use std::time::{Duration, Instant};
 pub(super) enum CrashPoint {
     SecondIntentWrite,
     FirstMainBackfillWrite,
+    PartialMainBackfill,
+    MainSyncedBeforeWalTruncate,
 }
 impl CrashPoint {
     fn name(self) -> &'static str {
         match self {
             Self::SecondIntentWrite => "second-intent",
             Self::FirstMainBackfillWrite => "first-main",
+            Self::PartialMainBackfill => "partial-main",
+            Self::MainSyncedBeforeWalTruncate => "synced-main",
         }
     }
 }
@@ -54,7 +58,15 @@ impl IntentCrashFixture {
             format!("READY {} {acknowledged_commits}", point.name())
         );
         child.kill();
-        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        let after_crash = std::fs::read(&path).unwrap();
+        match point {
+            CrashPoint::SecondIntentWrite | CrashPoint::FirstMainBackfillWrite => {
+                assert_eq!(after_crash, main_before);
+            }
+            CrashPoint::PartialMainBackfill | CrashPoint::MainSyncedBeforeWalTruncate => {
+                assert_ne!(after_crash, main_before);
+            }
+        }
         let io = factory(&path);
         let canonical = path.canonicalize().unwrap();
         let main = io
@@ -188,14 +200,19 @@ fn checkpoint_intent_crash_child() {
         point: match point.as_str() {
             "second-intent" => CrashPoint::SecondIntentWrite,
             "first-main" => CrashPoint::FirstMainBackfillWrite,
+            "partial-main" => CrashPoint::PartialMainBackfill,
+            "synced-main" => CrashPoint::MainSyncedBeforeWalTruncate,
             _ => panic!("invalid crash point"),
         },
+        main_before: std::fs::read(&canonical).unwrap(),
         main: canonical,
         manifest: namespace.join("manifest"),
         wal: namespace.join("physical-wal"),
         intent_writes: AtomicUsize::new(0),
         intent_syncs: AtomicUsize::new(0),
         wal_syncs: AtomicUsize::new(0),
+        changed_main_writes: AtomicUsize::new(0),
+        main_syncs: AtomicUsize::new(0),
         last_manifest_intent: AtomicBool::new(false),
         pending: Mutex::new(Vec::new()),
     });
@@ -247,11 +264,14 @@ enum FileRole {
 struct CrashControl {
     point: CrashPoint,
     main: PathBuf,
+    main_before: Vec<u8>,
     manifest: PathBuf,
     wal: PathBuf,
     intent_writes: AtomicUsize,
     intent_syncs: AtomicUsize,
     wal_syncs: AtomicUsize,
+    changed_main_writes: AtomicUsize,
+    main_syncs: AtomicUsize,
     last_manifest_intent: AtomicBool,
     pending: Mutex<Vec<Completion>>,
 }
@@ -344,8 +364,10 @@ impl File for CrashFile {
                     && matches!(self.control.point, CrashPoint::SecondIntentWrite)
             }
             FileRole::Main => {
-                matches!(self.control.point, CrashPoint::FirstMainBackfillWrite)
-                    && self.control.intent_syncs.load(Ordering::Acquire) == 2
+                self.control.intent_syncs.load(Ordering::Acquire) == 2
+                    && (matches!(self.control.point, CrashPoint::FirstMainBackfillWrite)
+                        || (matches!(self.control.point, CrashPoint::PartialMainBackfill)
+                            && self.control.changed_main_writes.load(Ordering::Acquire) == 1))
             }
             _ => false,
         };
@@ -358,11 +380,31 @@ impl File for CrashFile {
                     assert_eq!(self.control.intent_syncs.load(Ordering::Acquire), 2);
                     assert!(self.control.wal_syncs.load(Ordering::Acquire) > 0);
                 }
+                CrashPoint::PartialMainBackfill => {
+                    assert_eq!(self.control.intent_syncs.load(Ordering::Acquire), 2);
+                    assert_eq!(self.control.changed_main_writes.load(Ordering::Acquire), 1);
+                    assert!(self.control.wal_syncs.load(Ordering::Acquire) > 0);
+                }
+                CrashPoint::MainSyncedBeforeWalTruncate => unreachable!(),
             }
             self.control.pending.lock().push(completion.clone());
             return Ok(completion);
         }
-        self.inner.pwrite(offset, buffer, completion)
+        let changed = matches!(self.role, FileRole::Main)
+            && self.control.intent_syncs.load(Ordering::Acquire) == 2
+            && self
+                .control
+                .main_before
+                .get(offset as usize..offset as usize + buffer.len())
+                != Some(buffer.as_slice());
+        let result = self.inner.pwrite(offset, buffer, completion)?;
+        assert!(result.succeeded(), "fixture uses synchronous native I/O");
+        if changed {
+            self.control
+                .changed_main_writes
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(result)
     }
     fn sync(&self, completion: Completion, kind: FileSyncType) -> Result<Completion> {
         let complete = self.inner.sync(completion, kind)?;
@@ -377,11 +419,25 @@ impl File for CrashFile {
             FileRole::Wal => {
                 self.control.wal_syncs.fetch_add(1, Ordering::AcqRel);
             }
+            FileRole::Main if self.control.intent_syncs.load(Ordering::Acquire) == 2 => {
+                self.control.main_syncs.fetch_add(1, Ordering::AcqRel);
+            }
             _ => {}
         }
         Ok(complete)
     }
     fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
+        if matches!(self.role, FileRole::Wal)
+            && matches!(self.control.point, CrashPoint::MainSyncedBeforeWalTruncate)
+            && self.control.intent_syncs.load(Ordering::Acquire) == 2
+        {
+            assert_eq!(len, 0);
+            assert!(self.control.wal_syncs.load(Ordering::Acquire) > 0);
+            assert!(self.control.main_syncs.load(Ordering::Acquire) > 0);
+            assert!(self.control.changed_main_writes.load(Ordering::Acquire) > 0);
+            self.control.pending.lock().push(completion.clone());
+            return Ok(completion);
+        }
         self.inner.truncate(len, completion)
     }
     fn shared_wal_lock_byte(
