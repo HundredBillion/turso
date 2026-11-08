@@ -38,11 +38,12 @@ fn inspect_crash(fixture: &IntentCrashFixture, point: CrashPoint) -> CheckpointR
         }
         CrashPoint::FirstMainBackfillWrite => {
             assert_eq!(intents, 2);
-            let file = crate::mvcc::read_pinned_file::ReadPinnedFile::new_for_checkpoint_recovery(
-                fixture.runtime.files.physical_wal.clone(),
-                selection.manifest.guard().unwrap(),
-            )
-            .unwrap();
+            let file: Arc<dyn File> =
+                crate::mvcc::read_pinned_file::ReadPinnedFile::new_for_checkpoint_recovery(
+                    fixture.runtime.files.physical_wal.clone(),
+                    selection.manifest.guard().unwrap(),
+                )
+                .unwrap();
             let mut scan = crate::storage::sqlite3_ondisk::BuildSharedWal::begin(&file).unwrap();
             let wal = fixture.io.block(|| scan.poll()).unwrap();
             assert!(wal.read().metadata.max_frame.load(Ordering::Acquire) > 0);
