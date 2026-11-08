@@ -30,39 +30,6 @@ impl SharedPhysicalConnection {
         Self::new(io, path, options.storage(Arc::new(DatabaseFile::new(file))))
     }
 
-    pub(crate) fn validate_recovery_options(
-        options: &OpenOptions,
-        history_limit: u64,
-    ) -> Result<()> {
-        if history_limit == 0 {
-            return Err(LimboError::Corrupt(
-                "shared recovery history limit is zero".into(),
-            ));
-        }
-        if options
-            .shared_mvcc_history_limit
-            .is_some_and(|requested| requested != history_limit)
-        {
-            return Err(LimboError::InvalidArgument(
-                "physical recovery history limit differs from runtime".into(),
-            ));
-        }
-        if options.storage.is_some()
-            || options.durable_storage.is_some()
-            || options.wal_path.is_some()
-            || options.encryption.is_some()
-            || options.page_codec.is_some()
-            || options.db_opts.enable_encryption
-            || options.db_opts.enable_multiprocess_wal
-            || options.db_opts.enable_experimental_mvcc_passive_checkpoint
-        {
-            return Err(LimboError::InvalidArgument(
-                "physical WAL recovery requires private unencoded retained storage".into(),
-            ));
-        }
-        Ok(())
-    }
-
     pub(crate) fn new_with_retained_wal(
         io: Arc<dyn IO>,
         path: String,

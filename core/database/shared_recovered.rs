@@ -44,6 +44,22 @@ impl RecoveryOpenConfig {
         )
     }
 
+    pub(crate) fn open_physical_wal(
+        &self,
+        io: Arc<dyn IO>,
+        path: String,
+        file: Arc<dyn crate::File>,
+        wal: Arc<RwLock<WalFileShared>>,
+    ) -> Result<super::shared_physical::SharedPhysicalConnection> {
+        super::shared_physical::SharedPhysicalConnection::new_with_retained_wal(
+            io,
+            path,
+            self.options.clone(),
+            file,
+            wal,
+        )
+    }
+
     pub(crate) fn validate_history(&self, actual_limit: u64) -> Result<()> {
         if actual_limit == 0
             || self

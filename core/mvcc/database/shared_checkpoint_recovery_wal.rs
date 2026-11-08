@@ -29,6 +29,7 @@ impl SharedMvccRuntime {
 
 use super::shared_checkpoint_recovery_intent::RecoveredCheckpointIntent;
 use crate::database::shared_physical::SharedPhysicalConnection;
+use crate::database::shared_recovered::RecoveryOpenConfig;
 use crate::mvcc::commit_manifest::checkpoint_publication::CheckpointIntentInspection;
 use crate::mvcc::commit_manifest::ManifestRecord;
 use crate::mvcc::database::shared_bootstrap::{PhysicalBaseParts, PhysicalBaseReadState};
@@ -39,7 +40,7 @@ use crate::sync::atomic::AtomicUsize;
 use crate::sync::RwLock;
 
 pub(in crate::mvcc) struct RecoveredIntentPhysicalBase {
-    original_options: crate::OpenOptions,
+    config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
     intent: RecoveredCheckpointIntent,
 }
@@ -236,7 +237,7 @@ struct CommitRead {
 }
 pub(in crate::mvcc) struct CheckpointPhysicalWalRecovery {
     runtime: Arc<SharedMvccRuntime>,
-    options: crate::OpenOptions,
+    config: Arc<RecoveryOpenConfig>,
     phase: Phase,
     physical: Option<Arc<SharedWalRecoveryLocks>>,
     bindings: Vec<FileBinding>,
@@ -267,8 +268,8 @@ impl CheckpointPhysicalWalRecovery {
                 "shared checkpoint recovery requires a writable participant".into(),
             ));
         }
-        SharedPhysicalConnection::validate_recovery_options(
-            &options,
+        let config = RecoveryOpenConfig::capture(options)?;
+        config.validate_history(
             intent
                 .retained_runtime()
                 .files
@@ -277,7 +278,7 @@ impl CheckpointPhysicalWalRecovery {
         )?;
         Ok(Self {
             runtime: intent.retained_runtime().clone(),
-            options,
+            config,
             phase: Phase::Acquire,
             physical: None,
             bindings: Vec::new(),
@@ -317,20 +318,15 @@ impl CheckpointPhysicalWalRecovery {
             .ok_or_else(|| LimboError::InvalidArgument("shared physical path is not UTF-8".into()))?
             .to_owned();
         if wal {
-            SharedPhysicalConnection::new_with_retained_wal(
+            self.config.open_physical_wal(
                 self.runtime.io.clone(),
                 path,
-                self.options.clone(),
                 self.runtime.main_file(),
                 self.scanned.as_ref().unwrap().clone(),
             )
         } else {
-            SharedPhysicalConnection::new_with_retained_file(
-                self.runtime.io.clone(),
-                path,
-                self.options.clone(),
-                self.runtime.main_file(),
-            )
+            self.config
+                .open_physical(self.runtime.io.clone(), path, self.runtime.main_file())
         }
     }
     fn begin_inspection(&mut self) -> Result<()> {
@@ -592,7 +588,7 @@ impl CheckpointPhysicalWalRecovery {
                         .unwrap()
                         .empty_wal_state(self.physical.as_ref().unwrap())?;
                     let output = RecoveredIntentPhysicalBase {
-                        original_options: self.options.clone(),
+                        config: self.config.clone(),
                         parts: self.actual.take().unwrap(),
                         intent: self.intent.take().unwrap(),
                     };

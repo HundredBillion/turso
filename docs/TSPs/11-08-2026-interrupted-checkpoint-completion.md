@@ -1,6 +1,6 @@
 # Complete an interrupted shared checkpoint without admitting a partial Store
 
-Status: proposed private implementation seam for parent review. Builds on the approved interrupted physical-WAL recovery plan and the verified normal completed-checkpoint confirmation/finalization/reclamation work. Public mode remains disabled until integration and PHP acceptance pass.
+Status: parent-approved private implementation plan; normal-bootstrap peer independently reviewed the continuation interface. Builds on the approved interrupted physical-WAL recovery plan and the verified normal completed-checkpoint confirmation/finalization/reclamation work. Public mode remains disabled until integration and PHP acceptance pass.
 
 ## Outcome and invariants
 
@@ -26,7 +26,7 @@ Source references inspected in the normal-bootstrap worktree:
 
 ### SOURCE-only Store owner
 
-Introduce an opaque, non-Clone `IntentRecoveryStore` in the recovery child. Its constructor consumes a genuine fresh `SharedStoreReservation` while the original intent is held, constructs exactly one `Arc<MvStore>` using the actual config allocator and runtime storage, and records that exact Store, Runtime, config, source identity and publication lease. No constructor accepts a generic existing Store. No setter converts Attached back to Free or relabels an ordinary Store as recovery-owned.
+Introduce an opaque, non-Clone `IntentRecoveryStore` in the recovery child. Its constructor consumes a genuine fresh `SharedStoreReservation` while the original intent is held, constructs exactly one `Arc<MvStore>` using the actual config allocator and runtime storage, and records that exact Store, Runtime, config, source identity and publication lease. The owner also retains a strong actual PublicationLease Arc after the Store fields. This is not an IoPin: it preserves native exclusion when a consuming callee destroys the original guard first without preventing I/O retirement. No constructor accepts a generic existing Store. No setter converts Attached back to Free or relabels an ordinary Store as recovery-owned.
 
 The owner is carried through replay, materialization, real Normal completion, fresh normal selection, physical/ID confirmation, ID finalization, log reclamation and final local installation. While the owner exists, runtime replay stays None; no public Database/connection escapes. Every resume checks actual Store pointer, Runtime pointer, config Arc, lease, no local transactions and actual selected intent/completed identity. All owner/state fields and explicit abort paths destroy private source/materialization connections, pagers and Store references before the original guard and pause. Backend operations retain the publication/physical ownership needed through their actual retirement; late callbacks must not reopen admission. Dropping a failed owner is fail-closed; asynchronous backend completion keeps its authority until retirement. A retry that cannot retain that exact owner reconstructs through a fresh Runtime after the old owner and I/O have gone, rather than resetting Attached.
 
