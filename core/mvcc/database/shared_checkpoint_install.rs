@@ -1,3 +1,6 @@
+#[path = "shared_downgrade_preparation.rs"]
+mod shared_downgrade_preparation;
+
 use super::*;
 use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
 use crate::mvcc::database::shared_generation_reload::PreparedGenerationReload;
