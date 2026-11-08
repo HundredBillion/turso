@@ -212,3 +212,135 @@ old same-process main descriptors can remain owned by external runtime Arcs afte
 the capability drops; their later closure and ordinary POSIX-lock exclusion need
 an explicit lifecycle test before operator exposure. This is an unverified source
 concern, not a new policy requirement or a claim that the tested marker failed.
+
+## Approved continuation interface
+
+Root approved the continuation after the verified live marker slice. The private
+capability will distinguish Live(MirroredDowngradeIntent) from a separately sealed
+RecoveredTerminal source. RecoveredTerminal validates the selected terminal
+record, actual main/WAL identities, physical metadata and read-only finalized IDs
+with no pending selector; it does not require or fabricate normal published/Ready
+mapped state. It retains the same continuously held authority and admission pause.
+Only then may a surviving terminal copy be mirrored and an effective254 marker be
+committed; effective2 follows checkpoint/recovery without another marker commit.
+Partial-cleanup mode is separate, marker2-only, and cannot enter marker/replay or
+recreate IDs. Missing-WAL creation remains genuine-Live-only and durable before
+intent. A bounded real child-lock probe runs before any policy choice for old
+same-process descriptors. Dependencyfa225 was merged without production conflicts;
+review11554 transferred the narrow pending-selector accessor hunk to this task.
+
+## Continuation evidence
+
+Missing-WAL creation source `f267be5c9` passed Linux native creation2,
+preparation7 and marker3 plus strict library lint/formatting in
+[run42503599577](https://github.com/HundredBillion/turso/actions/runs/42503599577).
+The genuine desired operation first failed at the explicit missing-WAL restriction
+(0 passed/1 failed) in run42502871275. Invalid ordinary log/coordination files are
+rejected before creation. A WAL missing after terminal publication still fails
+without recreation. Process-death coverage of creation is still pending.
+
+The actual old-handle lifecycle probe passed in
+[run42503446343](https://github.com/HundredBillion/turso/actions/runs/42503446343),
+source `36dfcb9ba`. Weak references prove the old shared Database, runtime and
+native main handle retired before the second independent child attempted its
+nonblocking ordinary RW lock; the child remained excluded. This bounded path did
+not reproduce the hypothesized close-any-inode lock loss, so it does not justify
+an additional operator lifetime policy. It is not evidence for arbitrary legacy
+handle interactions or multi-process permission enforcement.
+
+Fresh-terminal resume source `d47369981` has an intentional stub. Its genuine
+live checkpoint publishes terminal intent, drops the live source and then asks
+for fresh resume. Run42503731841 observed the intended missing-operation failure
+(0 passed/1 failed). The replacement implementation is under verification and
+must not be treated as a completed downgrade until recovery and cleanup fault
+controls pass.
+
+### Subprocess evidence correction
+
+The earlier old-handle probe result42503446343 is **not accepted lock evidence**:
+its `--exact` child selector retained the `turso_core::` crate prefix, while the
+Rust test harness exposes names without that prefix. A zero-selected child could
+exit successfully. Source3351513 strips the prefix in both new downgrade child
+controllers and requires the lock child's actual one-test successful summary.
+Source71f7 adds a deliberate child failure control that the supervisor must reject.
+The initial actual-crash suite failed because its child exited before IPC readiness;
+it did not establish a protocol failure. Corrected child-count/IPC runs are pending.
+Other helpers and unrelated evidence are not invalidated by this local finding.
+
+### Approved cleanup-only view
+
+Partial cleanup has its own capability, not a marker-capable or fabricated ID
+proof. It requires native main exclusion, actual ordinary-WAL header and aligned
+physical extent, an empty identity-matched basename WAL, and the surviving
+terminal manifest's main/WAL identities. A separate forced-Syscall read-only raw
+view retains this capability and checks the materialized singleton timestamp
+against the terminal record before any unlink. No writable marker API, runtime
+Ready publication, ID reconstruction, or old-log replay is available. Close the
+actual view before unlinking; FULL-sync main first because observed marker bytes
+after process death alone do not establish durable completion. If terminal
+manifest is already gone, only an empty expected namespace and absent ordinary
+log qualify for idempotent directory removal. Unknown entries fail before unlink.
+
+The recovered mirror must refresh durability even when both slot bytes already
+match. Root review identified that observed matching bytes may still belong to an
+interrupted writer. Genuine recovery with matching slots first failed the added
+barrier assertion (0 versus2) in run42504814020. Source49f1 records the actual
+selected slot under continuous ownership and writes/FULL-syncs the opposite copy
+before writing/FULL-syncing the selected copy, without advancing record/sequence.
+This preserves the selected valid record if the first operation fails.
+
+Completed-token cleanup source26f48 passed native2/2 plus strict library lint and
+formatting in run42505270402: actual ordinary-MVCC-generated header-only log is
+removed before ordinary reopen, and unknown/replaced namespace files reject
+before any unlink. This is not partial-cleanup or process-death acceptance.
+
+## Confirmed ordinary lock lifetime defect and bounded prototype
+
+Corrected source273a in run42506332370 executes the actual child: the ordinary
+owner excludes it BEFORE old native-handle retirement, then the child acquires
+the lock AFTER the old Database/runtime/main aliases retire. The deliberate child
+failure control observes its exact failure diagnostic and one failed child before
+proving the supervisor rejects it. The earlier zero-selection conclusion is
+retracted, not treated as evidence against this defect.
+
+Both UnixFile and UringFile currently acquire process-scoped F_SETLK and explicitly
+unlock in Drop. Closing a different descriptor for the same inode can therefore
+release the live ordinary owner's lock. No Unix per-inode deferred-close registry
+exists in this source. A bounded prototype routes both backends through one helper:
+Linux64 uses nonblocking whole-file F_OFD_SETLK, including unlock; other Unix keeps
+the existing process-lock implementation. NoLock, ReadOnly and the explicit
+lock-disable environment behavior remain unchanged. Unsupported Linux64 OFD
+requests fail rather than silently restoring the unsafe process-lock ownership.
+
+A distinct raw same-process ordinary open now conflicts, matching exclusive
+ownership; process-wide Database cache reuse still shares the existing owner.
+Validation must cover actual Python SQLite POSIX locks in both cross-process
+directions, native/NoLock/read-only aliases closing, hardlink cached RW/RO callers,
+ordinary-owner SIGKILL release, the real downgrade regression, and optional Uring
+execution when the kernel actually permits it. Classic external SQLite ownership
+inside the same process is not claimed safe against arbitrary unrelated file
+closures; the existing explicit offline prerequisite still requires older workers
+to stop. No new user lifetime policy is being substituted for the defect fix.
+
+Partial-cleanup candidate cd5e4ec61 passed native run42506877040: final parent
+summaries were partial4, extent1, resume4, completed-cleanup2, missing-WAL2,
+preparation7 and marker4 (the known failing old-handle-close case was explicitly
+excluded). Partial coverage includes real SIGKILL at ten cleanup boundaries,
+read-only-view mutation rejection, stale target metadata and unexpected remaining
+files rejected before unlink. Strict Linux library lint/format and Windows check
+also passed. Downloaded logs are retained under
+`.local/issue-resolution/downgrade-partial-cd5` in the root checkout. These results
+do not clear the separately confirmed ordinary lock lifetime defect.
+
+The OFD prototype also changes ordinary Linux64 opens on kernels older than 3.15
+or filesystems/kernels that reject OFD locking: those opens now fail with the
+existing locking-error result instead of silently using process-scoped locks.
+This affects ordinary mode, not only the already-OFD-dependent shared mode.
+ReadOnly/NoLock still do not acquire this ordinary lock. Linux64 Drop relies on
+closing the descriptor, with no extra unlock syscall, so unsupported acquisition
+returns a normal locking error rather than panicking while dropping the failed
+handle. A child-only seccomp fault returns EOPNOTSUPP for the actual OFD syscall
+to test that error path; another test retains a duplicated descriptor to require
+ownership until the final native descriptor closes. The final compatibility decision must account for that older-kernel
+tradeoff. Non-Linux Unix and Linux32 retain the existing implementation. We do not
+add a fallback that would reintroduce the demonstrated alias-close loss.

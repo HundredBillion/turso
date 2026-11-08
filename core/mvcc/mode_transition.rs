@@ -1,5 +1,7 @@
+pub(super) mod downgrade_cleanup;
 pub(super) mod downgrade_files;
 pub(super) mod downgrade_marker;
+pub(super) mod downgrade_resume;
 pub(super) mod operation;
 mod ordinary;
 pub(super) mod recovery;

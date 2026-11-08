@@ -4761,7 +4761,7 @@ mod tests {
         }
         // let's not drop db as we don't want files to be removed
         let mut db = MvccTestDbNoConn::new_with_random_db();
-        let pager = {
+        {
             let conn = db.connect();
             let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
@@ -4806,13 +4806,13 @@ mod tests {
             }
 
             conn.close().unwrap();
-            pager
-        };
+        }
 
         db.restart();
 
         // connect after restart should recover log.
-        let _conn = db.connect();
+        let conn = db.connect();
+        let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
 
         // Check rowids that weren't deleted

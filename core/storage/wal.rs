@@ -8388,10 +8388,18 @@ pub mod test {
         let shm_path = dir.path().join("test.db-tshm");
         let io = shared_wal_test_io();
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
@@ -8680,10 +8688,18 @@ pub mod test {
         let shm_path = dir.path().join("test.db-tshm");
         let io = shared_wal_test_io();
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
@@ -8735,10 +8751,18 @@ pub mod test {
         let shm_path = dir.path().join("test.db-tshm");
         let io = PlatformIO::new().unwrap();
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
@@ -9707,7 +9731,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9733,7 +9761,11 @@ pub mod test {
         assert!(authority.try_acquire_writer(authority.owner_record()));
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         let stale = WalSnapshot {
@@ -9784,7 +9816,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9809,7 +9845,11 @@ pub mod test {
         coordination_a.cache_frame(9, 5);
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         set_shared_snapshot(&shared_b, authoritative);
@@ -9862,7 +9902,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -9889,7 +9933,11 @@ pub mod test {
         }
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         set_shared_snapshot(&shared_b, authoritative);
@@ -9993,7 +10041,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = WalSnapshot {
@@ -10018,7 +10070,11 @@ pub mod test {
         coordination_a.cache_frame(9, 5);
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         {
@@ -10178,7 +10234,11 @@ pub mod test {
         let io = shared_wal_test_io();
 
         let file_a = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_a = WalFileShared::new_shared(file_a).unwrap();
         let authoritative = SharedWalCoordinationHeader {
@@ -10222,7 +10282,11 @@ pub mod test {
         authority.install_snapshot(authoritative);
 
         let file_b = io
-            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .open_file(
+                wal_path.to_str().unwrap(),
+                crate::OpenFlags::Create | crate::OpenFlags::NoLock,
+                false,
+            )
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
         let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone());
