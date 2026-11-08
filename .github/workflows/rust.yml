@@ -18,32 +18,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: cddbf1f0eac28bc2a8b449a32cbb2809087f2938
+          ref: e72b821af8347283cce1d16e4d8dd566fd0e3888
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Genuine coordinator crash fixture prerequisite
+      - name: Actual intent mirroring and native failure boundaries
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = cddbf1f0eac28bc2a8b449a32cbb2809087f2938
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_crash_fixtures_keep_acknowledged_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee crash-fixture-green.log
-          grep -q '1 passed; 0 failed' crash-fixture-green.log
-      - name: Mirror actual intent without readiness
-        run: |
-          set -euo pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_mirrors_actual_crashed_selection -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-mirror-green.log
-          grep -q '1 passed; 0 failed' intent-mirror-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_two_full_syncs_before_owner -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-full-sync-green.log
-          grep -q '1 passed; 0 failed' intent-full-sync-green.log
+          test "$(git rev-parse HEAD)" = e72b821af8347283cce1d16e4d8dd566fd0e3888
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee intent-native-green.log
+          grep -q '6 passed; 0 failed' intent-native-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: interrupted-intent-mirror-green-cddbf1f0e
+          name: interrupted-intent-mirror-green-e72b821af
           path: |
             source.txt
             *.log
