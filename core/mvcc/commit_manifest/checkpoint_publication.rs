@@ -1,3 +1,7 @@
+#[cfg(all(host_shared_wal, unix))]
+#[path = "checkpoint_recovery_confirmation.rs"]
+pub(in crate::mvcc) mod checkpoint_recovery_confirmation;
+
 use super::*;
 
 pub(in crate::mvcc) struct CheckpointIntentPublication {

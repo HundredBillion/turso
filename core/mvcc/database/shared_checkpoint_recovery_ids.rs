@@ -1,5 +1,6 @@
 #[path = "shared_checkpoint_recovery_confirmation.rs"]
 mod shared_checkpoint_recovery_confirmation;
+pub(in crate::mvcc) use shared_checkpoint_recovery_confirmation::RecoveryCompletionEvidence;
 
 use super::shared_checkpoint_recovery_physical::InspectedRecoveryBase;
 use super::*;
