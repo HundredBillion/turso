@@ -96,10 +96,12 @@ impl RecoveredDowngradeSource {
         let pages = header.database_size.get();
         if header.magic != *b"SQLite format 3\0"
             || pages == 0
-            || !(512..=65536).contains(&page_size)
-            || !page_size.is_power_of_two()
-            || header.reserved_space as u32 >= page_size
-            || u64::from(pages) * u64::from(page_size) != bytes
+            || crate::PageSize::new(page_size).is_none()
+            || !header
+                .page_size
+                .has_valid_reserved_space(header.reserved_space)
+            || bytes % u64::from(page_size) != 0
+            || bytes / u64::from(page_size) < u64::from(pages)
         {
             return Err(invalid("terminal downgrade physical extent is invalid"));
         }
@@ -131,7 +133,12 @@ impl RecoveredDowngradeSource {
             },
             prefix: record.prefix(),
         };
-        let mut inspection = ids.inspect_completed_target(guard, identity, -i64::from(pages))?;
+        let physical_floor = i64::try_from(bytes / u64::from(page_size))
+            .ok()
+            .and_then(i64::checked_neg)
+            .filter(|floor| *floor != i64::MIN)
+            .ok_or(LimboError::DatabaseFull)?;
+        let mut inspection = ids.inspect_completed_target(guard, identity, physical_floor)?;
         let inspected = io.block(|| Ok(inspection.poll()?))?;
         drop(inspection);
         if inspected.has_pending_checkpoint() || inspected.source_database().is_some() {
