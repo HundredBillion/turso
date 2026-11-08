@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: bef0508e40df3982a0a2a769b254c0116af054ee
+          ref: 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -30,7 +30,7 @@ jobs:
           stat -f -c '%T %t' /tmp "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a environment.txt
           rustc --version | tee -a environment.txt
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = bef0508e40df3982a0a2a769b254c0116af054ee
+          test "$(git rev-parse HEAD)" = 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
           python3 - <<'PATCH'
           p='core/storage/shared_wal_recovery.rs'
           s=open(p).read(); old='            || local.reader_locks.iter().any(|count| *count != 0)\n'
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: physical-owner-final-bef0508e4
+          name: physical-owner-final-1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
           path: |
             source.txt
             environment.txt
@@ -89,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: bef0508e40df3982a0a2a769b254c0116af054ee
+          ref: 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -97,11 +97,29 @@ jobs:
       - name: Check exact Windows library
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = bef0508e40df3982a0a2a769b254c0116af054ee
+          test "$(git rev-parse HEAD)" = 1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
+          python3 - <<'PATCH'
+          p='core/storage/shared_wal_coordination.rs'
+          s=open(p).read(); old='#[path = "shared_wal_recovery.rs"]\nmod recovery;\npub(crate) use recovery::SharedWalRecoveryLocks;'
+          assert s.count(old)==1
+          new='#[cfg(unix)]\n#[path = "shared_wal_recovery.rs"]\nmod recovery;\n#[cfg(unix)]\npub(crate) use recovery::SharedWalRecoveryLocks;'
+          open(p,'w').write(s.replace(old,new))
+          PATCH
+          set +e
+          cargo check --locked -p turso_core --lib --features bench,conn_raw_api > windows-cfg-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/storage/shared_wal_coordination.rs
+          cat windows-cfg-control-red.log
+          test "$code" -ne 0
+          grep -q 'E0432' windows-cfg-control-red.log
+          grep -q 'SharedWalRecoveryLocks' windows-cfg-control-red.log
           cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-owner-check.log
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: physical-owner-windows-bef0508e4
-          path: windows-owner-check.log
+          name: physical-owner-windows-1b4bf7bdb5e9539c8dec5fc255f2b88e0bb7c4eb
+          path: |
+            windows-owner-check.log
+            windows-cfg-control-red.log
