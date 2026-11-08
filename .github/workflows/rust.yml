@@ -1,4 +1,4 @@
-name: Additional shared ID opcode acceptance
+name: Shared sequence watermark counterexample
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5e332ad964527f2696ed0a852fd09fafb378ed0b
+          ref: 715c4917b6ac985fbc84429cfdee4984e971ab51
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,25 +24,24 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 5e332ad964527f2696ed0a852fd09fafb378ed0b
+          test "$(git rev-parse HEAD)" = 715c4917b6ac985fbc84429cfdee4984e971ab51
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: AUTOINCREMENT updated key and replacement
+      - name: Expected watermark counterexample
         run: |
           set -o pipefail
           cargo test --locked -p turso_core --lib --features conn_raw_api --no-run
-          for selector in shared_id_opcode_native_autoincrement_ shared_id_opcode_native_updated_key_ shared_id_opcode_native_replace_; do
-            timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
-            grep -q '1 passed; 0 failed' "$selector.log"
-          done
-      - name: Strict library lint
-        run: |
-          set -o pipefail
-          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
+          set +e
+          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_watermark_tracks_live_peer_and_committed_boundary -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark-red.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 101
+          grep -q '0 passed; 1 failed' watermark-red.log
+          grep -q 'requires a global live-claim reader' watermark-red.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-additional-acceptance
+          name: shared-watermark-red
           path: |
             source.txt
             rustc.txt
