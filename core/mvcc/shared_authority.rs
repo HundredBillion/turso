@@ -916,6 +916,9 @@ mod tests {
         let mut guard = reopened.try_acquire().unwrap();
         assert!(guard.requires_recovery());
         assert!(guard.published().is_err());
+        guard.ensure_no_snapshot_locks().unwrap();
+        assert!(guard.requires_recovery());
+        assert!(guard.published().is_err());
         let recovered = PublishedPrefix {
             committed_timestamp: 9,
             end_offset: 128,
@@ -938,6 +941,10 @@ mod tests {
         initialize(&authority);
         let mut child = spawn(&path, "snapshot");
         let mut guard = authority.try_acquire().unwrap();
+        assert!(matches!(
+            guard.ensure_no_snapshot_locks(),
+            Err(LimboError::Busy)
+        ));
         let child_timestamp = guard.oldest_snapshot().unwrap().unwrap();
         let parent = guard.register_snapshot().unwrap();
         assert!(parent.begin_timestamp > child_timestamp);
@@ -957,6 +964,10 @@ mod tests {
         child.kill();
         let guard = authority.try_acquire().unwrap();
         assert!(!guard.requires_recovery());
+        assert!(matches!(
+            guard.ensure_no_snapshot_locks(),
+            Err(LimboError::Busy)
+        ));
         assert_eq!(
             guard.oldest_snapshot().unwrap(),
             Some(parent.begin_timestamp)
@@ -966,6 +977,7 @@ mod tests {
             vec![(parent.epoch, parent.begin_timestamp)]
         );
         drop(parent);
+        guard.ensure_no_snapshot_locks().unwrap();
         assert_eq!(guard.oldest_snapshot().unwrap(), None);
         assert!(guard.live_registrations().unwrap().is_empty());
         guard.finish().unwrap();

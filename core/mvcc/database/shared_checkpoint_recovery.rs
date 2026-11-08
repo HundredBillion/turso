@@ -121,4 +121,53 @@ mod tests {
             drop(runtime.files.authority.try_acquire().unwrap());
         }
     }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn checkpoint_recovery_entry_native_busy_preserves_reader_and_releases_pause() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = shared_runtime_fixture(directory.path());
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let database = crate::Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .with_shared_mvcc_for_test(limit),
+        )
+        .unwrap();
+        let connection = database.connect(crate::ConnectOpts::new()).unwrap();
+        let store = database.get_mv_store().as_ref().unwrap();
+        let runtime = store.shared_runtime.get().unwrap();
+        connection
+            .execute("BEGIN; SELECT value FROM preserved")
+            .unwrap();
+        let before = std::fs::read(runtime.files.namespace.join("manifest")).unwrap();
+        assert!(matches!(
+            runtime.begin_checkpoint_recovery(),
+            Err(LimboError::Busy)
+        ));
+        assert!(runtime.gate.try_enter_admission().is_ok());
+        let mut values = Vec::new();
+        connection
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                values.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(values, ["durable payload"]);
+        assert_eq!(
+            std::fs::read(runtime.files.namespace.join("manifest")).unwrap(),
+            before
+        );
+        connection.execute("ROLLBACK").unwrap();
+        let mut recovery = runtime.begin_checkpoint_recovery().unwrap();
+        let selected = io.block(|| recovery.poll()).unwrap();
+        assert!(selected.manifest.record().checkpoint_intent().is_none());
+        assert_eq!(
+            std::fs::read(runtime.files.namespace.join("manifest")).unwrap(),
+            before
+        );
+    }
 }
