@@ -27,7 +27,7 @@ fn checkpoint_recovery_bootstrap_native_retains_exactly_one_store() {
     let weak = Arc::downgrade(&store);
     assert!(Arc::ptr_eq(store.shared_runtime.get().unwrap(), &runtime));
     assert!(Arc::ptr_eq(&evidence.recovered.config, &config));
-    let expected = runtime.storage();
+    let expected: Arc<dyn crate::mvcc::persistent_storage::DurableStorage> = runtime.storage();
     assert!(Arc::ptr_eq(&store.storage, &expected));
     for _ in 0..8 {
         bootstrap.prepare_store().unwrap();
