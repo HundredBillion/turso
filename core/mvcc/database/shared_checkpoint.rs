@@ -1,4 +1,6 @@
 use super::super::checkpoint_state_machine::MaterializedCheckpointProof;
+#[path = "shared_checkpoint_base.rs"]
+mod shared_checkpoint_base;
 use super::*;
 use crate::mvcc::checkpoint_gate::CheckpointPause;
 use crate::mvcc::commit_manifest::checkpoint_publication::{
