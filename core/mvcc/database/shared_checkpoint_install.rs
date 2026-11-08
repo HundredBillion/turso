@@ -348,7 +348,10 @@ mod tests {
         );
         let logical: Arc<dyn File> = runtime.logical.clone();
         let storage = runtime.storage.shared_commit_snapshot(&logical).unwrap();
-        assert_eq!(storage.offset, 0);
+        assert_eq!(
+            storage.offset, 0,
+            "local storage did not adopt the completed empty prefix"
+        );
         assert_eq!(storage.running_crc, 0);
         assert!(storage.header.is_none());
         assert_eq!(
