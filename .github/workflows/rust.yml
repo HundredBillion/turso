@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2fb0d40f040dcd5c0c340880070d198c6634ff66
+          ref: 38ca5d4376a790e5c6d711b8a5ad5945e57a4f06
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 2fb0d40f040dcd5c0c340880070d198c6634ff66
+          test "$(git rev-parse HEAD)" = 38ca5d4376a790e5c6d711b8a5ad5945e57a4f06
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
       - name: Build exact native tests
@@ -34,7 +34,7 @@ jobs:
       - name: Native ID lifecycle and physical retirement
         run: |
           set -o pipefail
-          for spec in 'shared_id_lifecycle_native_:8' 'shared_id_lifecycle_io_native_:2' 'shared_id_opcode_native_:13' 'shared_watermark_identity_native_:1' 'shared_watermark_io_native_:1' 'shared_watermark_process_native_:1' 'shared_id_stale_prepare_native_:1'; do
+          for spec in 'shared_oracle_pager_uses_retained_identity_and_independent_read_state:1' 'shared_id_lifecycle_native_:8' 'shared_id_lifecycle_io_native_:2' 'shared_id_opcode_native_:13' 'shared_watermark_identity_native_:1' 'shared_watermark_io_native_:1' 'shared_watermark_process_native_:1' 'shared_id_stale_prepare_native_:1'; do
             selector=${spec%:*}
             count=${spec#*:}
             timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api "$selector" -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$selector.log"
@@ -51,33 +51,34 @@ jobs:
           cargo test --locked -p turso_core --lib --features conn_raw_api peer_import_sequence_frame_ 2>&1 | tee peer-descriptors.log
           grep -q '4 passed; 0 failed' peer-descriptors.log
           cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
-      - name: Commit preflight causal control and restored source
+      - name: Source layout memo causal control and restore
         run: |
           set -o pipefail
           python3 - <<'CONTROL'
           from pathlib import Path
-          path = Path('core/mvcc/shared_commit.rs')
+          path = Path('core/database/shared_oracle.rs')
           source = path.read_text()
-          start = source.index('                        if let Err(error) = loaded.guard()?.check_append_size_with_metadata(')
-          end = source.index('                        let next = ManifestRecord::new(', start)
-          path.write_text(source[:start] + '                        // Validation-only: bypass commit capacity rejection.\n' + source[end:])
+          needle = '        let reserved = source.get_reserved_space();'
+          assert source.count(needle) == 1
+          source = source.replace(needle, '        let reserved = Some(source.get_reserved_space().ok_or_else(|| LimboError::InvalidArgument("oracle source pager layout is not initialized".into()))?);')
+          path.write_text(source)
           CONTROL
-          git diff -- core/mvcc/shared_commit.rs > commit-preflight-control.diff
+          git diff > source-layout-control.diff
           set +e
-          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_explicit_commit_cap_busy_retains_transaction_on_reset_or_drop -- --test-threads=1 --nocapture 2>&1 | tee commit-preflight-red.log
+          timeout 240 cargo test --locked -p turso_core --lib --features conn_raw_api shared_oracle_pager_uses_retained_identity_and_independent_read_state -- --ignored --test-threads=1 --nocapture 2>&1 | tee source-layout-red.log
           code=${PIPESTATUS[0]}
           set -e
           test "$code" = 101
-          grep -q '0 passed; 1 failed' commit-preflight-red.log
-          grep -Eq 'commit.run_with_row_callback|cap rejection modified published bytes|cap Busy discarded' commit-preflight-red.log
-          git restore core/mvcc/shared_commit.rs
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_vdbe_ -- --test-threads=1 2>&1 | tee restored-vdbe.log
-          grep -q '6 passed; 0 failed' restored-vdbe.log
+          grep -q '0 passed; 1 failed' source-layout-red.log
+          grep -q 'oracle source pager layout is not initialized' source-layout-red.log
+          git restore core/database/shared_oracle.rs
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_oracle_pager_uses_retained_identity_and_independent_read_state -- --ignored --test-threads=1 2>&1 | tee restored-factory.log
+          grep -q '1 passed; 0 failed' restored-factory.log
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-id-lifecycle-budget-union
+          name: shared-sequence-oracle-layout
           path: |
             source.txt
             rustc.txt
