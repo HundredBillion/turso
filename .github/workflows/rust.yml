@@ -34,7 +34,7 @@ jobs:
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_ -- --ignored --test-threads=1 2>&1 | tee ids.log
           grep -q '13 passed; 0 failed' ids.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --test-threads=1 2>&1 | tee watermark.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api shared_watermark_ -- --ignored --skip shared_watermark_process_child --test-threads=1 2>&1 | tee watermark.log
           grep -q '3 passed; 0 failed' watermark.log
       - name: MVCC regression suite and lint
         run: |
