@@ -1847,7 +1847,12 @@ impl MappedSharedWalCoordination {
     /// may legitimately lag behind crash recovery or repair paths.
     fn byte_lock_is_held(&self, offset: u64, local_held: bool) -> bool {
         let local = self.local_lock_state.lock();
-        if local_held || local.recovery_held || local.recovery_poisoned {
+        let currently_owned = match offset {
+            WRITER_LOCK_OFFSET => local.writer_lock_held,
+            CHECKPOINT_LOCK_OFFSET => local.checkpoint_lock_held,
+            _ => false,
+        };
+        if local_held || currently_owned || local.recovery_held || local.recovery_poisoned {
             return true;
         }
         match self

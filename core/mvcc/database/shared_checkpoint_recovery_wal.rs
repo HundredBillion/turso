@@ -17,11 +17,12 @@ impl SharedMvccRuntime {
                 "physical recovery binding requires its retained runtime files".into(),
             ));
         }
-        physical.validate_mapping(&self.files.physical_coordination)?;
         guard.ensure_no_snapshot_locks()?;
-        Ok(vec![
-            self.main.bind_physical_recovery(guard, physical.clone())?,
-            self.wal.bind_physical_recovery(guard, physical.clone())?,
-        ])
+        let mut bindings = Vec::new();
+        for file in [&self.main, &self.wal] {
+            physical.validate_mapping(&self.files.physical_coordination)?;
+            bindings.push(file.bind_physical_recovery(guard, physical.clone())?);
+        }
+        Ok(bindings)
     }
 }

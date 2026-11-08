@@ -1,7 +1,8 @@
 //! Shared file mutations retain publication ownership through backend completion retirement.
 
-use super::shared_authority::{AuthorityGuard, PublicationLease, SharedMvccAuthority};
+use super::shared_authority::{AuthorityGuard, IoPin, PublicationLease, SharedMvccAuthority};
 use crate::io::{CompletionGroup, File, FileId, FileSyncType};
+use crate::storage::shared_wal_coordination::SharedWalRecoveryLocks;
 use crate::sync::{Arc, Mutex, Weak};
 use crate::{Buffer, Completion, CompletionError, LimboError, Result};
 
@@ -15,6 +16,7 @@ struct LeaseSlot {
     lease: Weak<PublicationLease>,
     bound: bool,
     pin_reads: bool,
+    physical: Option<Arc<SharedWalRecoveryLocks>>,
 }
 
 pub(super) struct FileBinding {
@@ -32,37 +34,38 @@ impl GuardedFile {
                 lease: Weak::new(),
                 bound: false,
                 pin_reads: false,
+                physical: None,
             }),
         })
     }
 
     pub(super) fn bind(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
-        self.bind_with_reads(guard, false)
+        self.bind_with_reads(guard, false, None)
     }
 
     /// Checkpoint admission is paused and all participants are quiescent before this binding.
     pub(super) fn bind_checkpoint(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
-        self.bind_with_reads(guard, true)
+        self.bind_with_reads(guard, true, None)
     }
 
     /// Physical initialization reads retain authority until the backend releases their completion.
     pub(super) fn bind_reads(self: &Arc<Self>, guard: &AuthorityGuard) -> Result<FileBinding> {
-        self.bind_with_reads(guard, true)
+        self.bind_with_reads(guard, true, None)
     }
 
     pub(super) fn bind_physical_recovery(
         self: &Arc<Self>,
         guard: &AuthorityGuard,
-        physical: Arc<crate::storage::shared_wal_coordination::SharedWalRecoveryLocks>,
+        physical: Arc<SharedWalRecoveryLocks>,
     ) -> Result<FileBinding> {
-        let _ = physical;
-        self.bind_checkpoint(guard)
+        self.bind_with_reads(guard, true, Some(physical))
     }
 
     fn bind_with_reads(
         self: &Arc<Self>,
         guard: &AuthorityGuard,
         pin_reads: bool,
+        physical: Option<Arc<SharedWalRecoveryLocks>>,
     ) -> Result<FileBinding> {
         let mut current = self.lease.lock();
         if current.lease.upgrade().is_some() {
@@ -78,18 +81,19 @@ impl GuardedFile {
         current.lease = lease.clone();
         current.bound = true;
         current.pin_reads = pin_reads;
+        current.physical = physical;
         Ok(FileBinding {
             file: self.clone(),
             lease,
         })
     }
 
-    fn pin(&self) -> Result<super::shared_authority::IoPin> {
+    fn pin(&self) -> Result<FileIoOwner> {
         let slot = self.lease.lock();
         if !slot.bound {
             return Err(LimboError::Busy);
         }
-        PublicationLease::pin(&slot.lease)
+        pin_slot(&slot)
     }
 
     fn completion(
@@ -125,6 +129,19 @@ impl GuardedFile {
     }
 }
 
+// Publication ownership must outlive the physical byte locks.
+struct FileIoOwner {
+    _physical: Option<Arc<SharedWalRecoveryLocks>>,
+    _publication: IoPin,
+}
+
+fn pin_slot(slot: &LeaseSlot) -> Result<FileIoOwner> {
+    Ok(FileIoOwner {
+        _physical: slot.physical.clone(),
+        _publication: PublicationLease::pin(&slot.lease)?,
+    })
+}
+
 enum CompletionKind {
     Write,
     Sync,
@@ -136,6 +153,7 @@ impl Drop for FileBinding {
         let mut current = self.file.lease.lock();
         if Weak::ptr_eq(&current.lease, &self.lease) {
             current.bound = false;
+            current.physical = None;
         }
     }
 }
@@ -154,7 +172,7 @@ impl File for GuardedFile {
         let pin = {
             let slot = self.lease.lock();
             if slot.bound && slot.pin_reads {
-                Some(PublicationLease::pin(&slot.lease).inspect_err(|_| c.abort())?)
+                Some(pin_slot(&slot).inspect_err(|_| c.abort())?)
             } else {
                 None
             }
