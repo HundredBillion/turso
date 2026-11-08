@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ff365e5524753ca2f4b2bdd34c06a0022c631dbc
+          ref: 46df3a19e5e927e722aaab230a97b8dc727049a4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -25,13 +25,13 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = "$(git rev-parse ff365e5524753ca2f4b2bdd34c06a0022c631dbc)"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse 46df3a19e5e927e722aaab230a97b8dc727049a4)"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Paused checkpoint recovery selection
         run: |
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_entry_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee recovery-green.log
-          grep -q '2 passed; 0 failed' recovery-green.log
+          grep -q '3 passed; 0 failed' recovery-green.log
       - name: Native same-process snapshot ownership negative control
         run: |
           cp core/mvcc/shared_authority.rs /tmp/shared-authority-original.rs
