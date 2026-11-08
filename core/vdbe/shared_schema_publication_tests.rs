@@ -267,3 +267,174 @@ impl Drop for ProcessWorker {
         }
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_worker_native_row_delete_and_unique_conflicts() {
+    for conflict in ["update", "delete", "unique"] {
+        for winner in [0, 1] {
+            eprintln!("worker conflict={conflict}, winner={winner}");
+            let directory = tempfile::tempdir().unwrap();
+            let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+            let mut setup = Worker::open(&path, limit, true);
+            assert_eq!(setup.execute("CREATE TABLE worker_rows(id INTEGER PRIMARY KEY, value INTEGER, tag TEXT); CREATE UNIQUE INDEX worker_tag ON worker_rows(tag); INSERT INTO worker_rows VALUES(1,100,'original')"), "OK");
+            drop(setup);
+            let mut workers = [
+                Worker::open(&path, limit, true),
+                Worker::open(&path, limit, true),
+            ];
+            for worker in &mut workers {
+                assert_eq!(worker.execute("BEGIN CONCURRENT"), "OK");
+                assert_eq!(
+                    worker.query("SELECT value FROM worker_rows WHERE id=1"),
+                    "[100]"
+                );
+            }
+            let sql = match conflict {
+                "update" => [
+                    "UPDATE worker_rows SET value=10 WHERE id=1",
+                    "UPDATE worker_rows SET value=20 WHERE id=1",
+                ],
+                "delete" => [
+                    "DELETE FROM worker_rows WHERE id=1",
+                    "UPDATE worker_rows SET value=20 WHERE id=1",
+                ],
+                "unique" => [
+                    "INSERT INTO worker_rows VALUES(10,10,'duplicate')",
+                    "INSERT INTO worker_rows VALUES(20,20,'duplicate')",
+                ],
+                _ => unreachable!(),
+            };
+            for index in 0..2 {
+                assert_eq!(
+                    workers[index].execute(sql[index]),
+                    "OK",
+                    "both conflicting writes must be staged before commit"
+                );
+            }
+            assert_eq!(workers[winner].execute("COMMIT"), "OK");
+            let loser = 1 - winner;
+            let error = workers[loser].execute("COMMIT");
+            eprintln!("conflict result: {error}");
+            assert!(
+                ["ERR WriteWriteConflict", "ERR Busy", "ERR Constraint"]
+                    .iter()
+                    .any(|prefix| error.starts_with(prefix)),
+                "second conflicting commit was not rejected: {error}"
+            );
+            workers[loser].execute("ROLLBACK");
+            drop(workers);
+            let mut fresh = Worker::open(&path, limit, true);
+            match conflict {
+                "unique" => {
+                    assert_eq!(
+                        fresh.query("SELECT count(*) FROM worker_rows WHERE tag='duplicate'"),
+                        "[1]"
+                    );
+                    assert_eq!(
+                        fresh.query("SELECT id FROM worker_rows WHERE tag='duplicate'"),
+                        format!("[{}]", (winner + 1) * 10)
+                    );
+                    assert_eq!(fresh.query("SELECT count(*) FROM worker_rows"), "[2]");
+                }
+                "delete" if winner == 0 => {
+                    assert_eq!(fresh.query("SELECT count(*) FROM worker_rows"), "[0]")
+                }
+                _ => assert_eq!(
+                    fresh.query("SELECT value FROM worker_rows WHERE id=1"),
+                    format!("[{}]", (winner + 1) * 10)
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_worker_native_snapshot_multirow_ack_and_rolling_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+    let mut setup = Worker::open(&path, limit, true);
+    assert_eq!(setup.execute("CREATE TABLE balances(id INTEGER PRIMARY KEY, amount INTEGER); INSERT INTO balances VALUES(1,100),(2,100); CREATE TABLE transfers(id INTEGER PRIMARY KEY, amount INTEGER)"), "OK");
+    drop(setup);
+    let main_before = std::fs::read(&path).unwrap();
+    let ledger_path = directory.path().join("external-ack-ledger");
+    let mut ledger = std::fs::File::create(&ledger_path).unwrap();
+    ledger.sync_all().unwrap();
+    std::fs::File::open(directory.path())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    let mut old_reader = Worker::open(&path, limit, true);
+    assert_eq!(old_reader.execute("BEGIN CONCURRENT"), "OK");
+    assert_eq!(
+        old_reader.query("SELECT amount FROM balances ORDER BY id"),
+        "[100, 100]"
+    );
+    for sequence in 1..=3 {
+        let mut writer = Worker::open(&path, limit, true);
+        assert_eq!(writer.execute("PRAGMA synchronous=FULL"), "OK");
+        assert_eq!(writer.execute("BEGIN CONCURRENT"), "OK");
+        assert_eq!(writer.execute(&format!("UPDATE balances SET amount=amount-10 WHERE id=1; UPDATE balances SET amount=amount+10 WHERE id=2; INSERT INTO transfers VALUES({sequence},10)")), "OK");
+        assert_eq!(
+            old_reader.query("SELECT amount FROM balances ORDER BY id"),
+            "[100, 100]"
+        );
+        assert_eq!(old_reader.query("SELECT count(*) FROM transfers"), "[0]");
+        assert_eq!(writer.execute("COMMIT"), "OK");
+        writeln!(ledger, "{sequence} 10").unwrap();
+        ledger.sync_all().unwrap();
+        if sequence == 2 {
+            let Worker::Process(child) = &mut writer else {
+                unreachable!()
+            };
+            child.child.kill().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "acknowledged worker did not die");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9));
+        }
+        drop(writer);
+        assert_eq!(
+            old_reader.query("SELECT amount FROM balances ORDER BY id"),
+            "[100, 100]"
+        );
+        let mut fresh = Worker::open(&path, limit, true);
+        assert_eq!(
+            fresh.query("SELECT amount FROM balances ORDER BY id"),
+            format!("[{}, {}]", 100 - sequence * 10, 100 + sequence * 10)
+        );
+        assert_eq!(
+            fresh.query("SELECT count(*) FROM transfers"),
+            format!("[{sequence}]")
+        );
+        assert_eq!(fresh.query("SELECT sum(amount) FROM balances"), "[200]");
+    }
+    assert_eq!(old_reader.execute("COMMIT"), "OK");
+    drop(old_reader);
+    drop(ledger);
+    let acknowledged = std::fs::read_to_string(ledger_path).unwrap();
+    let rows: Vec<_> = acknowledged.lines().collect();
+    assert_eq!(rows, ["1 10", "2 10", "3 10"]);
+    let mut recovered = Worker::open(&path, limit, true);
+    assert_eq!(
+        recovered.query("SELECT amount FROM balances ORDER BY id"),
+        "[70, 130]"
+    );
+    assert_eq!(
+        recovered.query("SELECT id FROM transfers ORDER BY id"),
+        "[1, 2, 3]"
+    );
+    assert_eq!(recovered.query("SELECT sum(amount) FROM transfers"), "[30]");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        main_before,
+        "test crossed a physical checkpoint boundary"
+    );
+}
