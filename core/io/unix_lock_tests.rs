@@ -209,10 +209,14 @@ fn linux_ordinary_lock_native_syscall_alias_cache_and_sigkill() {
 #[ignore = "requires native Linux64, enabled io_uring, and Python SQLite"]
 fn linux_ordinary_lock_native_uring_alias_cache_and_sigkill() {
     alias_cache_and_sigkill("uring");
+    respects_sqlite_posix_owner("uring");
 }
 #[test]
 #[ignore = "requires native Linux64 and Python SQLite"]
 fn linux_ordinary_lock_native_respects_sqlite_posix_owner() {
+    respects_sqlite_posix_owner("syscall");
+}
+fn respects_sqlite_posix_owner(name: &str) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sqlite-owned.db");
     fixture(&path);
@@ -229,7 +233,7 @@ fn linux_ordinary_lock_native_respects_sqlite_posix_owner() {
             .unwrap(),
     );
     wait_ready(&mut child, &ready);
-    let io = backend("syscall");
+    let io = backend(name);
     assert!(matches!(
         io.open_file(path.to_str().unwrap(), OpenFlags::None, false),
         Err(LimboError::LockingError(_))
