@@ -836,7 +836,16 @@ support remains explicit; attached shared readers are not silently redirected.
 The shared initial boundary is the committed uncalled backing value (for example,
 1). Ordinary mode still returns NULL before its local watermark map is populated;
 this path is unchanged. The shared value is an exclusive safe-scan boundary, not
-an allocation. A backing domain absent from the committed schema currently fails
-closed, including a sequence created only inside the requesting uncommitted
-transaction; that schedule needs an explicit compatibility test before claiming
-complete sequence behavior.
+an allocation. An absent committed backing domain is accepted only when the
+current Active transaction records that exact created table ID and the selected
+journal proves the same live owner's logical-table reservation. Its boundary is
+NULL before any allocation and the live claim minimum afterward; no committed
+row is invented. Unreserved, foreign, released, dead, stale, and wrong-generation
+proofs fail without journal writes. Native CREATE/INSERT and provisional
+CREATE SEQUENCE/nextval/watermark schedules cover commit and rollback.
+
+For committed sequences the oracle checks the backing name and descriptor fields
+under authority. A root resolved before authority acquisition cannot silently
+supply another sequence's boundary after remapping. Delayed main, manifest, and
+selector reads must retain physical authority through statement reset/drop and
+backend completion retirement; a callback alone is not retirement.

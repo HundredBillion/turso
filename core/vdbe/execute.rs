@@ -11238,6 +11238,7 @@ pub fn op_function(
                         &program.connection,
                         namespace.database_id,
                         root,
+                        &name,
                         sequence,
                         &mut state.shared_watermark,
                     )? {

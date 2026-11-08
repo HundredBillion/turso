@@ -560,23 +560,58 @@ fn shared_watermark_identity_native_rejects_mismatched_backing_root() {
     use crate::IOExt;
     let (_directory, first, _) = pair_with_setup(Some("CREATE SEQUENCE expected_sequence START 3"));
     first
-        .execute("CREATE SEQUENCE other_sequence START 99")
+        .execute("CREATE SEQUENCE other_sequence START 3")
         .unwrap();
     let (_, expected) = first.find_sequence("expected_sequence").unwrap();
-    let backing = crate::translate::sequence::sequence_backing_table_name("other_sequence");
-    let root = first.with_schema(0, |schema| {
-        schema
-            .get_btree_table(crate::namespace::NamespaceId::ROOT, &backing)
-            .unwrap()
-            .root_page
-    });
+    let backing_name = crate::translate::sequence::sequence_backing_table_name("expected_sequence");
+    let root = |name: &str| {
+        let backing = crate::translate::sequence::sequence_backing_table_name(name);
+        first.with_schema(0, |schema| {
+            schema
+                .get_btree_table(crate::namespace::NamespaceId::ROOT, &backing)
+                .unwrap()
+                .root_page
+        })
+    };
     let store = first.mv_store().as_ref().unwrap().clone();
     let mut state = crate::mvcc::database::SharedSequenceWatermarkState::default();
-    let result = first.get_pager().io.block(|| {
-        store.shared_sequence_watermark_nonblock(&first, 0, root, expected.clone(), &mut state)
-    });
-    assert!(
-        matches!(result, Err(crate::LimboError::SchemaUpdated)),
-        "accepted a backing root for another sequence: {result:?}"
-    );
+    let mut changed = (*expected).clone();
+    changed.increment_by = 2;
+    for (candidate_root, descriptor) in [
+        (root("other_sequence"), expected.clone()),
+        (root("expected_sequence"), Arc::new(changed)),
+    ] {
+        let result = first.get_pager().io.block(|| {
+            store.shared_sequence_watermark_nonblock(
+                &first,
+                0,
+                candidate_root,
+                &backing_name,
+                descriptor.clone(),
+                &mut state,
+            )
+        });
+        assert!(
+            matches!(result, Err(crate::LimboError::SchemaUpdated)),
+            "accepted mismatched backing identity: {result:?}"
+        );
+    }
+    let result = first
+        .get_pager()
+        .io
+        .block(|| {
+            store.shared_sequence_watermark_nonblock(
+                &first,
+                0,
+                root("expected_sequence"),
+                &backing_name,
+                expected.clone(),
+                &mut state,
+            )
+        })
+        .unwrap();
+    assert_eq!(result, Some(3));
 }
+
+#[path = "shared_watermark_io_tests.rs"]
+mod shared_watermark_io_tests;

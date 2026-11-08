@@ -13,6 +13,7 @@ struct PendingWatermark {
     connection: Weak<Connection>,
     runtime: Arc<SharedMvccRuntime>,
     root: i64,
+    backing_name: String,
     sequence: Arc<Sequence>,
     refresh: SharedTransactionCommit,
     oracle: Option<Box<dyn CommittedIdOracle>>,
@@ -38,6 +39,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
         connection: &Arc<Connection>,
         database_id: usize,
         root: i64,
+        backing_name: &str,
         sequence: Arc<Sequence>,
         state: &mut SharedSequenceWatermarkState,
     ) -> IOResultOr<Option<i64>> {
@@ -62,6 +64,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     .is_some_and(|saved| Arc::ptr_eq(&saved, connection))
                     || !Arc::ptr_eq(&pending.runtime, runtime)
                     || pending.root != root
+                    || pending.backing_name != backing_name
                     || pending.sequence.name != sequence.name
                     || pending.sequence.start_value != sequence.start_value
                     || pending.sequence.increment_by != sequence.increment_by
@@ -79,6 +82,7 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                     connection: Arc::downgrade(connection),
                     runtime: runtime.clone(),
                     root,
+                    backing_name: backing_name.to_owned(),
                     sequence,
                     refresh: SharedTransactionCommit::new(runtime.clone())?,
                     oracle: None,
@@ -117,11 +121,13 @@ impl<C: LogicalClock + 'static, A: ConcurrentAllocator + 'static> MvStore<C, A> 
                         table: table.into(),
                         sequence: true,
                     });
-                    pending.oracle = Some(Box::new(SharedIdOracle::new(
-                        self.clone(),
-                        connection.clone(),
-                        identity,
-                    )));
+                    pending.oracle = Some(Box::new(
+                        SharedIdOracle::new(self.clone(), connection.clone(), identity)
+                            .expect_sequence(
+                                pending.backing_name.clone(),
+                                pending.sequence.clone(),
+                            ),
+                    ));
                 }
                 let domain = pending.domain.unwrap();
                 let fact = return_if_io!(pending.oracle.as_mut().unwrap().poll(
