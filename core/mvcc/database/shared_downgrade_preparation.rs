@@ -873,4 +873,91 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_resume_native_rejects_unproven_files_without_writes() {
+        for case in ["missing-wal", "replaced-wal", "invalid-ids"] {
+            let mut fixture = installed_fixture();
+            let mut preparing = fixture
+                .installed
+                .take()
+                .unwrap()
+                .begin_downgrade(
+                    fixture.connection.clone(),
+                    OfflinePrerequisite::AllOlderWorkersStopped,
+                )
+                .unwrap();
+            let intent = fixture.io.block(|| preparing.poll()).unwrap();
+            drop(intent);
+            drop(preparing);
+            let wal = PathBuf::from(format!("{}-wal", fixture.path.display()));
+            if case == "invalid-ids" {
+                std::fs::write(fixture.namespace.join("ids-selector"), []).unwrap();
+            } else {
+                std::fs::rename(&wal, fixture.path.with_extension("retained-wal")).unwrap();
+                if case == "replaced-wal" {
+                    std::fs::write(&wal, []).unwrap();
+                }
+            }
+            let before = unchanged_files(&fixture);
+            let wal_before = std::fs::read(&wal).ok();
+            drop(fixture.connection);
+            drop(fixture.runtime);
+            assert!(
+                crate::mvcc::mode_transition::downgrade_resume::resume_marker(
+                    &fixture.path,
+                    fixture.limit,
+                    OfflinePrerequisite::AllOlderWorkersStopped,
+                )
+                .is_err(),
+                "accepted {case}"
+            );
+            assert_unchanged(&before);
+            assert_eq!(std::fs::read(&wal).ok(), wal_before);
+        }
+    }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_resume_native_restores_single_terminal_copy() {
+        use std::os::unix::fs::FileExt;
+        let mut fixture = installed_fixture();
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        let expected = intent.record();
+        drop(intent);
+        drop(preparing);
+        let manifest = fixture.namespace.join("manifest");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest)
+            .unwrap();
+        file.write_all_at(&[0; RECORD_SIZE], 0).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        drop(fixture.connection);
+        drop(fixture.runtime);
+        let completed = crate::mvcc::mode_transition::downgrade_resume::resume_marker(
+            &fixture.path,
+            fixture.limit,
+            OfflinePrerequisite::AllOlderWorkersStopped,
+        )
+        .unwrap();
+        let bytes = std::fs::read(manifest).unwrap();
+        for offset in [0, SLOT_SIZE] {
+            assert_eq!(
+                ManifestRecord::decode(&bytes[offset..offset + RECORD_SIZE]).unwrap(),
+                Some(expected)
+            );
+        }
+        assert_eq!(&std::fs::read(&fixture.path).unwrap()[18..20], &[2, 2]);
+        drop(completed);
+    }
 }
