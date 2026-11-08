@@ -64,7 +64,7 @@ jobs:
           binaries=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r.get('target',{}).get('name')=='turso_sync_engine' and r.get('profile',{}).get('test') and r.get('executable')]
           assert len(binaries)==1,binaries
           Path('test-binary.txt').write_text(binaries[0])
-          cmd=['lldb','--batch','-o','run','-k','thread backtrace all -c 120','-k','script print([(i, hex(f.GetSP()), hex(f.GetFP()), f.GetFunctionName()) for i,f in enumerate(lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread())])','-k','register read sp fp','-k','disassemble --frame','--',binaries[0],'--exact','database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base','--nocapture']
+          cmd=['lldb','--batch','-o',"script lldb.debugger.GetSelectedTarget().BreakpointCreateByLocation('database_replay_generator.rs', 852).SetOneShot(True)",'-o','run','-o','thread backtrace -c 80','-o','script print([(i, hex(f.GetSP()), hex(f.GetFP()), f.GetFunctionName()) for i,f in enumerate(lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread())])','-o','continue','-k','thread backtrace all -c 120','-k','script print([(i, hex(f.GetSP()), hex(f.GetFP()), f.GetFunctionName()) for i,f in enumerate(lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread())])','-k','register read sp fp','-k','disassemble --frame','--',binaries[0],'--exact','database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base','--nocapture']
           try:
               result=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
               Path('lldb.log').write_text(result.stdout+'\n'+result.stderr)
