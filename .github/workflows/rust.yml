@@ -1,4 +1,4 @@
-name: macOS lazy shared-state boxing control
+name: Shared statement stack release
 on:
   workflow_dispatch:
 permissions:
@@ -12,13 +12,13 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: '1'
 jobs:
-  stack:
+  macos:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: '68621e3747b1c29a52be772e84bcb6ed40fff434'
+          ref: '89a751390ea4c707b32cda7a015d468cccfd3269'
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
@@ -30,54 +30,83 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
-      - name: Matching workspace build
+      - name: Exact source and matching workspace build
         run: |
           git rev-parse HEAD HEAD^{tree} | tee source.txt
           rustc -Vv | tee rustc.txt
+          git diff 6a602a8075da5b53171450b00e7e05a80da84a7a HEAD --stat | tee source-diff.txt
           cargo build --verbose --locked --all-features 2>&1 | tee build.log
-      - name: Exact nextest counterexample
+      - name: Uninstrumented regression three times and complete sync suite
         env:
           NEXTEST_PROFILE: ci
           LOCAL_SYNC_SERVER: ../../target/debug/tursodb
           RUST_LOG: ''
         run: |
-          set +e
-          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'test(=database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base)' --no-tests=fail --failure-output=immediate --success-output=immediate 2>&1 | tee baseline.log
-          status=${PIPESTATUS[0]}
-          set -e
-          echo "$status" > status.txt
-          test "$status" -eq 100 -o "$status" -eq 0
+          for trial in 1 2 3; do
+            cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'test(=database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base)' --no-tests=fail --failure-output=immediate 2>&1 | tee "exact-$trial.log"
+          done
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'package(turso_sync_engine)' --no-tests=fail --failure-output=immediate 2>&1 | tee sync-suite.log
           python3 - <<'PYCODE'
           import re
           from pathlib import Path
-          Path('baseline-plain.log').write_text(re.sub(r'\x1b\[[0-9;]*m', '', Path('baseline.log').read_text()))
-          PYCODE
-          grep -Eq '1 tests? run:' baseline-plain.log
-      - name: Native stack trace without changing stack limits
-        if: always()
-        run: |
-          cargo test --workspace --all-features --locked --exclude memory-benchmark --no-run --message-format=json > test-metadata.json 2> test-metadata.log
-          python3 - <<'PYCODE'
-          import json, subprocess
-          from pathlib import Path
-          rows=[json.loads(line) for line in Path('test-metadata.json').read_text().splitlines()]
-          binaries=[r['executable'] for r in rows if r.get('reason')=='compiler-artifact' and r.get('target',{}).get('name')=='turso_sync_engine' and r.get('profile',{}).get('test') and r.get('executable')]
-          assert len(binaries)==1,binaries
-          Path('test-binary.txt').write_text(binaries[0])
-          cmd=['lldb','--batch','-o',"script lldb.debugger.GetSelectedTarget().BreakpointCreateByLocation('database_replay_generator.rs', 852).SetOneShot(True)",'-o','run','-o','thread backtrace -c 80','-o','script print([(i, hex(f.GetSP()), hex(f.GetFP()), f.GetFunctionName()) for i,f in enumerate(lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread())])','-o','continue','-k','thread backtrace all -c 120','-k','script print([(i, hex(f.GetSP()), hex(f.GetFP()), f.GetFunctionName()) for i,f in enumerate(lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread())])','-k','register read sp fp','-k','disassemble --frame','--',binaries[0],'--exact','database_sync_engine::tests::deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base','--nocapture']
-          try:
-              result=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
-              Path('lldb.log').write_text(result.stdout+'\n'+result.stderr)
-              Path('lldb-status.txt').write_text(str(result.returncode))
-          except subprocess.TimeoutExpired as error:
-              Path('lldb.log').write_bytes((error.stdout or b'')+(error.stderr or b'')+b'\nLLDB timed out')
-              raise
+          for path in [*Path('.').glob('exact-*.log'), Path('sync-suite.log')]:
+              text=re.sub(r'\x1b\[[0-9;]*m', '', path.read_text())
+              assert 'FLAKY' not in text, path
+              summaries=[line for line in text.splitlines() if 'Summary [' in line]
+              assert len(summaries)==1 and re.search(r'[1-9][0-9]* tests? run:', summaries[0]), summaries
+              if path.name.startswith('exact-'):
+                  assert '1 test run: 1 passed' in summaries[0], summaries
+              print(path.name, summaries[0])
           PYCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: macos-sync-stack-phases
+          name: macos-shared-stack-release
           path: |
             *.log
             *.txt
             target/nextest/ci/junit.xml
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: '89a751390ea4c707b32cda7a015d468cccfd3269'
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-stack-native
+          cache-on-failure: true
+      - name: Core and SDK ordinary suites
+        run: |
+          git rev-parse HEAD HEAD^{tree} | tee source.txt
+          rustc -Vv | tee rustc.txt
+          cargo test --locked -p turso_core -p turso_sdk_kit --lib --features turso_core/bench,turso_core/conn_raw_api,turso_core/fts,turso_core/io_uring 2>&1 | tee core-sdk.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' core-sdk.log
+      - name: Actual native shared state ownership
+        run: |
+          for pair in shared_id_opcode_native_:13 shared_id_lifecycle_native_:8 shared_id_lifecycle_io_native_:2 shared_watermark_io_native_:1 shared_watermark_process_native_:1; do
+            selector="${pair%:*}"
+            count="${pair#*:}"
+            cargo test --locked -p turso_core --lib --features bench,conn_raw_api,fts,io_uring "$selector" -- --ignored --test-threads=1 2>&1 | tee "$selector.log"
+            grep -Eq "test result: ok\. $count passed; 0 failed;" "$selector.log"
+          done
+      - name: Strict core and SDK lint and format
+        run: |
+          cargo clippy --locked -p turso_core -p turso_sdk_kit --all-targets --features turso_core/bench,turso_core/conn_raw_api,turso_core/fts,turso_core/io_uring -- --deny=warnings 2>&1 | tee clippy.log
+          cargo fmt --check
+          git diff --check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-shared-stack-release
+          path: |
+            *.log
+            *.txt
