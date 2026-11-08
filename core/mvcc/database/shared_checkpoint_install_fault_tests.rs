@@ -124,6 +124,14 @@ impl File for ControlledFile {
         self.control
             .mutation(self.inner.clone(), Mutation::Sync(kind), completion)
     }
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: crate::io::SharedWalLockKind,
+    ) -> Result<()> {
+        self.inner.shared_wal_lock_byte(offset, exclusive, kind)
+    }
     fn shared_wal_try_lock_byte(
         &self,
         offset: u64,
