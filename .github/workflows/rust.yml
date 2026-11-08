@@ -48,7 +48,8 @@ jobs:
       - name: Strict core lint and format
         run: |
           cargo fmt --all --check
-          cargo clippy --locked -p turso_core --all-targets --features conn_raw_api -- -D warnings 2>&1 | tee lint.log
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench,io_uring -- -D warnings
+          cargo clippy --locked -p turso_core --all-targets --features conn_raw_api,bench,io_uring -- -D warnings 2>&1 | tee lint.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
