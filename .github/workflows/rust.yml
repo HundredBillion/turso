@@ -23,22 +23,85 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: recovery-native-143ccda
-      - name: Actual physical exclusion behavior
+      - name: Causal native ownership controls and exact restored source
         run: |
           set -euo pipefail
+          uname -a | tee environment.txt
+          stat -f -c '%T %t' /tmp "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a environment.txt
+          rustc --version | tee -a environment.txt
           git rev-parse HEAD | tee source.txt
           test "$(git rev-parse HEAD)" = bef0508e40df3982a0a2a769b254c0116af054ee
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
-          grep -q '8 passed; 0 failed' physical-owner-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api mvcc::guarded_file::tests:: -- --test-threads=2 2>&1 | tee guarded-regression-green.log
-          cargo test --locked -p turso_core --lib --features conn_raw_api storage::shared_wal_coordination::tests:: -- --test-threads=2 2>&1 | tee coordination-regression-green.log
+          python3 - <<'PATCH'
+          p='core/storage/shared_wal_recovery.rs'
+          s=open(p).read(); old='            || local.reader_locks.iter().any(|count| *count != 0)\n'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,''))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_local_owners_remain_valid_until_release -- --ignored --test-threads=1 --nocapture > local-reader-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/storage/shared_wal_recovery.rs
+          cat local-reader-control-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' local-reader-control-red.log
+          python3 - <<'PATCH'
+          p='core/mvcc/guarded_file.rs'
+          s=open(p).read(); old='        _physical: slot.physical.clone(),'
+          assert s.count(old)==1
+          open(p,'w').write(s.replace(old,'        _physical: None,'))
+          PATCH
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_binding_retains_both_authorities_until_backend_retirement -- --ignored --test-threads=1 --nocapture > physical-capture-control-red.log 2>&1
+          code=$?
+          set -e
+          git restore core/mvcc/guarded_file.rs
+          cat physical-capture-control-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' physical-capture-control-red.log
+          grep -q 'physical reader admitted before backend retirement' physical-capture-control-red.log
+          git diff --exit-code
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-restored-green.log
+          grep -q '8 passed; 0 failed' physical-owner-restored-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee checkpoint-recovery-green.log
+          grep -q '24 passed; 0 failed' checkpoint-recovery-green.log
+          cargo test --locked -p turso_core --lib --features conn_raw_api 2>&1 | tee full-core-green.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: physical-owner-green
+          name: physical-owner-final-bef0508e4
           path: |
             source.txt
+            environment.txt
             *.log
+
+  physical-owner-windows:
+    needs: physical-owner-green
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bef0508e40df3982a0a2a769b254c0116af054ee
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pager-generation-windows-0b37
+      - name: Check exact Windows library
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = bef0508e40df3982a0a2a769b254c0116af054ee
+          cargo check --locked -p turso_core --lib --features bench,conn_raw_api 2>&1 | tee windows-owner-check.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: physical-owner-windows-bef0508e4
+          path: windows-owner-check.log
