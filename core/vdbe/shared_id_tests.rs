@@ -701,3 +701,72 @@ fn shared_id_lifecycle_native_failed_statement_releases_only_scoped_claims() {
         .expect("failed statement rolled back but retained scoped ID claim");
     first.execute("ROLLBACK").unwrap();
 }
+
+fn abandoned_claim_releases_scope(reset: bool) {
+    let (_directory, first, second) = pair();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'prior')")
+        .unwrap();
+    let outer = first.get_mv_tx_id_for_db(0).unwrap();
+    let store = first.mv_store().as_ref().unwrap().clone();
+    let snapshot = store.read_snapshot_ts(outer);
+    first.set_yield_injector(Some(Arc::new(AfterClaimYield(
+        std::sync::atomic::AtomicBool::new(true),
+    ))));
+    let mut statement = first
+        .prepare("INSERT INTO preserved(id,value) VALUES(77,'abandoned')")
+        .unwrap();
+    let mut parked = false;
+    for _ in 0..10000 {
+        match statement.step().unwrap() {
+            crate::StepResult::Yield => {
+                parked = true;
+                break;
+            }
+            crate::StepResult::IO => statement.get_pager().io.step().unwrap(),
+            other => panic!("expected durable claim boundary, got {other:?}"),
+        }
+    }
+    assert!(parked);
+    first.set_yield_injector(None);
+    if reset {
+        statement.reset().unwrap();
+    }
+    drop(statement);
+    assert_eq!(first.get_mv_tx_id_for_db(0), Some(outer));
+    assert_eq!(store.read_snapshot_ts(outer), snapshot);
+    assert_eq!(
+        integers(&first, "SELECT id FROM preserved WHERE id>=66"),
+        [66]
+    );
+    let error = second
+        .execute("INSERT INTO preserved(id,value) VALUES(66,'peer')")
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::LimboError::Busy),
+        "prior claim lost: {error:?}"
+    );
+    second
+        .execute("INSERT INTO preserved(id,value) VALUES(77,'peer')")
+        .expect("abandoned statement retained its scoped ID claim");
+    first
+        .execute("COMMIT")
+        .expect("abandoned statement poisoned the earlier transaction");
+    assert_eq!(
+        integers(&second, "SELECT id FROM preserved WHERE id>=66"),
+        [66, 77]
+    );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_reset_releases_only_scoped_claims() {
+    abandoned_claim_releases_scope(true);
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_id_lifecycle_native_drop_releases_only_scoped_claims() {
+    abandoned_claim_releases_scope(false);
+}
