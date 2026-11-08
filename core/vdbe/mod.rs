@@ -2654,7 +2654,13 @@ impl Program {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         #[cfg(all(host_shared_wal, unix))]
-        let cleanup_blocks_step = !self.connection.is_nested_stmt()
+        let cleanup_blocks_step = self.connection.mv_store().as_ref().is_some_and(|store| {
+            store.is_shared()
+                && self
+                    .connection
+                    .get_mv_tx_id()
+                    .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
+        }) && !self.connection.is_nested_stmt()
             && state.shared_named_rollback.is_none()
             && !self.insns.iter().any(|(insn, _)| {
                 matches!(
@@ -2665,11 +2671,6 @@ impl Program {
                             ..
                         }
                 )
-            })
-            && self.connection.mv_store().as_ref().is_some_and(|store| {
-                self.connection
-                    .get_mv_tx_id()
-                    .is_some_and(|tx| store.shared_id_cleanup_pending(tx))
             });
         #[cfg(not(all(host_shared_wal, unix)))]
         let cleanup_blocks_step = false;
