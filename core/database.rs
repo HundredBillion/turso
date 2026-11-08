@@ -3323,8 +3323,8 @@ impl Database {
 
     /// Non-blocking [`Self::connect`].
     ///
-    /// Creating the connection itself never waits, but the connect-time
-    /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
+    /// Connection initialization may need page I/O. The connect-time
+    /// ANALYZE stats refresh also runs a `SELECT` over `sqlite_stat1`, and that
     /// statement can have to wait: on page I/O, or on another transaction
     /// (a read that speculatively saw a version whose writer is still
     /// preparing waits for that writer at its own commit). `connect` pumps

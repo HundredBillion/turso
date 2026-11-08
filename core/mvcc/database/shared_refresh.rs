@@ -109,6 +109,7 @@ impl SharedRefresh {
         options: SharedBeginOptions,
     ) -> IOResultOr<TxID> {
         let mut loaded = return_if_io!(self.poll(store, connection));
+        #[cfg(all(host_shared_wal, unix))]
         if let Some(runtime) = store.shared_runtime.get() {
             runtime.certify_database_pager(
                 &connection.get_source_database(options.database_id),
