@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f02fc081a31dc60de403b96c7aafe8f5755ea019
+          ref: 19f37d76240f4db344faae1d47a7776303339728
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -28,9 +28,18 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f02fc081a31dc60de403b96c7aafe8f5755ea019
+          test "$(git rev-parse HEAD)" = 19f37d76240f4db344faae1d47a7776303339728
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
+      - name: Fresh terminal matching-bytes durability expected RED
+        run: |
+          set +e
+          timeout 600 cargo test --locked -p turso_core --lib --features conn_raw_api shared_downgrade_resume_native_terminal_reopens_without_live_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee mirror-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" = 101
+          grep -q '^test result: FAILED. 0 passed; 1 failed;' mirror-red.log
+          grep -q 'fresh recovery must establish both terminal durability barriers' mirror-red.log
       - name: Completed cleanup expected RED
         run: |
           set +e
