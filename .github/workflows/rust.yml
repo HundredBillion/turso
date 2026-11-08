@@ -1,4 +1,4 @@
-name: SDK inherited OFD control
+name: SDK native reopen scope validation
 on:
   workflow_dispatch:
 permissions:
@@ -14,33 +14,57 @@ env:
 jobs:
   sdk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: operator
+            source: 4fed1eea5878fc8c54e276246d8ad3b4093aa8b2
+            count: 43
+          - name: barrier-control
+            source: 17f34d097eb53f369d72c36b2ef974d3e3506916
+            count: 45
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 94a20d73f13dd76e8ac33ad674b5efc27a04a2f6
+          ref: ${{ matrix.source }}
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Focused ownership
+      - name: Exact SDK repeated contracts
         run: |
           git rev-parse HEAD | tee source.txt
           rustc -Vv | tee rustc.txt
-          cargo test --locked -p turso_sdk_kit --lib codec_reopen_observes_inherited_ofd_until_child_exec -- --nocapture 2>&1 | tee focused.log
-      - name: Full SDK ownership
-        if: always()
-        run: |
-          cargo test --locked -p turso_sdk_kit --lib -- --nocapture 2>&1 | tee sdk.log
-          for repeat in $(seq 1 20); do
-            cargo test --locked -p turso_sdk_kit --lib page_codec_is_applied_to_sdk_connections -- --nocapture 2>&1 | tee "codec-repeat-$repeat.log"
+          cargo tree --locked -p turso_sdk_kit -e features > sdk-features.txt
+          for repeat in 1 2 3; do
+            cargo test --locked -p turso_sdk_kit --lib -- --nocapture 2>&1 | tee "sdk-$repeat.log"
+            grep '^test result:' "sdk-$repeat.log" | tail -1 | grep -q '^test result: ok. ${{ matrix.count }} passed; 0 failed;'
           done
+      - name: Actual inherited descriptor and barrier controls
+        if: matrix.name == 'barrier-control'
+        run: |
+          cargo test --locked -p turso_sdk_kit --lib codec_reopen_ -- --nocapture 2>&1 | tee barrier.log
+          grep '^test result:' barrier.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
+      - name: Ordinary and shared close
+        if: matrix.name == 'operator'
+        run: |
+          cargo test --locked -p turso_core --lib --features conn_raw_api,bench test_close_persists_ -- --nocapture 2>&1 | tee ordinary-close.log
+          grep '^test result:' ordinary-close.log | tail -1 | grep -q '^test result: ok. 2 passed; 0 failed;'
+          cargo test --locked -p turso_core --lib --features conn_raw_api,bench shared_offline_operator_native_close_ -- --ignored --nocapture 2>&1 | tee shared-close.log
+          grep '^test result:' shared-close.log | tail -1 | grep -q '^test result: ok. 1 passed; 0 failed;'
+      - name: SDK strict lint
+        if: matrix.name == 'operator'
+        run: |
+          cargo clippy --locked -p turso_sdk_kit --all-targets --features turso_core/bench -- -D warnings 2>&1 | tee clippy.log
+          cargo fmt --all --check
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sdk-inherited-ofd-control
+          name: sdk-native-reopen-${{ matrix.name }}
           path: |
             *.log
-            source.txt
-            rustc.txt
+            *.txt
