@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 72b219a20bc2066d46cc11189a7ece061dfc8905
+          ref: 9459876e3abcfc382511d7b2a34fb63d4a810d51
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,7 +24,7 @@ jobs:
       - name: Record exact source
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 72b219a20bc2066d46cc11189a7ece061dfc8905
+          test "$(git rev-parse HEAD)" = 9459876e3abcfc382511d7b2a34fb63d4a810d51
           rustc -Vv | tee rustc.txt
           stat -f -c 'temporary filesystem: %T (%t)' /tmp
       - name: Actual checkpoint and later commits must expose stale idle Store
@@ -42,7 +42,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: idle-generation-72b2-red
+          name: idle-generation-9459-red
           path: |
             source.txt
             rustc.txt
