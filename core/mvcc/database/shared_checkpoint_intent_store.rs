@@ -264,6 +264,55 @@ mod tests {
 
     #[test]
     #[ignore = "requires native Linux ext-family filesystem"]
+    fn intent_source_store_native_retained_store_clone_keeps_native_authority() {
+        let probe = Arc::new(AllocationProbe::default());
+        let (fixture, physical) = physical_case(CrashPoint::BeforeWalCommit, options(&probe));
+        let file = fixture
+            .io
+            .open_file(
+                fixture
+                    .runtime
+                    .files
+                    .namespace
+                    .join("authority")
+                    .to_str()
+                    .unwrap(),
+                crate::OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        *probe.authority.lock() = Some(file.clone());
+        let SourceIntentStore { owner, physical } = physical.begin_source_store().unwrap();
+        let retained_store = owner.store.clone();
+        let store = Arc::downgrade(&retained_store);
+        assert!(matches!(
+            consume_physical_then_fail(physical),
+            Err(LimboError::Interrupt)
+        ));
+        probe.check_native.store(true, Ordering::Release);
+        drop(owner);
+        assert!(store.upgrade().is_some());
+        assert_eq!(probe.checked.load(Ordering::Acquire), 0);
+        assert!(
+            !native_publication_available(&file),
+            "owner drop released native authority while a real Store clone survived"
+        );
+        assert!(matches!(
+            fixture.runtime.files.authority.try_acquire(),
+            Err(LimboError::Busy)
+        ));
+        drop(retained_store);
+        assert!(store.upgrade().is_none());
+        assert!(probe.checked.load(Ordering::Acquire) > 0);
+        assert!(!probe.early_release.load(Ordering::Acquire));
+        assert!(native_publication_available(&file));
+        let guard = fixture.runtime.files.authority.try_acquire().unwrap();
+        assert!(guard.requires_recovery());
+        assert!(guard.published().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
     fn intent_source_store_native_allocation_failure_keeps_unused_claim_free() {
         let probe = Arc::new(AllocationProbe::default());
         let (fixture, physical) = physical_case(CrashPoint::BeforeWalCommit, options(&probe));
