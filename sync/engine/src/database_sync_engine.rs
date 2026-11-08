@@ -4777,127 +4777,124 @@ mod tests {
             std::mem::size_of::<turso_core::OpenDbAsyncState>(),
             std::mem::size_of::<turso_core::vdbe::ProgramState>()
         );
-        let mut gen = genawaiter::sync::Gen::new({
+        fn future_bytes<P, F>(_: &P) -> usize
+        where
+            P: FnOnce(genawaiter::sync::Co<SyncEngineIoResult, Result<()>>) -> F,
+            F: std::future::Future,
+        {
+            std::mem::size_of::<F>()
+        }
+        let producer = {
             let io = io.clone();
             let main_path = main_path.clone();
-            move |coro| {
-                let future = async move {
-                    eprintln!("[STACK-PROBE] first poll");
-                    let coro: Coro<()> = coro.into();
-                    eprintln!("[STACK-PROBE] before create_db");
-                    let engine = DatabaseSyncEngine::create_db(
-                        &coro,
-                        io.clone(),
-                        sync_engine_io.clone(),
-                        &main_path,
-                        opts,
-                    )
-                    .await
-                    .map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!("test create_db failed: {error}"))
-                    })?;
-                    assert_eq!(
-                        engine.meta().remote_pull_protocol,
-                        RemotePullProtocol::Unknown
-                    );
-
-                    eprintln!("[STACK-PROBE] created engine");
-                    // Local writes before ever contacting the server.
-                    let conn = engine.connect_rw(&coro).await.map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!("test connect_rw failed: {error}"))
-                    })?;
-                    assert!(!conn.mvcc_enabled());
-                    conn.execute("CREATE TABLE local_notes(id INTEGER PRIMARY KEY, note TEXT)")?;
-                    conn.execute("INSERT INTO local_notes VALUES (1, 'kept-across-conversion')")?;
-                    let base_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
-                    update_last_change_id(
-                        &coro,
-                        &conn,
-                        &engine.client_unique_id,
-                        1,
-                        base_change_id,
-                    )
-                    .await?;
-                    drop(conn);
-
-                    // First contact: detection, conversion, replace-base pull.
-                    eprintln!("[STACK-PROBE] before remote wait");
-                    let status = engine.wait_changes_from_remote(&coro).await?;
-                    eprintln!("[STACK-PROBE] after remote wait");
-                    assert!(matches!(
-                        status.stream_kind,
-                        DbChangesStreamKind::ReplaceBasePages
-                    ));
-                    assert!(status.file_slot.is_some());
-                    assert_eq!(
-                        engine.meta().remote_pull_protocol,
-                        RemotePullProtocol::MvccLogical
-                    );
-                    assert!(engine.meta().logical_mvcc_pull_active());
-
-                    eprintln!("[STACK-PROBE] before apply");
-                    engine.apply_changes_from_remote(&coro, status).await?;
-                    eprintln!("[STACK-PROBE] after apply");
-                    assert_eq!(
-                        engine.meta().synced_revision,
-                        Some(DatabasePullRevision::V1 {
-                            revision: server_revision.to_string(),
-                        })
-                    );
-
-                    // Remote base and replayed local data both present, on an
-                    // MVCC-mode connection.
-                    let conn = engine.connect_rw(&coro).await.map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!("test reconnect failed: {error}"))
-                    })?;
-                    assert!(conn.mvcc_enabled());
-                    let mut stmt = conn.prepare("SELECT value FROM items ORDER BY id")?;
-                    let mut values = Vec::new();
-                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
-                        values.push(row.get_value(0).to_text().unwrap().to_string());
-                    }
-                    assert_eq!(values, vec!["remote-a".to_string(), "remote-b".to_string()]);
-                    let mut stmt = conn.prepare("SELECT note FROM local_notes")?;
-                    let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
-                    assert_eq!(
-                        row.get_value(0).to_text().unwrap(),
-                        "kept-across-conversion"
-                    );
-                    assert!(run_stmt_once(&coro, &mut stmt).await?.is_none());
-                    drop(stmt);
-                    drop(conn);
-                    drop(engine);
-
-                    // The conversion must survive a reopen: header version and
-                    // logical log agree, so a fresh open comes up in MVCC mode
-                    // with the same data.
-                    eprintln!("[STACK-PROBE] before reopen");
-                    let verify_db = turso_core::Database::open_file(
-                        io.clone(),
-                        &main_path,
-                        Arc::new(SqliteDialect),
-                    )
-                    .map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
-                    })?;
-                    let verify_conn = verify_db.connect(ConnectOpts::new()).map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!(
-                            "test verify connect failed: {error}"
-                        ))
-                    })?;
-                    assert!(verify_conn.mvcc_enabled());
-                    let mut stmt = verify_conn.prepare("SELECT COUNT(*) FROM items")?;
-                    let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
-                    assert_eq!(row.get_value(0).as_int(), Some(2));
-                    Result::Ok(())
-                };
-                eprintln!(
-                    "[STACK-PROBE] producer future bytes={}",
-                    std::mem::size_of_val(&future)
+            move |coro: genawaiter::sync::Co<SyncEngineIoResult, Result<()>>| async move {
+                eprintln!("[STACK-PROBE] first poll");
+                let coro: Coro<()> = coro.into();
+                eprintln!("[STACK-PROBE] before create_db");
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    opts,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test create_db failed: {error}"))
+                })?;
+                assert_eq!(
+                    engine.meta().remote_pull_protocol,
+                    RemotePullProtocol::Unknown
                 );
-                future
+
+                eprintln!("[STACK-PROBE] created engine");
+                // Local writes before ever contacting the server.
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test connect_rw failed: {error}"))
+                })?;
+                assert!(!conn.mvcc_enabled());
+                conn.execute("CREATE TABLE local_notes(id INTEGER PRIMARY KEY, note TEXT)")?;
+                conn.execute("INSERT INTO local_notes VALUES (1, 'kept-across-conversion')")?;
+                let base_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
+                update_last_change_id(&coro, &conn, &engine.client_unique_id, 1, base_change_id)
+                    .await?;
+                drop(conn);
+
+                // First contact: detection, conversion, replace-base pull.
+                eprintln!("[STACK-PROBE] before remote wait");
+                let status = engine.wait_changes_from_remote(&coro).await?;
+                eprintln!("[STACK-PROBE] after remote wait");
+                assert!(matches!(
+                    status.stream_kind,
+                    DbChangesStreamKind::ReplaceBasePages
+                ));
+                assert!(status.file_slot.is_some());
+                assert_eq!(
+                    engine.meta().remote_pull_protocol,
+                    RemotePullProtocol::MvccLogical
+                );
+                assert!(engine.meta().logical_mvcc_pull_active());
+
+                eprintln!("[STACK-PROBE] before apply");
+                engine.apply_changes_from_remote(&coro, status).await?;
+                eprintln!("[STACK-PROBE] after apply");
+                assert_eq!(
+                    engine.meta().synced_revision,
+                    Some(DatabasePullRevision::V1 {
+                        revision: server_revision.to_string(),
+                    })
+                );
+
+                // Remote base and replayed local data both present, on an
+                // MVCC-mode connection.
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test reconnect failed: {error}"))
+                })?;
+                assert!(conn.mvcc_enabled());
+                let mut stmt = conn.prepare("SELECT value FROM items ORDER BY id")?;
+                let mut values = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    values.push(row.get_value(0).to_text().unwrap().to_string());
+                }
+                assert_eq!(values, vec!["remote-a".to_string(), "remote-b".to_string()]);
+                let mut stmt = conn.prepare("SELECT note FROM local_notes")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(
+                    row.get_value(0).to_text().unwrap(),
+                    "kept-across-conversion"
+                );
+                assert!(run_stmt_once(&coro, &mut stmt).await?.is_none());
+                drop(stmt);
+                drop(conn);
+                drop(engine);
+
+                // The conversion must survive a reopen: header version and
+                // logical log agree, so a fresh open comes up in MVCC mode
+                // with the same data.
+                eprintln!("[STACK-PROBE] before reopen");
+                let verify_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
+                })?;
+                let verify_conn = verify_db.connect(ConnectOpts::new()).map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
+                })?;
+                assert!(verify_conn.mvcc_enabled());
+                let mut stmt = verify_conn.prepare("SELECT COUNT(*) FROM items")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(row.get_value(0).as_int(), Some(2));
+                Result::Ok(())
             }
-        });
+        };
+        eprintln!(
+            "[STACK-PROBE] producer future bytes={}",
+            future_bytes(&producer)
+        );
+        let mut gen = genawaiter::sync::Gen::new(producer);
         eprintln!("[STACK-PROBE] generator constructed");
 
         loop {
