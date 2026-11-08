@@ -1,4 +1,4 @@
-name: SDK codec ownership diagnosis
+name: Direct SQLite offline upgrade counterexamples
 on:
   workflow_dispatch:
 permissions:
@@ -18,25 +18,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: bf6140a36601770206e790e3c1f330bb029a8fe2
+          ref: d2190b36a5ce4fef4db42e5f7f91c7038ffc069a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fork-mvcc-authority
           cache-on-failure: true
-      - name: Focused ownership
+      - name: Actual direct SQLite upgrade counterexamples
         run: |
           git rev-parse HEAD | tee source.txt
           rustc -Vv | tee rustc.txt
-          cargo test --locked -p turso_sdk_kit --lib page_codec_is_applied_to_sdk_connections -- --nocapture 2>&1 | tee focused.log
-      - name: Full SDK ownership
-        if: always()
-        run: |
-          cargo test --locked -p turso_sdk_kit --lib -- --nocapture 2>&1 | tee sdk.log
+          cargo build --locked -p turso_cli --bin tursodb 2>&1 | tee build.log
+          for case in stock-delete stock-wal; do
+            set +e
+            python3 testing/cli_tests/shared_offline.py --binary target/debug/tursodb --case "$case" > "$case.log" 2>&1
+            status=$?
+            set -e
+            test "$status" -eq 1
+            grep -q 'offline backend initially requires ordinary MVCC mode' "$case.log"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sdk-codec-ownership
+          name: direct-sqlite-upgrade-red
           path: |
             *.log
             source.txt
