@@ -1,4 +1,4 @@
-name: Shared sequence watermark counterexample
+name: Shared sequence watermark acceptance
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 715c4917b6ac985fbc84429cfdee4984e971ab51
+          ref: ae5ea2076dc484ac01fc11dd14aed1e02a3839f3
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,24 +24,22 @@ jobs:
       - name: Record exact source and filesystem
         run: |
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 715c4917b6ac985fbc84429cfdee4984e971ab51
+          test "$(git rev-parse HEAD)" = ae5ea2076dc484ac01fc11dd14aed1e02a3839f3
           rustc -Vv | tee rustc.txt
           stat -f -c '%T %t' . /tmp
-      - name: Expected watermark counterexample
+      - name: Native watermark boundary and live claims
         run: |
           set -o pipefail
-          cargo test --locked -p turso_core --lib --features conn_raw_api --no-run
-          set +e
-          timeout 120 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_watermark_tracks_live_peer_and_committed_boundary -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark-red.log
-          result=${PIPESTATUS[0]}
-          set -e
-          test "$result" -eq 101
-          grep -q '0 passed; 1 failed' watermark-red.log
-          grep -q 'requires a global live-claim reader' watermark-red.log
+          timeout 1200 cargo test --locked -p turso_core --lib --features conn_raw_api shared_id_opcode_native_watermark_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee watermark.log
+          grep -q '2 passed; 0 failed' watermark.log
+      - name: Strict library lint
+        run: |
+          set -o pipefail
+          cargo clippy --locked -p turso_core --lib --features conn_raw_api,bench -- -D warnings 2>&1 | tee clippy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-watermark-red
+          name: shared-watermark
           path: |
             source.txt
             rustc.txt
