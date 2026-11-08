@@ -68,7 +68,9 @@ fn run_idle_generation_case(role: &str) {
     let image = std::fs::read(fixture.namespace.join("manifest")).unwrap();
     assert!(image.len() >= 2 * SLOT_SIZE);
     for slot in image[..2 * SLOT_SIZE].chunks_exact(SLOT_SIZE) {
-        let record = ManifestRecord::decode(&slot[..RECORD_SIZE]).unwrap().unwrap();
+        let record = ManifestRecord::decode(&slot[..RECORD_SIZE])
+            .unwrap()
+            .unwrap();
         assert_eq!(record.log_generation(), target.database.generation);
         assert!(!record.requires_recovery());
         assert!(
