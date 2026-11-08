@@ -1,4 +1,4 @@
-name: Physical WAL exclusion GREEN
+name: Physical WAL I/O owner RED
 on:
   workflow_dispatch:
 permissions:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f73f414c4fcd23ea4ee75188972ded4268352fac
+          ref: 20b18a79e367efea7cf471a52cd40ada925944ec
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,9 +27,17 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = f73f414c4fcd23ea4ee75188972ded4268352fac
-          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
+          test "$(git rev-parse HEAD)" = 20b18a79e367efea7cf471a52cd40ada925944ec
+          cargo test --locked -p turso_core --lib --features conn_raw_api storage::shared_wal_coordination::recovery::tests::physical_wal_recovery_native_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee physical-owner-green.log
           grep -q '3 passed; 0 failed' physical-owner-green.log
+          set +e
+          cargo test --locked -p turso_core --lib --features conn_raw_api physical_wal_recovery_native_binding_retains_both_authorities_until_backend_retirement -- --ignored --test-threads=1 --nocapture > physical-binding-red.log 2>&1
+          code=$?
+          set -e
+          cat physical-binding-red.log
+          test "$code" -ne 0
+          grep -q '0 passed; 1 failed' physical-binding-red.log
+          grep -q 'physical reader admitted before backend retirement' physical-binding-red.log
           cargo clippy --locked -p turso_core --lib --features bench,conn_raw_api -- -D warnings
           cargo fmt --all -- --check
           git diff --exit-code
