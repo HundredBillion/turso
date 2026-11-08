@@ -32,6 +32,9 @@ mod shared_checkpoint_recovery_physical;
 #[path = "shared_checkpoint_recovery_ids.rs"]
 mod shared_checkpoint_recovery_ids;
 pub(in crate::mvcc) use shared_checkpoint_recovery_ids::RecoveryCompletionEvidence;
+pub(crate) use shared_checkpoint_recovery_ids::{
+    RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
 
 #[path = "shared_id_runtime.rs"]
 mod shared_id_runtime;

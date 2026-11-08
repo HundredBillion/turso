@@ -1171,7 +1171,7 @@ fn checkpoint_recovery_bootstrap_native_original_optin_survives() {
     let reclaimed = fixture.io.block(|| reclaiming.poll()).unwrap();
     assert!(Arc::ptr_eq(reclaimed.config_for_test(), &original));
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
-    let error = match bootstrap.poll() {
+    let error = match fixture.io.block(|| bootstrap.poll()) {
         Ok(_) => panic!("missing factory produced readiness"),
         Err(error) => error,
     };

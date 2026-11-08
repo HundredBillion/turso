@@ -1,5 +1,8 @@
 #[path = "shared_checkpoint_recovery_reclaim.rs"]
 mod shared_checkpoint_recovery_reclaim;
+pub(crate) use shared_checkpoint_recovery_reclaim::{
+    RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
 
 use super::*;
 use crate::mvcc::shared_ids::io_protocol::checkpoint_prepare::finalize::FinalizedIds;

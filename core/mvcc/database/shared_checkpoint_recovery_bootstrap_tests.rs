@@ -26,7 +26,7 @@ fn checkpoint_recovery_bootstrap_native_retains_exactly_one_store() {
     let store = evidence.store.clone();
     let weak = Arc::downgrade(&store);
     assert!(Arc::ptr_eq(store.shared_runtime.get().unwrap(), &runtime));
-    assert!(Arc::ptr_eq(&evidence.recovered.config, &config));
+    assert!(Arc::ptr_eq(&evidence.config, &config));
     let expected: Arc<dyn crate::mvcc::persistent_storage::DurableStorage> = runtime.storage();
     assert!(Arc::ptr_eq(&store.storage, &expected));
     for _ in 0..8 {
@@ -91,11 +91,11 @@ fn checkpoint_recovery_bootstrap_native_failed_allocation_releases_unused_claim(
 #[test]
 #[ignore = "requires native shared MVCC files"]
 fn checkpoint_recovery_bootstrap_native_missing_factory_withdraws_store() {
-    let (_directory, _io, runtime, reclaimed) = bootstrap_fixture();
+    let (_directory, io, runtime, reclaimed) = bootstrap_fixture();
     let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
     bootstrap.prepare_store().unwrap();
     let weak = Arc::downgrade(&bootstrap.evidence.as_ref().unwrap().store);
-    let error = match bootstrap.poll() {
+    let error = match io.block(|| bootstrap.poll()) {
         Ok(_) => panic!("unimplemented recovery factory produced readiness"),
         Err(error) => error,
     };
@@ -109,8 +109,31 @@ fn checkpoint_recovery_bootstrap_native_missing_factory_withdraws_store() {
     assert!(bootstrap.prepare_store().is_err());
 }
 
+struct HeldRead {
+    file: Arc<dyn File>,
+    offset: u64,
+    completion: Completion,
+}
+impl HeldRead {
+    fn complete(&self) {
+        drop(
+            self.file
+                .pread(self.offset, self.completion.clone())
+                .unwrap(),
+        );
+        assert!(self.completion.finished());
+    }
+}
+#[derive(Default)]
+struct ReadControl {
+    target: Option<crate::io::FileId>,
+    skip: usize,
+    held: Option<HeldRead>,
+    armed: bool,
+}
 #[derive(Default)]
 struct ReleaseObserver {
+    read: Mutex<ReadControl>,
     store: Mutex<Option<crate::sync::Weak<crate::MvStore>>>,
     releases: crate::sync::atomic::AtomicUsize,
     live_store_at_release: crate::sync::atomic::AtomicBool,
@@ -133,6 +156,23 @@ impl File for ReleaseFile {
         self.inner.unlock_file()
     }
     fn pread(&self, offset: u64, completion: Completion) -> Result<Completion> {
+        let mut read = self.observer.read.lock();
+        if read.armed && read.target == self.inner.file_id()? {
+            if read.skip == 0 {
+                assert!(read
+                    .held
+                    .replace(HeldRead {
+                        file: self.inner.clone(),
+                        offset,
+                        completion: completion.clone(),
+                    })
+                    .is_none());
+                read.armed = false;
+                return Ok(completion);
+            }
+            read.skip -= 1;
+        }
+        drop(read);
         self.inner.pread(offset, completion)
     }
     fn pwrite(
@@ -226,18 +266,10 @@ impl crate::IO for ReleaseIo {
         direct: bool,
     ) -> Result<Arc<dyn File>> {
         let file = self.inner.open_file(path, flags, direct)?;
-        if std::path::Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some("authority")
-        {
-            Ok(Arc::new(ReleaseFile {
-                inner: file,
-                observer: self.observer.clone(),
-            }))
-        } else {
-            Ok(file)
-        }
+        Ok(Arc::new(ReleaseFile {
+            inner: file,
+            observer: self.observer.clone(),
+        }))
     }
     fn remove_file(&self, path: &str) -> Result<()> {
         self.inner.remove_file(path)
@@ -286,4 +318,133 @@ fn checkpoint_recovery_bootstrap_native_last_arc_drops_store_before_authority() 
     observer.store.lock().take();
     assert!(runtime.replay.lock().is_none());
     assert!(runtime.reserve_store().is_err());
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_factory_keeps_actual_store_private() {
+    let (_directory, io, runtime, reclaimed) = bootstrap_fixture();
+    let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+    bootstrap.prepare_store().unwrap();
+    let evidence = bootstrap.evidence.as_mut().unwrap();
+    let store = Arc::downgrade(&evidence.store);
+    let mut factory =
+        crate::database::shared_recovered::RecoveredDatabaseFactory::new(evidence).unwrap();
+    io.block(|| factory.poll(evidence)).unwrap();
+    evidence.validate().unwrap();
+    assert!(evidence.guard().io_retired());
+    assert!(runtime.replay.lock().is_none());
+    assert!(matches!(
+        runtime.gate.try_enter_admission(),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        runtime.files.authority.try_acquire(),
+        Err(LimboError::Busy)
+    ));
+    drop(factory);
+    drop(bootstrap);
+    assert!(store.upgrade().is_none());
+    assert!(runtime.replay.lock().is_none());
+    assert!(runtime.reserve_store().is_err());
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_factory_cancellation_retains_physical_reads() {
+    use super::super::super::tests::reclaim_tests::bootstrap_fixture_with_io;
+    for skip in 0..2 {
+        for after_callback in [false, true] {
+            let observer = Arc::new(ReleaseObserver::default());
+            let wrapping = observer.clone();
+            let (_directory, _io, runtime, reclaimed) = bootstrap_fixture_with_io(move |inner| {
+                Arc::new(ReleaseIo {
+                    inner,
+                    observer: wrapping,
+                })
+            });
+            let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+            bootstrap.prepare_store().unwrap();
+            let store = Arc::downgrade(&bootstrap.evidence.as_ref().unwrap().store);
+            *observer.read.lock() = ReadControl {
+                target: runtime.main_file().file_id().unwrap(),
+                skip,
+                held: None,
+                armed: true,
+            };
+            let waiting = match bootstrap.poll().unwrap() {
+                IOResult::IO(waiting) => waiting,
+                IOResult::Done(_) => panic!("recovered connection escaped a delayed physical read"),
+            };
+            let held = observer
+                .read
+                .lock()
+                .held
+                .take()
+                .expect("factory did not read retained main");
+            if after_callback {
+                held.complete();
+            }
+            drop(waiting);
+            drop(bootstrap);
+            assert!(store.upgrade().is_none());
+            assert!(runtime.replay.lock().is_none());
+            assert!(runtime.reserve_store().is_err());
+            assert!(
+                matches!(runtime.files.authority.try_acquire(), Err(LimboError::Busy)),
+                "factory cancellation released authority before backend retirement"
+            );
+            if !after_callback {
+                held.complete();
+            }
+            assert!(
+                matches!(runtime.files.authority.try_acquire(), Err(LimboError::Busy)),
+                "physical callback released authority before backend retirement"
+            );
+            drop(held);
+            drop(runtime.files.authority.try_acquire().unwrap());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native shared MVCC files"]
+fn checkpoint_recovery_bootstrap_native_factory_waits_for_physical_retirement() {
+    use super::super::super::tests::reclaim_tests::bootstrap_fixture_with_io;
+    for skip in 0..2 {
+        let observer = Arc::new(ReleaseObserver::default());
+        let wrapping = observer.clone();
+        let (_directory, io, runtime, reclaimed) = bootstrap_fixture_with_io(move |inner| {
+            Arc::new(ReleaseIo {
+                inner,
+                observer: wrapping,
+            })
+        });
+        let mut bootstrap = reclaimed.begin_bootstrap().unwrap();
+        bootstrap.prepare_store().unwrap();
+        let evidence = bootstrap.evidence.as_mut().unwrap();
+        let mut factory =
+            crate::database::shared_recovered::RecoveredDatabaseFactory::new(evidence).unwrap();
+        *observer.read.lock() = ReadControl {
+            target: runtime.main_file().file_id().unwrap(),
+            skip,
+            held: None,
+            armed: true,
+        };
+        assert!(matches!(factory.poll(evidence).unwrap(), IOResult::IO(_)));
+        let held = observer.read.lock().held.take().unwrap();
+        held.complete();
+        let waiter = match factory.poll(evidence).unwrap() {
+            IOResult::IO(waiter) => waiter,
+            IOResult::Done(_) => panic!("factory completed before retained physical read retired"),
+        };
+        drop(waiter);
+        assert!(!evidence.guard().io_retired());
+        drop(held);
+        io.block(|| factory.poll(evidence)).unwrap();
+        assert!(evidence.guard().io_retired());
+        assert!(runtime.replay.lock().is_none());
+        drop(factory);
+        drop(bootstrap);
+    }
 }

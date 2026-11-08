@@ -22,6 +22,11 @@ impl RecoveryOpenConfig {
                 "recovery bootstrap requires unencoded retained shared storage and compatible open options".into(),
             ));
         }
+        if options.dialect.supports_roles() {
+            return Err(LimboError::InvalidArgument(
+                "recovery bootstrap does not support role-aware dialects".into(),
+            ));
+        }
         Ok(Arc::new(Self { options }))
     }
 
@@ -173,6 +178,56 @@ mod tests {
         assert!(readonly.effective_readonly(true));
     }
 
+    struct RoleDialect;
+    impl Dialect for RoleDialect {
+        fn name(&self) -> &'static str {
+            "roles-test"
+        }
+        fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            crate::EngineDialect.parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<crate::schema::BTreeTable> {
+            crate::EngineDialect.parse_table_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+            crate::EngineDialect.parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            crate::EngineDialect.table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> Result<String> {
+            crate::EngineDialect.format_table_sql(input, name, body)
+        }
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enabled: bool,
+        ) -> Result<()> {
+            crate::EngineDialect.register_catalog(schema, enabled)
+        }
+        fn resolve_function(&self, name: &str, args: usize) -> Result<Option<crate::Func>> {
+            crate::EngineDialect.resolve_function(name, args)
+        }
+        fn supports_roles(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn recovery_open_config_rejects_role_catalog_before_io() {
+        let error = RecoveryOpenConfig::capture(OpenOptions::new(Arc::new(RoleDialect)))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("does not support role-aware dialects"));
+    }
+
     #[test]
     fn recovery_open_config_rejects_storage_and_mode_overrides() {
         for opts in [
@@ -194,5 +249,118 @@ mod tests {
         let options = OpenOptions::new(Arc::new(crate::EngineDialect))
             .storage(Arc::new(DatabaseFile::new(file)));
         assert!(RecoveryOpenConfig::capture(options).is_err());
+    }
+}
+
+pub(crate) struct RecoveredDatabaseFactory {
+    connection: Option<Arc<Connection>>,
+    pager: Option<Arc<Pager>>,
+    database: Option<Arc<Database>>,
+    building: Option<Database>,
+    validation: HeaderValidationState,
+    permit: Arc<crate::mvcc::database::RecoveryConstructionPermit>,
+    config: Arc<RecoveryOpenConfig>,
+}
+impl RecoveredDatabaseFactory {
+    pub(crate) fn new(source: &crate::mvcc::database::RecoveryBootstrapEvidence) -> Result<Self> {
+        source.validate()?;
+        let config = source.config().clone();
+        let io = source.io();
+        let runtime = source.runtime();
+        let flags = if config.effective_readonly(source.original_readonly()) {
+            OpenFlags::NoLock | OpenFlags::ReadOnly
+        } else {
+            OpenFlags::NoLock
+        };
+        let mut database = Database::new(
+            config.options.db_opts,
+            flags,
+            source.path()?,
+            runtime.wal_path().to_str().ok_or_else(|| {
+                LimboError::InvalidArgument("shared WAL path must be UTF-8".into())
+            })?,
+            &io,
+            Arc::new(DatabaseFile::new(runtime.main_file())),
+            None,
+            config.options.allocators.clone(),
+            None,
+            config.options.dialect.clone(),
+            &config.options.native_extensions,
+        )?;
+        {
+            let shared =
+                Arc::get_mut(&mut database.shared).expect("new recovery Database state is unique");
+            shared.shared_mvcc_runtime = Some(runtime.clone());
+            shared.durable_storage = Some(runtime.storage());
+            shared.mv_store.store(Some(source.store().clone()));
+        }
+        let permit = source.make_permit(&database)?;
+        Arc::get_mut(&mut database.shared)
+            .expect("new recovery Database state is unique")
+            .recovery_construction = Some(permit.clone());
+        Ok(Self {
+            connection: None,
+            pager: None,
+            database: None,
+            building: Some(database),
+            validation: Default::default(),
+            permit,
+            config,
+        })
+    }
+    pub(crate) fn poll(
+        &mut self,
+        source: &mut crate::mvcc::database::RecoveryBootstrapEvidence,
+    ) -> IOResultOr<()> {
+        self.permit.validate_source(source)?;
+        if !Arc::ptr_eq(source.config(), &self.config) {
+            return Err(LimboError::InvalidArgument(
+                "recovery constructor resumed with another configuration".into(),
+            )
+            .into());
+        }
+        if self.database.is_none() {
+            let pager = return_if_io!(self.building.as_mut().unwrap().header_validation(
+                &mut self.validation,
+                None,
+                None
+            ));
+            self.pager = Some(pager);
+            self.database = Some(Arc::new(self.building.take().unwrap()));
+        }
+        let database = self.database.as_ref().unwrap();
+        self.permit.validate_database(database)?;
+        let pager = self.pager.as_ref().unwrap();
+        let header = return_if_io!(pager.with_header(|header| *header));
+        source.validate_header(&header)?;
+        if let Some(waiter) = source.physical_retirement() {
+            return Ok(IOResult::IO(crate::types::IOCompletions(waiter)));
+        }
+        if self.connection.is_none() {
+            self.connection = Some(database.new_connection(
+                false,
+                pager.clone(),
+                None,
+                header.default_page_cache_size.get(),
+                ConnectionContext::default(),
+                database.is_readonly(),
+            )?);
+        }
+        Ok(IOResult::Done(()))
+    }
+    fn abort(&mut self) {
+        if let HeaderValidationState::Start { init } = &mut self.validation {
+            init.cancel();
+        }
+        self.connection = None;
+        self.validation = Default::default();
+        self.pager = None;
+        self.database = None;
+        self.building = None;
+    }
+}
+impl Drop for RecoveredDatabaseFactory {
+    fn drop(&mut self) {
+        self.abort();
     }
 }

@@ -1,5 +1,8 @@
 #[path = "shared_checkpoint_recovery_bootstrap.rs"]
 mod shared_checkpoint_recovery_bootstrap;
+pub(crate) use shared_checkpoint_recovery_bootstrap::{
+    RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+};
 
 use super::*;
 use crate::io::FileSyncType;
@@ -258,9 +261,25 @@ fn validate_target(
     proof: &CompletedCheckpointProof,
     guard: &AuthorityGuard,
 ) -> Result<()> {
+    validate_geometry(
+        runtime,
+        &parts.header,
+        parts.persistent_timestamp,
+        proof,
+        guard,
+    )
+}
+
+fn validate_geometry(
+    runtime: &Arc<SharedMvccRuntime>,
+    header: &DatabaseHeader,
+    persistent_timestamp: u64,
+    proof: &CompletedCheckpointProof,
+    guard: &AuthorityGuard,
+) -> Result<()> {
     let target = proof.target_identity();
     let bytes = runtime.files.main.size()?;
-    let page_size = u64::from(parts.header.page_size.get());
+    let page_size = u64::from(header.page_size.get());
     let floor = i64::try_from(bytes / page_size)
         .ok()
         .and_then(i64::checked_neg)
@@ -273,8 +292,8 @@ fn validate_target(
         || runtime.files.main.file_id()? != Some(runtime.database_id)
         || runtime.files.physical_wal.size()? != 0
         || bytes % page_size != 0
-        || bytes / page_size < u64::from(parts.header.database_size.get())
-        || parts.persistent_timestamp != target.database.checkpoint_timestamp
+        || bytes / page_size < u64::from(header.database_size.get())
+        || persistent_timestamp != target.database.checkpoint_timestamp
         || proof.materialized_floor() != floor
         || target.database.generation == 0
         || target.prefix.end_offset != 0
