@@ -157,6 +157,12 @@ impl Worker {
             Self::Process(child) => child.request(&format!("EXEC {sql}")),
         }
     }
+    fn integrity(&mut self) -> String {
+        match self {
+            Self::Local(connection) => integrity(connection),
+            Self::Process(child) => child.request("CHECK"),
+        }
+    }
     fn query(&mut self, sql: &str) -> String {
         match self {
             Self::Local(connection) => format!("{:?}", integers(connection, sql)),
@@ -173,6 +179,18 @@ fn open_connection(path: &std::path::Path, limit: u64) -> Arc<Connection> {
     .unwrap()
     .connect(ConnectOpts::new())
     .unwrap()
+}
+fn integrity(connection: &Arc<Connection>) -> String {
+    let mut rows = Vec::new();
+    connection
+        .prepare("PRAGMA integrity_check")
+        .unwrap()
+        .run_with_row_callback(|row| {
+            rows.push(row.get::<&str>(0)?.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    format!("{rows:?}")
 }
 fn execute(connection: &Arc<Connection>, sql: &str) -> String {
     match connection.execute(sql) {
@@ -197,7 +215,9 @@ fn shared_schema_publication_child() {
     reply("READY");
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
-        if let Some(sql) = line.strip_prefix("EXEC ") {
+        if line == "CHECK" {
+            reply(&integrity(&connection));
+        } else if let Some(sql) = line.strip_prefix("EXEC ") {
             reply(&execute(&connection, sql));
         } else if let Some(sql) = line.strip_prefix("QUERY ") {
             reply(&format!("{:?}", integers(&connection, sql)));
@@ -348,6 +368,7 @@ fn worker_conflicts(conflict: &str) {
         workers[loser].execute("ROLLBACK");
         drop(workers);
         let mut fresh = Worker::open(&path, limit, true);
+        assert_eq!(fresh.integrity(), "[\"ok\"]");
         match conflict {
             "unique" => {
                 assert_eq!(
@@ -445,6 +466,7 @@ fn shared_worker_native_snapshot_multirow_ack_and_rolling_restart() {
     let rows: Vec<_> = acknowledged.lines().collect();
     assert_eq!(rows, ["1 10", "2 10", "3 10"]);
     let mut recovered = Worker::open(&path, limit, true);
+    assert_eq!(recovered.integrity(), "[\"ok\"]");
     assert_eq!(
         recovered.query("SELECT amount FROM balances ORDER BY id"),
         "[70, 130]"
@@ -459,4 +481,50 @@ fn shared_worker_native_snapshot_multirow_ack_and_rolling_restart() {
         main_before,
         "test crossed a physical checkpoint boundary"
     );
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_worker_native_disjoint_updates_delete_and_insert_both_commit() {
+    for first_commit in [0, 1] {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, limit) = crate::mvcc::database::shared_runtime_fixture(directory.path());
+        let mut setup = Worker::open(&path, limit, true);
+        assert_eq!(setup.execute("CREATE TABLE disjoint(id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO disjoint VALUES(1,100),(2,200),(3,300)"), "OK");
+        drop(setup);
+        let mut workers = [
+            Worker::open(&path, limit, true),
+            Worker::open(&path, limit, true),
+        ];
+        for worker in &mut workers {
+            assert_eq!(worker.execute("BEGIN CONCURRENT"), "OK");
+            assert_eq!(worker.query("SELECT count(*) FROM disjoint"), "[3]");
+        }
+        assert_eq!(
+            workers[0].execute(
+                "UPDATE disjoint SET value=101 WHERE id=1; DELETE FROM disjoint WHERE id=3"
+            ),
+            "OK"
+        );
+        assert_eq!(
+            workers[1].execute(
+                "UPDATE disjoint SET value=202 WHERE id=2; INSERT INTO disjoint VALUES(4,404)"
+            ),
+            "OK"
+        );
+        for index in [first_commit, 1 - first_commit] {
+            assert_eq!(workers[index].execute("COMMIT"), "OK");
+        }
+        drop(workers);
+        let mut fresh = Worker::open(&path, limit, true);
+        assert_eq!(
+            fresh.query("SELECT id FROM disjoint ORDER BY id"),
+            "[1, 2, 4]"
+        );
+        assert_eq!(
+            fresh.query("SELECT value FROM disjoint ORDER BY id"),
+            "[101, 202, 404]"
+        );
+        assert_eq!(fresh.integrity(), "[\"ok\"]");
+    }
 }
