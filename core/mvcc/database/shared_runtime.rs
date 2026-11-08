@@ -1250,3 +1250,7 @@ fn shared_checkpoint_native_completion_requires_id_finalization_before_admission
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "../../database/shared_physical_native_tests.rs"]
 mod shared_physical_native_tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_connection_tests.rs"]
+mod shared_connection_tests;
