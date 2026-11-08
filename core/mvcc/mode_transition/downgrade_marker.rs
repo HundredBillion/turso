@@ -91,6 +91,14 @@ pub(in crate::mvcc) struct CompletedDowngradeMarker {
     _proof: Arc<PreparedDowngradeMarker>,
 }
 
+impl CompletedDowngradeMarker {
+    pub(in crate::mvcc) fn cleanup(self) -> Result<()> {
+        Err(invalid(
+            "completed downgrade namespace cleanup is not implemented",
+        ))
+    }
+}
+
 pub(in crate::mvcc) fn commit_marker(
     intent: MirroredDowngradeIntent,
 ) -> Result<CompletedDowngradeMarker> {

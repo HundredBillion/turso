@@ -1071,4 +1071,64 @@ mod tests {
             assert_eq!(integrity, ["ok"]);
         }
     }
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_downgrade_cleanup_native_removes_namespace_and_header_only_log() {
+        let mut fixture = installed_fixture();
+        let source_path = fixture._directory.path().join("header-source.db");
+        let source = Database::open(
+            fixture.io.clone(),
+            source_path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let source_connection = source.connect(crate::ConnectOpts::new()).unwrap();
+        source_connection
+            .execute("PRAGMA journal_mode=mvcc")
+            .unwrap();
+        source_connection
+            .execute("CREATE TABLE header_source(v)")
+            .unwrap();
+        let log = std::fs::read(source_path.with_extension("db-log")).unwrap();
+        let header = &log[..crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE];
+        crate::mvcc::persistent_storage::logical_log::LogHeader::validate_header_only_file(header)
+            .unwrap();
+        std::fs::write(fixture.path.with_extension("db-log"), header).unwrap();
+        drop(source_connection);
+        drop(source);
+        let mut preparing = fixture
+            .installed
+            .take()
+            .unwrap()
+            .begin_downgrade(
+                fixture.connection.clone(),
+                OfflinePrerequisite::AllOlderWorkersStopped,
+            )
+            .unwrap();
+        let intent = fixture.io.block(|| preparing.poll()).unwrap();
+        let completed =
+            crate::mvcc::mode_transition::downgrade_marker::commit_marker(intent).unwrap();
+        completed
+            .cleanup()
+            .expect("durable marker must clean namespace and retained header-only ordinary log");
+        assert!(!fixture.namespace.exists());
+        assert!(!fixture.path.with_extension("db-log").exists());
+        let db = Database::open(
+            fixture.io.clone(),
+            fixture.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(EngineDialect)),
+        )
+        .unwrap();
+        let connection = db.connect(crate::ConnectOpts::new()).unwrap();
+        let mut rows = Vec::new();
+        connection
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, ["materialized shared row"]);
+    }
 }
