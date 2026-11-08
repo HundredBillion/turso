@@ -268,6 +268,48 @@ fn shared_connection_native_active_helper_keeps_outer_transaction() {
     connection.execute("ROLLBACK").unwrap();
 }
 
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_connection_native_later_commits_keep_the_physical_checkpoint_tag() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, limit) = shared_runtime_fixture(directory.path());
+    let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let database = crate::Database::open(
+        io,
+        path.to_str().unwrap(),
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect)).with_shared_mvcc_for_test(limit),
+    )
+    .unwrap();
+    let writer = database.connect(crate::ConnectOpts::new()).unwrap();
+    writer
+        .execute("UPDATE preserved SET value='after physical base' WHERE id=1")
+        .unwrap();
+    let store = database.get_mv_store().as_ref().unwrap().clone();
+    let runtime = store.shared_runtime.get().unwrap();
+    let identity = runtime.replay.lock().as_ref().unwrap().identity().unwrap();
+    assert!(identity.prefix.committed_timestamp > identity.database.checkpoint_timestamp);
+    let fresh = database.connect(crate::ConnectOpts::new()).unwrap();
+    let pager = fresh.get_pager();
+    let guard = runtime.files.authority.try_acquire().unwrap();
+    pager.begin_read_tx().unwrap();
+    assert!(
+        pager
+            .ensure_shared_generation(crate::storage::pager::SharedPagerGeneration {
+                database_id: runtime.database_id,
+                generation: identity.database.generation,
+                checkpoint_timestamp: identity.database.checkpoint_timestamp,
+            })
+            .is_ok(),
+        "constructor used a logical commit timestamp as its physical checkpoint tag"
+    );
+    assert!(pager.holds_read_lock());
+    pager.end_read_tx();
+    guard.finish().unwrap();
+    fresh
+        .execute("SELECT value FROM preserved WHERE id=1")
+        .unwrap();
+}
+
 struct HeldMainRead {
     file: Arc<dyn File>,
     offset: u64,
