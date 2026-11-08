@@ -24,9 +24,19 @@
 
 **Interfaces:** Consume `SharedCheckpointPublication::new(store, connection)`, `PublishedSharedCheckpoint::begin_physical_read`, `VerifiedPhysicalBase::begin_local_install`, and `InstalledLocalCheckpoint::publish_ready`. Produce `pub(crate) fn checkpoint_shared(connection: Arc<Connection>, mode: CheckpointMode) -> Result<CheckpointResult>`.
 
-- [ ] Add actual public API, SQL PRAGMA, and live-reader checkpoint regressions using `shared_runtime_fixture`; assert persisted payload, reclaimed logical file, repeated commits/checkpoints, and reader preservation.
-- [ ] Run the three tests on native Linux against unchanged production code; retain actual failure output and positive selected-test counts.
-- [ ] Retain materialization result in the coordinator and call `release_guard()` immediately on Done. Drive publication, physical read, installation and Ready in the adapter with `io.block`.
-- [ ] Route shared stores in Core checkpoint and the SQL opcode to the adapter after existing explicit guards; leave ordinary branches intact.
-- [ ] Run native regressions, existing checkpoint ownership/install/readiness suites, Rust formatting and strict core all-target lint. Document shared-mode quiescence and correct the contradictory read-only paragraph.
-- [ ] Commit, push to fork, record evidence, and obtain peer review before integration.
+- [x] Add actual public API, SQL PRAGMA, and live-reader checkpoint regressions using `shared_runtime_fixture`; assert persisted payload, reclaimed logical file, repeated commits/checkpoints, and reader preservation.
+- [x] Run the three tests on native Linux against unchanged production code; retain actual failure output and positive selected-test counts.
+- [x] Retain materialization result in the coordinator and call `release_guard()` immediately on Done. Drive publication, physical read, installation and Ready in the adapter with `io.block`.
+- [x] Route shared stores in Core checkpoint and the SQL opcode to the adapter after existing explicit guards; leave ordinary branches intact.
+- [x] Run native regressions, existing checkpoint ownership/install/readiness suites, Rust formatting and strict core all-target lint. Document shared-mode quiescence and correct the contradictory read-only paragraph.
+- [x] Commit, push to fork, record evidence, and obtain peer review before integration.
+
+## Acceptance evidence
+
+Native Linux run [42520469060](https://github.com/HundredBillion/turso/actions/runs/42520469060) passed on exact runtime commit `7a8717eee3c664433230789fe00f0ffc507f82ba`:
+
+- Three entry tests covering all four API and SQL checkpoint modes, bounded requests, read-only access, and preservation of live readers after BUSY.
+- Four existing Ready tests and six installation tests.
+- Strict Clippy for the production library and all targets with `conn_raw_api,bench,io_uring`, plus formatting.
+
+The first baseline, run 42519852274 on `bff85abeb`, selected three tests and failed all three because the public paths lacked mirrored intent. The expanded baseline, run 42520262278 on `c2da24455`, selected three tests and failed only SQL PASSIVE at translation. Independent review accepted the ownership chain and result lock timing, identified the PASSIVE omission, and accepted its seven-line correction. Public C/PDO activation remains disabled.
