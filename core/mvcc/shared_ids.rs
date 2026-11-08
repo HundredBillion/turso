@@ -6,7 +6,7 @@ use crate::{LimboError, Result};
 
 const PAGE_SIZE: usize = 4096;
 pub(super) const INITIAL_RETAINED_BYTES: u64 = (4 * PAGE_SIZE) as u64;
-/// Offline minimum: initial files, replacement snapshot, one claim and a small logical frame.
+/// Minimum namespace/checkpoint budget. Writes also require claim-cleanup capacity.
 pub(super) const MIN_HISTORY_LIMIT: u64 = (8 * PAGE_SIZE) as u64;
 /// Minimum ID metadata admission cost after compaction, excluding a new claim or logical frame.
 pub(super) const MIN_ID_BUDGET_BYTES: u64 = (6 * PAGE_SIZE) as u64;
@@ -1155,6 +1155,18 @@ pub(super) mod journal {
             self.owners
                 .iter()
                 .filter_map(|(owner, claims)| (!claims.retired).then_some(*owner))
+        }
+        pub(super) fn release_record_credits(&self) -> Result<u64> {
+            self.owners
+                .values()
+                .filter(|owner| !owner.retired)
+                .try_fold(0u64, |total, owner| {
+                    u64::try_from(owner.claims.len())
+                        .ok()
+                        .and_then(|claims| claims.checked_add(1))
+                        .and_then(|records| total.checked_add(records))
+                        .ok_or(LimboError::TooBig)
+                })
         }
         pub(super) fn row_owner(&self, domain: Domain, value: i64) -> Option<Owner> {
             self.rows.get(&(domain, value)).map(|entry| entry.0)

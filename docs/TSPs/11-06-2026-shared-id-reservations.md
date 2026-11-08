@@ -264,9 +264,18 @@ floor-only replacement bank. This is separate from factual retained bytes; alrea
 retained inactive-bank space counts toward the same total and is not reserved twice.
 Both ID appends and logical-log commit preflight must use `required_budget_bytes`
 plus the prospective logical prefix. Without this reserve an active bank could fill
-the cap and make quiescent compaction permanently impossible. Offline initialization requires a separate `MIN_HISTORY_LIMIT` of 32KiB: the
-16KiB initial files, 8KiB replacement capacity, one 4KiB claim and a small 4KiB
-logical frame. This does not guarantee any-sized write fits. `MIN_ID_BUDGET_BYTES`
+the cap and make quiescent compaction permanently impossible.
+
+Admission additionally reserves one 4KiB release record per retained claim and one
+per unretired owner, including owners whose claims were released by a savepoint.
+Use the proposed post-append state: a release consumes its existing reserve rather
+than demanding additional free capacity. Reserve journal and selector sequence
+increments for these records too, and reject a claim before acknowledging ordinal
+exhaustion. Idempotent retirement retries need no append or additional capacity.
+
+Offline initialization retains the structural `MIN_HISTORY_LIMIT` of 32KiB.
+This minimum does not guarantee room for a claim and logical frame once release
+capacity is included. `MIN_ID_BUDGET_BYTES`
 is 24KiB after compaction, before adding a claim or logical frame. A single frame
 that cannot fit even that empty-generation minimum returns TooBig; retained-history
 pressure returns bounded BUSY. Neither error promises that checkpointing can always
