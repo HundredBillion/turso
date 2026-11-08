@@ -108,3 +108,36 @@ impl Database {
         Ok(())
     }
 }
+
+impl Database {
+    pub(crate) fn validate_shared_runtime(&self, runtime: &SharedMvccRuntime) -> Result<()> {
+        if !self
+            .shared_mvcc_runtime
+            .as_ref()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), runtime))
+        {
+            return Err(LimboError::InvalidArgument(
+                "database belongs to another shared runtime".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_shared_base_layout(
+        &self,
+        runtime: &SharedMvccRuntime,
+        header: &DatabaseHeader,
+    ) -> Result<()> {
+        self.validate_shared_runtime(runtime)?;
+        if self.pager_state.page_size() != Some(header.page_size)
+            || !header
+                .page_size
+                .has_valid_reserved_space(header.reserved_space)
+        {
+            return Err(LimboError::Corrupt(
+                "selected physical base has an incompatible local page layout".into(),
+            ));
+        }
+        Ok(())
+    }
+}

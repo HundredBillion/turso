@@ -1,3 +1,6 @@
+#[path = "shared_current_base.rs"]
+mod shared_current_base;
+
 #[path = "shared_pager_generation.rs"]
 mod shared_pager_generation;
 
