@@ -255,3 +255,189 @@ fn checkpoint_recovery_intent_native_two_full_syncs_before_owner() {
     }
     assert_eq!(selected_slots, std::collections::BTreeSet::from([0, 1]));
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_intent_native_rejects_same_bytes_from_memory_manifest() {
+    let control = Control::new();
+    let fixture = IntentCrashFixture::with_parent_io(CrashPoint::SecondIntentWrite, 1, |path| {
+        control.io(path)
+    });
+    let selection = inspect_crash(&fixture, CrashPoint::SecondIntentWrite);
+    let image = std::fs::read(fixture.runtime.files.namespace.join("manifest")).unwrap();
+    let memory: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+    let file = memory
+        .open_file("substitute-manifest", crate::OpenFlags::Create, false)
+        .unwrap();
+    let buffer = Arc::new(crate::Buffer::new_temporary(image.len()));
+    buffer.as_mut_slice().copy_from_slice(&image);
+    memory
+        .wait_for_completion(
+            file.pwrite(0, buffer, Completion::new_write(|_| {}))
+                .unwrap(),
+        )
+        .unwrap();
+    let CheckpointRecoverySelection {
+        runtime,
+        manifest,
+        pause,
+    } = selection;
+    let mut load =
+        ManifestLoad::new(file, manifest.into_guard().unwrap(), runtime.database_id).unwrap();
+    let substitute = memory.block(|| Ok(load.poll()?)).unwrap();
+    let substitute = CheckpointRecoverySelection {
+        runtime,
+        manifest: substitute,
+        pause,
+    };
+    control.arm(Fault::None);
+    assert!(
+        matches!(substitute.begin_intent_mirror(), Err(LimboError::InvalidArgument(message)) if message.contains("actual retained checkpoint selection"))
+    );
+    assert!(control.events.lock().is_empty());
+    assert!(fixture.runtime.replay.lock().is_none());
+    assert_eq!(
+        std::fs::read(fixture.runtime.files.namespace.join("manifest")).unwrap(),
+        image
+    );
+    fixture.assert_durable_unchanged();
+    let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
+    let mut retry = selected.begin_intent_mirror().unwrap();
+    let recovered = fixture.io.block(|| retry.poll()).unwrap();
+    assert!(recovered.guard().requires_recovery());
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_intent_native_io_failures_preserve_retry_and_source() {
+    let faults: Vec<_> = (1..=6)
+        .map(Fault::Error)
+        .chain([Fault::Short(3), Fault::Short(5)])
+        .collect();
+    for fault in faults {
+        for commits in [1, 2] {
+            let control = Control::new();
+            let fixture = IntentCrashFixture::with_parent_io(
+                CrashPoint::SecondIntentWrite,
+                commits,
+                |path| control.io(path),
+            );
+            let selection = inspect_crash(&fixture, CrashPoint::SecondIntentWrite);
+            let expected = selection.manifest.record();
+            let mut mirror = selection.begin_intent_mirror().unwrap();
+            control.arm(fault);
+            let result = fixture.io.block(|| mirror.poll());
+            match fault {
+                Fault::Short(_) => assert!(
+                    matches!(result, Err(LimboError::Corrupt(message)) if message.contains("short MVCC manifest write"))
+                ),
+                Fault::Error(_) => assert!(matches!(
+                    result,
+                    Err(LimboError::CompletionError(crate::CompletionError::Aborted))
+                )),
+                _ => unreachable!(),
+            }
+            assert!(mirror.poll().is_err());
+            assert!(fixture.runtime.replay.lock().is_none());
+            fixture.assert_durable_unchanged();
+            control.arm(Fault::None);
+            let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+            let selection = fixture.io.block(|| opening.poll()).unwrap();
+            assert_eq!(selection.manifest.record(), expected);
+            assert!(selection.manifest.guard().unwrap().requires_recovery());
+            let mut retry = selection.begin_intent_mirror().unwrap();
+            let recovered = fixture.io.block(|| retry.poll()).unwrap();
+            assert_eq!(recovered.record(), expected);
+            assert!(recovered.guard().requires_recovery());
+            assert!(recovered.guard().published().is_err());
+            fixture.assert_durable_unchanged();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn checkpoint_recovery_intent_native_cancel_retains_backend_until_retirement() {
+    for at in 1..=6 {
+        for callback_before_drop in [false, true] {
+            for commits in [1, 2] {
+                let control = Control::new();
+                let fixture = IntentCrashFixture::with_parent_io(
+                    CrashPoint::SecondIntentWrite,
+                    commits,
+                    |path| control.io(path),
+                );
+                let selection = inspect_crash(&fixture, CrashPoint::SecondIntentWrite);
+                let expected = selection.manifest.record();
+                let mut mirror = selection.begin_intent_mirror().unwrap();
+                control.arm(Fault::Hold(at));
+                let (waiter, held) = {
+                    let mut polls = 0;
+                    loop {
+                        polls += 1;
+                        assert!(polls < 1000, "intent mirror did not reach held I/O");
+                        match mirror.poll().unwrap() {
+                            IOResult::IO(waiter) => {
+                                if let Some(held) = control.held.lock().take() {
+                                    break (waiter, held);
+                                }
+                                waiter.wait(fixture.io.as_ref()).unwrap();
+                            }
+                            IOResult::Done(_) => {
+                                panic!("intent mirror bypassed held operation {at}")
+                            }
+                        }
+                    }
+                };
+                let callback_waiter = if callback_before_drop {
+                    held.complete();
+                    match mirror.poll().unwrap() {
+                        IOResult::IO(waiter) => Some(waiter),
+                        IOResult::Done(_) => panic!(
+                            "intent owner returned before backend retirement at operation {at}"
+                        ),
+                    }
+                } else {
+                    None
+                };
+                drop(waiter);
+                drop(callback_waiter);
+                drop(mirror);
+                assert!(fixture.runtime.replay.lock().is_none());
+                assert!(matches!(
+                    fixture.runtime.files.authority.try_acquire(),
+                    Err(LimboError::Busy)
+                ));
+                assert!(matches!(
+                    fixture.runtime.begin_open(),
+                    Err(LimboError::Busy)
+                ));
+                if !callback_before_drop {
+                    held.complete();
+                }
+                assert!(matches!(
+                    fixture.runtime.files.authority.try_acquire(),
+                    Err(LimboError::Busy)
+                ));
+                assert!(matches!(
+                    fixture.runtime.begin_open(),
+                    Err(LimboError::Busy)
+                ));
+                drop(held);
+                fixture.assert_durable_unchanged();
+                control.arm(Fault::None);
+                let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
+                let selection = fixture.io.block(|| opening.poll()).unwrap();
+                assert_eq!(selection.manifest.record(), expected);
+                let mut retry = selection.begin_intent_mirror().unwrap();
+                let recovered = fixture.io.block(|| retry.poll()).unwrap();
+                assert_eq!(recovered.record(), expected);
+                assert!(recovered.guard().io_retired());
+                assert!(recovered.guard().requires_recovery());
+                assert!(recovered.guard().published().is_err());
+                fixture.assert_durable_unchanged();
+            }
+        }
+    }
+}
