@@ -11,6 +11,14 @@ pub(in crate::mvcc) struct InstalledLocalCheckpoint {
     schema: Arc<Schema>,
 }
 
+impl InstalledLocalCheckpoint {
+    pub(in crate::mvcc) fn publish_ready(self, _connection: Arc<Connection>) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "completed checkpoint readiness publication is not implemented".into(),
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Phase {
     Manifest,
@@ -300,6 +308,75 @@ mod fault_tests;
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn shared_checkpoint_ready_native_resumes_original_connection_and_new_commits() {
+        let fixture = shared_completed_checkpoint_fixture(|_| {
+            Arc::new(crate::io::PlatformIO::new().unwrap())
+        });
+        let store = fixture.database.get_mv_store().as_ref().unwrap().clone();
+        let runtime = store.shared_runtime.get().unwrap().clone();
+        let mut finalizer = fixture.ids.finalize(fixture.guard, fixture.proof).unwrap();
+        let finalized = loop {
+            match finalizer.poll().unwrap() {
+                IOResult::IO(waiter) => fixture.io.wait_for_completion(waiter.0).unwrap(),
+                IOResult::Done(finalized) => break finalized,
+            }
+        };
+        let target = finalized.proof().target_identity();
+        let published = PublishedSharedCheckpoint {
+            finalized,
+            pause: fixture.pause,
+        };
+        let mut reading = published
+            .begin_physical_read(store.clone(), fixture.connection.clone())
+            .unwrap();
+        let verified = fixture.io.block(|| reading.poll()).unwrap();
+        let mut installing = verified
+            .begin_local_install(store.clone(), fixture.connection.clone())
+            .unwrap();
+        let installed = fixture.io.block(|| installing.poll()).unwrap();
+        assert!(runtime.replay.lock().is_none());
+        installed.publish_ready(fixture.connection.clone()).unwrap();
+        assert_eq!(
+            runtime.replay.lock().as_ref().unwrap().identity().unwrap(),
+            target
+        );
+        assert!(runtime.gate.try_enter_admission().is_ok());
+        fixture
+            .connection
+            .execute("UPDATE preserved SET value='committed after ready' WHERE id=1")
+            .unwrap();
+        assert!(
+            runtime
+                .replay
+                .lock()
+                .as_ref()
+                .unwrap()
+                .identity()
+                .unwrap()
+                .prefix
+                .end_offset
+                > 0
+        );
+        let options = crate::OpenOptions::new(fixture.database.dialect().clone())
+            .with_shared_mvcc_for_test(fixture.limit);
+        let fresh =
+            crate::Database::open(fixture.io.clone(), fixture.path.to_str().unwrap(), options)
+                .unwrap();
+        let reader = fresh.connect(crate::ConnectOpts::new()).unwrap();
+        let mut values = Vec::new();
+        reader
+            .prepare("SELECT value FROM preserved WHERE id=1")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                values.push(row.get::<&str>(0)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(values, ["committed after ready"]);
+    }
 
     #[test]
     #[ignore = "requires native Linux ext-family filesystem"]
