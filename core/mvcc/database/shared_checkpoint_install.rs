@@ -1,5 +1,6 @@
 use super::*;
 use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
+use crate::mvcc::database::shared_generation_reload::PreparedGenerationReload;
 use crate::mvcc::shared_authority::AuthorityGuard;
 
 pub(in crate::mvcc) struct InstalledLocalCheckpoint {
@@ -10,10 +11,34 @@ pub(in crate::mvcc) struct InstalledLocalCheckpoint {
     schema: Arc<Schema>,
 }
 
+#[derive(Clone, Copy)]
+enum Phase {
+    Manifest,
+    Preflight,
+    Truncate,
+    Sync,
+    Retire,
+    Install,
+    Finished,
+}
+
 pub(in crate::mvcc) struct SharedCheckpointLocalInstall<C: LogicalClock, A: ConcurrentAllocator> {
-    base: Option<VerifiedPhysicalBase>,
     store: Arc<MvStore<C, A>>,
     connection: Arc<Connection>,
+    runtime: Arc<SharedMvccRuntime>,
+    phase: Phase,
+    load: Option<ManifestLoad>,
+    record: Option<crate::mvcc::commit_manifest::ManifestRecord>,
+    parts: Option<PhysicalBaseParts>,
+    prepared: Option<PreparedGenerationReload<A>>,
+    schema: Option<Arc<Schema>>,
+    replay: Option<Arc<SharedReplayContext>>,
+    pending: Option<Completion>,
+    binding: Option<FileBinding>,
+    guard: Option<AuthorityGuard>,
+    proof: Option<CompletedCheckpointProof>,
+    pause: Option<CheckpointPause>,
+    prepare_generation: u64,
 }
 
 impl VerifiedPhysicalBase {
@@ -22,20 +47,249 @@ impl VerifiedPhysicalBase {
         store: Arc<MvStore<C, A>>,
         connection: Arc<Connection>,
     ) -> Result<SharedCheckpointLocalInstall<C, A>> {
+        let runtime = store.shared_runtime.get().cloned().ok_or_else(|| {
+            LimboError::InvalidArgument("checkpoint installation requires shared runtime".into())
+        })?;
+        let (parts, published) = self.into_parts();
+        validate_owner(&store, &connection, &runtime, &published)?;
+        let PublishedSharedCheckpoint { finalized, pause } = published;
+        let (ids, proof) = finalized.into_parts();
+        if ids.identity() != proof.target_identity() || ids.has_pending_checkpoint() {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint IDs are not finalized".into(),
+            ));
+        }
+        let load = ManifestLoad::new(
+            runtime.files.manifest.clone(),
+            ids.into_guard(),
+            runtime.database_id,
+        )?;
         Ok(SharedCheckpointLocalInstall {
-            base: Some(self),
             store,
             connection,
+            runtime,
+            phase: Phase::Manifest,
+            load: Some(load),
+            record: None,
+            parts: Some(parts),
+            prepared: None,
+            schema: None,
+            replay: None,
+            pending: None,
+            binding: None,
+            guard: None,
+            proof: Some(proof),
+            pause: Some(pause),
+            prepare_generation: 0,
         })
     }
 }
 
 impl<C: LogicalClock, A: ConcurrentAllocator> SharedCheckpointLocalInstall<C, A> {
     pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<InstalledLocalCheckpoint> {
-        Err(LimboError::InvalidArgument(
-            "local completed checkpoint installation is not implemented".into(),
-        )
-        .into())
+        let result = self.poll_inner();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    fn poll_inner(&mut self) -> IOResultOr<InstalledLocalCheckpoint> {
+        loop {
+            if let Some(completion) = self.pending.take() {
+                if !completion.finished() {
+                    self.pending = Some(completion.clone());
+                    return Ok(IOResult::IO(IOCompletions(completion)));
+                }
+                if let Some(error) = completion.get_error() {
+                    return Err(error.into());
+                }
+            }
+            match self.phase {
+                Phase::Manifest => {
+                    let loaded = return_if_io!(self.load.as_mut().unwrap().poll());
+                    self.load = None;
+                    let record = loaded.record();
+                    let proof = self.proof.as_ref().unwrap();
+                    let target = proof.target_identity();
+                    if record.requires_recovery()
+                        || record.database_id() != self.runtime.database_id
+                        || record.log_generation() != target.database.generation
+                        || record.prefix() != target.prefix
+                        || record.log_salt() != 0
+                        || target.prefix.end_offset != 0
+                        || target.prefix.running_crc != 0
+                        || target.database.checkpoint_timestamp != target.prefix.committed_timestamp
+                        || !proof.matches_lease(loaded.guard()?)
+                    {
+                        return Err(LimboError::Corrupt(
+                            "selected manifest is not the completed checkpoint target".into(),
+                        )
+                        .into());
+                    }
+                    self.record = Some(record);
+                    self.guard = Some(loaded.into_guard()?);
+                    self.phase = Phase::Preflight;
+                }
+                Phase::Preflight => {
+                    self.validate_owner()?;
+                    let guard = self.guard.as_ref().unwrap();
+                    if !guard.io_retired() {
+                        return Ok(IOResult::IO(IOCompletions(guard.retirement_completion())));
+                    }
+                    let parts = self.parts.take().unwrap();
+                    if parts.persistent_timestamp
+                        != self
+                            .proof
+                            .as_ref()
+                            .unwrap()
+                            .target_identity()
+                            .database
+                            .checkpoint_timestamp
+                    {
+                        return Err(LimboError::Corrupt(
+                            "physical checkpoint timestamp changed".into(),
+                        )
+                        .into());
+                    }
+                    self.prepare_generation = self.connection.prepare_context_generation();
+                    self.prepare_generation
+                        .checked_add(1)
+                        .ok_or(LimboError::DatabaseFull)?;
+                    let prepared = self.store.prepare_generation_reload(
+                        parts.header,
+                        &parts.schema,
+                        parts.persistent_timestamp,
+                    )?;
+                    let schema = parts.schema.clone();
+                    let context = parts.into_context(&self.store);
+                    let replay = SharedReplayContext::new(
+                        context,
+                        self.record.unwrap(),
+                        self.runtime.storage(),
+                    );
+                    self.binding = Some(self.runtime.logical.bind_checkpoint(guard)?);
+                    self.prepared = Some(prepared);
+                    self.schema = Some(schema);
+                    self.replay = Some(replay);
+                    // A failed reclamation or install must never restore old-generation readiness.
+                    self.runtime.replay.lock().take();
+                    self.phase = Phase::Truncate;
+                }
+                Phase::Truncate => {
+                    self.validate_owner()?;
+                    self.pending = Some(
+                        self.runtime
+                            .logical
+                            .truncate(0, Completion::new_trunc(|_| {}))?,
+                    );
+                    self.phase = Phase::Sync;
+                }
+                Phase::Sync => {
+                    self.pending = Some(
+                        self.runtime
+                            .logical
+                            .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync)?,
+                    );
+                    self.phase = Phase::Retire;
+                }
+                Phase::Retire => {
+                    self.validate_owner()?;
+                    let guard = self.guard.as_ref().unwrap();
+                    if !guard.io_retired() {
+                        return Ok(IOResult::IO(IOCompletions(guard.retirement_completion())));
+                    }
+                    self.runtime.storage.adopt_shared_prefix(
+                        None,
+                        0,
+                        0,
+                        self.proof
+                            .as_ref()
+                            .unwrap()
+                            .target_identity()
+                            .database
+                            .checkpoint_timestamp,
+                    )?;
+                    self.phase = Phase::Install;
+                }
+                Phase::Install => {
+                    self.validate_owner()?;
+                    if self.connection.prepare_context_generation() != self.prepare_generation {
+                        return Err(LimboError::Busy.into());
+                    }
+                    self.connection.get_pager().reset_shared_generation()?;
+                    self.prepared.take().unwrap().install(
+                        &self.store,
+                        self.proof.as_ref().unwrap(),
+                        self.guard.as_ref().unwrap(),
+                    )?;
+                    let schema = self.schema.take().unwrap();
+                    *self.connection.db.schema.lock() = schema.clone();
+                    *self.connection.schema.write() = schema.clone();
+                    self.connection.bump_prepare_context_generation();
+                    self.phase = Phase::Finished;
+                    return Ok(IOResult::Done(InstalledLocalCheckpoint {
+                        guard: self.guard.take().unwrap(),
+                        proof: self.proof.take().unwrap(),
+                        pause: self.pause.take().unwrap(),
+                        replay: self.replay.take().unwrap(),
+                        schema,
+                    }));
+                }
+                Phase::Finished => {
+                    return Err(
+                        LimboError::InvalidArgument("checkpoint installation ended".into()).into(),
+                    )
+                }
+            }
+        }
+    }
+
+    fn validate_owner(&self) -> Result<()> {
+        let guard = self.guard.as_ref().unwrap();
+        let target = self.proof.as_ref().unwrap().target_identity();
+        if self
+            .connection
+            .db
+            .get_mv_store()
+            .as_ref()
+            .is_none_or(|store| {
+                Arc::as_ptr(store).cast::<()>() != Arc::as_ptr(&self.store).cast::<()>()
+            })
+            || !self.runtime.owns_authority(guard)
+            || !self.proof.as_ref().unwrap().matches_lease(guard)
+            || guard.published()? != target.prefix
+            || self.runtime.files.main.file_id()? != Some(self.runtime.database_id)
+            || self.runtime.files.physical_wal.size()? != 0
+        {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint installation owner changed".into(),
+            ));
+        }
+        if !self.store.txs.is_empty() || !guard.live_registrations()?.is_empty() {
+            return Err(LimboError::Busy);
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        self.parts = None;
+        self.prepared = None;
+        self.schema = None;
+        self.replay = None;
+        self.pending = None;
+        self.binding = None;
+        self.load = None;
+        self.guard = None;
+        self.proof = None;
+        self.pause = None;
+        self.phase = Phase::Finished;
+    }
+}
+
+impl<C: LogicalClock, A: ConcurrentAllocator> Drop for SharedCheckpointLocalInstall<C, A> {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
