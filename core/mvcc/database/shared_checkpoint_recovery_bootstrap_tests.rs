@@ -71,6 +71,7 @@ fn checkpoint_recovery_bootstrap_native_failed_allocation_releases_unused_claim(
         reservation,
     } = reclaimed;
     assert!(reservation
+        .unwrap()
         .construct_store(DynAllocator::new(RejectAllocation))
         .is_err());
     let available = runtime.reserve_store().unwrap();

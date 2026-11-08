@@ -17,6 +17,7 @@ pub(in crate::mvcc) use shared_checkpoint::InstalledDowngradeSource;
 
 #[path = "shared_checkpoint_recovery.rs"]
 mod shared_checkpoint_recovery;
+use shared_checkpoint_recovery::RecoveryStoreContinuation;
 
 #[path = "shared_checkpoint_recovery_intent.rs"]
 mod shared_checkpoint_recovery_intent;

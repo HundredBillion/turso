@@ -9,6 +9,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_prepare::finalize::Finalize
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct FinalizedRecoveredCheckpoint {
+    continuation: RecoveryStoreContinuation,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
@@ -27,6 +28,7 @@ impl FinalizedRecoveredCheckpoint {
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryIdFinalizationState {
+    continuation: Option<RecoveryStoreContinuation>,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: Option<PhysicalBaseParts>,
@@ -73,6 +75,7 @@ impl RecoveredCheckpointConfirmation {
             .ids
             .begin_finalize(self.guard, self.proof, self.max_owner_epoch)?;
         Ok(RecoveryIdFinalizationState {
+            continuation: Some(self.continuation),
             runtime: self.runtime,
             config: self.config,
             parts: Some(self.parts),
@@ -101,6 +104,7 @@ impl RecoveryIdFinalizationState {
         self.finalizer = None;
         self.finished = true;
         Ok(IOResult::Done(FinalizedRecoveredCheckpoint {
+            continuation: self.continuation.take().unwrap(),
             runtime: self.runtime.clone(),
             config: self.config.clone(),
             parts: self.parts.take().unwrap(),
@@ -109,6 +113,7 @@ impl RecoveryIdFinalizationState {
         }))
     }
     fn abort(&mut self) {
+        self.continuation = None;
         self.finalizer = None;
         self.parts = None;
         self.pause = None;

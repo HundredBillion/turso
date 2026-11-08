@@ -1,8 +1,14 @@
 use super::*;
 use crate::mvcc::checkpoint_gate::CheckpointPause;
 
+pub(in crate::mvcc) enum RecoveryStoreContinuation {
+    Fresh,
+    Owned(Box<super::shared_checkpoint_recovery_wal::IntentRecoveryStore>),
+}
+
 #[allow(dead_code)]
 pub(in crate::mvcc) struct CheckpointRecoverySelection {
+    pub(in crate::mvcc::database::shared_runtime) continuation: RecoveryStoreContinuation,
     pub runtime: Arc<SharedMvccRuntime>,
     pub manifest: LoadedManifest,
     pub pause: CheckpointPause,
@@ -33,6 +39,7 @@ impl CheckpointRecoverySelection {
         }
         manifest.guard()?.ensure_no_snapshot_locks()?;
         Ok(Self {
+            continuation: RecoveryStoreContinuation::Fresh,
             runtime,
             manifest,
             pause,

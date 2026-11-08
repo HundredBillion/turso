@@ -12,6 +12,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::SuspendedRecovery
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveredCheckpointConfirmation {
+    continuation: RecoveryStoreContinuation,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
@@ -84,6 +85,7 @@ impl RecoveryCompletionEvidence {
 }
 
 struct RetainedConfirmation {
+    continuation: RecoveryStoreContinuation,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
@@ -110,6 +112,7 @@ fn suspend_inspected(
     AuthorityGuard,
 )> {
     let InspectedRecoveryIds {
+        continuation,
         runtime,
         config,
         parts,
@@ -162,6 +165,7 @@ fn suspend_inspected(
     let (ids, guard) = ids.suspend();
     Ok((
         RetainedConfirmation {
+            continuation,
             runtime,
             config,
             parts,
@@ -232,6 +236,7 @@ impl RecoveryCheckpointConfirmationState {
         let retained = self.retained.take().unwrap();
         self.finished = true;
         Ok(IOResult::Done(RecoveredCheckpointConfirmation {
+            continuation: retained.continuation,
             runtime: retained.runtime,
             config: retained.config,
             parts: retained.parts,

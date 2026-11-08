@@ -13,7 +13,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_prepare::finalize::Suspende
 pub(in crate::mvcc) struct ReclaimedRecoveredCheckpoint {
     recovered: FinalizedRecoveredCheckpoint,
     record: crate::mvcc::commit_manifest::ManifestRecord,
-    reservation: SharedStoreReservation,
+    reservation: Option<SharedStoreReservation>,
 }
 #[allow(dead_code)]
 impl ReclaimedRecoveredCheckpoint {
@@ -39,6 +39,7 @@ enum Phase {
 }
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryLogReclamation {
+    continuation: Option<RecoveryStoreContinuation>,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: Option<PhysicalBaseParts>,
@@ -66,7 +67,18 @@ impl FinalizedRecoveredCheckpoint {
         if !self.guard().io_retired() {
             return Err(LimboError::Busy);
         }
-        let reservation = self.runtime.reserve_store()?;
+        let reservation = match &self.continuation {
+            RecoveryStoreContinuation::Fresh => Some(self.runtime.reserve_store()?),
+            RecoveryStoreContinuation::Owned(owner) => {
+                owner.validate_completed(
+                    &self.runtime,
+                    &self.config,
+                    self.proof(),
+                    self.guard(),
+                )?;
+                None
+            }
+        };
         let (suspended, guard) = self.finalized.suspend();
         let load = ManifestLoad::new(
             self.runtime.files.manifest.clone(),
@@ -74,13 +86,14 @@ impl FinalizedRecoveredCheckpoint {
             self.runtime.database_id,
         )?;
         Ok(RecoveryLogReclamation {
+            continuation: Some(self.continuation),
             runtime: self.runtime,
             config: self.config,
             parts: Some(self.parts),
             finalized: None,
             suspended: Some(suspended),
             pause: Some(self.pause),
-            reservation: Some(reservation),
+            reservation,
             load: Some(load),
             loaded: None,
             record: None,
@@ -204,6 +217,7 @@ impl RecoveryLogReclamation {
                     self.phase = Phase::Finished;
                     return Ok(IOResult::Done(ReclaimedRecoveredCheckpoint {
                         recovered: FinalizedRecoveredCheckpoint {
+                            continuation: self.continuation.take().unwrap(),
                             runtime: self.runtime.clone(),
                             config: self.config.clone(),
                             parts: self.parts.take().unwrap(),
@@ -211,7 +225,7 @@ impl RecoveryLogReclamation {
                             pause: self.pause.take().unwrap(),
                         },
                         record: self.record.take().unwrap(),
-                        reservation: self.reservation.take().unwrap(),
+                        reservation: self.reservation.take(),
                     }));
                 }
                 Phase::Finished => {
@@ -224,8 +238,29 @@ impl RecoveryLogReclamation {
         }
     }
     fn validate_owner(&self) -> Result<()> {
-        self.reservation.as_ref().unwrap().validate(&self.runtime)?;
         let finalized = self.finalized.as_ref().unwrap();
+        match self.continuation.as_ref().unwrap() {
+            RecoveryStoreContinuation::Fresh => self
+                .reservation
+                .as_ref()
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument("fresh recovery lost its Store reservation".into())
+                })?
+                .validate(&self.runtime)?,
+            RecoveryStoreContinuation::Owned(owner) => {
+                if self.reservation.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "owned Store cannot reserve a second Store".into(),
+                    ));
+                }
+                owner.validate_completed(
+                    &self.runtime,
+                    &self.config,
+                    finalized.proof(),
+                    finalized.guard(),
+                )?;
+            }
+        }
         validate_target(
             &self.runtime,
             self.parts.as_ref().unwrap(),
@@ -237,6 +272,7 @@ impl RecoveryLogReclamation {
         Ok(())
     }
     fn abort(&mut self) {
+        self.continuation = None;
         self.pending = None;
         self.binding = None;
         self.load = None;

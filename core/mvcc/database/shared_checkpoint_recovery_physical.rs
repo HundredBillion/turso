@@ -41,8 +41,36 @@ impl CheckpointRecoverySelection {
         self,
         options: crate::OpenOptions,
     ) -> Result<RecoveryPhysicalRead> {
+        if !matches!(self.continuation, RecoveryStoreContinuation::Fresh) {
+            return Err(LimboError::InvalidArgument(
+                "owned recovery requires its original captured configuration".into(),
+            ));
+        }
+        let config = RecoveryOpenConfig::capture(options)?;
+        self.begin_physical_read_captured(config)
+    }
+
+    pub(in crate::mvcc) fn begin_physical_read_owned(self) -> Result<RecoveryPhysicalRead> {
+        let config = match &self.continuation {
+            RecoveryStoreContinuation::Owned(owner) => owner.original_config(),
+            RecoveryStoreContinuation::Fresh => {
+                return Err(LimboError::InvalidArgument(
+                    "owned recovery requires an actual source Store".into(),
+                ))
+            }
+        };
+        self.begin_physical_read_captured(config)
+    }
+
+    fn begin_physical_read_captured(
+        self,
+        config: Arc<RecoveryOpenConfig>,
+    ) -> Result<RecoveryPhysicalRead> {
         let runtime = &self.runtime;
         let guard = self.manifest.guard()?;
+        if let RecoveryStoreContinuation::Owned(owner) = &self.continuation {
+            owner.validate_normal_record(runtime, &config, self.manifest.record(), guard)?;
+        }
         if !runtime.owns_authority(guard)
             || self.manifest.record().database_id() != runtime.database_id
             || runtime.files.main.file_id()? != Some(runtime.database_id)
@@ -60,7 +88,6 @@ impl CheckpointRecoverySelection {
         let path = runtime.path.to_str().ok_or_else(|| {
             LimboError::InvalidArgument("shared database path must be UTF-8".into())
         })?;
-        let config = RecoveryOpenConfig::capture(options)?;
         config.validate_history(runtime.files.authority.configured_history_limit())?;
         let opening = config.open_physical(runtime.io.clone(), path.to_owned(), file)?;
         Ok(RecoveryPhysicalRead {

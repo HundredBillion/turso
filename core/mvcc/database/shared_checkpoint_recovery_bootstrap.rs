@@ -346,7 +346,28 @@ impl RecoveryBootstrap {
             reclaimed.proof(),
             reclaimed.guard(),
         )?;
-        reclaimed.reservation.validate(runtime)?;
+        match &reclaimed.recovered.continuation {
+            RecoveryStoreContinuation::Fresh => reclaimed
+                .reservation
+                .as_ref()
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument("fresh bootstrap lost its Store reservation".into())
+                })?
+                .validate(runtime)?,
+            RecoveryStoreContinuation::Owned(owner) => {
+                if reclaimed.reservation.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "owned bootstrap cannot construct a second Store".into(),
+                    ));
+                }
+                owner.validate_completed(
+                    runtime,
+                    &reclaimed.recovered.config,
+                    reclaimed.proof(),
+                    reclaimed.guard(),
+                )?;
+            }
+        }
         let target = reclaimed.proof().target_identity();
         let logical: Arc<dyn File> = runtime.logical.clone();
         let snapshot = runtime.storage.shared_commit_snapshot(&logical)?;
@@ -367,16 +388,28 @@ impl RecoveryBootstrap {
                 "bootstrap no longer matches reclaimed checkpoint".into(),
             ));
         }
-        let store = reclaimed
-            .reservation
-            .construct_store(reclaimed.recovered.config.store_allocator())?;
         let FinalizedRecoveredCheckpoint {
+            continuation,
             runtime,
             config,
             parts,
             finalized,
             pause,
         } = reclaimed.recovered;
+        let store = match continuation {
+            RecoveryStoreContinuation::Fresh => reclaimed
+                .reservation
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument("fresh bootstrap lost its Store reservation".into())
+                })?
+                .construct_store(config.store_allocator())?,
+            RecoveryStoreContinuation::Owned(owner) => owner.into_bootstrap_store(
+                &runtime,
+                &config,
+                finalized.proof(),
+                finalized.guard(),
+            )?,
+        };
         self.evidence = Some(RecoveryBootstrapEvidence {
             store,
             bindings: Vec::new(),

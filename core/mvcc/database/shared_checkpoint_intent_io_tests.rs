@@ -278,6 +278,7 @@ fn checkpoint_recovery_intent_native_rejects_same_bytes_from_memory_manifest() {
         )
         .unwrap();
     let CheckpointRecoverySelection {
+        continuation,
         runtime,
         manifest,
         pause,
@@ -286,6 +287,7 @@ fn checkpoint_recovery_intent_native_rejects_same_bytes_from_memory_manifest() {
         ManifestLoad::new(file, manifest.into_guard().unwrap(), runtime.database_id).unwrap();
     let substitute = memory.block(|| Ok(load.poll()?)).unwrap();
     let substitute = CheckpointRecoverySelection {
+        continuation,
         runtime,
         manifest: substitute,
         pause,
@@ -502,6 +504,7 @@ fn checkpoint_recovery_intent_native_rejects_replacement_lease() {
         runtime,
         manifest,
         pause,
+        ..
     } = selection;
     drop(manifest.into_guard().unwrap());
     let replacement = runtime.files.authority.try_acquire().unwrap();

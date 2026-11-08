@@ -17,6 +17,7 @@ use crate::mvcc::shared_ids::io_protocol::checkpoint_recovery::{
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct InspectedRecoveryIds {
+    continuation: RecoveryStoreContinuation,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: PhysicalBaseParts,
@@ -27,6 +28,7 @@ pub(in crate::mvcc) struct InspectedRecoveryIds {
 
 #[allow(dead_code)]
 pub(in crate::mvcc) struct RecoveryIdInspection {
+    continuation: Option<RecoveryStoreContinuation>,
     runtime: Arc<SharedMvccRuntime>,
     config: Arc<RecoveryOpenConfig>,
     parts: Option<PhysicalBaseParts>,
@@ -70,6 +72,7 @@ impl InspectedRecoveryBase {
             physical_floor,
         )?;
         Ok(RecoveryIdInspection {
+            continuation: Some(selection.continuation),
             runtime: selection.runtime,
             config,
             parts: Some(parts),
@@ -85,6 +88,7 @@ impl RecoveryIdInspection {
     pub(in crate::mvcc) fn poll(&mut self) -> IOResultOr<InspectedRecoveryIds> {
         let result = self.poll_inner();
         if result.is_err() {
+            self.continuation = None;
             self.load = None;
             self.parts = None;
             self.pause = None;
@@ -99,6 +103,7 @@ impl RecoveryIdInspection {
         let ids = return_if_io!(load.poll());
         self.load = None;
         Ok(IOResult::Done(InspectedRecoveryIds {
+            continuation: self.continuation.take().unwrap(),
             runtime: self.runtime.clone(),
             config: self.config.clone(),
             parts: self.parts.take().unwrap(),

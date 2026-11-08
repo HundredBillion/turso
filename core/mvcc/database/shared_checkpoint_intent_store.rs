@@ -1,4 +1,5 @@
 use super::*;
+use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
 
 pub(in crate::mvcc::database) struct SourceStoreLifetime {
     lease: Arc<PublicationLease>,
@@ -119,6 +120,131 @@ impl IntentRecoveryStore {
             return Err(LimboError::InvalidArgument(
                 "source Store changed its actual owner or base".into(),
             ));
+        }
+        Ok(())
+    }
+
+    pub(in crate::mvcc::database::shared_runtime) fn original_config(
+        &self,
+    ) -> Arc<RecoveryOpenConfig> {
+        self.config.clone()
+    }
+
+    pub(in crate::mvcc::database::shared_runtime) fn validate_normal_record(
+        &self,
+        runtime: &Arc<SharedMvccRuntime>,
+        config: &Arc<RecoveryOpenConfig>,
+        record: ManifestRecord,
+        guard: &AuthorityGuard,
+    ) -> Result<()> {
+        self.validate_owner(runtime, config, guard)?;
+        let target = self.record.checkpoint_intent().unwrap().target_generation;
+        if record.requires_recovery()
+            || record.database_id() != self.record.database_id()
+            || record.log_generation() != target
+            || record.log_salt() != 0
+            || record.sequence() <= self.record.sequence()
+            || self.store.last_committed_tx_ts.load(Ordering::Acquire)
+                != self.record.prefix().committed_timestamp
+            || self.store.durable_txid_max.load(Ordering::Acquire)
+                != self.record.prefix().committed_timestamp
+            || record.prefix()
+                != (crate::mvcc::shared_authority::PublishedPrefix {
+                    committed_timestamp: self.record.prefix().committed_timestamp,
+                    end_offset: 0,
+                    running_crc: 0,
+                })
+        {
+            return Err(LimboError::InvalidArgument(
+                "owned Store differs from completed manifest".into(),
+            ));
+        }
+        self.require_inspected_source()
+    }
+
+    pub(in crate::mvcc::database::shared_runtime) fn validate_completed(
+        &self,
+        runtime: &Arc<SharedMvccRuntime>,
+        config: &Arc<RecoveryOpenConfig>,
+        proof: &CompletedCheckpointProof,
+        guard: &AuthorityGuard,
+    ) -> Result<()> {
+        self.validate_owner(runtime, config, guard)?;
+        let target = proof.target_identity();
+        let intent = self.record.checkpoint_intent().unwrap();
+        if !proof.matches_lease(guard)
+            || proof.source_identity().is_some()
+            || proof.source_database().is_some_and(|source| {
+                source
+                    != DatabaseGeneration {
+                        generation: self.record.log_generation(),
+                        checkpoint_timestamp: intent.source_checkpoint_timestamp,
+                    }
+            })
+            || target.database.generation != intent.target_generation
+            || target.database.checkpoint_timestamp != self.record.prefix().committed_timestamp
+            || target.prefix.committed_timestamp != self.record.prefix().committed_timestamp
+            || target.prefix.end_offset != 0
+            || target.prefix.running_crc != 0
+            || self.store.last_committed_tx_ts.load(Ordering::Acquire)
+                != target.prefix.committed_timestamp
+            || self.store.durable_txid_max.load(Ordering::Acquire)
+                != target.database.checkpoint_timestamp
+        {
+            return Err(LimboError::InvalidArgument(
+                "owned Store differs from actual completed checkpoint".into(),
+            ));
+        }
+        self.require_inspected_source()
+    }
+
+    pub(in crate::mvcc::database::shared_runtime) fn into_bootstrap_store(
+        self,
+        runtime: &Arc<SharedMvccRuntime>,
+        config: &Arc<RecoveryOpenConfig>,
+        proof: &CompletedCheckpointProof,
+        guard: &AuthorityGuard,
+    ) -> Result<Arc<crate::MvStore>> {
+        self.validate_completed(runtime, config, proof, guard)?;
+        Ok(self.store)
+    }
+
+    fn validate_owner(
+        &self,
+        runtime: &Arc<SharedMvccRuntime>,
+        config: &Arc<RecoveryOpenConfig>,
+        guard: &AuthorityGuard,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.runtime, runtime)
+            || !Arc::ptr_eq(&self.config, config)
+            || !runtime.owns_authority(guard)
+            || !Weak::ptr_eq(&self.lease, &guard.io_lease())
+            || runtime.replay.lock().is_some()
+            || !self
+                .store
+                .shared_runtime
+                .get()
+                .is_some_and(|actual| Arc::ptr_eq(actual, runtime))
+            || self
+                .store
+                .source_recovery_lifetime
+                .as_ref()
+                .is_none_or(|lifetime| !lifetime.matches_lease(&self.lease))
+            || !self.store.txs.is_empty()
+            || require_native_id(&runtime.files.main)? != self.main_id
+            || require_native_id(&runtime.files.physical_wal)? != self.wal_id
+            || require_native_id(&runtime.files.manifest)? != self.manifest_id
+            || runtime.files.physical_coordination.file_id()? != Some(self.coordination_id)
+            || runtime.files.physical_wal.size()? != 0
+        {
+            return Err(LimboError::InvalidArgument(
+                "owned recovery Store changed its runtime, config or lease".into(),
+            ));
+        }
+        config.validate_history(runtime.files.authority.configured_history_limit())?;
+        guard.ensure_no_snapshot_locks()?;
+        if !guard.io_retired() {
+            return Err(LimboError::Busy);
         }
         Ok(())
     }
@@ -390,6 +516,95 @@ mod tests {
         source.owner.validate_source(&source.physical).unwrap();
         assert!(fixture.runtime.replay.lock().is_none());
         assert!(other_fixture.runtime.replay.lock().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn intent_source_store_native_owned_carrier_cannot_recapture_configuration() {
+        let (fixture, physical) = physical_case(
+            CrashPoint::BeforeWalCommit,
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+        );
+        let SourceIntentStore { owner, physical } = physical.begin_source_store().unwrap();
+        let source_before = durable(&fixture);
+        let (_directory, _runtime, mut selected, before) = completed_selection();
+        selected.continuation = RecoveryStoreContinuation::Owned(Box::new(owner));
+        let error = match selected
+            .begin_physical_read(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
+        {
+            Ok(_) => panic!("owned Store recaptured another configuration"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("original captured configuration"));
+        assert_durable(&before);
+        assert_durable(&source_before);
+        assert!(physical.guard().requires_recovery());
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn intent_source_store_native_owned_carrier_rejects_foreign_completed_selection() {
+        let (fixture, physical) = physical_case(
+            CrashPoint::BeforeWalCommit,
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+        );
+        let SourceIntentStore { owner, physical } = physical.begin_source_store().unwrap();
+        let source_before = durable(&fixture);
+        let (_directory, _runtime, mut selected, before) = completed_selection();
+        selected.continuation = RecoveryStoreContinuation::Owned(Box::new(owner));
+        let error = match selected.begin_physical_read_owned() {
+            Ok(_) => panic!("foreign completed selection reused another source Store"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("runtime, config or lease"));
+        assert_durable(&before);
+        assert_durable(&source_before);
+        assert!(physical.guard().requires_recovery());
+    }
+
+    fn completed_selection() -> (
+        tempfile::TempDir,
+        Arc<SharedMvccRuntime>,
+        super::super::super::shared_checkpoint_recovery::CheckpointRecoverySelection,
+        Vec<(PathBuf, Vec<u8>)>,
+    ) {
+        let fixture =
+            shared_completed_checkpoint_fixture(|_| Arc::new(crate::io::SyscallIO::new().unwrap()));
+        let runtime = fixture
+            .database
+            .get_mv_store()
+            .as_ref()
+            .unwrap()
+            .shared_runtime
+            .get()
+            .unwrap()
+            .clone();
+        drop(fixture.ids);
+        drop(fixture.guard);
+        drop(fixture.proof);
+        drop(fixture.pause);
+        drop(fixture.connection);
+        drop(fixture.database);
+        let mut open = runtime.begin_checkpoint_recovery().unwrap();
+        let selected = fixture.io.block(|| open.poll()).unwrap();
+        let before = [
+            fixture.path.clone(),
+            runtime.files.namespace.join("manifest"),
+            runtime.files.namespace.join("logical"),
+            runtime.files.namespace.join("physical-wal"),
+            runtime.files.namespace.join("ids-a"),
+            runtime.files.namespace.join("ids-b"),
+            runtime.files.namespace.join("ids-selector"),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        (fixture.directory, runtime, selected, before)
     }
 
     fn consume_physical_then_fail(physical: RecoveredIntentPhysicalBase) -> Result<()> {
