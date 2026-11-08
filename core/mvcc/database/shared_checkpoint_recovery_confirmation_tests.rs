@@ -123,7 +123,7 @@ fn checkpoint_recovery_confirmation_native_rejects_same_record_from_foreign_file
         )
         .unwrap();
     let mut load = ManifestLoad::new(fake, guard, runtime.database_id).unwrap();
-    let loaded = fake_io.block(|| Ok(load.poll()?)).unwrap();
+    let loaded = fake_io.block(|| load.poll()).unwrap();
     let error = match loaded.mirror_recovered_completion(evidence) {
         Err(error) => error,
         Ok(_) => panic!("substitute manifest file authorized recovered completion"),
@@ -353,13 +353,13 @@ pub(super) struct FaultFixture {
 }
 fn inspect(fixture: &FaultFixture) -> InspectedRecoveryIds {
     let mut opening = fixture.runtime.begin_checkpoint_recovery().unwrap();
-    let selected = fixture.io.block(|| Ok(opening.poll()?)).unwrap();
+    let selected = fixture.io.block(|| opening.poll()).unwrap();
     let mut physical = selected
         .begin_physical_read(crate::OpenOptions::new(Arc::new(crate::EngineDialect)))
         .unwrap();
-    let physical = fixture.io.block(|| Ok(physical.poll()?)).unwrap();
+    let physical = fixture.io.block(|| physical.poll()).unwrap();
     let mut loading = physical.begin_id_inspection().unwrap();
-    fixture.io.block(|| Ok(loading.poll()?)).unwrap()
+    fixture.io.block(|| loading.poll()).unwrap()
 }
 fn fault_fixture(target_only: bool) -> FaultFixture {
     fault_fixture_with_seed(target_only, false)
@@ -438,12 +438,12 @@ pub(super) fn fault_fixture_with_seed_and_io(
         .token
         .begin_completion(fixture.materialized, fixture.prepared)
         .unwrap();
-    let completed = fixture.io.block(|| Ok(publication.poll()?)).unwrap();
+    let completed = fixture.io.block(|| publication.poll()).unwrap();
     let (proof, mut guard, ids) = completed.into_parts();
     guard.publish_checkpoint(&proof).unwrap();
     let (guard, proof) = if target_only {
         let mut finalizer = ids.finalize(guard, proof).unwrap();
-        let finalized = fixture.io.block(|| Ok(finalizer.poll()?)).unwrap();
+        let finalized = fixture.io.block(|| finalizer.poll()).unwrap();
         let (ids, proof) = finalized.into_parts();
         (ids.into_guard(), proof)
     } else {
@@ -545,7 +545,7 @@ fn checkpoint_recovery_confirmation_native_failures_preserve_selected_durable_no
                 .unwrap()
                 .begin_confirmation()
                 .unwrap();
-            let error = match fixture.io.block(|| Ok(state.poll()?)) {
+            let error = match fixture.io.block(|| state.poll()) {
                 Err(error) => error,
                 Ok(_) => panic!("confirmation escaped failed mutation {boundary}/{callback_error}"),
             };
@@ -572,7 +572,7 @@ fn checkpoint_recovery_confirmation_native_failures_preserve_selected_durable_no
             drop(guard);
             let inspected = inspect(&fixture);
             let mut retry = inspected.begin_confirmation().unwrap();
-            let confirmed = fixture.io.block(|| Ok(retry.poll()?)).unwrap();
+            let confirmed = fixture.io.block(|| retry.poll()).unwrap();
             assert!(confirmed.guard().requires_recovery());
             assert!(confirmed.proof().matches_lease(confirmed.guard()));
             assert!(matches!(
@@ -666,7 +666,7 @@ fn checkpoint_recovery_confirmation_native_waits_final_sync_backend_before_proof
     ));
     fixture.control.retire();
     fixture.io.wait_for_completion(waiter.0).unwrap();
-    let confirmed = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+    let confirmed = fixture.io.block(|| state.poll()).unwrap();
     assert!(confirmed.proof().matches_lease(confirmed.guard()));
     assert!(confirmed.guard().requires_recovery());
     assert!(confirmed.guard().published().is_err());
@@ -697,7 +697,7 @@ fn checkpoint_recovery_confirmation_native_reselects_exact_record_before_writes(
         .unwrap()
         .begin_confirmation()
         .unwrap();
-    let error = match fixture.io.block(|| Ok(state.poll()?)) {
+    let error = match fixture.io.block(|| state.poll()) {
         Err(error) => error,
         Ok(_) => panic!("stale inspection confirmed a newly selected manifest"),
     };
@@ -711,7 +711,7 @@ fn checkpoint_recovery_confirmation_native_reselects_exact_record_before_writes(
     let inspected = inspect(&fixture);
     assert_eq!(inspected.record, newer);
     let mut retry = inspected.begin_confirmation().unwrap();
-    let confirmed = fixture.io.block(|| Ok(retry.poll()?)).unwrap();
+    let confirmed = fixture.io.block(|| retry.poll()).unwrap();
     assert!(confirmed.guard().requires_recovery());
 }
 
@@ -730,7 +730,7 @@ fn checkpoint_recovery_confirmation_native_finalized_selector_does_not_infer_sou
         usize::MAX,
     );
     let mut state = inspected.begin_confirmation().unwrap();
-    let confirmed = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+    let confirmed = fixture.io.block(|| state.poll()).unwrap();
     assert_eq!(confirmed.proof().source_identity(), None);
     assert_eq!(confirmed.proof().source_database(), None);
     assert_eq!(confirmed.max_owner_epoch(), maximum);
@@ -761,7 +761,7 @@ fn checkpoint_recovery_confirmation_native_preserves_owner_epoch_and_distinct_ph
         "fixture did not distinguish permanent ID floor from physical extent"
     );
     let mut state = inspected.begin_confirmation().unwrap();
-    let confirmed = fixture.io.block(|| Ok(state.poll()?)).unwrap();
+    let confirmed = fixture.io.block(|| state.poll()).unwrap();
     assert_eq!(
         confirmed.max_owner_epoch(),
         maximum,

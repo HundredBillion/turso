@@ -22229,11 +22229,13 @@ mod shared_begin_tests {
     use crate::{ConnectOpts, Database, EngineDialect, OpenOptions, IO};
     use std::os::unix::fs::MetadataExt;
 
+    type PendingRead = (Arc<dyn File>, u64, Completion);
+
     #[derive(Default)]
     struct DelayedReads {
         enabled: std::sync::atomic::AtomicBool,
         release_retained: std::sync::atomic::AtomicBool,
-        pending: crate::sync::Mutex<Vec<(Arc<dyn File>, u64, Completion)>>,
+        pending: crate::sync::Mutex<Vec<PendingRead>>,
         retained: crate::sync::Mutex<Vec<Completion>>,
     }
     struct DelayedManifestFile {

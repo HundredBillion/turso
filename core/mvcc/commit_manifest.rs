@@ -1132,9 +1132,11 @@ mod tests {
         );
     }
 
+    type PendingManifestOperation = (Option<(u64, Arc<Buffer>)>, Completion);
+
     struct DelayedManifestFile {
         bytes: Mutex<Vec<u8>>,
-        pending: Mutex<Option<(Option<(u64, Arc<Buffer>)>, Completion)>>,
+        pending: Mutex<Option<PendingManifestOperation>>,
         syncs: std::sync::atomic::AtomicUsize,
         pending_read: Mutex<Option<(u64, Completion)>>,
     }
