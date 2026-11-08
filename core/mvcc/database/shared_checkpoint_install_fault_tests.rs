@@ -16,6 +16,7 @@ struct Pending {
 }
 
 struct Control {
+    fail_finish: crate::sync::atomic::AtomicBool,
     step: AtomicUsize,
     fail: AtomicUsize,
     delay: AtomicUsize,
@@ -25,6 +26,7 @@ struct Control {
 impl Default for Control {
     fn default() -> Self {
         Self {
+            fail_finish: crate::sync::atomic::AtomicBool::new(false),
             step: AtomicUsize::new(0),
             fail: AtomicUsize::new(usize::MAX),
             delay: AtomicUsize::new(usize::MAX),
@@ -80,6 +82,7 @@ impl Control {
 }
 
 struct ControlledFile {
+    authority: bool,
     inner: Arc<dyn File>,
     control: Arc<Control>,
 }
@@ -108,12 +111,49 @@ impl File for ControlledFile {
         self.inner.pwrite(offset, bytes, completion)
     }
     fn truncate(&self, size: u64, completion: Completion) -> Result<Completion> {
+        if self.authority {
+            return self.inner.truncate(size, completion);
+        }
         self.control
             .mutation(self.inner.clone(), Mutation::Truncate(size), completion)
     }
     fn sync(&self, completion: Completion, kind: FileSyncType) -> Result<Completion> {
+        if self.authority {
+            return self.inner.sync(completion, kind);
+        }
         self.control
             .mutation(self.inner.clone(), Mutation::Sync(kind), completion)
+    }
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: crate::io::SharedWalLockKind,
+    ) -> Result<bool> {
+        self.inner.shared_wal_try_lock_byte(offset, exclusive, kind)
+    }
+    fn shared_wal_unlock_byte(
+        &self,
+        offset: u64,
+        kind: crate::io::SharedWalLockKind,
+    ) -> Result<()> {
+        self.inner.shared_wal_unlock_byte(offset, kind)?;
+        if self.authority && offset == 1 && self.control.fail_finish.swap(false, Ordering::AcqRel) {
+            return Err(LimboError::InvalidArgument(
+                "injected publication unlock failure".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        self.inner.shared_wal_set_len(len)
+    }
+    fn shared_wal_map(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<Box<dyn crate::io::SharedWalMappedRegion>> {
+        self.inner.shared_wal_map(offset, len)
     }
 }
 struct ControlledIo {
@@ -131,8 +171,10 @@ impl crate::Clock for ControlledIo {
 impl crate::IO for ControlledIo {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         let inner = self.inner.open_file(path, flags, direct)?;
-        if Path::new(path).file_name().and_then(|name| name.to_str()) == Some("logical") {
+        let name = Path::new(path).file_name().and_then(|name| name.to_str());
+        if matches!(name, Some("logical" | "authority")) {
             Ok(Arc::new(ControlledFile {
+                authority: name == Some("authority"),
                 inner,
                 control: self.control.clone(),
             }))
@@ -445,4 +487,69 @@ fn shared_checkpoint_install_native_waits_for_sync_backend_before_store_mutation
         &roots,
         &fixture.store.table_id_to_rootpage.load_full()
     ));
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_checkpoint_ready_native_rejects_foreign_connection_with_same_schema() {
+    let mut fixture = fixture();
+    let mut installing = installer(&mut fixture);
+    let installed = fixture.io.block(|| installing.poll()).unwrap();
+    let foreign = fixture
+        .connection
+        .db
+        ._connect_with_pager_and_default_cache_size(true, fixture.connection.get_pager(), None, 0)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &foreign.schema.read(),
+        &fixture.connection.schema.read()
+    ));
+    let error = installed.publish_ready(foreign).unwrap_err();
+    assert!(error.to_string().contains("original connection"), "{error}");
+    assert!(fixture.runtime.replay.lock().is_none());
+    assert!(fixture.runtime.gate.try_enter_admission().is_ok());
+}
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem"]
+fn shared_checkpoint_ready_native_late_failures_leave_no_replay() {
+    for boundary in 0..3 {
+        let mut fixture = fixture();
+        let mut installing = installer(&mut fixture);
+        let installed = fixture.io.block(|| installing.poll()).unwrap();
+        let pager = fixture.connection.get_pager();
+        match boundary {
+            0 => {
+                fixture
+                    .store
+                    .last_committed_tx_ts
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            1 => pager.begin_read_tx().unwrap(),
+            2 => fixture.control.fail_finish.store(true, Ordering::Release),
+            _ => unreachable!(),
+        }
+        let error = installed
+            .publish_ready(fixture.connection.clone())
+            .unwrap_err();
+        match boundary {
+            0 => assert!(error.to_string().contains("installed metadata"), "{error}"),
+            1 => {
+                assert!(matches!(error, LimboError::Busy), "{error}");
+                pager.end_read_tx();
+            }
+            2 => assert!(
+                error
+                    .to_string()
+                    .contains("injected publication unlock failure"),
+                "{error}"
+            ),
+            _ => unreachable!(),
+        }
+        assert!(
+            fixture.runtime.replay.lock().is_none(),
+            "failed readiness retained replay at {boundary}"
+        );
+        assert!(fixture.runtime.gate.try_enter_admission().is_ok());
+    }
 }

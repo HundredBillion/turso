@@ -9,13 +9,61 @@ pub(in crate::mvcc) struct InstalledLocalCheckpoint {
     pause: CheckpointPause,
     replay: Arc<SharedReplayContext>,
     schema: Arc<Schema>,
+    original_connection: crate::sync::Weak<Connection>,
 }
 
 impl InstalledLocalCheckpoint {
-    pub(in crate::mvcc) fn publish_ready(self, _connection: Arc<Connection>) -> Result<()> {
-        Err(LimboError::InvalidArgument(
-            "completed checkpoint readiness publication is not implemented".into(),
-        ))
+    pub(in crate::mvcc) fn publish_ready(self, connection: Arc<Connection>) -> Result<()> {
+        if !crate::sync::Weak::ptr_eq(&self.original_connection, &Arc::downgrade(&connection)) {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint handoff requires its original connection".into(),
+            ));
+        }
+        let store = connection
+            .db
+            .get_mv_store()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InvalidArgument("checkpoint handoff lost its store".into())
+            })?;
+        let runtime = store.shared_runtime.get().ok_or_else(|| {
+            LimboError::InvalidArgument("checkpoint handoff lost its runtime".into())
+        })?;
+        let target = self.proof.target_identity();
+        if !runtime.owns_authority(&self.guard)
+            || !self.proof.matches_lease(&self.guard)
+            || self.guard.published()? != target.prefix
+            || target.prefix.end_offset != 0
+            || target.prefix.running_crc != 0
+            || target.database.checkpoint_timestamp != target.prefix.committed_timestamp
+            || !self.replay.matches_oracle_identity(target)
+            || store.last_committed_tx_ts.load(Ordering::Acquire)
+                != target.prefix.committed_timestamp
+            || store.durable_txid_max.load(Ordering::Acquire)
+                != target.database.checkpoint_timestamp
+            || !Arc::ptr_eq(&self.schema, &connection.db.schema.lock())
+            || !Arc::ptr_eq(&self.schema, &connection.schema.read())
+        {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint handoff no longer matches installed metadata".into(),
+            ));
+        }
+        let logical: Arc<dyn File> = runtime.logical.clone();
+        let storage = runtime.storage.shared_commit_snapshot(&logical)?;
+        if storage.offset != 0 || storage.running_crc != 0 || storage.header.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint handoff has nonempty append state".into(),
+            ));
+        }
+        runtime.certify_completed_pager(&connection, &self.proof, &self.guard)?;
+        *runtime.replay.lock() = Some(self.replay);
+        let result = self.guard.finish();
+        if result.is_err() {
+            runtime.replay.lock().take();
+        }
+        drop(self.pause);
+        result
     }
 }
 
@@ -242,6 +290,7 @@ impl<C: LogicalClock, A: ConcurrentAllocator> SharedCheckpointLocalInstall<C, A>
                         pause: self.pause.take().unwrap(),
                         replay: self.replay.take().unwrap(),
                         schema,
+                        original_connection: Arc::downgrade(&self.connection),
                     }));
                 }
                 Phase::Finished => {
