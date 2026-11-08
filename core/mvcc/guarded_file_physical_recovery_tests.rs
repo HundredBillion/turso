@@ -195,3 +195,70 @@ fn physical_wal_recovery_native_binding_retains_both_authorities_until_backend_r
         }
     }
 }
+
+#[test]
+#[ignore = "requires native Linux ext-family filesystem and OFD locks"]
+fn physical_wal_recovery_native_binding_rejects_foreign_mapping_and_authority() {
+    let left_directory = tempfile::tempdir().unwrap();
+    let right_directory = tempfile::tempdir().unwrap();
+    let (left_path, left_limit) = shared_runtime_fixture(left_directory.path());
+    let (right_path, right_limit) = shared_runtime_fixture(right_directory.path());
+    let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+    let open_runtime = |path: &std::path::Path, limit| {
+        let canonical = path.canonicalize().unwrap();
+        let raw = io
+            .open_file(canonical.to_str().unwrap(), OpenFlags::NoLock, false)
+            .unwrap();
+        let id = raw.file_id().unwrap().unwrap();
+        SharedMvccRuntime::open_existing(io.clone(), raw, id, &canonical, limit, false).unwrap()
+    };
+    let left = open_runtime(&left_path, left_limit);
+    let right = open_runtime(&right_path, right_limit);
+    let mut left_open = left.begin_checkpoint_recovery().unwrap();
+    let left_selection = io.block(|| left_open.poll()).unwrap();
+    let mut right_open = right.begin_checkpoint_recovery().unwrap();
+    let right_selection = io.block(|| right_open.poll()).unwrap();
+    let id = left.main_file().file_id().unwrap().unwrap();
+    let namespace =
+        crate::mvcc::mode_transition::namespace_for(&left_path.canonicalize().unwrap(), id)
+            .unwrap();
+    let substitute = Arc::new(
+        crate::storage::shared_wal_coordination::MappedSharedWalCoordination::open_existing(
+            &io,
+            &namespace.join("physical-tshm"),
+            64,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(
+        substitute.file_id().unwrap(),
+        left.physical_coordination().file_id().unwrap()
+    );
+    assert!(!Arc::ptr_eq(&substitute, &left.physical_coordination()));
+    let foreign = SharedWalRecoveryLocks::acquire(substitute).unwrap();
+    assert!(
+        matches!(left.bind_physical_recovery_files(left_selection.manifest.guard().unwrap(), &foreign), Err(LimboError::InvalidArgument(message)) if message.contains("changed owner or native file"))
+    );
+    assert!(matches!(
+        left.main_file()
+            .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync),
+        Err(LimboError::Busy)
+    ));
+    drop(foreign);
+    let physical = SharedWalRecoveryLocks::acquire(left.physical_coordination()).unwrap();
+    assert!(
+        matches!(left.bind_physical_recovery_files(right_selection.manifest.guard().unwrap(), &physical), Err(LimboError::InvalidArgument(message)) if message.contains("retained runtime files"))
+    );
+    assert!(matches!(
+        left.main_file()
+            .sync(Completion::new_sync(|_| {}), FileSyncType::FullFsync),
+        Err(LimboError::Busy)
+    ));
+    let bindings = left
+        .bind_physical_recovery_files(left_selection.manifest.guard().unwrap(), &physical)
+        .unwrap();
+    assert_eq!(bindings.len(), 2);
+    drop(bindings);
+    drop(physical);
+}

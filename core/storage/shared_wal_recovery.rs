@@ -335,6 +335,193 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LockFaults {
+        tries: AtomicU64,
+        fail_try: AtomicU64,
+        busy_try: AtomicU64,
+        unlocks: AtomicU64,
+        fail_unlock: AtomicU64,
+    }
+    struct FaultFile {
+        inner: Arc<dyn File>,
+        faults: Arc<LockFaults>,
+    }
+    impl File for FaultFile {
+        fn file_id(&self) -> Result<Option<FileId>> {
+            self.inner.file_id()
+        }
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, offset: u64, completion: Completion) -> Result<Completion> {
+            self.inner.pread(offset, completion)
+        }
+        fn pwrite(
+            &self,
+            offset: u64,
+            buffer: Arc<crate::Buffer>,
+            completion: Completion,
+        ) -> Result<Completion> {
+            self.inner.pwrite(offset, buffer, completion)
+        }
+        fn sync(&self, completion: Completion, kind: FileSyncType) -> Result<Completion> {
+            self.inner.sync(completion, kind)
+        }
+        fn truncate(&self, size: u64, completion: Completion) -> Result<Completion> {
+            self.inner.truncate(size, completion)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn shared_wal_try_lock_byte(
+            &self,
+            offset: u64,
+            exclusive: bool,
+            kind: SharedWalLockKind,
+        ) -> Result<bool> {
+            let ordinal = self.faults.tries.fetch_add(1, Ordering::AcqRel) + 1;
+            if self.faults.fail_try.load(Ordering::Acquire) == ordinal {
+                return Err(LimboError::LockingError(
+                    "injected physical acquisition error".into(),
+                ));
+            }
+            if self.faults.busy_try.load(Ordering::Acquire) == ordinal {
+                return Ok(false);
+            }
+            self.inner.shared_wal_try_lock_byte(offset, exclusive, kind)
+        }
+        fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+            if offset != PROCESS_LIFETIME_LOCK_OFFSET {
+                let ordinal = self.faults.unlocks.fetch_add(1, Ordering::AcqRel) + 1;
+                if self.faults.fail_unlock.load(Ordering::Acquire) == ordinal {
+                    return Err(LimboError::LockingError(
+                        "injected physical unlock error".into(),
+                    ));
+                }
+            }
+            self.inner.shared_wal_unlock_byte(offset, kind)
+        }
+    }
+    fn faulty_mapping(path: &Path, faults: Arc<LockFaults>) -> Arc<MappedSharedWalCoordination> {
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let mut mapping = MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap();
+        mapping.file = Arc::new(FaultFile {
+            inner: mapping.file.clone(),
+            faults,
+        });
+        Arc::new(mapping)
+    }
+    fn foreign_file(path: &Path) -> Arc<dyn File> {
+        let io: Arc<dyn IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        io.open_file(path.to_str().unwrap(), OpenFlags::NoLock, false)
+            .unwrap()
+    }
+    fn assert_poisoned(mapping: &Arc<MappedSharedWalCoordination>) {
+        assert!(
+            matches!(SharedWalRecoveryLocks::acquire(mapping.clone()), Err(LimboError::InvalidArgument(message)) if message.contains("lost native lock ownership"))
+        );
+        assert!(!mapping.try_acquire_writer(mapping.owner_record()));
+        assert!(!mapping.try_acquire_checkpoint(mapping.owner_record()));
+        assert!(mapping.register_reader(mapping.owner_record(), 1).is_none());
+        assert!(mapping
+            .register_db_file_reader(mapping.owner_record())
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires native Linux OFD locks"]
+    fn physical_wal_recovery_native_acquisition_failures_release_only_owned_prefix() {
+        for busy in [false, true] {
+            for at in 1..=66 {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("tshm");
+                let faults = Arc::new(LockFaults::default());
+                let mapping = faulty_mapping(&path, faults.clone());
+                if busy {
+                    faults.busy_try.store(at, Ordering::Release);
+                } else {
+                    faults.fail_try.store(at, Ordering::Release);
+                }
+                let result = SharedWalRecoveryLocks::acquire(mapping.clone());
+                if busy {
+                    assert!(matches!(result, Err(LimboError::Busy)));
+                } else {
+                    assert!(
+                        matches!(result, Err(LimboError::LockingError(message)) if message == "injected physical acquisition error")
+                    );
+                }
+                assert_eq!(faults.unlocks.load(Ordering::Acquire), at - 1);
+                assert!(!mapping.local_lock_state.lock().recovery_poisoned);
+                let foreign = foreign_file(&path);
+                for offset in 1..67 {
+                    assert!(foreign
+                        .shared_wal_try_lock_byte(offset, true, mapping.lock_kind())
+                        .unwrap());
+                    foreign
+                        .shared_wal_unlock_byte(offset, mapping.lock_kind())
+                        .unwrap();
+                }
+                drop(SharedWalRecoveryLocks::acquire(mapping).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native Linux OFD locks"]
+    fn physical_wal_recovery_native_unlock_failures_poison_incomplete_cleanup_and_drop() {
+        for fail_at in 1..=66 {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("tshm");
+            let faults = Arc::new(LockFaults::default());
+            let mapping = faulty_mapping(&path, faults.clone());
+            let recovery = SharedWalRecoveryLocks::acquire(mapping.clone()).unwrap();
+            let failed_offset = recovery.offsets[66 - fail_at as usize];
+            faults.fail_unlock.store(fail_at, Ordering::Release);
+            drop(recovery);
+            assert_eq!(faults.unlocks.load(Ordering::Acquire), 66);
+            assert_poisoned(&mapping);
+            let foreign = foreign_file(&path);
+            for offset in 1..67 {
+                let acquired = foreign
+                    .shared_wal_try_lock_byte(offset, true, mapping.lock_kind())
+                    .unwrap();
+                assert_eq!(acquired, offset != failed_offset);
+                if acquired {
+                    foreign
+                        .shared_wal_unlock_byte(offset, mapping.lock_kind())
+                        .unwrap();
+                }
+            }
+            drop(mapping);
+            assert!(foreign
+                .shared_wal_try_lock_byte(failed_offset, true, SharedWalLockKind::LinuxOfd)
+                .unwrap());
+            foreign
+                .shared_wal_unlock_byte(failed_offset, SharedWalLockKind::LinuxOfd)
+                .unwrap();
+        }
+        for failed_acquisition in 2..=66 {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("tshm");
+            let faults = Arc::new(LockFaults::default());
+            let mapping = faulty_mapping(&path, faults.clone());
+            faults.fail_try.store(failed_acquisition, Ordering::Release);
+            faults.fail_unlock.store(1, Ordering::Release);
+            assert!(
+                matches!(SharedWalRecoveryLocks::acquire(mapping.clone()), Err(LimboError::LockingError(message)) if message == "injected physical unlock error")
+            );
+            assert_eq!(
+                faults.unlocks.load(Ordering::Acquire),
+                failed_acquisition - 1
+            );
+            assert_poisoned(&mapping);
+        }
+    }
+
     #[test]
     #[ignore = "subprocess helper; requires parent physical participant parameters"]
     fn physical_wal_recovery_child() {
