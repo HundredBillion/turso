@@ -32,6 +32,16 @@ pub(super) struct IntentCrashFixture {
 }
 impl IntentCrashFixture {
     pub fn new(point: CrashPoint, acknowledged_commits: usize) -> Self {
+        Self::with_parent_io(point, acknowledged_commits, |_| {
+            Arc::new(crate::io::SyscallIO::new().unwrap())
+        })
+    }
+
+    pub fn with_parent_io(
+        point: CrashPoint,
+        acknowledged_commits: usize,
+        factory: impl FnOnce(&Path) -> Arc<dyn crate::IO>,
+    ) -> Self {
         eprintln!(
             "checkpoint crash fixture {point:?}, acknowledged commits={acknowledged_commits}"
         );
@@ -45,7 +55,7 @@ impl IntentCrashFixture {
         );
         child.kill();
         assert_eq!(std::fs::read(&path).unwrap(), main_before);
-        let io: Arc<dyn crate::IO> = Arc::new(crate::io::SyscallIO::new().unwrap());
+        let io = factory(&path);
         let canonical = path.canonicalize().unwrap();
         let main = io
             .open_file(canonical.to_str().unwrap(), crate::OpenFlags::NoLock, false)

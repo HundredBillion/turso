@@ -118,3 +118,6 @@ fn checkpoint_recovery_intent_native_mirrors_actual_crashed_selection() {
         }
     }
 }
+
+#[path = "shared_checkpoint_intent_io_tests.rs"]
+mod io_tests;
