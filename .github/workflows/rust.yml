@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 63693f98db98fb9ee0f86bf4e9df46033d06dde0
+          ref: fa22532749e2c20839ad12b678fc8985d9b83fa6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -26,7 +26,7 @@ jobs:
           cache-on-failure: true
       - name: Exact native source
         run: |
-          test "$(git rev-parse HEAD)" = "63693f98db98fb9ee0f86bf4e9df46033d06dde0"
+          test "$(git rev-parse HEAD)" = "fa22532749e2c20839ad12b678fc8985d9b83fa6"
           test "$(id -u)" -ne 0
           stat -f -c '%T %t' . /tmp
       - name: Final checkpoint readiness
@@ -121,7 +121,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 63693f98db98fb9ee0f86bf4e9df46033d06dde0
+          ref: fa22532749e2c20839ad12b678fc8985d9b83fa6
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
