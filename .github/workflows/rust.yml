@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 318bd2dd09786d70a61af7eb863c01fbc4282486
+          ref: ed4502bee2ca597eb13045edc8dd65d5fc866f4a
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee source.txt
-          test "$(git rev-parse HEAD)" = 318bd2dd09786d70a61af7eb863c01fbc4282486
+          test "$(git rev-parse HEAD)" = ed4502bee2ca597eb13045edc8dd65d5fc866f4a
           cargo test --locked -p turso_core --lib --features conn_raw_api checkpoint_recovery_intent_native_crash_fixtures_keep_acknowledged_source -- --ignored --test-threads=1 --nocapture 2>&1 | tee crash-fixture-green.log
           grep -q '1 passed; 0 failed' crash-fixture-green.log
       - name: Missing intent mirror must fail behaviorally
@@ -47,7 +47,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: interrupted-intent-fixture-red-318bd2dd0
+          name: interrupted-intent-fixture-red-ed4502bee
           path: |
             source.txt
             *.log
