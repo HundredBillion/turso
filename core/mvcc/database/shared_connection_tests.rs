@@ -81,11 +81,18 @@ fn shared_connection_native_cancel_keeps_header_authority_until_backend_release(
                 .lock()
                 .take()
                 .expect("constructor did not submit expected header read");
+            if read_offset == 2 {
+                assert!(runtime.physical_coordination().has_active_db_file_reader());
+            }
             if complete_before_drop {
                 held.complete();
             }
             drop(waiter);
             drop(state);
+            assert!(
+                !runtime.physical_coordination().has_active_db_file_reader(),
+                "cancelled page-one initialization retained its physical read lock"
+            );
             assert!(
                 matches!(runtime.files.authority.try_acquire(), Err(LimboError::Busy)),
                 "cancelled header read released authority before backend release"

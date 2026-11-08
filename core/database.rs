@@ -3360,7 +3360,14 @@ impl Database {
                             ConnectionContext::default(),
                         )?);
                     }
-                    return_if_io!(state.shared.as_mut().unwrap().poll(self))
+                    match state.shared.as_mut().unwrap().poll(self) {
+                        Ok(IOResult::Done(connection)) => connection,
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(error) => {
+                            state.shared = None;
+                            return Err(error);
+                        }
+                    }
                 } else {
                     self._connect(
                         false,
