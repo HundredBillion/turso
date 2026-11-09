@@ -62,3 +62,5 @@ Focused C URI and capability tests may run before the recovery integrations are 
 - [ ] Verify default immediate BUSY and a configured bounded timeout with no transaction admission, followed by a successful prepare after guard release.
 - [ ] Use the existing handler/backoff only for initial lock acquisition; preserve all later errors and lifetime cleanup.
 - [ ] Run the native counterexamples, existing prepare/cancellation tests, strict lint, and unchanged simultaneous-BEGIN PHP overlap barrier.
+
+The C prepare bridge must release its handle mutex around Core preparation so a busy callback can observe `sqlite3_db_readonly` and `sqlite3_errcode`. A scoped count of preparing statements preserves close protection and defers zombie collation cleanup; errors and successful registration release the count exactly once. Native callback coverage also attempts close from another thread while preparation is in flight and requires BUSY. Same-connection mutation from the busy callback remains outside the SQLite contract.

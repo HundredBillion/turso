@@ -204,6 +204,7 @@ struct sqlite3Inner {
     pub(crate) p_err: Option<CString>,
     pub(crate) filename: CString,
     pub(crate) stmt_list: *mut sqlite3_stmt,
+    preparing_statements: usize,
     inactive_collations: HashMap<String, UserData>,
     /// Set when the caller opened "" and we created a private on-disk
     /// database for it; the file is removed when the handle goes away.
@@ -228,6 +229,7 @@ impl sqlite3Inner {
             p_err: None,
             filename,
             stmt_list: std::ptr::null_mut(),
+            preparing_statements: 0,
             inactive_collations: HashMap::new(),
             temp_path: None,
         }
@@ -818,7 +820,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
         if inner.e_open_state == SQLITE_STATE_ZOMBIE {
             return SQLITE_MISUSE;
         }
-        if !inner.stmt_list.is_null() {
+        if !inner.stmt_list.is_null() || inner.preparing_statements != 0 {
             set_db_err_msg(
                 &mut inner,
                 SQLITE_BUSY,
@@ -847,7 +849,7 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
             return SQLITE_MISUSE;
         }
         inner.e_open_state = SQLITE_STATE_ZOMBIE;
-        if inner.stmt_list.is_null() {
+        if inner.stmt_list.is_null() && inner.preparing_statements == 0 {
             std::mem::take(&mut inner.inactive_collations)
         } else {
             HashMap::new()
@@ -1115,9 +1117,18 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         return SQLITE_MISUSE;
     }
     let db_handle = sqlite3::clone_from_raw(raw_db);
-    let mut db = db_handle.inner.lock().unwrap();
-    let Some(conn) = db.connection() else {
-        return SQLITE_MISUSE;
+    let (conn, _preparing) = {
+        let mut db = db_handle.inner.lock().unwrap();
+        let Some(conn) = db.connection().cloned() else {
+            return SQLITE_MISUSE;
+        };
+        db.preparing_statements += 1;
+        (
+            conn,
+            PreparingStatement {
+                db: db_handle.clone(),
+            },
+        )
     };
     // SQLite C-API contract (https://www.sqlite.org/c3ref/prepare.html):
     //   If nByte is negative, zSql is read up to the first zero terminator.
@@ -1137,7 +1148,11 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     let sql_str = match std::str::from_utf8(sql_bytes) {
         Ok(s) => s,
         Err(_) => {
-            return set_db_err_code(&mut db, SQLITE_MISUSE);
+            let code = {
+                let mut db = db_handle.inner.lock().unwrap();
+                set_db_err_code(&mut db, SQLITE_MISUSE)
+            };
+            return code;
         }
     };
     let stmt = match conn.prepare(sql_str) {
@@ -1156,7 +1171,11 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             return SQLITE_OK;
         }
         Err(err) => {
-            return set_db_err(&mut db, err);
+            let code = {
+                let mut db = db_handle.inner.lock().unwrap();
+                set_db_err(&mut db, err)
+            };
+            return code;
         }
     };
     if !tail.is_null() {
@@ -1176,13 +1195,45 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         }
         *tail = sql.add(off);
     }
+    let mut db = db_handle.inner.lock().unwrap();
+    if !db
+        .connection()
+        .is_some_and(|current| Arc::ptr_eq(current, &conn))
+    {
+        drop(db);
+        return SQLITE_MISUSE;
+    }
     let new_stmt = Box::leak(Box::new(sqlite3_stmt::new(db_handle.clone(), stmt)));
 
     new_stmt.next = db.stmt_list;
     db.stmt_list = new_stmt;
 
     *out_stmt = new_stmt;
+    drop(db);
     SQLITE_OK
+}
+
+struct PreparingStatement {
+    db: Arc<sqlite3>,
+}
+
+impl Drop for PreparingStatement {
+    fn drop(&mut self) {
+        let inactive = {
+            let mut inner = self.db.inner.lock().unwrap();
+            assert!(inner.preparing_statements > 0);
+            inner.preparing_statements -= 1;
+            if inner.preparing_statements == 0
+                && inner.e_open_state == SQLITE_STATE_ZOMBIE
+                && inner.stmt_list.is_null()
+            {
+                std::mem::take(&mut inner.inactive_collations)
+            } else {
+                HashMap::new()
+            }
+        };
+        drop(inactive);
+    }
 }
 
 /// sqlite3_prepare_v3 is identical to sqlite3_prepare_v2 but accepts a
@@ -1252,7 +1303,10 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     drop(Box::from_raw(stmt));
     let inactive = {
         let mut inner = handle.inner.lock().unwrap();
-        if inner.e_open_state == SQLITE_STATE_ZOMBIE && inner.stmt_list.is_null() {
+        if inner.e_open_state == SQLITE_STATE_ZOMBIE
+            && inner.stmt_list.is_null()
+            && inner.preparing_statements == 0
+        {
             std::mem::take(&mut inner.inactive_collations)
         } else {
             HashMap::new()
@@ -4391,12 +4445,22 @@ mod tests {
             readonly: i32,
             error: i32,
             released: bool,
+            ready: std::sync::mpsc::Sender<()>,
+            closed: std::sync::mpsc::Receiver<()>,
         }
         unsafe extern "C" fn busy(context: *mut ffi::c_void, count: ffi::c_int) -> ffi::c_int {
             let context = &mut *context.cast::<Context>();
             context.count = count + 1;
             context.readonly = sqlite3_db_readonly(context.handle, c"main".as_ptr());
             context.error = sqlite3_errcode(context.handle);
+            if context.ready.send(()).is_err()
+                || context
+                    .closed
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err()
+            {
+                return 0;
+            }
             context.released = context
                 .release
                 .take()
@@ -4413,6 +4477,20 @@ mod tests {
             turso_core::mvcc::database::hold_shared_prepare_authority_for_test(&connection)
                 .unwrap();
         let handle = sqlite3::new(connection, CString::new("callback.db").unwrap()).into_raw();
+        let (ready, await_ready) = std::sync::mpsc::channel();
+        let (finished_close, closed) = std::sync::mpsc::channel();
+        let address = handle as usize;
+        let closing = std::thread::spawn(move || {
+            if await_ready
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_err()
+            {
+                return SQLITE_MISUSE;
+            }
+            let result = unsafe { sqlite3_close(address as *mut sqlite3) };
+            let _ = finished_close.send(());
+            result
+        });
         let mut context = Context {
             handle,
             release: Some(release),
@@ -4420,6 +4498,8 @@ mod tests {
             readonly: -1,
             error: -1,
             released: false,
+            ready,
+            closed,
         };
         unsafe {
             assert_eq!(
@@ -4437,6 +4517,7 @@ mod tests {
                 ),
                 SQLITE_OK
             );
+            assert_eq!(closing.join().unwrap(), SQLITE_BUSY);
             assert_eq!(context.count, 1);
             assert_eq!(context.readonly, 0);
             assert_eq!(context.error, SQLITE_OK);
