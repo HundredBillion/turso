@@ -30,6 +30,30 @@ impl MirroredCheckpointIntent {
         })
     }
 }
+impl CheckpointIntentToken {
+    pub(in crate::mvcc) fn inspect_exact_for_source(
+        &self,
+        guard: &AuthorityGuard,
+        evidence: &RecoveryWalEvidence,
+    ) -> Result<CheckpointIntentInspection> {
+        if !crate::sync::Weak::ptr_eq(&self.lease, &guard.io_lease()) {
+            return Err(LimboError::InvalidArgument(
+                "source intent changed its original lease".into(),
+            ));
+        }
+        let (file, binding) = evidence.inspection_file(&self.file, self.record, guard)?;
+        Ok(CheckpointIntentInspection {
+            load: Some(ManifestLoad::start(file, None, self.record.database_id())?),
+            evidence: evidence.clone(),
+            lease: guard.io_lease(),
+            expected: self.record,
+            selected: false,
+            finished: false,
+            binding: Some(binding),
+        })
+    }
+}
+
 impl CheckpointIntentInspection {
     pub(in crate::mvcc) fn poll(&mut self, guard: &AuthorityGuard) -> IOResultOr<()> {
         let result = self.poll_inner(guard);

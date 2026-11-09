@@ -36,6 +36,9 @@ pub(in crate::mvcc) use shared_checkpoint_recovery_wal::{
 pub(crate) use shared_checkpoint_recovery_wal::{
     RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence,
 };
+pub(crate) use shared_checkpoint_recovery_wal::{
+    SourceAliases, SourceConstructionEvidence, SourceConstructionPermit,
+};
 
 #[path = "shared_checkpoint_recovery_physical.rs"]
 mod shared_checkpoint_recovery_physical;

@@ -109,6 +109,10 @@ pub(crate) use shared_runtime::{
 pub(crate) use shared_runtime::{RecoveredPhysicalWalEvidence, RecoveryWalSyncEvidence};
 #[cfg(all(host_shared_wal, unix))]
 pub(in crate::mvcc) use shared_runtime::{RecoveryCompletionEvidence, RecoveryIntentEvidence};
+#[cfg(all(host_shared_wal, unix))]
+pub(crate) use shared_runtime::{
+    SourceAliases, SourceConstructionEvidence, SourceConstructionPermit,
+};
 
 #[cfg(all(test, host_shared_wal, target_os = "linux", not(shuttle)))]
 #[allow(unused_imports)]

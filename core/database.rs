@@ -808,6 +808,8 @@ pub struct DatabaseSharedState<
     #[cfg(all(host_shared_wal, unix))]
     recovery_construction: Option<Arc<mvcc::database::RecoveryConstructionPermit>>,
     #[cfg(all(host_shared_wal, unix))]
+    source_construction: Option<Arc<mvcc::database::SourceConstructionPermit>>,
+    #[cfg(all(host_shared_wal, unix))]
     offline_marker_recovery: Option<Arc<mvcc::PreparedMarkerRecovery>>,
     #[cfg(all(host_shared_wal, unix))]
     offline_downgrade: Option<Arc<mvcc::PreparedDowngradeMarker>>,
@@ -1021,6 +1023,8 @@ impl Database {
                 shared_mvcc_runtime: None,
                 #[cfg(all(host_shared_wal, unix))]
                 recovery_construction: None,
+                #[cfg(all(host_shared_wal, unix))]
+                source_construction: None,
                 #[cfg(all(host_shared_wal, unix))]
                 offline_marker_recovery: None,
                 #[cfg(all(host_shared_wal, unix))]
@@ -2863,7 +2867,11 @@ impl Database {
                                 if driver.is_none() {
                                     *driver = Some(storage::wal::OpenSharedWal::Build(
                                         storage::sqlite3_ondisk::BuildSharedWal::begin(
-                                            &runtime.physical_wal_file(),
+                                            &if let Some(permit) = &self.source_construction {
+                                                permit.retained_wal(self)?
+                                            } else {
+                                                runtime.physical_wal_file()
+                                            },
                                         )?,
                                     ));
                                 }
@@ -2995,6 +3003,15 @@ impl Database {
                         if !open_mv_store {
                             return Err(LimboError::InvalidArgument(
                                 "recovery construction requires the existing MVCC marker".into(),
+                            )
+                            .into());
+                        }
+                        permit.validate_database(self)?;
+                        true
+                    } else if let Some(permit) = &self.source_construction {
+                        if !open_mv_store {
+                            return Err(LimboError::InvalidArgument(
+                                "source construction requires its existing MVCC marker".into(),
                             )
                             .into());
                         }
@@ -3754,6 +3771,11 @@ impl Database {
     fn open_shared_wal_coordination_inner(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        #[cfg(unix)]
+        if let Some(permit) = &self.source_construction {
+            permit.validate_database(self)?;
+            return Ok(None);
+        }
         #[cfg(unix)]
         if let Some(runtime) = &self.shared_mvcc_runtime {
             return Ok(Some(runtime.physical_coordination()));

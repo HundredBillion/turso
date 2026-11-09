@@ -2,6 +2,7 @@ use super::*;
 use crate::mvcc::commit_manifest::checkpoint_publication::CompletedCheckpointProof;
 
 pub(in crate::mvcc::database) struct SourceStoreLifetime {
+    phase: Mutex<Option<Arc<shared_checkpoint_intent_source::SourcePhysicalPhase>>>,
     lease: Arc<PublicationLease>,
 }
 
@@ -288,6 +289,7 @@ impl RecoveredIntentPhysicalBase {
         Arc::get_mut(&mut store)
             .expect("fresh source Store has a single owner")
             .source_recovery_lifetime = Some(SourceStoreLifetime {
+            phase: Mutex::new(None),
             lease: authority_owner,
         });
         let owner = IntentRecoveryStore {
@@ -1040,3 +1042,7 @@ mod tests {
 
 #[path = "shared_checkpoint_intent_source.rs"]
 mod shared_checkpoint_intent_source;
+
+pub(crate) use shared_checkpoint_intent_source::{
+    SourceAliases, SourceConstructionEvidence, SourceConstructionPermit,
+};

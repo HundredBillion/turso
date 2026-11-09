@@ -699,3 +699,7 @@ pub(in crate::mvcc::database) use shared_checkpoint_intent_store::SourceStoreLif
 
 pub(in crate::mvcc) use shared_checkpoint_intent_store::IntentSourceIdEvidence;
 pub(super) use shared_checkpoint_intent_store::{SourceIdInspection, SourceIdInspectionInput};
+
+pub(crate) use shared_checkpoint_intent_store::{
+    SourceAliases, SourceConstructionEvidence, SourceConstructionPermit,
+};

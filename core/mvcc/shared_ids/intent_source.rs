@@ -113,6 +113,14 @@ impl IntentSourceIdLoad {
 }
 
 impl LoadedSourceIds {
+    pub(in crate::mvcc) fn inspect_source_manifest(
+        &self,
+        evidence: &crate::mvcc::database::RecoveryWalEvidence,
+    ) -> Result<crate::mvcc::commit_manifest::checkpoint_publication::CheckpointIntentInspection>
+    {
+        self.intent.inspect_exact_for_source(self.guard(), evidence)
+    }
+
     pub(in crate::mvcc) fn guard(&self) -> &AuthorityGuard {
         self.loaded.guard()
     }

@@ -1,3 +1,6 @@
+#[path = "shared_source.rs"]
+pub(crate) mod shared_source;
+
 use super::*;
 
 #[allow(dead_code)]
