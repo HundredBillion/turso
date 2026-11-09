@@ -525,6 +525,58 @@ mod tests {
 
     #[test]
     #[ignore = "requires native Linux ext-family filesystem"]
+    fn intent_source_factory_native_private_connection_stays_unadmitted_with_private_wal() {
+        let (fixture, physical) = physical_case(
+            CrashPoint::BeforeWalCommit,
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect)),
+        );
+        let mut inspection = physical
+            .begin_source_store()
+            .unwrap()
+            .begin_source_id_inspection()
+            .unwrap();
+        let inspected = fixture.io.block(|| inspection.poll()).unwrap();
+        let store = Arc::downgrade(&inspected.owner.store);
+        let before = durable(&fixture);
+        let mut construction = inspected.begin_private_source_construction().unwrap();
+        let staging = fixture.io.block(|| construction.poll()).unwrap();
+        let actual_store = store.upgrade().unwrap();
+        assert!(Arc::ptr_eq(
+            staging.database.get_mv_store().as_ref().unwrap(),
+            &actual_store
+        ));
+        assert!(Arc::ptr_eq(&staging.connection.get_pager(), &staging.pager));
+        let wal = staging.pager.wal.as_ref().unwrap();
+        let wal = wal
+            .as_any()
+            .downcast_ref::<crate::storage::wal::WalFile>()
+            .unwrap();
+        assert_eq!(wal.coordination_backend_name(), "in_process");
+        assert!(matches!(
+            staging.connection.prepare("SELECT 1"),
+            Err(LimboError::Busy)
+        ));
+        assert!(matches!(
+            staging.database.connect(crate::ConnectOpts::new()),
+            Err(LimboError::Busy)
+        ));
+        assert!(actual_store.txs.is_empty());
+        assert!(actual_store.rows.is_empty());
+        assert!(fixture.runtime.replay.lock().is_none());
+        assert!(staging.source.ids.guard().requires_recovery());
+        assert!(staging.source.ids.guard().published().is_err());
+        assert!(staging.source.ids.guard().io_retired());
+        assert!(matches!(
+            crate::storage::shared_wal_coordination::SharedWalRecoveryLocks::acquire(
+                fixture.runtime.physical_coordination()
+            ),
+            Err(LimboError::Busy)
+        ));
+        assert_durable(&before);
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
     fn intent_source_ids_native_genuine_source_seeds_actual_floor_without_publication() {
         let (fixture, physical) = physical_case(
             CrashPoint::BeforeWalCommit,
@@ -985,3 +1037,6 @@ mod tests {
         }
     }
 }
+
+#[path = "shared_checkpoint_intent_source.rs"]
+mod shared_checkpoint_intent_source;
