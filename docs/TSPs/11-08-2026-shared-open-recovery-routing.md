@@ -64,21 +64,21 @@ INTENT later enters the same fresh paused-selection decision as a typed successo
 
 ## Task 1: genuine public-open counterexample and routing probe
 
-- [ ] Add an actual completed-checkpoint fixture retaining actual pending IDs, then discard every old Store/Database/Runtime/proof/guard/pause before calling Database::open with shared options. First SQL uses a new normal connect call and must see the acknowledged completed row and commit another update. Observe the current exact missing-public-recovery failure natively before production.
+- [x] Add an actual completed-checkpoint fixture retaining actual pending IDs, then discard every old Store/Database/Runtime/proof/guard/pause before calling Database::open with shared options. First SQL uses a new normal connect call and must see the acknowledged completed row and commit another update. Observe the current exact missing-public-recovery failure natively before production.
 - [ ] Add healthy empty/nonzero-prefix public-open cases with another live reader (same process and real peer process where existing harness fits). They must open/connect without checkpoint pause or forcing the reader out. Also verify complete/corrupt/torn unacknowledged tails under an empty prefix are ignored without content changes by read-only opens, including another live reader. Test typed mismatched selector/manifest rejection.
-- [ ] Implement the bounded actual two-slot read-only selector probe with original guard/native file identity and callback/retirement ownership; no LoadedIds escape or global quiescence. Obtain parent source review.
+- [x] Implement the bounded actual two-slot read-only selector probe with original guard/native file identity and callback/retirement ownership; no LoadedIds escape or global quiescence. Obtain parent source review.
 
 ## Task 2: pre-Store shared-open driver and full normal recovery
 
-- [ ] Implement ordinary healthy transfer and paused fresh reclassification, bounded healthy restart, original-readonly refusal, and explicit normal/intent/downgrade decisions before Store construction. Do not route by mapped recovery flags or error strings.
-- [ ] Drive the accepted actual normal chain to Ready, drop the unused private connection safely, return actual Database through open_shared_async and verify normal connect/post-open SELECT/UPDATE/INSERT/commit plus independent peer observation.
+- [x] Implement ordinary healthy transfer and paused fresh reclassification, bounded healthy restart, original-readonly refusal, and explicit normal/intent/downgrade decisions before Store construction. Do not route by mapped recovery flags or error strings.
+- [x] Drive the accepted actual normal chain to Ready, drop the unused private connection safely, return actual Database through open_shared_async and verify normal connect/post-open SELECT/UPDATE/INSERT/commit plus independent peer observation.
 - [ ] Test matching prepared IDs and healthy finalized IDs with ignored unacknowledged tail bytes, both selector slot parities, captured caller options/native extension/readonly behavior, and no second Store claim. The normal public C URI remains disabled in this slice.
 
 ## Task 3: races, cancellation and integration
 
-- [ ] Exercise candidate-to-healthy reclassification when another legitimate participant finishes and commits after the initial probe; use actual state transitions/I/O boundaries, not fake records or proof flags.
+- [x] Exercise candidate-to-healthy reclassification when another legitimate participant finishes and commits after the initial probe; use actual state transitions/I/O boundaries, not fake records or proof flags.
 - [ ] Inject selector/manifest callback/submission errors and cancellation before callback and after callback before backend retirement. No Store/replay/commit may escape early; native authority remains BUSY until actual retirement. Exercise cancellation during actual subsequent recovery with the already accepted transport fixtures.
-- [ ] Causal controls: bypass candidate routing (genuine public counterexample fails), force healthy into quiescent recovery (live-reader case fails), omit read-retirement/actual reselection (the corresponding real race/ownership test fails). Restore exact source before positive/lint runs.
+- [x] Causal controls: bypass candidate routing (genuine public counterexample fails), force healthy into quiescent recovery (live-reader case fails), omit read-retirement/actual reselection (the corresponding real race/ownership test fails). Restore exact source before positive/lint runs.
 - [ ] Run targeted native public-open/probe/normal-recovery/constructor/ID/watermark cohorts, selected Core/C/SDK/Windows checks appropriate to the final parent union, strict lint/fmt and independent whole-source review. Preserve the accepted Ready/C release and integrate on a separate branch. Public PDO/URI activation and the SOURCE/ACK intent successor require their separate final acceptance, not a test-helper-only success claim.
 
 
@@ -91,3 +91,23 @@ Baseline exact merged source94f425dd9dfc866aad01a11049869d67d413588e (contains p
 Probe source29e22f40ad9fb873bf4aae2a9f9fd0ce6d66d528 native42534317707 SUCCESS: directselector3 (actual prepared readonly facts; healthy live-reader/nonzero prefix/same-guard full ID load and real logical/rowid allocation; reused existing transport cancellation plus successful/error callback retirement), existing transport2, healthy public positives2, unchanged intended pending public0/1RED, strict tests Clippy51.33s/fmt. Parent source-reviewed actual two-page probe and read-view association helper CLEAR. Integrated parent33c atffa0fa849 before driver implementation. Standalone fresh-selection factory7717/testfix4532 is a dependency candidate; its native endpoint gate is separately owned by11558.
 
 New Core state and driver payload are boxed (including Healthy outcome and large stage payloads); this adds only one pointer to OpenDbAsyncState rather than a large inline recovery enum. Existing shared_open boxing is coordinated with the separate measured stack investigation owner. Live driver waits manifest and selector backend retirement before returning classifications/errors or changing admission phase; whole-state cancellation still retains native authority through backend completion pins.
+
+
+## Accepted normal-open implementation and final evidence
+
+Runtime implementation: `097256765512384e519412b923ce5eddc8b33f10`.
+Final tested source: `a343a8df1c5dc8ed0e155b135a38c682daa48a22`; its later changes are tests only. The parent independently reviewed the actual selector probe, retained-file association, driver and Core state wiring and found no blocker.
+
+The ordinary `Database::open` shared path now uses this driver before Store allocation. Matching prepared IDs drive the complete real Normal recovery pipeline to Ready and return its actual Database. Healthy opens transfer ordinary ownership, preserving live readers and ignored unacknowledged tails. Cancellation before/after callback retains native authority until physical retirement; a fresh public retry can allocate real rows. An actual competing public participant completes recovery, commits and retains a reader before the original opener acquires pause, requiring fresh healthy reclassification rather than quiescent recovery of stale facts. Original readonly recovery rejection preserves file contents.
+
+Native [run 42537189887](https://github.com/HundredBillion/turso/actions/runs/42537189887) completed successfully on exact source a343. Raw results were inspected, including exit-status checks with explicit Bash/pipefail:
+
+- Initial and restored public-open cases: 6 passed; selector cases: 3 passed.
+- Five individually applied source mutations each produced the required actual `0 passed; 1 failed`: bypass candidate routing, force healthy recovery, reuse stale candidate classification, bypass selector preflight, and bypass physical-retirement waiting. The workflow restored exact source before subsequent checks.
+- Full Core library: 2,910 passed, 244 ignored, zero failures (129.67 seconds). Dedicated ignored native cases above were explicitly executed; this does not claim the remaining ignored cohorts ran here.
+- SDK library: 43 passed. C units: 19 passed, 1 ignored.
+- Strict Core/C/SDK all-target Clippy with `conn_raw_api,bench`: passed (1 minute 35 seconds). Formatting and exact restored-tree integrity checks passed.
+
+Earlier run42536578437 also explicitly passed entry5, existing Ready16 and existing transport2 alongside public6/selector3. The separate standalone fresh-selection dependency was verified by its owner in run42535107175. Original SqliteDialect/native-extension/readonly/sequence configuration is preserved by the accepted Ready/C release774; this routing layer passes the original OpenOptions through unchanged.
+
+This completes Normal checkpoint routing through public Core shared opens. The checklist's wider acceptance clauses remain delegated where appropriate: full INTENT/SOURCE/ACK continuation and its common-driver typed hook belong to the successor owner; Windows, process/PDO and final combined crash cohorts belong to parent integration. Public C URI activation is unchanged and is not claimed by this milestone. No validation workflow commits are part of the product branch.
