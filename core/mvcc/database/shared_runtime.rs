@@ -61,6 +61,7 @@ mod shared_checkpoint_recovery_ids;
 pub(in crate::mvcc) use shared_checkpoint_recovery_ids::RecoveryCompletionEvidence;
 pub(crate) use shared_checkpoint_recovery_ids::{
     RecoveredDatabaseReady, RecoveryBootstrapEvidence, RecoveryConstructionPermit,
+    SharedInitialOpen, SharedInitialOpenResult,
 };
 
 #[path = "shared_id_runtime.rs"]
@@ -309,36 +310,10 @@ impl SharedOpenState {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(loaded)) => {
                 self.load = None;
-                if loaded.record().requires_recovery() {
-                    self.failed = true;
-                    return Err(LimboError::InvalidArgument(
-                        "shared manifest recovery is required".into(),
-                    )
-                    .into());
+                if let Err(error) = self.accept_selected_manifest(loaded) {
+                    self.abort();
+                    return Err(error.into());
                 }
-                let bindings = (|| {
-                    let guard = loaded.guard()?;
-                    Ok::<_, LimboError>(if self.pin_physical_reads {
-                        vec![
-                            self.runtime.main.bind_reads(guard)?,
-                            self.runtime.wal.bind_reads(guard)?,
-                        ]
-                    } else {
-                        vec![
-                            self.runtime.main.bind(guard)?,
-                            self.runtime.wal.bind(guard)?,
-                        ]
-                    })
-                })();
-                match bindings {
-                    Ok(bindings) => self.bindings = bindings,
-                    Err(error) => {
-                        self.abort();
-                        return Err(error.into());
-                    }
-                }
-                self.loaded = Some(loaded);
-                self.manifest_ready = true;
                 Ok(IOResult::Done(()))
             }
             Err(error) => {
@@ -346,6 +321,29 @@ impl SharedOpenState {
                 Err(error.into())
             }
         }
+    }
+
+    fn accept_selected_manifest(&mut self, loaded: LoadedManifest) -> Result<()> {
+        if loaded.record().requires_recovery() {
+            return Err(LimboError::InvalidArgument(
+                "shared manifest recovery is required".into(),
+            ));
+        }
+        let guard = loaded.guard()?;
+        self.bindings = if self.pin_physical_reads {
+            vec![
+                self.runtime.main.bind_reads(guard)?,
+                self.runtime.wal.bind_reads(guard)?,
+            ]
+        } else {
+            vec![
+                self.runtime.main.bind(guard)?,
+                self.runtime.wal.bind(guard)?,
+            ]
+        };
+        self.loaded = Some(loaded);
+        self.manifest_ready = true;
+        Ok(())
     }
 
     pub(crate) fn capture_connection_generation(

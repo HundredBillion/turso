@@ -663,6 +663,8 @@ pub struct OpenDbAsyncState {
     #[cfg(all(host_shared_wal, unix))]
     shared_open: Option<mvcc::database::SharedOpenState>,
     #[cfg(all(host_shared_wal, unix))]
+    shared_initial: Option<Box<mvcc::database::SharedInitialOpen>>,
+    #[cfg(all(host_shared_wal, unix))]
     shared_bootstrap: mvcc::database::SharedBootstrapState,
     dialect_schema_stmt: Option<Box<Statement>>,
     dialect_schema_rows: Vec<Vec<Value>>,
@@ -705,6 +707,8 @@ impl OpenDbAsyncState {
             shared_request: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_open: None,
+            #[cfg(all(host_shared_wal, unix))]
+            shared_initial: None,
             #[cfg(all(host_shared_wal, unix))]
             shared_bootstrap: mvcc::database::SharedBootstrapState::default(),
             dialect_schema_stmt: None,
@@ -1862,7 +1866,7 @@ impl Database {
                             .expect("shared mode requested"),
                         flags.contains(OpenFlags::ReadOnly),
                     )?;
-                    state.shared_open = Some(runtime.begin_read_pinned_open()?);
+                    state.shared_initial = Some(runtime.begin_initial_open(options.clone())?);
                     state.shared_runtime = Some(runtime);
                     state.shared_request = Some(SharedOpenRequest {
                         path: path.to_owned(),
@@ -1870,12 +1874,22 @@ impl Database {
                         options: options.clone(),
                     });
                 }
-                if state.phase == OpenDbAsyncPhase::Init {
-                    return_if_io!(state
-                        .shared_open
-                        .as_mut()
-                        .expect("open guard initialized")
-                        .poll_manifest());
+                if state.phase == OpenDbAsyncPhase::Done {
+                    return Ok(IOResult::Done(state.db.as_ref().unwrap().clone()));
+                }
+                if let Some(initial) = state.shared_initial.as_mut() {
+                    let outcome = return_if_io!(initial.poll());
+                    state.shared_initial = None;
+                    match outcome {
+                        mvcc::database::SharedInitialOpenResult::Healthy(open) => {
+                            state.shared_open = Some(*open)
+                        }
+                        mvcc::database::SharedInitialOpenResult::Recovered(database) => {
+                            state.db = Some(database.clone());
+                            state.phase = OpenDbAsyncPhase::Done;
+                            return Ok(IOResult::Done(database));
+                        }
+                    }
                 }
                 let runtime = state.shared_runtime.as_ref().unwrap();
                 let mut resolved = options.clone();
@@ -1895,6 +1909,7 @@ impl Database {
                 Self::do_open_async(state, io, path, &resolved)
             })();
             if result.is_err() {
+                state.shared_initial = None;
                 state.shared_open = None;
                 state.shared_runtime = None;
                 state.shared_request = None;

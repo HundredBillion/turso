@@ -100,8 +100,8 @@ pub(in crate::mvcc) use shared_runtime::RecoveryWalEvidence;
 pub(crate) use shared_runtime::{
     checkpoint_shared, RecoveredDatabaseReady, RecoveryBootstrapEvidence,
     RecoveryConstructionPermit, SharedBeginState, SharedBootstrapState, SharedIdRequest,
-    SharedIdResult, SharedIdState, SharedMvccRuntime, SharedOpenState,
-    SharedSequenceWatermarkState,
+    SharedIdResult, SharedIdState, SharedInitialOpen, SharedInitialOpenResult, SharedMvccRuntime,
+    SharedOpenState, SharedSequenceWatermarkState,
 };
 #[cfg(all(host_shared_wal, unix))]
 #[allow(unused_imports)]

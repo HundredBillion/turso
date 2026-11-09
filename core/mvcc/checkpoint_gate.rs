@@ -24,6 +24,14 @@ pub(super) struct CheckpointPause {
     gate: Arc<CheckpointAdmissionGate>,
 }
 
+impl CheckpointPause {
+    pub(super) fn belongs_to(&self, gate: &Arc<CheckpointAdmissionGate>) -> bool {
+        Arc::ptr_eq(&self.gate, gate)
+            && gate.pause_owned.load(Ordering::Acquire)
+            && !gate.poisoned.load(Ordering::Acquire)
+    }
+}
+
 impl CheckpointAdmissionGate {
     /// The caller supplies native I/O and the identity of a retained, validated authority.
     /// Each open must create an independent open-file description for OFD exclusion.

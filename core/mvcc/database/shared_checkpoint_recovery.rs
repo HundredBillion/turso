@@ -8,6 +8,38 @@ pub(in crate::mvcc) struct CheckpointRecoverySelection {
     pub pause: CheckpointPause,
 }
 
+impl CheckpointRecoverySelection {
+    pub(in crate::mvcc) fn fresh(
+        runtime: Arc<SharedMvccRuntime>,
+        manifest: LoadedManifest,
+        pause: CheckpointPause,
+    ) -> Result<Self> {
+        if !manifest.belongs_to_file(&runtime.files.manifest)
+            || !runtime.owns_authority(manifest.guard()?)
+            || !pause.belongs_to(&runtime.gate)
+            || manifest.record().database_id() != runtime.database_id
+            || runtime.files.main.file_id()? != Some(runtime.database_id)
+            || runtime.files.manifest.file_id()?.is_none()
+            || runtime.files.physical_wal.file_id()?.is_none()
+        {
+            return Err(LimboError::InvalidArgument(
+                "fresh recovery selection changed its runtime, files or pause".into(),
+            ));
+        }
+        if manifest.record().downgrade_intent().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint recovery cannot resume a downgrade".into(),
+            ));
+        }
+        manifest.guard()?.ensure_no_snapshot_locks()?;
+        Ok(Self {
+            runtime,
+            manifest,
+            pause,
+        })
+    }
+}
+
 #[allow(dead_code)]
 pub(in crate::mvcc) struct CheckpointRecoveryOpen {
     runtime: Arc<SharedMvccRuntime>,
@@ -49,18 +81,11 @@ impl CheckpointRecoveryOpen {
         })?;
         let manifest = return_if_io!(load.poll());
         self.load = None;
-        if manifest.record().downgrade_intent().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "checkpoint recovery cannot resume a downgrade".into(),
-            )
-            .into());
-        }
-        manifest.guard()?.ensure_no_snapshot_locks()?;
-        Ok(IOResult::Done(CheckpointRecoverySelection {
-            runtime: self.runtime.clone(),
+        Ok(IOResult::Done(CheckpointRecoverySelection::fresh(
+            self.runtime.clone(),
             manifest,
-            pause: self.pause.take().unwrap(),
-        }))
+            self.pause.take().unwrap(),
+        )?))
     }
 }
 
@@ -225,5 +250,81 @@ mod tests {
             assert!(!selected.manifest.record().requires_recovery());
             assert!(selected.manifest.guard().unwrap().requires_recovery());
         }
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn checkpoint_recovery_entry_native_fresh_selection_rejects_foreign_pause() {
+        use super::super::shared_checkpoint_intent_fixture::{CrashPoint, IntentCrashFixture};
+        let first = IntentCrashFixture::new(CrashPoint::SecondIntentWrite, 1);
+        let second = IntentCrashFixture::new(CrashPoint::SecondIntentWrite, 1);
+        let mut open = first.runtime.begin_checkpoint_recovery().unwrap();
+        let selected = first.io.block(|| open.poll()).unwrap();
+        let mut other_open = second.runtime.begin_checkpoint_recovery().unwrap();
+        let other = second.io.block(|| other_open.poll()).unwrap();
+        let CheckpointRecoverySelection {
+            manifest,
+            pause: actual_pause,
+            ..
+        } = selected;
+        let error = match CheckpointRecoverySelection::fresh(
+            first.runtime.clone(),
+            manifest,
+            other.pause,
+        ) {
+            Ok(_) => panic!("foreign pause authorized fresh recovery"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("runtime, files or pause"));
+        assert!(matches!(
+            first.runtime.gate.try_enter_admission(),
+            Err(LimboError::Busy)
+        ));
+        first.assert_durable_unchanged();
+        second.assert_durable_unchanged();
+        drop(actual_pause);
+    }
+
+    #[test]
+    #[ignore = "requires native Linux ext-family filesystem"]
+    fn checkpoint_recovery_entry_native_fresh_selection_rejects_substitute_manifest() {
+        use super::super::shared_checkpoint_intent_fixture::{CrashPoint, IntentCrashFixture};
+        let fixture = IntentCrashFixture::new(CrashPoint::SecondIntentWrite, 1);
+        let original = std::fs::read(fixture.runtime.files.namespace.join("manifest")).unwrap();
+        let mut open = fixture.runtime.begin_checkpoint_recovery().unwrap();
+        let selected = fixture.io.block(|| open.poll()).unwrap();
+        let CheckpointRecoverySelection {
+            manifest, pause, ..
+        } = selected;
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let fake = io
+            .open_file("substitute", crate::OpenFlags::Create, false)
+            .unwrap();
+        io.wait_for_completion(
+            fake.pwrite(
+                0,
+                Arc::new(crate::Buffer::new(original.clone())),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut load = ManifestLoad::new(
+            fake,
+            manifest.into_guard().unwrap(),
+            fixture.runtime.database_id,
+        )
+        .unwrap();
+        let fake = io.block(|| Ok(load.poll()?)).unwrap();
+        let error = match CheckpointRecoverySelection::fresh(fixture.runtime.clone(), fake, pause) {
+            Ok(_) => panic!("substitute manifest authorized fresh recovery"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("runtime, files or pause"));
+        assert_eq!(
+            std::fs::read(fixture.runtime.files.namespace.join("manifest")).unwrap(),
+            original
+        );
+        fixture.assert_durable_unchanged();
     }
 }

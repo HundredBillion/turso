@@ -1,3 +1,7 @@
+#[path = "shared_open_recovery.rs"]
+mod shared_open_recovery;
+pub(crate) use shared_open_recovery::{SharedInitialOpen, SharedInitialOpenResult};
+
 use super::*;
 
 #[allow(dead_code)]
@@ -442,3 +446,7 @@ impl Drop for RecoveryBootstrap {
 #[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
 #[path = "shared_checkpoint_recovery_bootstrap_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64", not(shuttle)))]
+#[path = "shared_open_recovery_tests.rs"]
+mod open_recovery_tests;
